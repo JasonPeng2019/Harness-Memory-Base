@@ -17,7 +17,7 @@ class PrivacyBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.policy = privacy.PrivacyPolicy(
             known_secrets=("synthetic-secret-alpha-1234567890",),
-            forbidden_environment_keys=("MEMORY_HARNESS_CONTROL_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"),
+            forbidden_environment_keys=("MEMORY_HARNESS_CONTROL_TOKEN",),
         )
 
     def test_mandatory_secret_blocks_without_rewriting_the_raw_source(self) -> None:
@@ -36,10 +36,13 @@ class PrivacyBoundaryTests(unittest.TestCase):
         environment = {
             "PATH": "/usr/bin",
             "MEMORY_HARNESS_CONTROL_TOKEN": "synthetic-secret-alpha-1234567890",
-            "OPENAI_API_KEY": "another-secret",
+            "OPENAI_API_KEY": "provider-transport-secret",
         }
         safe = privacy.worker_environment(environment, self.policy)
-        self.assertEqual({"PATH": "/usr/bin"}, safe)
+        self.assertEqual(
+            {"PATH": "/usr/bin", "OPENAI_API_KEY": "provider-transport-secret"},
+            safe,
+        )
         self.assertNotIn("synthetic-secret-alpha-1234567890", json.dumps(safe))
 
     def test_worker_prompt_has_no_control_credentials_or_forbidden_authority(self) -> None:
@@ -52,6 +55,16 @@ class PrivacyBoundaryTests(unittest.TestCase):
         self.assertNotIn("synthetic-secret-alpha-1234567890", prompt)
         self.assertNotIn("MEMORY_HARNESS_CONTROL_TOKEN", prompt)
         self.assertNotIn("approve/publish/revoke", prompt)
+
+    def test_mandatory_plan_secret_blocks_instead_of_being_rewritten(self) -> None:
+        plan = {"steps": ["Use synthetic-secret-alpha-1234567890"]}
+        with self.assertRaisesRegex(privacy.MandatorySecretError, "synthetic-secret"):
+            privacy.worker_prompt(
+                "Inspect the failing test.",
+                plan,
+                privacy_policy=self.policy,
+            )
+        self.assertIn("synthetic-secret-alpha-1234567890", plan["steps"][0])
 
     def test_experience_fixture_sanitizes_but_preserves_raw_authoritative_record(self) -> None:
         examples = experience.load_experience_examples(self.policy)
@@ -83,10 +96,12 @@ class PrivacyBoundaryTests(unittest.TestCase):
         request = apc.make_apc_request(
             template=template,
             parent_decision_id="decision-1",
+            parent_objective_id="objective-1",
             permitted_edits=["bindings"],
             binding={
                 "provider": "codex",
                 "model": "model-a",
+                "cli": "codex",
                 "effort": "high",
                 "source": "explicit",
             },

@@ -46,6 +46,14 @@ class RuntimeDispatchTests(unittest.TestCase):
         )
         self.envelope = self.prepared.envelope
 
+    def test_decision_retains_resolved_configuration_identity(self) -> None:
+        decision = self.prepared.decision
+        self.assertEqual("standard", decision["configuration"]["strategy"])
+        self.assertEqual(
+            contracts.sha256_hex(decision["configuration"]),
+            decision["configuration_digest"],
+        )
+
     def tearDown(self) -> None:
         self.memory_store.close()
         self.temporary.cleanup()
@@ -126,6 +134,30 @@ class RuntimeDispatchTests(unittest.TestCase):
             base_commit="base-1",
             worktree_path=self.root / "worktree",
         )
+
+    def test_outcome_requires_the_exact_dispatched_decision_plan_and_run(self) -> None:
+        self.runtime.dispatch(
+            self.envelope,
+            lambda envelope: {"invocation_id": "ctrl-1"},
+        )
+        cases = (
+            {"decision_id": "wrong-decision"},
+            {"plan_id": "wrong-plan"},
+            {"plan_digest": "wrong-digest"},
+            {"linked_run_id": "wrong-run"},
+        )
+        base = {
+            "decision_id": self.envelope["decision_id"],
+            "plan_id": self.plan["plan_id"],
+            "plan_digest": self.plan["content_hash"],
+            "status": "PASS",
+            "evidence_digest": "evidence-1",
+            "linked_run_id": "run-1",
+        }
+        for change in cases:
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(ValueError, "decision|plan|run"):
+                    self.runtime.record_outcome(**(base | change))
 
 
 if __name__ == "__main__":

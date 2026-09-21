@@ -49,6 +49,26 @@ class FixedConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(config.DeferredCapabilityError, "deferred/not implemented"):
                 config.resolve_config(request)
 
+    def test_feature_prerequisites_resolve_to_effective_off(self) -> None:
+        resolved = config.resolve_config(
+            {
+                "experience_write": False,
+                "generated_skill_creation": True,
+                "template_memory": False,
+                "apc": True,
+                "light_adaptation": True,
+            }
+        )
+        self.assertFalse(resolved.generated_skill_creation)
+        self.assertFalse(resolved.apc)
+        self.assertFalse(resolved.light_adaptation)
+
+        deeper_disabled = config.resolve_config(
+            {"strategy": "deeper", "deeper": False}
+        )
+        self.assertEqual("standard", deeper_disabled.strategy)
+        self.assertIn("fallback", deeper_disabled.reason)
+
 
 if __name__ == "__main__":
     unittest.main()

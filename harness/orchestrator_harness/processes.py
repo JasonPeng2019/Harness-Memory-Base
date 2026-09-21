@@ -175,6 +175,7 @@ def spawn_detached(
     cwd: str | Path | None = None,
     stdout: Any = subprocess.DEVNULL,
     stderr: Any = subprocess.DEVNULL,
+    env: dict[str, str] | None = None,
 ) -> subprocess.Popen[Any]:
     """Start one detached monitor/helper process and return its Popen handle."""
 
@@ -187,6 +188,7 @@ def spawn_detached(
         stdin=subprocess.DEVNULL,
         creationflags=creationflags,
         close_fds=True,
+        env=env,
     )
 
 

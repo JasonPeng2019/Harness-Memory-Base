@@ -140,12 +140,14 @@ class StageAIntegrationTests(unittest.TestCase):
         binding = {
             "provider": "synthetic-provider",
             "model": "synthetic-model",
+            "cli": "synthetic-cli",
             "effort": "medium",
             "source": "explicit",
         }
         request = apc.make_apc_request(
             template=template,
             parent_decision_id="decision-1",
+            parent_objective_id="objective-1",
             permitted_edits=["bindings"],
             binding=binding,
         )
@@ -161,9 +163,21 @@ class StageAIntegrationTests(unittest.TestCase):
         result = apc.make_apc_result(request, draft)
         apc.validate_apc_result(result, request)
         self.assertEqual("decision-1", result["parent_decision_id"])
+        self.assertEqual("objective-1", result["parent_objective_id"])
         self.assertEqual(template.template_id, result["template_id"])
+        self.assertEqual(template.version, result["template_version"])
+        self.assertEqual(request["template_digest"], result["template_digest"])
         self.assertEqual(("bindings",), tuple(result["permitted_edits"]))
         self.assertEqual("proposed", result["proposed_plan"]["state"])
+
+        with self.assertRaisesRegex(apc.APCError, "permitted"):
+            apc.make_apc_request(
+                template=template,
+                parent_decision_id="decision-1",
+                parent_objective_id="objective-1",
+                permitted_edits=["fixed_steps"],
+                binding=binding,
+            )
 
     def test_all_off_and_deferred_strategy_do_not_create_learner_state(self) -> None:
         resolved = config.resolve_config({"all_features": False})

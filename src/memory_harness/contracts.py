@@ -15,10 +15,13 @@ DECISION_SCHEMA = "memory-decision/v1"
 ENVELOPE_SCHEMA = "memory-dispatch/v1"
 OPERATION_SCHEMA = "memory-operation/v1"
 OUTCOME_SCHEMA = "memory-outcome/v1"
+APC_REQUEST_SCHEMA = "apc-request/v1"
+APC_RESULT_SCHEMA = "apc-result/v1"
 
 PLAN_STATES = frozenset({"candidate", "accepted", "proposed", "fresh"})
 ROUTES = frozenset({"ordinary", "problem_focused", "deeper"})
 OUTCOME_STATUSES = frozenset({"PASS", "FAIL", "BLOCKED", "UNKNOWN"})
+OPERATION_STATUSES = frozenset({"pending", "ambiguous", "delivered"})
 
 
 class ContractError(ValueError):
@@ -254,15 +257,34 @@ def revise_plan(
     )
 
 
+def validate_task_plan_binding(
+    task_card: Mapping[str, Any], plan: Mapping[str, Any]
+) -> None:
+    """Require an enhanced task card to name the same exact current plan."""
+
+    validate_task_card(task_card)
+    validate_plan(plan)
+    handoff = task_card.get("memory_handoff")
+    if handoff is None:
+        return
+    bound_plan = handoff["plan"]
+    if bound_plan["content_hash"] != plan["content_hash"]:
+        raise ContractError("task card plan does not match the supplied plan")
+
+
 def make_decision(
     task_card: Mapping[str, Any],
     plan: Mapping[str, Any],
     *,
     strategy: str = "standard",
+    configuration: Mapping[str, Any] | None = None,
     decision_id: str | None = None,
 ) -> dict[str, Any]:
-    validate_task_card(task_card)
-    validate_plan(plan)
+    validate_task_plan_binding(task_card, plan)
+    resolved_configuration = dict(configuration or {"strategy": strategy})
+    if resolved_configuration.get("strategy") != strategy:
+        raise ContractError("decision strategy does not match its configuration")
+    configuration_digest = sha256_hex(resolved_configuration)
     identity = decision_id or sha256_hex(
         {
             "task_card_digest": task_card["content_hash"],
@@ -270,6 +292,7 @@ def make_decision(
             "route": plan["route"],
             "plan_id": plan["plan_id"],
             "strategy": strategy,
+            "configuration_digest": configuration_digest,
         }
     )
     record: dict[str, Any] = {
@@ -282,6 +305,8 @@ def make_decision(
         "plan_state": plan["state"],
         "plan_digest": plan["content_hash"],
         "strategy": strategy,
+        "configuration": resolved_configuration,
+        "configuration_digest": configuration_digest,
         "state": "prepared" if plan["state"] == "accepted" else plan["state"],
         "created_at": utc_now(),
     }
@@ -301,11 +326,19 @@ def validate_decision(record: Mapping[str, Any]) -> None:
         "plan_state",
         "plan_digest",
         "strategy",
+        "configuration_digest",
         "state",
     ):
         _require_nonempty_str(record.get(field), field)
     if record["route"] not in ROUTES:
         raise ContractError(f"unknown route: {record['route']!r}")
+    configuration = record.get("configuration")
+    if not isinstance(configuration, Mapping):
+        raise ContractError("configuration must be an object")
+    if configuration.get("strategy") != record["strategy"]:
+        raise ContractError("decision strategy does not match its configuration")
+    if record["configuration_digest"] != sha256_hex(configuration):
+        raise ContractError("decision configuration digest mismatch")
 
 
 def _normalize_content_list(value: Iterable[Mapping[str, Any]] | None, field: str) -> list[dict[str, Any]]:
@@ -340,15 +373,24 @@ def make_envelope(
     mandatory_content: list[Mapping[str, Any]] | None = None,
     optional_content: list[Mapping[str, Any]] | None = None,
     omitted_content: list[str] | None = None,
+    strategy: str = "standard",
+    configuration: Mapping[str, Any] | None = None,
     created_at: str | None = None,
 ) -> dict[str, Any]:
-    validate_task_card(task_card)
+    validate_task_plan_binding(task_card, plan)
     validate_plan(plan, expected_state="accepted")
     validate_decision_id = _require_nonempty_str(decision_id, "decision_id")
     lane = _require_nonempty_str(lane_id, "lane_id")
     run = _require_nonempty_str(run_id, "run_id")
     worktree = _require_nonempty_str(str(worktree_path), "worktree_path")
     base = _require_nonempty_str(base_commit, "base_commit")
+    resolved_configuration = dict(configuration or {"strategy": strategy})
+    if resolved_configuration.get("strategy") != strategy:
+        raise ContractError("envelope strategy does not match its configuration")
+    if task_card["base_commit"] != base:
+        raise ContractError(
+            f"task card base mismatch: expected {task_card['base_commit']!r}, got {base!r}"
+        )
     mandatory = _normalize_content_list(mandatory_content, "mandatory_content")
     optional = _normalize_content_list(optional_content, "optional_content")
     omitted = omitted_content or []
@@ -359,6 +401,9 @@ def make_envelope(
         "lane_id": lane,
         "run_id": run,
         "decision_id": validate_decision_id,
+        "strategy": strategy,
+        "configuration": resolved_configuration,
+        "configuration_digest": sha256_hex(resolved_configuration),
         "task_card_digest": task_card["content_hash"],
         "objective_id": plan["objective_id"],
         "route": plan["route"],
@@ -405,7 +450,8 @@ def validate_envelope(
 ) -> None:
     validate_record(record, ENVELOPE_SCHEMA)
     validate_task_card(task_card)
-    validate_plan(plan)
+    validate_task_plan_binding(task_card, plan)
+    validate_plan(plan, expected_state="accepted")
     expected = {
         "lane_id": lane_id,
         "run_id": run_id,
@@ -417,12 +463,26 @@ def validate_envelope(
         "plan_digest": plan["content_hash"],
         "base_commit": base_commit,
         "worktree_path": str(worktree_path),
-        "decision_id": decision_id or make_decision(task_card, plan)["decision_id"],
+        "decision_id": decision_id
+        or make_decision(
+            task_card,
+            plan,
+            strategy=str(record.get("strategy")),
+            configuration=record.get("configuration"),
+        )["decision_id"],
     }
     for field, expected_value in expected.items():
         actual = record.get(field)
         if actual != expected_value:
             raise ContractError(f"envelope {field.replace('_', ' ')} mismatch: expected {expected_value!r}, got {actual!r}")
+    strategy = _require_nonempty_str(record.get("strategy"), "strategy")
+    configuration = record.get("configuration")
+    if not isinstance(configuration, Mapping):
+        raise ContractError("envelope configuration must be an object")
+    if configuration.get("strategy") != strategy:
+        raise ContractError("envelope strategy does not match its configuration")
+    if record.get("configuration_digest") != sha256_hex(configuration):
+        raise ContractError("envelope configuration digest mismatch")
     mandatory = _normalize_content_list(record.get("mandatory_content"), "mandatory_content")
     optional = _normalize_content_list(record.get("optional_content"), "optional_content")
     if record.get("mandatory_digest") != _digest_content_list(mandatory):
@@ -459,6 +519,7 @@ def make_operation(
         "kind": selected_kind,
         "decision_id": envelope["decision_id"],
         "envelope_digest": validate_envelope_identity,
+        "run_id": envelope["run_id"],
         "status": status,
         "observed_invocation": dict(observed_invocation) if observed_invocation is not None else None,
         "created_at": utc_now(),
@@ -470,8 +531,12 @@ def make_operation(
 
 def validate_operation(record: Mapping[str, Any]) -> None:
     validate_record(record, OPERATION_SCHEMA)
-    for field in ("operation_id", "kind", "decision_id", "envelope_digest", "status"):
+    for field in ("operation_id", "kind", "decision_id", "envelope_digest", "run_id", "status"):
         _require_nonempty_str(record.get(field), field)
+    if record["status"] not in OPERATION_STATUSES:
+        raise ContractError(f"unknown operation status: {record['status']!r}")
+    if record["status"] == "delivered" and record.get("observed_invocation") is None:
+        raise ContractError("delivered operation requires an observed invocation")
     if record.get("observed_invocation") is not None and not isinstance(record["observed_invocation"], Mapping):
         raise ContractError("observed_invocation must be an object or null")
 
@@ -484,6 +549,8 @@ def make_outcome(
     status: str,
     evidence_digest: str,
     linked_run_id: str,
+    task_card_digest: str,
+    objective_id: str,
 ) -> dict[str, Any]:
     decision = _require_nonempty_str(decision_id, "decision_id")
     plan = _require_nonempty_str(plan_id, "plan_id")
@@ -493,6 +560,8 @@ def make_outcome(
         raise ContractError(f"unknown outcome status: {outcome_status!r}")
     evidence = _require_nonempty_str(evidence_digest, "evidence_digest")
     run = _require_nonempty_str(linked_run_id, "linked_run_id")
+    task_digest = _require_nonempty_str(task_card_digest, "task_card_digest")
+    objective = _require_nonempty_str(objective_id, "objective_id")
     outcome_id = sha256_hex(
         {
             "decision_id": decision,
@@ -501,6 +570,8 @@ def make_outcome(
             "status": outcome_status,
             "evidence_digest": evidence,
             "linked_run_id": run,
+            "task_card_digest": task_digest,
+            "objective_id": objective,
         }
     )
     record: dict[str, Any] = {
@@ -512,6 +583,8 @@ def make_outcome(
         "status": outcome_status,
         "evidence_digest": evidence,
         "linked_run_id": run,
+        "task_card_digest": task_digest,
+        "objective_id": objective,
         "observed_at": utc_now(),
     }
     record["content_hash"] = content_hash(record)
@@ -521,7 +594,10 @@ def make_outcome(
 
 def validate_outcome(record: Mapping[str, Any]) -> None:
     validate_record(record, OUTCOME_SCHEMA)
-    for field in ("outcome_id", "decision_id", "plan_id", "plan_digest", "status", "evidence_digest", "linked_run_id"):
+    for field in (
+        "outcome_id", "decision_id", "task_card_digest", "objective_id",
+        "plan_id", "plan_digest", "status", "evidence_digest", "linked_run_id",
+    ):
         _require_nonempty_str(record.get(field), field)
     if record["status"] not in OUTCOME_STATUSES:
         raise ContractError(f"unknown outcome status: {record['status']!r}")
@@ -536,9 +612,12 @@ __all__ = [
     "ENVELOPE_SCHEMA",
     "OPERATION_SCHEMA",
     "OUTCOME_SCHEMA",
+    "APC_REQUEST_SCHEMA",
+    "APC_RESULT_SCHEMA",
     "PLAN_STATES",
     "ROUTES",
     "OUTCOME_STATUSES",
+    "OPERATION_STATUSES",
     "canonical_json",
     "sha256_hex",
     "content_hash",
@@ -550,6 +629,7 @@ __all__ = [
     "make_plan",
     "validate_plan",
     "revise_plan",
+    "validate_task_plan_binding",
     "make_decision",
     "validate_decision",
     "make_envelope",

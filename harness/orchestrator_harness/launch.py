@@ -241,9 +241,12 @@ def run_launch(lane_id: str) -> dict[str, Any]:
         if not binding_path.is_file():
             raise LaunchError(LAUNCH_BINDING_FAILED, f"binding missing: {binding_path}")
 
+        spawn_options: dict[str, Any] = {"cwd": str(harness_root)}
+        if memory_envelope is not None:
+            spawn_options["env"] = memory_handoff.worker_environment()
         child = processes.spawn_detached(
             processes.python_argv("orchestrator_harness.controller", lane_id),
-            cwd=str(harness_root),
+            **spawn_options,
         )
         controller_identity = processes.process_identity(child.pid)
         if controller_identity is None:

@@ -29,8 +29,6 @@ class PrivacyPolicy:
     forbidden_environment_keys: tuple[str, ...] = (
         "MEMORY_HARNESS_CONTROL_TOKEN",
         "MEMORY_HARNESS_POLICY_TOKEN",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
     )
 
     def detect(self, value: Any) -> list[str]:
@@ -116,9 +114,8 @@ def worker_prompt(
     privacy_policy: PrivacyPolicy | None = None,
 ) -> str:
     policy = privacy_policy or PrivacyPolicy()
-    guard_mandatory(task_text, policy)
-    mandatory = sanitize_payload(plan_content, policy)
-    parts = ["## Task", str(task_text), "## Accepted plan", _render(mandatory)]
+    guard_mandatory({"task": task_text, "plan": plan_content}, policy)
+    parts = ["## Task", str(task_text), "## Accepted plan", _render(plan_content)]
     if optional_content is not None:
         sanitized_optional = sanitize_payload(optional_content, policy)
         parts.extend(["## Optional historical evidence", _render(sanitized_optional)])

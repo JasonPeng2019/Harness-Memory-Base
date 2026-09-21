@@ -108,6 +108,33 @@ class ContractBasics(unittest.TestCase):
         self.assertEqual(2, revised["revision"])
         self.assertNotEqual(old["content_hash"], revised["content_hash"])
 
+    def test_task_card_cannot_be_bound_to_a_different_valid_plan(self) -> None:
+        first = contracts.make_plan(
+            plan_id="plan-1",
+            objective_id="objective-1",
+            route="ordinary",
+            state="accepted",
+            content={"steps": ["first"]},
+            accepted_by="ROOT",
+        )
+        second = contracts.make_plan(
+            plan_id="plan-2",
+            objective_id="objective-1",
+            route="ordinary",
+            state="accepted",
+            content={"steps": ["second"]},
+            accepted_by="ROOT",
+        )
+        card = contracts.make_task_card(
+            task="Task",
+            base_commit="base-1",
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id="objective-1", route="ordinary", plan=first
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "task card plan"):
+            contracts.make_decision(card, second)
+
 
 class DispatchEnvelopeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -170,6 +197,18 @@ class DispatchEnvelopeTests(unittest.TestCase):
                 base_commit="base-1",
                 worktree_path="C:/worktree",
             )
+
+    def test_envelope_cannot_be_prepared_for_a_different_task_base(self) -> None:
+        with self.assertRaisesRegex(ValueError, "task card base"):
+            contracts.make_envelope(
+                task_card=self.card,
+                plan=self.plan,
+                decision_id=self.decision["decision_id"],
+                lane_id="lane-1",
+                run_id="run-1",
+                worktree_path="C:/worktree",
+                base_commit="base-2",
+            )
         with self.assertRaisesRegex(ValueError, "base"):
             contracts.validate_envelope(
                 self.envelope,
@@ -186,6 +225,7 @@ class DispatchEnvelopeTests(unittest.TestCase):
             "lane_id",
             "run_id",
             "decision_id",
+            "configuration_digest",
             "objective_id",
             "route",
             "plan_id",

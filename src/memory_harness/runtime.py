@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Mapping
 
 from . import contracts
@@ -57,7 +57,14 @@ class MemoryRuntime:
     ) -> PreparedMemory:
         contracts.validate_task_card(task_card)
         contracts.validate_plan(plan)
-        decision = contracts.make_decision(task_card, plan, strategy=self.config.strategy)
+        if task_card["base_commit"] != base_commit:
+            raise RuntimeError("task card base does not match the preparation base")
+        decision = contracts.make_decision(
+            task_card,
+            plan,
+            strategy=self.config.strategy,
+            configuration=asdict(self.config),
+        )
         self.store.record_decision(decision)
 
         if plan["state"] != "accepted":
@@ -78,6 +85,8 @@ class MemoryRuntime:
             base_commit=base_commit,
             mandatory_content=mandatory,
             optional_content=sanitized_optional,
+            strategy=self.config.strategy,
+            configuration=asdict(self.config),
         )
         return PreparedMemory(decision=decision, envelope=envelope)
 
@@ -95,15 +104,14 @@ class MemoryRuntime:
             envelope=envelope,
             status="pending",
         )
-        existing = self._try_get_operation(operation["operation_id"])
-        if existing is not None:
+        existing, created = self.store.create_operation(operation)
+        if not created:
             if existing["status"] == "delivered":
                 return existing
-            if existing["status"] == "ambiguous":
-                raise DispatchAmbiguityError(
-                    "ambiguous dispatch acknowledgement is unresolved; reconcile before retrying"
-                )
-        self.store.record_operation(operation)
+            raise DispatchAmbiguityError(
+                f"{existing['status']} dispatch intent is unresolved; "
+                "reconcile before retrying"
+            )
         observed = launcher(envelope)
         if observed is None:
             ambiguous = contracts.make_operation(
@@ -127,6 +135,22 @@ class MemoryRuntime:
             observed_invocation=observed,
         )
         return self.store.record_operation(delivered)
+
+    def record_dispatch_intent(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist one launch intent for callers that use the existing launcher."""
+
+        operation = contracts.make_operation(
+            kind="dispatch",
+            envelope=envelope,
+            status="pending",
+        )
+        existing, created = self.store.create_operation(operation)
+        if not created:
+            raise DispatchAmbiguityError(
+                f"{existing['status']} dispatch already exists; "
+                "reconcile it before any new launch"
+            )
+        return existing
 
     def reconcile_ambiguous_dispatch(
         self,
@@ -191,6 +215,23 @@ class MemoryRuntime:
         evidence_digest: str,
         linked_run_id: str,
     ) -> dict[str, Any]:
+        try:
+            decision = self.store.get_decision(decision_id)
+        except Exception as exc:
+            raise RuntimeError(f"outcome decision is not durable: {decision_id}") from exc
+        if decision["plan_id"] != plan_id:
+            raise RuntimeError("outcome plan does not match its decision")
+        if decision["plan_digest"] != plan_digest:
+            raise RuntimeError("outcome plan digest does not match its decision")
+        matching_dispatches = [
+            operation
+            for operation in self.store.list_operations(decision_id)
+            if operation["kind"] == "dispatch"
+            and operation["status"] == "delivered"
+            and operation["run_id"] == linked_run_id
+        ]
+        if not matching_dispatches:
+            raise RuntimeError("outcome run has no exact delivered dispatch")
         outcome = contracts.make_outcome(
             decision_id=decision_id,
             plan_id=plan_id,
@@ -198,6 +239,8 @@ class MemoryRuntime:
             status=status,
             evidence_digest=evidence_digest,
             linked_run_id=linked_run_id,
+            task_card_digest=decision["task_card_digest"],
+            objective_id=decision["objective_id"],
         )
         return self.store.record_outcome(outcome)
 

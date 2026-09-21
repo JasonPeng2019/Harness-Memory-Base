@@ -14,7 +14,7 @@ from orchestrator_harness import memory_handoff
 from memory_harness import contracts, runtime
 
 
-def _task_card() -> tuple[dict, dict]:
+def _task_card(configuration: dict | None = None) -> tuple[dict, dict]:
     plan = contracts.make_plan(
         plan_id="plan-1",
         objective_id="objective-1",
@@ -27,6 +27,7 @@ def _task_card() -> tuple[dict, dict]:
         objective_id="objective-1",
         route="ordinary",
         plan=plan,
+        configuration=configuration,
     )
     card = contracts.make_task_card(
         task="Fix the regression and verify it",
@@ -132,6 +133,32 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         )
         self.assertIsNone(memory_handoff.load_envelope(self.worktree))
 
+    def test_all_off_bypasses_memory_and_learned_mode_fails_before_state(self) -> None:
+        all_off_card, _ = _task_card({"all_features": False})
+        self.assertIsNone(
+            memory_handoff.prepare_bootstrap_envelope(
+                task_card=all_off_card,
+                lane_id="lane-off",
+                run_id="run-off",
+                worktree_path=self.worktree,
+                base_commit="base-1",
+            )
+        )
+        store_path, envelope_path = memory_handoff.memory_paths(self.worktree)
+        self.assertFalse(store_path.exists())
+        self.assertFalse(envelope_path.exists())
+
+        learned_card, _ = _task_card({"strategy": "learned"})
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "deferred"):
+            memory_handoff.prepare_bootstrap_envelope(
+                task_card=learned_card,
+                lane_id="lane-learned",
+                run_id="run-learned",
+                worktree_path=self.worktree,
+                base_commit="base-1",
+            )
+        self.assertFalse(store_path.exists())
+
     def test_changed_task_or_base_is_rejected_at_launch(self) -> None:
         envelope = memory_handoff.prepare_bootstrap_envelope(
             task_card=self.card,
@@ -214,6 +241,24 @@ class MemoryHandoffSeamTests(unittest.TestCase):
                 launcher=launcher,
             )
         self.assertEqual(1, len(calls))
+
+    def test_split_launch_intent_cannot_overwrite_ambiguous_dispatch(self) -> None:
+        envelope = memory_handoff.prepare_bootstrap_envelope(
+            task_card=self.card,
+            lane_id="lane-1",
+            run_id="run-1",
+            worktree_path=self.worktree,
+            base_commit="base-1",
+        )
+        memory_handoff.record_ambiguous_dispatch(
+            worktree_path=self.worktree,
+            envelope=envelope,
+        )
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "ambiguous"):
+            memory_handoff.record_dispatch_intent(
+                worktree_path=self.worktree,
+                envelope=envelope,
+            )
 
     def test_optional_omission_preserves_plan_and_updates_delivery_trace(self) -> None:
         card_with_optional = contracts.make_task_card(

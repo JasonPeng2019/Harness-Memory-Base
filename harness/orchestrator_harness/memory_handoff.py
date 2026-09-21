@@ -7,6 +7,7 @@ slice.  Legacy task cards without ``memory_handoff`` take the ordinary path.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -65,13 +66,19 @@ def prepare_bootstrap_envelope(
     if handoff is None:
         return None
     try:
-        from memory_harness import contracts, runtime, store
+        from memory_harness import config, runtime, store
+
+        resolved_config = config.resolve_config(handoff.get("configuration"))
+        if resolved_config.all_off:
+            _, envelope_path = memory_paths(worktree_path)
+            envelope_path.unlink(missing_ok=True)
+            return None
 
         store_path, _ = memory_paths(worktree_path)
         memory_store = store.MemoryStore(store_path)
         memory_store.initialize()
         try:
-            memory_runtime = runtime.MemoryRuntime(memory_store)
+            memory_runtime = runtime.MemoryRuntime(memory_store, config=resolved_config)
             prepared = memory_runtime.prepare(
                 plan=handoff["plan"],
                 task_card=task_card,
@@ -79,6 +86,14 @@ def prepare_bootstrap_envelope(
                 run_id=run_id,
                 worktree_path=str(worktree_path),
                 base_commit=base_commit,
+                mandatory_content=[
+                    {"id": "task", "kind": "task", "content": task_card["task"]},
+                    {
+                        "id": "accepted-plan",
+                        "kind": "accepted-plan",
+                        "content": handoff["plan"]["content"],
+                    },
+                ],
             )
         finally:
             memory_store.close()
@@ -161,6 +176,14 @@ def _open_runtime(worktree_path: str | Path):
     return memory_store, runtime.MemoryRuntime(memory_store)
 
 
+def worker_environment() -> dict[str, str]:
+    """Return the inherited environment without product control credentials."""
+
+    from memory_harness import privacy
+
+    return privacy.worker_environment(os.environ)
+
+
 def dispatch(
     *,
     worktree_path: str | Path,
@@ -182,16 +205,11 @@ def record_dispatch_intent(
 ) -> dict[str, Any]:
     """Record the exact dispatch intent before the existing launcher runs."""
 
-    from memory_harness import contracts
-
-    memory_store, _ = _open_runtime(worktree_path)
+    memory_store, memory_runtime = _open_runtime(worktree_path)
     try:
-        operation = contracts.make_operation(
-            kind="dispatch",
-            envelope=envelope,
-            status="pending",
-        )
-        return memory_store.record_operation(operation)
+        return memory_runtime.record_dispatch_intent(envelope)
+    except Exception as exc:
+        raise MemoryHandoffError(f"cannot record dispatch intent: {exc}") from exc
     finally:
         memory_store.close()
 
@@ -265,4 +283,5 @@ __all__ = [
     "record_observed_invocation",
     "validate_envelope_for_launch",
     "validate_task_card",
+    "worker_environment",
 ]

@@ -143,6 +143,17 @@ def resolve_config(raw: Mapping[str, Any] | None = None) -> MemoryConfig:
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be boolean")
 
+    feature_values["generated_skill_creation"] = bool(
+        feature_values["generated_skill_creation"] and feature_values["experience_write"]
+    )
+    feature_values["apc"] = bool(feature_values["apc"] and feature_values["template_memory"])
+    feature_values["light_adaptation"] = bool(
+        feature_values["light_adaptation"] and feature_values["apc"]
+    )
+    if strategy == DEEPER and not feature_values["deeper"]:
+        strategy = STANDARD
+        reason = "fallback to standard: deeper strategy is disabled"
+
     return MemoryConfig(
         strategy=strategy,
         requested_strategy=requested_strategy,
