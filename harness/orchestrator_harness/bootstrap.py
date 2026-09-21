@@ -26,6 +26,7 @@ from .epochs import (
     write_active_lanes,
 )
 from .lanes import LANE_SCHEMA, write_lane
+from . import memory_handoff
 from .records import atomic_write_json
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
@@ -571,6 +572,7 @@ def run_bootstrap(
 
     try:
         task_card = _read_task_card(Path(task_card_path))
+        memory_handoff.validate_task_card(task_card)
         state = open_epoch(rt, config, manifest)
         epoch_id = state["epoch_id"]
         for entry in read_active_lanes(rt, epoch_id):
@@ -623,6 +625,13 @@ def run_bootstrap(
             receipt["provider_payload"] = f"adapter-payloads/{provider}"
         atomic_write_json(agent_workspace / "overlay-receipt.json", receipt)
         atomic_write_json(agent_workspace / "task-card.json", task_card)
+        memory_handoff.prepare_bootstrap_envelope(
+            task_card=task_card,
+            lane_id=lane_id,
+            run_id=run_id,
+            worktree_path=worktree_path,
+            base_commit=base_commit,
+        )
 
         _write_worker_prompt(worktree_path, task_card, managed=managed)
         _write_result_template(worktree_path, lane_id, run_id)

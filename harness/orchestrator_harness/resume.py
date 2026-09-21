@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from . import memory_handoff
 from .bootstrap import (
     _write_invocation,
     _write_result_template,
@@ -244,7 +245,8 @@ def run_resume(
 
         try:
             task_card = _read_task_card(Path(resume_task_card))
-        except (OSError, ValueError) as exc:
+            memory_handoff.validate_task_card(task_card)
+        except (OSError, ValueError, memory_handoff.MemoryHandoffError) as exc:
             return {
                 "ok": False,
                 "code": INVALID_RESUME_TASK_CARD,
@@ -256,6 +258,13 @@ def run_resume(
         prior_run_id = str(lane.get("run_id") or "")
         run_id = new_id()
         managed = config.profile == "managed"
+        memory_handoff.prepare_resume_envelope(
+            task_card=task_card,
+            lane_id=lane_id,
+            run_id=run_id,
+            worktree_path=worktree,
+            base_commit=str(task_card.get("base_commit") or "HEAD"),
+        )
         update_lane(
             rt,
             epoch_id,

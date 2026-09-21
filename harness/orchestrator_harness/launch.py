@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import processes
+from . import memory_handoff, processes
 from .bootstrap import BootstrapError, _validate_provider_launch_config
 from .config import find_harness_root, load_config
 from .core import read_json, require_schema
@@ -211,6 +211,30 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                 LAUNCH_INVOCATION_INVALID,
                 "provider launch configuration is not in its validated canonical form",
             )
+        memory_envelope = memory_handoff.load_envelope(lane["worktree_path"])
+        if memory_envelope is not None:
+            task_card_path = (
+                Path(lane["worktree_path"]) / ".agent-workspace" / "task-card.json"
+            )
+            try:
+                task_card = read_json(task_card_path)
+            except (OSError, ValueError) as exc:
+                raise LaunchError(
+                    LAUNCH_INVOCATION_INVALID,
+                    f"cannot read the task card for memory dispatch: {exc}",
+                ) from exc
+            memory_handoff.validate_envelope_for_launch(
+                envelope=memory_envelope,
+                task_card=task_card,
+                lane_id=lane_id,
+                run_id=str(lane.get("run_id")),
+                worktree_path=lane["worktree_path"],
+                base_commit=str(task_card.get("base_commit") or "HEAD"),
+            )
+            memory_handoff.record_dispatch_intent(
+                worktree_path=lane["worktree_path"],
+                envelope=memory_envelope,
+            )
         binding_path = (
             harness_root / "orchestrator_harness" / "provider_adapters" / provider_id / "launcher_binding.py"
         )
@@ -223,11 +247,29 @@ def run_launch(lane_id: str) -> dict[str, Any]:
         )
         controller_identity = processes.process_identity(child.pid)
         if controller_identity is None:
+            if memory_envelope is not None:
+                memory_handoff.record_ambiguous_dispatch(
+                    worktree_path=lane["worktree_path"],
+                    envelope=memory_envelope,
+                )
             child.terminate()
             child.wait(timeout=10.0)
             raise LaunchError(
                 LAUNCH_CONTROLLER_START_FAILED,
                 "cannot record the launched controller process identity",
+            )
+        if memory_envelope is not None and controller_identity is not None:
+            memory_handoff.record_observed_invocation(
+                worktree_path=lane["worktree_path"],
+                envelope=memory_envelope,
+                observed_invocation={
+                    "invocation_id": (
+                        f"controller:{controller_identity['pid']}:"
+                        f"{controller_identity['creation_time']}"
+                    ),
+                    "pid": controller_identity["pid"],
+                    "creation_time": controller_identity["creation_time"],
+                },
             )
         try:
             lane = update_lane(
