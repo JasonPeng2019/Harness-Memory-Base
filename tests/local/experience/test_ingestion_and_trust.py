@@ -98,6 +98,12 @@ class ReviewedExperienceIngestionTests(unittest.TestCase):
             plan=plan,
             reviewed_by="ROOT",
             evidence_refs=("review://run-1",),
+            protected_source_refs=("evidence://protected/trace",),
+            raw_evidence=(
+                "The parser repair failed after synthetic-secret-alpha-1234567890 "
+                "was found in a protected trace."
+            ),
+            failed_hypotheses=("network timeout",),
         )
         return self.service.capture(
             task_card=task_card,
@@ -106,12 +112,6 @@ class ReviewedExperienceIngestionTests(unittest.TestCase):
             outcome=outcome,
             review_receipt=review,
             scope=self.scope,
-            raw_evidence=(
-                "The parser repair failed after synthetic-secret-alpha-1234567890 "
-                "was found in a protected trace."
-            ),
-            failed_hypotheses=("network timeout",),
-            protected_source_refs=("evidence://protected/trace",),
         )
 
     def test_uncertain_ingestion_never_replays_and_recent_evidence_waits_for_receipt(
@@ -122,7 +122,12 @@ class ReviewedExperienceIngestionTests(unittest.TestCase):
         adapter = experience.EverOSAdapter(
             scope=self.scope,
             base_root=self.root / "everos",
-            surface=experience.EverOSPublicSurface.from_object(failed_surface),
+            surface=experience.EverOSPublicSurface.from_object(
+                failed_surface,
+                memory_root=experience.EverOSAdapter.memory_root_for_scope(
+                    self.root / "everos", self.scope
+                ),
+            ),
             privacy_policy=self.policy,
         )
 
@@ -146,7 +151,12 @@ class ReviewedExperienceIngestionTests(unittest.TestCase):
         recovery = experience.EverOSAdapter(
             scope=self.scope,
             base_root=self.root / "everos",
-            surface=experience.EverOSPublicSurface.from_object(recovery_surface),
+            surface=experience.EverOSPublicSurface.from_object(
+                recovery_surface,
+                memory_root=experience.EverOSAdapter.memory_root_for_scope(
+                    self.root / "everos", self.scope
+                ),
+            ),
             privacy_policy=self.policy,
         )
         replay = asyncio.run(
@@ -189,6 +199,71 @@ class ReviewedExperienceIngestionTests(unittest.TestCase):
         self.assertNotIn(
             "synthetic-secret-alpha-1234567890", str(receipt["source_case"])
         )
+
+    def test_ingestion_status_compare_and_swap_rejects_a_stale_writer(self) -> None:
+        trajectory = self._capture()
+        source = _FakeEverOS()
+        adapter = experience.EverOSAdapter(
+            scope=self.scope,
+            base_root=self.root / "everos",
+            surface=experience.EverOSPublicSurface.from_object(
+                source,
+                memory_root=experience.EverOSAdapter.memory_root_for_scope(
+                    self.root / "everos", self.scope
+                ),
+            ),
+            privacy_policy=self.policy,
+        )
+        pending = asyncio.run(
+            self.service.extract_trajectory(trajectory["trajectory_id"], adapter)
+        )
+        self.assertEqual("pending", pending["status"])
+
+        second_connection = store.MemoryStore(self.root / "memory.sqlite3")
+        second_connection.initialize()
+        try:
+            stale = second_connection.get_experience_ingestion(pending["ingestion_id"])
+
+            source.case_results = [
+                {
+                    "id": "cas-locked",
+                    "agent_id": adapter.everos_owner_id,
+                    "app_id": adapter.everos_application_id,
+                    "project_id": adapter.everos_project_id,
+                    "session_id": pending["session_id"],
+                    "task_intent": "repair parser failure",
+                    "approach": "inspect failing parser check",
+                    "quality_score": 0.0,
+                    "key_insight": "the network hypothesis was disproved",
+                    "timestamp": "2026-09-21T00:00:00Z",
+                    "score": 1.0,
+                }
+            ]
+            confirmed = asyncio.run(
+                self.service.reconcile_extraction(trajectory["trajectory_id"], adapter)
+            )
+            self.assertEqual("confirmed", confirmed["status"])
+
+            with self.assertRaisesRegex(store.ExperienceConflictError, "stale"):
+                second_connection.update_experience_ingestion(
+                    pending["ingestion_id"],
+                    status="uncertain",
+                    expected_version=stale["version"],
+                    error="a stale retry must not overwrite confirmation",
+                )
+
+            durable_receipt = self.memory_store.get_case_receipt(
+                self.scope.to_record(), "cas-locked"
+            )
+            retried = second_connection.confirm_experience_ingestion(
+                pending["ingestion_id"],
+                [durable_receipt],
+                expected_version=confirmed["version"],
+            )
+            self.assertEqual("confirmed", retried["status"])
+            self.assertEqual(confirmed["version"], retried["version"])
+        finally:
+            second_connection.close()
 
 
 if __name__ == "__main__":

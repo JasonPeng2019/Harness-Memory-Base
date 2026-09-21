@@ -31,6 +31,33 @@ class _EverOSResults:
         }
 
 
+class _TrustedRootApprovalVerifier:
+    """A test-only configured trust policy, not caller-provided authority."""
+
+    def verify_generated_skill_approval(
+        self,
+        *,
+        issuer: str,
+        candidate: dict,
+        scope: dict,
+        recipients: tuple[str, ...],
+    ) -> object:
+        if issuer != "ROOT":
+            raise experience.ApprovalError("issuer is not authenticated by this policy")
+        if recipients != (scope["owner"],):
+            raise experience.ApprovalError("recipient is outside this policy's owner")
+        return experience.VerifiedApproval(
+            issuer=issuer,
+            candidate_id=candidate["candidate_id"],
+            scope=scope,
+            recipients=recipients,
+            authority_evidence={
+                "policy_id": "test-root-approval/v1",
+                "authenticated_subject": "root-operator",
+            },
+        )
+
+
 class GeneratedSkillTrustTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -53,7 +80,12 @@ class GeneratedSkillTrustTests(unittest.TestCase):
         self.adapter = experience.EverOSAdapter(
             scope=self.scope,
             base_root=self.root / "everos",
-            surface=experience.EverOSPublicSurface.from_object(self.results),
+            surface=experience.EverOSPublicSurface.from_object(
+                self.results,
+                memory_root=experience.EverOSAdapter.memory_root_for_scope(
+                    self.root / "everos", self.scope
+                ),
+            ),
             privacy_policy=self.policy,
         )
 
@@ -98,6 +130,8 @@ class GeneratedSkillTrustTests(unittest.TestCase):
             plan=plan,
             reviewed_by="ROOT",
             evidence_refs=("review://run-1",),
+            raw_evidence="The parser repair passed after the local lock was released.",
+            failed_hypotheses=("network timeout",),
         )
         trajectory = self.service.capture(
             task_card=task_card,
@@ -106,8 +140,6 @@ class GeneratedSkillTrustTests(unittest.TestCase):
             outcome=outcome,
             review_receipt=review,
             scope=self.scope,
-            raw_evidence="The parser repair passed after the local lock was released.",
-            failed_hypotheses=("network timeout",),
         )
         pending = asyncio.run(
             self.service.extract_trajectory(trajectory["trajectory_id"], self.adapter)
@@ -178,7 +210,22 @@ class GeneratedSkillTrustTests(unittest.TestCase):
             self.service.resolve_generated_skill_candidate(self._skill(), self.adapter),
         )
 
-        approval = self.service.approve_generated_skill(
+        with self.assertRaisesRegex(experience.ApprovalError, "not configured"):
+            self.service.approve_generated_skill(
+                candidate_id=candidate["candidate_id"],
+                scope=self.scope,
+                approval_id="self-asserted-approval",
+                issuer="ROOT",
+                recipients=("root-agent",),
+                approved_at="2026-09-21T00:00:00Z",
+            )
+
+        trusted_service = experience.ReviewedExperienceService(
+            self.memory_store,
+            privacy_policy=self.policy,
+            approval_verifier=_TrustedRootApprovalVerifier(),
+        )
+        approval = trusted_service.approve_generated_skill(
             candidate_id=candidate["candidate_id"],
             scope=self.scope,
             approval_id="approval-1",
@@ -189,9 +236,16 @@ class GeneratedSkillTrustTests(unittest.TestCase):
         self.assertEqual("generated", approval["origin"])
         self.assertEqual(candidate["content_digest"], approval["content_digest"])
         self.assertEqual(("root-agent",), tuple(approval["recipients"]))
+        self.assertEqual(
+            {
+                "policy_id": "test-root-approval/v1",
+                "authenticated_subject": "root-operator",
+            },
+            approval["authority_evidence"],
+        )
 
-        with self.assertRaisesRegex(contracts.ContractError, "only ROOT may approve"):
-            self.service.approve_generated_skill(
+        with self.assertRaisesRegex(experience.ApprovalError, "issuer is not authenticated"):
+            trusted_service.approve_generated_skill(
                 candidate_id=candidate["candidate_id"],
                 scope=self.scope,
                 approval_id="untrusted-approval",
@@ -199,6 +253,41 @@ class GeneratedSkillTrustTests(unittest.TestCase):
                 recipients=("root-agent",),
                 approved_at="2026-09-21T00:00:00Z",
             )
+        with self.assertRaisesRegex(experience.ApprovalError, "outside"):
+            trusted_service.approve_generated_skill(
+                candidate_id=candidate["candidate_id"],
+                scope=self.scope,
+                approval_id="cross-owner-approval",
+                issuer="ROOT",
+                recipients=("other-agent",),
+                approved_at="2026-09-21T00:00:00Z",
+            )
+
+        # The persistence boundary repeats the join rather than trusting a
+        # caller that presents a candidate id beside a different content hash.
+        forged_candidate = contracts.make_generated_skill_candidate(
+            scope=candidate["scope"],
+            skill_id=candidate["skill_id"],
+            content="A different generated candidate must not inherit this approval.",
+            source_cases=candidate["source_cases"],
+            metadata=candidate["metadata"],
+            created_at=candidate["created_at"],
+        )
+        forged_approval = contracts.make_skill_approval(
+            approval_id="durable-candidate-mismatch",
+            candidate=forged_candidate,
+            issuer="ROOT",
+            recipients=("root-agent",),
+            approved_at="2026-09-21T00:00:00Z",
+            authority_evidence={
+                "policy_id": "test-root-approval/v1",
+                "authenticated_subject": "root-operator",
+            },
+        )
+        forged_approval["candidate_id"] = candidate["candidate_id"]
+        forged_approval["content_hash"] = contracts.content_hash(forged_approval)
+        with self.assertRaisesRegex(store.ExperienceConflictError, "exact durable candidate"):
+            self.memory_store.record_skill_approval(forged_approval)
 
         with self.assertRaisesRegex(experience.ProvenanceError, "cannot be resolved"):
             self.service.resolve_generated_skill_candidate(
@@ -252,6 +341,32 @@ class GeneratedSkillTrustTests(unittest.TestCase):
                 scope=self.scope,
                 selected_ids=("curated-unscoped",),
             )
+
+    def test_verified_approval_evidence_survives_store_restart(self) -> None:
+        self._confirmed_case()
+        candidate = self.service.resolve_generated_skill_candidate(
+            self._skill(), self.adapter
+        )
+        trusted_service = experience.ReviewedExperienceService(
+            self.memory_store,
+            privacy_policy=self.policy,
+            approval_verifier=_TrustedRootApprovalVerifier(),
+        )
+        approval = trusted_service.approve_generated_skill(
+            candidate_id=candidate["candidate_id"],
+            scope=self.scope,
+            approval_id="restart-approval",
+            issuer="ROOT",
+            recipients=("root-agent",),
+            approved_at="2026-09-21T00:00:00Z",
+        )
+
+        self.memory_store.close()
+        self.memory_store = store.MemoryStore(self.root / "memory.sqlite3")
+        self.memory_store.initialize()
+        restored = self.memory_store.get_skill_approval(approval["approval_id"])
+        self.assertEqual(approval, restored)
+        self.assertEqual("generated", restored["origin"])
 
 
 if __name__ == "__main__":

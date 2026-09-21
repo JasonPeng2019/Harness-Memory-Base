@@ -12,12 +12,12 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Mapping
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Protocol
 
 from . import contracts
 from . import privacy as privacy_module
 from .privacy import PrivacyPolicy
-from .store import MemoryStore
+from .store import ExperienceConflictError, MemoryStore
 
 SYNTHETIC_SECRET = "synthetic-secret-alpha-1234567890"
 
@@ -143,15 +143,48 @@ class EverOSUnavailableError(ExperienceError):
 
 
 @dataclass(frozen=True)
+class VerifiedApproval:
+    """A configured trust policy's authenticated approval result.
+
+    The service verifies every field against the durable candidate before it
+    persists this evidence.  Constructing an approval record from a caller's
+    ``issuer`` string is deliberately not an authorization path.
+    """
+
+    issuer: str
+    candidate_id: str
+    scope: Mapping[str, Any]
+    recipients: tuple[str, ...]
+    authority_evidence: Mapping[str, Any]
+
+
+class TrustedApprovalVerifier(Protocol):
+    """Authenticate approval of one exact generated candidate and recipient set."""
+
+    def verify_generated_skill_approval(
+        self,
+        *,
+        issuer: str,
+        candidate: Mapping[str, Any],
+        scope: Mapping[str, Any],
+        recipients: tuple[str, ...],
+    ) -> VerifiedApproval:
+        """Return retained authority evidence or reject the requested approval."""
+
+
+@dataclass(frozen=True)
 class EverOSPublicSurface:
-    """Only the vendored EverOS public memorize/search/model seam we use."""
+    """Only the vendored public EverOS seam plus its captured memory root."""
 
     memorize: Callable[..., Awaitable[Any]]
     search: Callable[[Any], Awaitable[Any]]
     make_search_request: Callable[..., Any]
+    memory_root: Path
 
     @classmethod
-    def from_object(cls, value: object) -> "EverOSPublicSurface":
+    def from_object(
+        cls, value: object, *, memory_root: str | Path
+    ) -> "EverOSPublicSurface":
         memorize = getattr(value, "memorize", None)
         search = getattr(value, "search", None)
         make_search_request = getattr(value, "make_search_request", None)
@@ -161,19 +194,40 @@ class EverOSPublicSurface:
             memorize=memorize,
             search=search,
             make_search_request=make_search_request,
+            memory_root=_normalize_memory_root(memory_root, "captured EverOS root"),
         )
 
 
-def load_vendored_everos_public_surface() -> EverOSPublicSurface:
+def _normalize_memory_root(value: str | Path, label: str) -> Path:
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        raise ScopeBoundaryError(f"{label} must be a nonempty path")
+    return Path(value).expanduser().resolve()
+
+
+def load_vendored_everos_public_surface(
+    *, memory_root: str | Path
+) -> EverOSPublicSurface:
     """Load vendored EverOS through its public service and search DTO exports.
 
     The product package keeps this import lazy so ordinary all-off installs do
-    not acquire EverOS's optional runtime dependency set. A configured EverOS
-    environment must expose these public symbols; we intentionally do not
-    reach into its repositories or mutate its process-global singletons.
+    not acquire EverOS's optional runtime dependency set.  The caller must
+    configure ``EVEROS_ROOT`` for this exact namespace *before* loading the
+    public surface.  We then capture EverOS's own public ``MemoryRoot`` once;
+    later environment changes cannot rebind this surface.
     """
 
+    expected_root = _normalize_memory_root(memory_root, "requested EverOS root")
+    configured_root = os.environ.get("EVEROS_ROOT")
+    if configured_root is None or not configured_root.strip():
+        raise ScopeBoundaryError(
+            "EVEROS_ROOT must be configured before loading the EverOS surface"
+        )
+    if _normalize_memory_root(configured_root, "EVEROS_ROOT") != expected_root:
+        raise ScopeBoundaryError(
+            "configured EverOS root is outside the requested namespace"
+        )
     try:
+        from everos.core.persistence import MemoryRoot
         from everos.memory.search import SearchRequest
         from everos.service import memorize, search
     except ModuleNotFoundError as exc:
@@ -181,10 +235,18 @@ def load_vendored_everos_public_surface() -> EverOSPublicSurface:
             "EverOS is unavailable; install the vendored EverOS runtime before "
             "enabling reviewed-experience extraction"
         ) from exc
+    captured_root = _normalize_memory_root(
+        MemoryRoot.resolve().root, "captured EverOS root"
+    )
+    if captured_root != expected_root:
+        raise ScopeBoundaryError(
+            "loaded EverOS public surface captured a root outside the requested namespace"
+        )
     return EverOSPublicSurface(
         memorize=memorize,
         search=search,
         make_search_request=SearchRequest,
+        memory_root=captured_root,
     )
 
 
@@ -193,9 +255,10 @@ class EverOSAdapter:
 
     EverOS natively has application, project, and agent-owner fields. A
     product namespace is isolated by a deterministic EverOS root, so one
-    adapter is intentionally bound to one four-part scope. Callers configure
-    the EverOS service process for :attr:`memory_root`; changing an active
-    vendor singleton from this adapter would make cross-namespace reads unsafe.
+    adapter is intentionally bound to one four-part scope.  Callers configure
+    the EverOS service process before loading the public surface; this adapter
+    checks the root captured by that surface rather than trusting a mutable
+    process environment or vendor singleton afterward.
     """
 
     destination = "everos-agent-memory/v1"
@@ -214,6 +277,7 @@ class EverOSAdapter:
         self.memory_root = self.memory_root_for_scope(self.base_root, scope)
         self.surface = surface
         self.privacy_policy = privacy_policy or PrivacyPolicy()
+        self._assert_bound_memory_root()
 
     @staticmethod
     def _validate_scope(scope: ExperienceScope) -> None:
@@ -252,29 +316,19 @@ class EverOSAdapter:
         if dict(scope) != self.scope.to_record():
             raise ScopeBoundaryError("EverOS adapter is bound to a different scope")
 
-    def _assert_configured_memory_root(self) -> None:
-        """Reject a namespace adapter when the vendor process names another root.
+    def _assert_bound_memory_root(self) -> None:
+        """Reject a scope that differs from the root captured at surface load."""
 
-        EverOS does not expose a namespace field in its public case/skill
-        models. Its configured root is therefore the namespace boundary. When
-        the standard ``EVEROS_ROOT`` binding is present, checking it before a
-        public call prevents a same-app/project/owner record in a different
-        namespace from being accepted through a misconfigured vendor process.
-        """
-
-        configured_root = os.environ.get("EVEROS_ROOT")
-        if configured_root is None:
-            return
-        if Path(configured_root).resolve() != self.memory_root:
+        if self.surface.memory_root != self.memory_root:
             raise ScopeBoundaryError(
-                "configured EverOS root is outside the adapter namespace"
+                "captured EverOS root is outside the adapter namespace"
             )
 
     def add_payload(
         self, trajectory: Mapping[str, Any], *, session_id: str
     ) -> dict[str, Any]:
         self.assert_scope(trajectory.get("scope", {}))
-        self._assert_configured_memory_root()
+        self._assert_bound_memory_root()
         derived = privacy_module.sanitize_payload(
             {
                 "task": trajectory["task_text"],
@@ -314,14 +368,14 @@ class EverOSAdapter:
         }
 
     async def memorize(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        self._assert_configured_memory_root()
+        self._assert_bound_memory_root()
         result = await self.surface.memorize(dict(payload), is_final=True)
         return _model_mapping(result, "EverOS memorize result")
 
     async def search_representation(
         self, *, session_id: str, query: str
     ) -> dict[str, list[dict[str, Any]]]:
-        self._assert_configured_memory_root()
+        self._assert_bound_memory_root()
         safe_query = privacy_module.sanitize_text(query, self.privacy_policy).strip()
         if not safe_query:
             raise ExperienceError("EverOS search query became empty after sanitization")
@@ -473,6 +527,20 @@ def select_curated_guidance(
     return selected
 
 
+def _canonical_approval_recipients(recipients: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(recipients, str):
+        raise ApprovalError("approval recipients must be a collection of identities")
+    selected = list(recipients)
+    if not selected or any(
+        not isinstance(recipient, str) or not recipient.strip()
+        for recipient in selected
+    ):
+        raise ApprovalError("approval recipients must be nonempty identities")
+    if len(selected) != len(set(selected)):
+        raise ApprovalError("approval recipients must be unique")
+    return tuple(sorted(selected))
+
+
 class ReviewedExperienceService:
     """Persist and query immutable reviewed trajectories before extraction.
 
@@ -483,10 +551,15 @@ class ReviewedExperienceService:
     """
 
     def __init__(
-        self, memory_store: MemoryStore, *, privacy_policy: PrivacyPolicy | None = None
+        self,
+        memory_store: MemoryStore,
+        *,
+        privacy_policy: PrivacyPolicy | None = None,
+        approval_verifier: TrustedApprovalVerifier | None = None,
     ) -> None:
         self.store = memory_store
         self.privacy_policy = privacy_policy or PrivacyPolicy()
+        self.approval_verifier = approval_verifier
 
     def capture(
         self,
@@ -497,9 +570,6 @@ class ReviewedExperienceService:
         outcome: Mapping[str, Any],
         review_receipt: Mapping[str, Any],
         scope: ExperienceScope,
-        raw_evidence: str,
-        failed_hypotheses: tuple[str, ...] | list[str] = (),
-        protected_source_refs: tuple[str, ...] | list[str] = (),
     ) -> dict[str, Any]:
         """Durably capture one reviewed terminal trajectory.
 
@@ -512,16 +582,14 @@ class ReviewedExperienceService:
             raise contracts.ContractError(
                 "reviewed trajectory outcome is not the durable outcome for its decision"
             )
+        persisted_review_receipt = self.store.record_review_receipt(review_receipt)
         trajectory = contracts.make_reviewed_trajectory(
             task_card=task_card,
             plan=plan,
             decision=decision,
             outcome=outcome,
-            review_receipt=review_receipt,
+            review_receipt=persisted_review_receipt,
             scope=scope.to_record(),
-            raw_evidence=raw_evidence,
-            failed_hypotheses=failed_hypotheses,
-            protected_source_refs=protected_source_refs,
         )
         return self.store.record_reviewed_trajectory(trajectory)
 
@@ -556,11 +624,18 @@ class ReviewedExperienceService:
         except Exception as exc:
             # The public API does not expose a source-backed idempotency key for
             # this write. Treat every failed/lost result as potentially committed.
-            return self.store.update_experience_ingestion(
-                ingestion["ingestion_id"],
-                status="uncertain",
-                error=_safe_error(exc, self.privacy_policy),
-            )
+            try:
+                return self.store.update_experience_ingestion(
+                    ingestion["ingestion_id"],
+                    status="uncertain",
+                    expected_version=ingestion["version"],
+                    error=_safe_error(exc, self.privacy_policy),
+                )
+            except ExperienceConflictError as update_error:
+                latest = self.store.get_experience_ingestion(ingestion["ingestion_id"])
+                if latest["version"] != ingestion["version"]:
+                    return latest
+                raise update_error from exc
         return await self.reconcile_extraction(trajectory_id, adapter)
 
     async def reconcile_extraction(
@@ -598,9 +673,17 @@ class ReviewedExperienceService:
             )
         if not receipts:
             return ingestion
-        return self.store.confirm_experience_ingestion(
-            ingestion["ingestion_id"], receipts
-        )
+        try:
+            return self.store.confirm_experience_ingestion(
+                ingestion["ingestion_id"],
+                receipts,
+                expected_version=ingestion["version"],
+            )
+        except ExperienceConflictError:
+            latest = self.store.get_experience_ingestion(ingestion["ingestion_id"])
+            if latest["version"] != ingestion["version"]:
+                return latest
+            raise
 
     def resolve_generated_skill_candidate(
         self,
@@ -693,6 +776,7 @@ class ReviewedExperienceService:
             raise ApprovalError("only generated candidates use this approval path")
         if candidate["state"] != "proposed":
             raise ApprovalError("generated skill candidate is not a proposed candidate")
+        selected_recipients = _canonical_approval_recipients(recipients)
         for source in candidate["source_cases"]:
             try:
                 receipt = self.store.get_case_receipt(expected_scope, source["case_id"])
@@ -709,14 +793,71 @@ class ReviewedExperienceService:
                 raise ApprovalError("generated skill source receipt changed or is ambiguous")
             if trajectory["scope"] != expected_scope or not is_reviewed(trajectory):
                 raise ApprovalError("generated skill source trajectory is not reviewed in scope")
+        verifier = self.approval_verifier
+        if verifier is None:
+            raise ApprovalError("trusted generated-skill approval verifier is not configured")
+        try:
+            verified = verifier.verify_generated_skill_approval(
+                issuer=issuer,
+                candidate=candidate,
+                scope=expected_scope,
+                recipients=selected_recipients,
+            )
+        except ApprovalError:
+            raise
+        except Exception as exc:
+            raise ApprovalError("trusted approval verifier rejected the request") from exc
+        self._validate_verified_approval(
+            verified=verified,
+            issuer=issuer,
+            candidate=candidate,
+            scope=expected_scope,
+            recipients=selected_recipients,
+        )
         approval = contracts.make_skill_approval(
             approval_id=approval_id,
             candidate=candidate,
             issuer=issuer,
-            recipients=recipients,
+            recipients=selected_recipients,
             approved_at=approved_at,
+            authority_evidence=verified.authority_evidence,
         )
         return self.store.record_skill_approval(approval)
+
+    @staticmethod
+    def _validate_verified_approval(
+        *,
+        verified: VerifiedApproval,
+        issuer: str,
+        candidate: Mapping[str, Any],
+        scope: Mapping[str, Any],
+        recipients: tuple[str, ...],
+    ) -> None:
+        if not isinstance(verified, VerifiedApproval):
+            raise ApprovalError("trusted approval verifier returned no verified authority")
+        if verified.issuer != issuer:
+            raise ApprovalError("trusted approval issuer does not match the request")
+        if verified.candidate_id != candidate["candidate_id"]:
+            raise ApprovalError("trusted approval does not bind the exact candidate")
+        try:
+            verified_scope = contracts.normalize_experience_scope(verified.scope)
+        except contracts.ContractError as exc:
+            raise ApprovalError("trusted approval has an invalid scope") from exc
+        if verified_scope != scope:
+            raise ApprovalError("trusted approval scope does not match the request")
+        if tuple(verified.recipients) != recipients:
+            raise ApprovalError("trusted approval recipients do not match the request")
+        try:
+            contracts.make_skill_approval(
+                approval_id="authority-validation",
+                candidate=candidate,
+                issuer=issuer,
+                recipients=recipients,
+                approved_at="authority-validation",
+                authority_evidence=verified.authority_evidence,
+            )
+        except contracts.ContractError as exc:
+            raise ApprovalError("trusted approval has no retained authority evidence") from exc
 
     def get_trajectory(self, trajectory_id: str) -> dict[str, Any]:
         return self.store.get_reviewed_trajectory(trajectory_id)
@@ -807,6 +948,8 @@ __all__ = [
     "ReviewedExperienceService",
     "ScopeBoundaryError",
     "SYNTHETIC_SECRET",
+    "TrustedApprovalVerifier",
+    "VerifiedApproval",
     "derived_optional_content",
     "is_reviewed",
     "load_vendored_everos_public_surface",

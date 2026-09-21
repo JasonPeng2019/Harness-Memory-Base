@@ -12,7 +12,6 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 SRC = ROOT / "src"
-EVEROS_SRC = ROOT / "harness" / "vendor" / "everos" / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -29,8 +28,6 @@ class RealEverOSAdapterTests(unittest.TestCase):
         when that optional runtime is unavailable.
         """
 
-        if str(EVEROS_SRC) not in sys.path:
-            sys.path.insert(0, str(EVEROS_SRC))
         try:
             import everos  # noqa: F401
             from everalgo.testing.fake_llm import FakeLLMClient
@@ -66,12 +63,6 @@ class RealEverOSAdapterTests(unittest.TestCase):
             namespace="everos-isolated",
             owner="root-agent",
         )
-        surface = experience.load_vendored_everos_public_surface()
-        adapter = experience.EverOSAdapter(
-            scope=scope,
-            base_root=root / "everos",
-            surface=surface,
-        )
         service = experience.ReviewedExperienceService(state)
         old_environment = {
             key: os.environ.get(key)
@@ -83,14 +74,26 @@ class RealEverOSAdapterTests(unittest.TestCase):
             )
         }
         try:
-            os.environ["EVEROS_ROOT"] = str(adapter.memory_root)
+            memory_root = experience.EverOSAdapter.memory_root_for_scope(
+                root / "everos", scope
+            )
+            os.environ["EVEROS_ROOT"] = str(memory_root)
             os.environ["EVEROS_MEMORIZE__MODE"] = "agent"
             os.environ["EVEROS_LLM__API_KEY"] = "fake-key"
             os.environ["EVEROS_LLM__BASE_URL"] = "https://fake.invalid"
-            adapter.memory_root.mkdir(parents=True, exist_ok=True)
-            (adapter.memory_root / "ome.toml").write_text("# isolated test\n")
+            memory_root.mkdir(parents=True, exist_ok=True)
+            (memory_root / "ome.toml").write_text("# isolated test\n")
             load_settings.cache_clear()
             self._reset_everos_singletons()
+            surface = experience.load_vendored_everos_public_surface(
+                memory_root=memory_root
+            )
+            self.assertEqual(memory_root.resolve(), surface.memory_root)
+            adapter = experience.EverOSAdapter(
+                scope=scope,
+                base_root=root / "everos",
+                surface=surface,
+            )
 
             trajectory = self._capture_reviewed_trajectory(service, state, scope)
             await self._seed_through_public_memorize(
@@ -143,35 +146,27 @@ class RealEverOSAdapterTests(unittest.TestCase):
                     session_id=confirmed["session_id"], query="parser failure"
                 )
                 self.assertEqual([], project_results["agent_cases"])
-                other_namespace = experience.EverOSAdapter(
-                    scope=experience.ExperienceScope(
-                        application="harness",
-                        project="product",
-                        namespace="another-namespace",
-                        owner="root-agent",
-                    ),
-                    base_root=root / "everos",
-                    surface=surface,
-                )
-                self.assertNotEqual(adapter.memory_root, other_namespace.memory_root)
                 with self.assertRaises(experience.ScopeBoundaryError):
-                    await other_namespace.search_representation(
-                        session_id=confirmed["session_id"], query="parser failure"
+                    experience.EverOSAdapter(
+                        scope=experience.ExperienceScope(
+                            application="harness",
+                            project="product",
+                            namespace="another-namespace",
+                            owner="root-agent",
+                        ),
+                        base_root=root / "everos",
+                        surface=surface,
                     )
-                other_application = experience.EverOSAdapter(
-                    scope=experience.ExperienceScope(
-                        application="another-harness",
-                        project="product",
-                        namespace="everos-isolated",
-                        owner="root-agent",
-                    ),
-                    base_root=root / "everos",
-                    surface=surface,
-                )
-                self.assertNotEqual(adapter.memory_root, other_application.memory_root)
                 with self.assertRaises(experience.ScopeBoundaryError):
-                    await other_application.search_representation(
-                        session_id=confirmed["session_id"], query="parser failure"
+                    experience.EverOSAdapter(
+                        scope=experience.ExperienceScope(
+                            application="another-harness",
+                            project="product",
+                            namespace="everos-isolated",
+                            owner="root-agent",
+                        ),
+                        base_root=root / "everos",
+                        surface=surface,
                     )
         finally:
             for key, value in old_environment.items():
@@ -249,6 +244,8 @@ class RealEverOSAdapterTests(unittest.TestCase):
             plan=plan,
             reviewed_by="ROOT",
             evidence_refs=("review://everos/run",),
+            raw_evidence="The parser repair passed after a discriminating local check.",
+            failed_hypotheses=("network timeout",),
         )
         return service.capture(
             task_card=card,
@@ -257,8 +254,6 @@ class RealEverOSAdapterTests(unittest.TestCase):
             outcome=outcome,
             review_receipt=review,
             scope=scope,
-            raw_evidence="The parser repair passed after a discriminating local check.",
-            failed_hypotheses=("network timeout",),
         )
 
     async def _seed_through_public_memorize(

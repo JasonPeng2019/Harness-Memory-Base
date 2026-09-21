@@ -71,6 +71,12 @@ class ReviewedTrajectoryPersistenceTests(unittest.TestCase):
             plan=plan,
             reviewed_by="ROOT",
             evidence_refs=("review://run/retired-run-1", "check://parser"),
+            protected_source_refs=("evidence://protected/parser-log",),
+            raw_evidence=(
+                "The parser repair passed. Keep synthetic-secret-alpha-1234567890 "
+                "only in protected local evidence."
+            ),
+            failed_hypotheses=("the network adapter caused the regression",),
         )
         scope = experience.ExperienceScope(
             application="harness",
@@ -88,12 +94,6 @@ class ReviewedTrajectoryPersistenceTests(unittest.TestCase):
             outcome=outcome,
             review_receipt=review,
             scope=scope,
-            raw_evidence=(
-                "The parser repair passed. Keep synthetic-secret-alpha-1234567890 "
-                "only in protected local evidence."
-            ),
-            failed_hypotheses=("the network adapter caused the regression",),
-            protected_source_refs=("evidence://protected/parser-log",),
         )
 
         self.assertEqual("reviewed_success", trajectory["status"])
@@ -146,6 +146,7 @@ class ReviewedTrajectoryPersistenceTests(unittest.TestCase):
                 plan=plan,
                 reviewed_by="worker",
                 evidence_refs=("review://run/retired-run-1",),
+                raw_evidence="An untrusted reviewer cannot bind this evidence.",
             )
 
         # A syntactically valid record cannot replace the already durable run
@@ -161,6 +162,7 @@ class ReviewedTrajectoryPersistenceTests(unittest.TestCase):
             plan=plan,
             reviewed_by="ROOT",
             evidence_refs=("review://wrong-run",),
+            raw_evidence="A forged event must not be stored.",
         )
         forged_trajectory = contracts.make_reviewed_trajectory(
             task_card=card,
@@ -169,7 +171,6 @@ class ReviewedTrajectoryPersistenceTests(unittest.TestCase):
             outcome=forged_outcome,
             review_receipt=forged_review,
             scope=scope.to_record(),
-            raw_evidence="A forged event must not be stored.",
         )
         with self.assertRaisesRegex(store.TrajectoryConflictError, "durable outcome"):
             self.memory_store.record_reviewed_trajectory(forged_trajectory)

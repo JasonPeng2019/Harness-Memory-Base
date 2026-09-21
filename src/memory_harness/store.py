@@ -77,6 +77,29 @@ _SCHEMA = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS review_receipts (
+        review_receipt_id TEXT PRIMARY KEY,
+        outcome_id TEXT NOT NULL UNIQUE REFERENCES outcomes(outcome_id),
+        review_id TEXT NOT NULL,
+        decision_id TEXT NOT NULL,
+        task_card_digest TEXT NOT NULL,
+        task_text TEXT NOT NULL,
+        objective_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        plan_id TEXT NOT NULL,
+        plan_digest TEXT NOT NULL,
+        route TEXT NOT NULL,
+        reviewed_by TEXT NOT NULL,
+        state TEXT NOT NULL,
+        evidence_refs TEXT NOT NULL,
+        protected_source_refs TEXT NOT NULL,
+        raw_evidence TEXT NOT NULL,
+        failed_hypotheses TEXT NOT NULL,
+        reviewed_at TEXT NOT NULL,
+        content_hash TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS reviewed_trajectories (
         trajectory_id TEXT PRIMARY KEY,
         outcome_id TEXT NOT NULL UNIQUE REFERENCES outcomes(outcome_id),
@@ -118,6 +141,7 @@ _SCHEMA = [
         status TEXT NOT NULL,
         case_ids TEXT NOT NULL,
         error TEXT,
+        version INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         content_hash TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -169,6 +193,7 @@ _SCHEMA = [
         recipients TEXT NOT NULL,
         source_cases TEXT NOT NULL,
         approved_at TEXT NOT NULL,
+        authority_evidence TEXT NOT NULL,
         content_hash TEXT NOT NULL
     )
     """,
@@ -212,6 +237,18 @@ class MemoryStore:
                     "state",
                     "TEXT NOT NULL DEFAULT 'proposed'",
                 )
+                self._ensure_column(
+                    "experience_ingestions",
+                    "version",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                self._ensure_column(
+                    "generated_skill_approvals",
+                    "authority_evidence",
+                    "TEXT",
+                )
+                self._ensure_column("review_receipts", "task_text", "TEXT")
+                self._ensure_column("review_receipts", "route", "TEXT")
         except sqlite3.Error as exc:
             if self.connection is not None:
                 self.connection.close()
@@ -455,6 +492,159 @@ class MemoryStore:
             raise StoreError(f"outcome not found for decision: {decision_id}")
         return dict(row)
 
+    def record_review_receipt(self, review_receipt: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist the exact ROOT receipt that authorizes a later trajectory.
+
+        This is durable retention of the existing review receipt, not a second
+        review workflow.  A trajectory may only copy its protected narrative
+        and failed hypotheses from this immutable local source.
+        """
+
+        contracts.validate_review_receipt(review_receipt)
+        connection = self._require_connection()
+        durable_outcome = connection.execute(
+            "SELECT * FROM outcomes WHERE outcome_id = ?",
+            (review_receipt["outcome_id"],),
+        ).fetchone()
+        if durable_outcome is None:
+            raise StoreError(
+                "review receipt outcome is not durable: "
+                f"{review_receipt['outcome_id']}"
+            )
+        outcome = dict(durable_outcome)
+        expected_outcome_fields = {
+            "decision_id": review_receipt["decision_id"],
+            "task_card_digest": review_receipt["task_card_digest"],
+            "objective_id": review_receipt["objective_id"],
+            "plan_id": review_receipt["plan_id"],
+            "plan_digest": review_receipt["plan_digest"],
+            "linked_run_id": review_receipt["run_id"],
+            "observed_at": review_receipt["reviewed_at"],
+        }
+        for field, expected in expected_outcome_fields.items():
+            if outcome[field] != expected:
+                raise TrajectoryConflictError(
+                    "review receipt does not match durable outcome "
+                    f"for {field}"
+                )
+        receipt_id = str(review_receipt["review_receipt_id"])
+        existing = connection.execute(
+            "SELECT * FROM review_receipts WHERE review_receipt_id = ?",
+            (receipt_id,),
+        ).fetchone()
+        if existing is not None:
+            restored = self._review_receipt_from_row(existing)
+            if restored["content_hash"] != review_receipt["content_hash"]:
+                raise TrajectoryConflictError(
+                    f"review receipt conflict for {receipt_id}"
+                )
+            return restored
+        linked = connection.execute(
+            "SELECT review_receipt_id FROM review_receipts WHERE outcome_id = ?",
+            (review_receipt["outcome_id"],),
+        ).fetchone()
+        if linked is not None:
+            raise TrajectoryConflictError(
+                "terminal outcome already has a different durable review receipt: "
+                f"{review_receipt['outcome_id']}"
+            )
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO review_receipts (
+                    review_receipt_id, outcome_id, review_id, decision_id,
+                    task_card_digest, task_text, objective_id, run_id, plan_id, plan_digest,
+                    route,
+                    reviewed_by, state, evidence_refs, protected_source_refs,
+                    raw_evidence, failed_hypotheses, reviewed_at, content_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review_receipt["review_receipt_id"],
+                    review_receipt["outcome_id"],
+                    review_receipt["review_id"],
+                    review_receipt["decision_id"],
+                    review_receipt["task_card_digest"],
+                    review_receipt["task_text"],
+                    review_receipt["objective_id"],
+                    review_receipt["run_id"],
+                    review_receipt["plan_id"],
+                    review_receipt["plan_digest"],
+                    review_receipt["route"],
+                    review_receipt["reviewed_by"],
+                    review_receipt["state"],
+                    json.dumps(review_receipt["evidence_refs"], sort_keys=True),
+                    json.dumps(review_receipt["protected_source_refs"], sort_keys=True),
+                    review_receipt["raw_evidence"],
+                    json.dumps(review_receipt["failed_hypotheses"], sort_keys=False),
+                    review_receipt["reviewed_at"],
+                    review_receipt["content_hash"],
+                ),
+            )
+        return self.get_review_receipt(receipt_id)
+
+    def get_review_receipt(self, review_receipt_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM review_receipts WHERE review_receipt_id = ?",
+            (review_receipt_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"review receipt not found: {review_receipt_id}")
+        return self._review_receipt_from_row(row)
+
+    @staticmethod
+    def _review_receipt_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        for field in ("evidence_refs", "protected_source_refs", "failed_hypotheses"):
+            result[field] = json.loads(result[field])
+        result["schema"] = contracts.REVIEW_RECEIPT_SCHEMA
+        contracts.validate_review_receipt(result)
+        return result
+
+    def _durable_review_receipt_for_trajectory(
+        self, trajectory: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Return the full receipt and reject flattened narrative substitution."""
+
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM review_receipts WHERE review_receipt_id = ?",
+            (trajectory["review_receipt_id"],),
+        ).fetchone()
+        if row is None:
+            raise TrajectoryConflictError(
+                "reviewed trajectory requires a durable review receipt"
+            )
+        receipt = self._review_receipt_from_row(row)
+        expected_fields = {
+            "outcome_id": trajectory["outcome_id"],
+            "decision_id": trajectory["decision_id"],
+            "task_card_digest": trajectory["task_card_digest"],
+            "task_text": trajectory["task_text"],
+            "objective_id": trajectory["objective_id"],
+            "run_id": trajectory["run_id"],
+            "plan_id": trajectory["accepted_plan_id"],
+            "plan_digest": trajectory["accepted_plan_digest"],
+            "route": trajectory["route"],
+            "review_id": trajectory["review_id"],
+            "content_hash": trajectory["review_receipt_digest"],
+            "state": trajectory["review_state"],
+            "reviewed_by": trajectory["reviewed_by"],
+            "reviewed_at": trajectory["reviewed_at"],
+            "evidence_refs": trajectory["evidence_refs"],
+            "protected_source_refs": trajectory["protected_source_refs"],
+            "raw_evidence": trajectory["raw_evidence"],
+            "failed_hypotheses": trajectory["failed_hypotheses"],
+        }
+        for field, expected in expected_fields.items():
+            if receipt[field] != expected:
+                raise TrajectoryConflictError(
+                    "reviewed trajectory does not match durable review receipt "
+                    f"for {field}"
+                )
+        return receipt
+
     def record_reviewed_trajectory(
         self, trajectory: Mapping[str, Any]
     ) -> dict[str, Any]:
@@ -497,6 +687,7 @@ class MemoryStore:
             raise TrajectoryConflictError(
                 "reviewed trajectory status does not match durable outcome"
             )
+        self._durable_review_receipt_for_trajectory(trajectory)
         trajectory_id = str(trajectory["trajectory_id"])
         existing = connection.execute(
             "SELECT * FROM reviewed_trajectories WHERE trajectory_id = ?",
@@ -571,7 +762,9 @@ class MemoryStore:
         ).fetchone()
         if row is None:
             raise StoreError(f"reviewed trajectory not found: {trajectory_id}")
-        return self._trajectory_from_row(row)
+        trajectory = self._trajectory_from_row(row)
+        self._durable_review_receipt_for_trajectory(trajectory)
+        return trajectory
 
     def list_reviewed_trajectories(
         self, scope: Mapping[str, Any]
@@ -587,11 +780,13 @@ class MemoryStore:
             """,
             (scope_digest,),
         ).fetchall()
-        return [
-            trajectory
-            for row in rows
-            if (trajectory := self._trajectory_from_row(row))["scope"] == expected_scope
-        ]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            trajectory = self._trajectory_from_row(row)
+            self._durable_review_receipt_for_trajectory(trajectory)
+            if trajectory["scope"] == expected_scope:
+                result.append(trajectory)
+        return result
 
     @staticmethod
     def _trajectory_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -628,11 +823,13 @@ class MemoryStore:
             """,
             (scope_digest,),
         ).fetchall()
-        return [
-            trajectory
-            for row in rows
-            if (trajectory := self._trajectory_from_row(row))["scope"] == expected_scope
-        ]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            trajectory = self._trajectory_from_row(row)
+            self._durable_review_receipt_for_trajectory(trajectory)
+            if trajectory["scope"] == expected_scope:
+                result.append(trajectory)
+        return result
 
     def create_experience_ingestion(
         self, ingestion: Mapping[str, Any]
@@ -647,8 +844,8 @@ class MemoryStore:
                 INSERT OR IGNORE INTO experience_ingestions (
                     ingestion_id, trajectory_id, scope_digest, scope, destination,
                     session_id, payload_digest, status, case_ids, error,
-                    created_at, content_hash, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    version, created_at, content_hash, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ingestion["ingestion_id"],
@@ -661,6 +858,7 @@ class MemoryStore:
                     ingestion["status"],
                     json.dumps(ingestion["case_ids"], sort_keys=True),
                     ingestion.get("error"),
+                    ingestion["version"],
                     ingestion["created_at"],
                     ingestion["content_hash"],
                     ingestion["created_at"],
@@ -707,12 +905,23 @@ class MemoryStore:
         ingestion_id: str,
         *,
         status: str,
+        expected_version: int,
         case_ids: list[str] | None = None,
         error: str | None = None,
     ) -> dict[str, Any]:
         """Advance a local operation without converting uncertainty into success."""
 
         existing = self.get_experience_ingestion(ingestion_id)
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 0
+        ):
+            raise ExperienceConflictError("experience ingestion version must be nonnegative")
+        if existing["version"] != expected_version:
+            raise ExperienceConflictError(
+                f"stale experience ingestion update for {ingestion_id}"
+            )
         allowed = {
             "pending": {"pending", "uncertain", "confirmed", "blocked"},
             "uncertain": {"uncertain", "confirmed", "blocked"},
@@ -729,25 +938,32 @@ class MemoryStore:
         if case_ids is not None:
             updated["case_ids"] = list(case_ids)
         updated["error"] = error
+        updated["version"] = expected_version + 1
         updated["content_hash"] = contracts.content_hash(updated)
         contracts.validate_experience_ingestion(updated)
         connection = self._require_connection()
         with connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE experience_ingestions
-                SET status = ?, case_ids = ?, error = ?, content_hash = ?, updated_at = ?
-                WHERE ingestion_id = ?
+                SET status = ?, case_ids = ?, error = ?, version = ?, content_hash = ?, updated_at = ?
+                WHERE ingestion_id = ? AND version = ?
                 """,
                 (
                     updated["status"],
                     json.dumps(updated["case_ids"], sort_keys=True),
                     updated["error"],
+                    updated["version"],
                     updated["content_hash"],
                     contracts.utc_now(),
                     ingestion_id,
+                    expected_version,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise ExperienceConflictError(
+                    f"stale experience ingestion update for {ingestion_id}"
+                )
         return self.get_experience_ingestion(ingestion_id)
 
     @staticmethod
@@ -761,11 +977,25 @@ class MemoryStore:
         return result
 
     def confirm_experience_ingestion(
-        self, ingestion_id: str, case_receipts: list[Mapping[str, Any]]
+        self,
+        ingestion_id: str,
+        case_receipts: list[Mapping[str, Any]],
+        *,
+        expected_version: int,
     ) -> dict[str, Any]:
         """Atomically retain exact case receipts and mark their representation confirmed."""
 
         existing = self.get_experience_ingestion(ingestion_id)
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 0
+        ):
+            raise ExperienceConflictError("experience ingestion version must be nonnegative")
+        if existing["version"] != expected_version:
+            raise ExperienceConflictError(
+                f"stale experience ingestion confirmation for {ingestion_id}"
+            )
         if existing["status"] not in {"pending", "uncertain", "confirmed"}:
             raise ExperienceConflictError(
                 f"blocked experience ingestion {ingestion_id} cannot be confirmed"
@@ -856,22 +1086,29 @@ class MemoryStore:
             updated["status"] = "confirmed"
             updated["case_ids"] = sorted(case_ids)
             updated["error"] = None
+            updated["version"] = expected_version + 1
             updated["content_hash"] = contracts.content_hash(updated)
             contracts.validate_experience_ingestion(updated)
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE experience_ingestions
-                SET status = ?, case_ids = ?, error = NULL, content_hash = ?, updated_at = ?
-                WHERE ingestion_id = ?
+                SET status = ?, case_ids = ?, error = NULL, version = ?, content_hash = ?, updated_at = ?
+                WHERE ingestion_id = ? AND version = ?
                 """,
                 (
                     updated["status"],
                     json.dumps(updated["case_ids"], sort_keys=True),
+                    updated["version"],
                     updated["content_hash"],
                     contracts.utc_now(),
                     ingestion_id,
+                    expected_version,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise ExperienceConflictError(
+                    f"stale experience ingestion confirmation for {ingestion_id}"
+                )
         return self.get_experience_ingestion(ingestion_id)
 
     def get_case_receipt(
@@ -977,6 +1214,7 @@ class MemoryStore:
     def record_skill_approval(self, approval: Mapping[str, Any]) -> dict[str, Any]:
         contracts.validate_skill_approval(approval)
         connection = self._require_connection()
+        self._durable_candidate_for_approval(approval)
         approval_id = str(approval["approval_id"])
         existing = connection.execute(
             "SELECT * FROM generated_skill_approvals WHERE approval_id = ?",
@@ -993,8 +1231,8 @@ class MemoryStore:
                 INSERT INTO generated_skill_approvals (
                     approval_id, candidate_id, skill_id, origin, scope_digest, scope,
                     content_digest, issuer, recipients, source_cases, approved_at,
-                    content_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    authority_evidence, content_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     approval["approval_id"],
@@ -1008,6 +1246,7 @@ class MemoryStore:
                     json.dumps(approval["recipients"], sort_keys=True),
                     json.dumps(approval["source_cases"], sort_keys=True),
                     approval["approved_at"],
+                    json.dumps(approval["authority_evidence"], sort_keys=True),
                     approval["content_hash"],
                 ),
             )
@@ -1021,13 +1260,48 @@ class MemoryStore:
         ).fetchone()
         if row is None:
             raise StoreError(f"skill approval not found: {approval_id}")
-        return self._skill_approval_from_row(row)
+        approval = self._skill_approval_from_row(row)
+        self._durable_candidate_for_approval(approval)
+        return approval
+
+    def _durable_candidate_for_approval(
+        self, approval: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Rejoin an approval to its exact candidate before accepting it."""
+
+        try:
+            candidate = self.get_generated_skill_candidate(str(approval["candidate_id"]))
+        except StoreError as exc:
+            raise ExperienceConflictError(
+                "skill approval cannot resolve its durable generated candidate"
+            ) from exc
+        expected_fields = {
+            "skill_id": approval["skill_id"],
+            "origin": approval["origin"],
+            "scope_digest": approval["scope_digest"],
+            "scope": approval["scope"],
+            "content_digest": approval["content_digest"],
+            "source_cases": approval["source_cases"],
+        }
+        for field, expected in expected_fields.items():
+            if candidate[field] != expected:
+                raise ExperienceConflictError(
+                    "skill approval does not rejoin its exact durable candidate "
+                    f"for {field}"
+                )
+        return candidate
 
     @staticmethod
     def _skill_approval_from_row(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         for field in ("scope", "recipients", "source_cases"):
             result[field] = json.loads(result[field])
+        authority_evidence = result.get("authority_evidence")
+        if not isinstance(authority_evidence, str):
+            raise ExperienceConflictError(
+                "skill approval has no retained authority evidence"
+            )
+        result["authority_evidence"] = json.loads(authority_evidence)
         result["schema"] = contracts.SKILL_APPROVAL_SCHEMA
         contracts.validate_skill_approval(result)
         return result

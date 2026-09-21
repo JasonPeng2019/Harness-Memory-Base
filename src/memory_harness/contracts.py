@@ -82,6 +82,20 @@ def _validate_content(value: Any, field: str = "content") -> None:
         raise ContractError(f"{field} must be a JSON object or array")
 
 
+def _normalize_json_object(value: Any, field: str) -> dict[str, Any]:
+    """Return a nonempty JSON object with a stable, portable representation."""
+
+    if not isinstance(value, Mapping) or not value:
+        raise ContractError(f"{field} must be a nonempty JSON object")
+    try:
+        normalized = json.loads(canonical_json(value).decode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise ContractError(f"{field} must be JSON serializable") from exc
+    if not isinstance(normalized, dict) or not normalized:
+        raise ContractError(f"{field} must be a nonempty JSON object")
+    return normalized
+
+
 def make_task_card(
     *,
     task: str,
@@ -686,6 +700,8 @@ def make_review_receipt(
     evidence_refs: Iterable[str],
     state: str = "reviewed",
     protected_source_refs: Iterable[str] = (),
+    raw_evidence: str,
+    failed_hypotheses: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Bind existing review evidence to one exact terminal product outcome.
 
@@ -709,20 +725,28 @@ def make_review_receipt(
     protected = _normalize_string_refs(
         protected_source_refs, "protected_source_refs"
     )
+    evidence = _require_nonempty_str(raw_evidence, "raw_evidence")
+    hypotheses = _normalize_string_refs(
+        failed_hypotheses, "failed_hypotheses", sort_values=False
+    )
     receipt_id = sha256_hex(
         {
             "review_id": selected_review_id,
             "outcome_id": outcome["outcome_id"],
             "decision_id": decision["decision_id"],
             "task_card_digest": task_card["content_hash"],
+            "task_text": task_card["task"],
             "objective_id": plan["objective_id"],
             "run_id": outcome["linked_run_id"],
             "plan_id": plan["plan_id"],
             "plan_digest": plan["content_hash"],
+            "route": plan["route"],
             "reviewed_by": reviewer,
             "state": state,
             "evidence_refs": references,
             "protected_source_refs": protected,
+            "raw_evidence": evidence,
+            "failed_hypotheses": hypotheses,
         }
     )
     record: dict[str, Any] = {
@@ -732,14 +756,18 @@ def make_review_receipt(
         "outcome_id": outcome["outcome_id"],
         "decision_id": decision["decision_id"],
         "task_card_digest": task_card["content_hash"],
+        "task_text": task_card["task"],
         "objective_id": plan["objective_id"],
         "run_id": outcome["linked_run_id"],
         "plan_id": plan["plan_id"],
         "plan_digest": plan["content_hash"],
+        "route": plan["route"],
         "reviewed_by": reviewer,
         "state": state,
         "evidence_refs": references,
         "protected_source_refs": protected,
+        "raw_evidence": evidence,
+        "failed_hypotheses": hypotheses,
         "reviewed_at": outcome["observed_at"],
     }
     record["content_hash"] = content_hash(record)
@@ -755,12 +783,15 @@ def validate_review_receipt(record: Mapping[str, Any]) -> None:
         "outcome_id",
         "decision_id",
         "task_card_digest",
+        "task_text",
         "objective_id",
         "run_id",
         "plan_id",
         "plan_digest",
+        "route",
         "reviewed_by",
         "state",
+        "raw_evidence",
         "reviewed_at",
     ):
         _require_nonempty_str(record.get(field), field)
@@ -768,6 +799,8 @@ def validate_review_receipt(record: Mapping[str, Any]) -> None:
         raise ContractError(f"unknown review state: {record['state']!r}")
     if record["reviewed_by"] != "ROOT":
         raise ContractError("only ROOT may review a reusable trajectory")
+    if record["route"] not in ROUTES:
+        raise ContractError(f"unknown route: {record['route']!r}")
     evidence_refs = record.get("evidence_refs")
     if not isinstance(evidence_refs, list) or not evidence_refs:
         raise ContractError("evidence_refs must be a nonempty list")
@@ -780,20 +813,32 @@ def validate_review_receipt(record: Mapping[str, Any]) -> None:
     normalized_protected = _normalize_string_refs(protected, "protected_source_refs")
     if protected != normalized_protected:
         raise ContractError("protected_source_refs must use canonical ordering")
+    failed_hypotheses = record.get("failed_hypotheses")
+    if not isinstance(failed_hypotheses, list):
+        raise ContractError("failed_hypotheses must be a list")
+    normalized_hypotheses = _normalize_string_refs(
+        failed_hypotheses, "failed_hypotheses", sort_values=False
+    )
+    if failed_hypotheses != normalized_hypotheses:
+        raise ContractError("failed_hypotheses must preserve review ordering")
     expected_receipt_id = sha256_hex(
         {
             "review_id": record["review_id"],
             "outcome_id": record["outcome_id"],
             "decision_id": record["decision_id"],
             "task_card_digest": record["task_card_digest"],
+            "task_text": record["task_text"],
             "objective_id": record["objective_id"],
             "run_id": record["run_id"],
             "plan_id": record["plan_id"],
             "plan_digest": record["plan_digest"],
+            "route": record["route"],
             "reviewed_by": record["reviewed_by"],
             "state": record["state"],
             "evidence_refs": normalized_evidence_refs,
             "protected_source_refs": normalized_protected,
+            "raw_evidence": record["raw_evidence"],
+            "failed_hypotheses": normalized_hypotheses,
         }
     )
     if record["review_receipt_id"] != expected_receipt_id:
@@ -808,9 +853,6 @@ def make_reviewed_trajectory(
     outcome: Mapping[str, Any],
     review_receipt: Mapping[str, Any],
     scope: Mapping[str, Any],
-    raw_evidence: str,
-    failed_hypotheses: Iterable[str] = (),
-    protected_source_refs: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Create one immutable reviewed trajectory from linked terminal evidence."""
 
@@ -822,10 +864,12 @@ def make_reviewed_trajectory(
         "outcome_id": outcome["outcome_id"],
         "decision_id": decision["decision_id"],
         "task_card_digest": task_card["content_hash"],
+        "task_text": task_card["task"],
         "objective_id": plan["objective_id"],
         "run_id": outcome["linked_run_id"],
         "plan_id": plan["plan_id"],
         "plan_digest": plan["content_hash"],
+        "route": plan["route"],
     }.items():
         if review_receipt.get(field) != expected:
             raise ContractError(
@@ -838,17 +882,6 @@ def make_reviewed_trajectory(
     else:
         raise ContractError("terminal UNKNOWN outcome cannot become reviewed experience")
     normalized_scope = normalize_experience_scope(scope)
-    evidence = _require_nonempty_str(raw_evidence, "raw_evidence")
-    hypotheses = _normalize_string_refs(
-        failed_hypotheses, "failed_hypotheses", sort_values=False
-    )
-    protected = _normalize_string_refs(
-        protected_source_refs, "protected_source_refs"
-    )
-    all_protected = _normalize_string_refs(
-        [*review_receipt["protected_source_refs"], *protected],
-        "protected_source_refs",
-    )
     trajectory_id = sha256_hex(
         {
             "outcome_id": outcome["outcome_id"],
@@ -861,13 +894,13 @@ def make_reviewed_trajectory(
         "trajectory_id": trajectory_id,
         "outcome_id": outcome["outcome_id"],
         "task_card_digest": task_card["content_hash"],
-        "task_text": task_card["task"],
+        "task_text": review_receipt["task_text"],
         "objective_id": plan["objective_id"],
         "decision_id": decision["decision_id"],
         "run_id": outcome["linked_run_id"],
         "accepted_plan_id": plan["plan_id"],
         "accepted_plan_digest": plan["content_hash"],
-        "route": plan["route"],
+        "route": review_receipt["route"],
         "scope": normalized_scope,
         "scope_digest": sha256_hex(normalized_scope),
         "status": trajectory_status,
@@ -878,9 +911,9 @@ def make_reviewed_trajectory(
         "reviewed_by": review_receipt["reviewed_by"],
         "reviewed_at": review_receipt["reviewed_at"],
         "evidence_refs": list(review_receipt["evidence_refs"]),
-        "protected_source_refs": all_protected,
-        "failed_hypotheses": hypotheses,
-        "raw_evidence": evidence,
+        "protected_source_refs": list(review_receipt["protected_source_refs"]),
+        "failed_hypotheses": list(review_receipt["failed_hypotheses"]),
+        "raw_evidence": review_receipt["raw_evidence"],
         "evidence_digest": outcome["evidence_digest"],
         "recorded_at": outcome["observed_at"],
     }
@@ -972,6 +1005,7 @@ def make_experience_ingestion(
         "status": "pending",
         "case_ids": [],
         "error": None,
+        "version": 0,
         "created_at": trajectory["recorded_at"],
     }
     record["content_hash"] = content_hash(record)
@@ -1012,6 +1046,9 @@ def validate_experience_ingestion(record: Mapping[str, Any]) -> None:
     _normalize_string_refs(case_ids, "case_ids")
     if record.get("error") is not None and not isinstance(record["error"], str):
         raise ContractError("experience ingestion error must be a string or null")
+    version = record.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        raise ContractError("experience ingestion version must be a nonnegative integer")
     if record["status"] == "confirmed" and not case_ids:
         raise ContractError("confirmed experience ingestion requires case_ids")
 
@@ -1236,18 +1273,20 @@ def make_skill_approval(
     issuer: str,
     recipients: Iterable[str],
     approved_at: str,
+    authority_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Bind explicit trusted approval to one immutable generated candidate."""
 
     validate_generated_skill_candidate(candidate)
     selected_approval_id = _require_nonempty_str(approval_id, "approval_id")
     selected_issuer = _require_nonempty_str(issuer, "issuer")
-    if selected_issuer != "ROOT":
-        raise ContractError("only ROOT may approve a generated skill candidate")
     selected_recipients = _normalize_string_refs(recipients, "recipients")
     if not selected_recipients:
         raise ContractError("approval recipients must not be empty")
     selected_approved_at = _require_nonempty_str(approved_at, "approved_at")
+    selected_authority_evidence = _normalize_json_object(
+        authority_evidence, "authority_evidence"
+    )
     record: dict[str, Any] = {
         "schema": SKILL_APPROVAL_SCHEMA,
         "approval_id": selected_approval_id,
@@ -1261,6 +1300,7 @@ def make_skill_approval(
         "recipients": selected_recipients,
         "source_cases": [dict(item) for item in candidate["source_cases"]],
         "approved_at": selected_approved_at,
+        "authority_evidence": selected_authority_evidence,
     }
     record["content_hash"] = content_hash(record)
     validate_skill_approval(record)
@@ -1282,8 +1322,6 @@ def validate_skill_approval(record: Mapping[str, Any]) -> None:
         _require_nonempty_str(record.get(field), field)
     if record["origin"] != "generated":
         raise ContractError("approval cannot rewrite generated origin")
-    if record["issuer"] != "ROOT":
-        raise ContractError("only ROOT may approve a generated skill candidate")
     scope = normalize_experience_scope(record.get("scope"))
     if record["scope_digest"] != sha256_hex(scope):
         raise ContractError("approval scope digest mismatch")
@@ -1291,6 +1329,11 @@ def validate_skill_approval(record: Mapping[str, Any]) -> None:
     if not isinstance(recipients, list) or not recipients:
         raise ContractError("approval recipients must be a nonempty list")
     _normalize_string_refs(recipients, "recipients")
+    authority_evidence = _normalize_json_object(
+        record.get("authority_evidence"), "authority_evidence"
+    )
+    if record.get("authority_evidence") != authority_evidence:
+        raise ContractError("authority_evidence must use canonical JSON values")
     source_cases = record.get("source_cases")
     if not isinstance(source_cases, list) or not source_cases:
         raise ContractError("approval source cases must be a nonempty list")
