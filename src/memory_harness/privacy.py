@@ -23,6 +23,10 @@ class MandatorySecretError(PrivacyError):
     """A prohibited secret appeared in mandatory worker content."""
 
 
+class RemotePayloadPrivacyError(PrivacyError):
+    """A reusable remote payload contains a configured secret or sensitive value."""
+
+
 @dataclass(frozen=True)
 class PrivacyPolicy:
     known_secrets: tuple[str, ...] = ()
@@ -90,6 +94,22 @@ def sanitize_optional(value: Any, policy: PrivacyPolicy) -> Any:
     return sanitize_payload(value, policy)
 
 
+def guard_remote_payload(value: Any, policy: PrivacyPolicy | None = None) -> None:
+    """Reject remote egress rather than silently mutate approved meaning.
+
+    Optional historical evidence can be redacted before it is approved.  Once
+    a procedure revision is approved, replacing sensitive text under the same
+    content identity would break the trust binding, so publication must stop
+    until an explicitly sanitized/reapproved revision exists.
+    """
+
+    selected_policy = policy or PrivacyPolicy()
+    if detect_secrets(value, selected_policy):
+        raise RemotePayloadPrivacyError(
+            "remote procedure payload contains a prohibited secret or sensitive value"
+        )
+
+
 def worker_environment(
     environment: Mapping[str, str], policy: PrivacyPolicy | None = None
 ) -> dict[str, str]:
@@ -138,10 +158,12 @@ def safe_query_payload(value: Any, policy: PrivacyPolicy | None = None) -> Any:
 __all__ = [
     "PrivacyError",
     "MandatorySecretError",
+    "RemotePayloadPrivacyError",
     "PrivacyPolicy",
     "REDACTION_MARKER",
     "detect_secrets",
     "guard_mandatory",
+    "guard_remote_payload",
     "safe_query_payload",
     "sanitize_optional",
     "sanitize_payload",

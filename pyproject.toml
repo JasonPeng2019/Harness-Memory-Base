@@ -14,6 +14,9 @@ dependencies = []
 # EverOS itself requires Python 3.12 or newer; the vendored checkout satisfies
 # this exact extra when installed through the documented portable path.
 everos = ["everos==1.3.1; python_version >= '3.12'"]
+# Atlas is intentionally optional.  The product imports it lazily so local
+# durable-procedure use does not acquire network or provider dependencies.
+atlas = ["langchain-mongodb==0.12.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

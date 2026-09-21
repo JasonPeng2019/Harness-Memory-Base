@@ -77,3 +77,13 @@ scope, and requested recipient set and return `VerifiedApproval` evidence.
 The durable approval retains that evidence and preserves the candidate's
 `generated` origin; approval does not publish, designate, inject, or execute
 the content.
+
+## Optional Atlas trusted-procedure adapter
+
+Install `memory-harness[atlas]` only in a ROOT-controlled environment that is
+authorized to use Atlas.  `AtlasProcedureAdapter` uses the public
+`MongoDBAtlasVectorSearch` surface solely to discover stable publication IDs;
+it exact-reads complete records and lifecycle controls from the supplied
+PyMongo collection before any delivery.  Private/local partitions are never
+published remotely, and the adapter's configured Atlas metric must match each
+published representation.

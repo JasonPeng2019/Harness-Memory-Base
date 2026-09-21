@@ -30,6 +30,14 @@ class ExperienceConflictError(StoreError):
     """An extraction receipt, case, candidate, or approval conflicts with evidence."""
 
 
+class ProcedureConflictError(StoreError):
+    """Trusted procedure evidence or its immutable source binding conflicts."""
+
+
+class ProcedureDesignationConflictError(ProcedureConflictError):
+    """A delayed designation or withdrawal lost its conditional generation race."""
+
+
 _SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS decisions (
@@ -195,6 +203,128 @@ _SCHEMA = [
         approved_at TEXT NOT NULL,
         authority_evidence TEXT NOT NULL,
         content_hash TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS procedure_revisions (
+        revision_id TEXT PRIMARY KEY,
+        logical_id TEXT NOT NULL,
+        origin_scope_digest TEXT NOT NULL,
+        record TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS procedure_approvals (
+        approval_id TEXT PRIMARY KEY,
+        revision_id TEXT NOT NULL REFERENCES procedure_revisions(revision_id),
+        logical_id TEXT NOT NULL,
+        record TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS procedure_representations (
+        representation_id TEXT PRIMARY KEY,
+        revision_id TEXT NOT NULL REFERENCES procedure_revisions(revision_id),
+        logical_id TEXT NOT NULL,
+        record TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS procedure_designations (
+        designation_id TEXT PRIMARY KEY,
+        logical_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL REFERENCES procedure_revisions(revision_id),
+        partition_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        record TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(logical_id, partition_id, generation)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS procedure_withdrawals (
+        withdrawal_id TEXT PRIMARY KEY,
+        logical_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        partition_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        record TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(logical_id, partition_id, generation)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS procedure_current_designations (
+        logical_id TEXT NOT NULL,
+        partition_id TEXT NOT NULL,
+        current_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        record TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(logical_id, partition_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS procedure_publications (
+        publication_id TEXT PRIMARY KEY,
+        logical_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL REFERENCES procedure_revisions(revision_id),
+        partition_id TEXT NOT NULL,
+        designation_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        record TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS procedure_revocations (
+        revocation_id TEXT PRIMARY KEY,
+        logical_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL UNIQUE REFERENCES procedure_revisions(revision_id),
+        record TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS procedure_remote_operations (
+        operation_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        logical_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        partition_id TEXT,
+        payload_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        record TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS procedure_exposures (
+        exposure_id TEXT PRIMARY KEY,
+        publication_id TEXT NOT NULL REFERENCES procedure_publications(publication_id),
+        revision_id TEXT NOT NULL,
+        record TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        delivered_at TEXT NOT NULL
     )
     """,
 ]
@@ -1306,8 +1436,873 @@ class MemoryStore:
         contracts.validate_skill_approval(result)
         return result
 
+    # Trusted-procedure state lives in separate tables so Stage-A decisions,
+    # dispatch operations, and outcomes remain readable without migration loss.
+
+    @staticmethod
+    def _stored_record(row: sqlite3.Row, validator: Any) -> dict[str, Any]:
+        try:
+            record = json.loads(str(row["record"]))
+        except (TypeError, ValueError) as exc:
+            raise ProcedureConflictError("stored procedure record is not valid JSON") from exc
+        if not isinstance(record, dict):
+            raise ProcedureConflictError("stored procedure record is not an object")
+        try:
+            validator(record)
+        except contracts.ContractError as exc:
+            raise ProcedureConflictError("stored procedure record violates its contract") from exc
+        return record
+
+    @staticmethod
+    def _serialize_record(record: Mapping[str, Any]) -> str:
+        return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    def _validate_durable_procedure_source(
+        self, procedure: Mapping[str, Any]
+    ) -> None:
+        """Rejoin generated provenance to the accepted Step-02 evidence.
+
+        Curated/builtin origins retain their explicit provenance reference in
+        the procedure record.  Generated material must additionally resolve
+        the durable candidate and its already-verified source approval.
+        """
+
+        source = procedure["source"]
+        if source.get("kind") != "generated_skill":
+            return
+        required = (
+            "candidate_id",
+            "candidate_digest",
+            "skill_approval_id",
+            "skill_approval_digest",
+            "source_cases",
+        )
+        if any(not source.get(field) for field in required):
+            raise ProcedureConflictError("generated procedure source lacks exact approval provenance")
+        try:
+            candidate = self.get_generated_skill_candidate(str(source["candidate_id"]))
+            skill_approval = self.get_skill_approval(str(source["skill_approval_id"]))
+        except StoreError as exc:
+            raise ProcedureConflictError(
+                "generated procedure source cannot resolve durable Step-02 evidence"
+            ) from exc
+        expected = {
+            "candidate_digest": candidate["content_hash"],
+            "skill_approval_digest": skill_approval["content_hash"],
+            "source_cases": candidate["source_cases"],
+        }
+        if any(source.get(field) != value for field, value in expected.items()):
+            raise ProcedureConflictError("generated procedure source provenance changed or is ambiguous")
+        if skill_approval["candidate_id"] != candidate["candidate_id"]:
+            raise ProcedureConflictError("generated procedure source approval names another candidate")
+        if candidate["content"] != procedure["behavior"]["body"]:
+            raise ProcedureConflictError("generated procedure body does not match its approved source candidate")
+
+    def record_procedure_revision(self, procedure: Mapping[str, Any]) -> dict[str, Any]:
+        contracts.validate_procedure_revision(procedure)
+        self._validate_durable_procedure_source(procedure)
+        connection = self._require_connection()
+        revision_id = str(procedure["revision_id"])
+        existing = connection.execute(
+            "SELECT * FROM procedure_revisions WHERE revision_id = ?", (revision_id,)
+        ).fetchone()
+        if existing is not None:
+            restored = self._stored_record(existing, contracts.validate_procedure_revision)
+            if restored["content_hash"] != procedure["content_hash"]:
+                raise ProcedureConflictError(f"procedure revision conflict for {revision_id}")
+            return restored
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO procedure_revisions (
+                    revision_id, logical_id, origin_scope_digest, record, content_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    procedure["revision_id"],
+                    procedure["logical_id"],
+                    procedure["origin_scope_digest"],
+                    self._serialize_record(procedure),
+                    procedure["content_hash"],
+                    procedure["created_at"],
+                ),
+            )
+        return self.get_procedure_revision(revision_id)
+
+    def get_procedure_revision(self, revision_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM procedure_revisions WHERE revision_id = ?", (revision_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"procedure revision not found: {revision_id}")
+        procedure = self._stored_record(row, contracts.validate_procedure_revision)
+        self._validate_durable_procedure_source(procedure)
+        return procedure
+
+    def record_procedure_approval(self, approval: Mapping[str, Any]) -> dict[str, Any]:
+        contracts.validate_procedure_approval(approval)
+        procedure = self.get_procedure_revision(str(approval["revision_id"]))
+        try:
+            contracts.validate_procedure_approval(approval, procedure=procedure)
+        except contracts.ContractError as exc:
+            raise ProcedureConflictError("procedure approval does not bind durable procedure") from exc
+        connection = self._require_connection()
+        approval_id = str(approval["approval_id"])
+        existing = connection.execute(
+            "SELECT * FROM procedure_approvals WHERE approval_id = ?", (approval_id,)
+        ).fetchone()
+        if existing is not None:
+            restored = self._stored_record(existing, contracts.validate_procedure_approval)
+            if restored["content_hash"] != approval["content_hash"]:
+                raise ProcedureConflictError(f"procedure approval conflict for {approval_id}")
+            return restored
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO procedure_approvals (
+                    approval_id, revision_id, logical_id, record, content_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    approval["approval_id"], approval["revision_id"], approval["logical_id"],
+                    self._serialize_record(approval), approval["content_hash"], approval["approved_at"],
+                ),
+            )
+        return self.get_procedure_approval(approval_id)
+
+    def get_procedure_approval(self, approval_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM procedure_approvals WHERE approval_id = ?", (approval_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"procedure approval not found: {approval_id}")
+        approval = self._stored_record(row, contracts.validate_procedure_approval)
+        procedure = self.get_procedure_revision(str(approval["revision_id"]))
+        try:
+            contracts.validate_procedure_approval(approval, procedure=procedure)
+        except contracts.ContractError as exc:
+            raise ProcedureConflictError("stored approval does not bind durable procedure") from exc
+        return approval
+
+    def record_procedure_representation(
+        self, representation: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        contracts.validate_procedure_representation(representation)
+        procedure = self.get_procedure_revision(str(representation["revision_id"]))
+        try:
+            contracts.validate_procedure_representation(representation, procedure=procedure)
+        except contracts.ContractError as exc:
+            raise ProcedureConflictError("representation does not bind durable procedure") from exc
+        connection = self._require_connection()
+        representation_id = str(representation["representation_id"])
+        existing = connection.execute(
+            "SELECT * FROM procedure_representations WHERE representation_id = ?",
+            (representation_id,),
+        ).fetchone()
+        if existing is not None:
+            restored = self._stored_record(existing, contracts.validate_procedure_representation)
+            if restored["content_hash"] != representation["content_hash"]:
+                raise ProcedureConflictError(
+                    f"procedure representation conflict for {representation_id}"
+                )
+            return restored
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO procedure_representations (
+                    representation_id, revision_id, logical_id, record, content_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    representation["representation_id"], representation["revision_id"],
+                    representation["logical_id"], self._serialize_record(representation),
+                    representation["content_hash"], representation["created_at"],
+                ),
+            )
+        return self.get_procedure_representation(representation_id)
+
+    def get_procedure_representation(self, representation_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM procedure_representations WHERE representation_id = ?",
+            (representation_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"procedure representation not found: {representation_id}")
+        representation = self._stored_record(row, contracts.validate_procedure_representation)
+        procedure = self.get_procedure_revision(str(representation["revision_id"]))
+        try:
+            contracts.validate_procedure_representation(representation, procedure=procedure)
+        except contracts.ContractError as exc:
+            raise ProcedureConflictError("stored representation does not bind durable procedure") from exc
+        return representation
+
+    def _current_procedure_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            source_record = json.loads(str(row["record"]))
+        except (TypeError, ValueError) as exc:
+            raise ProcedureConflictError("stored current procedure state is invalid") from exc
+        if not isinstance(source_record, dict):
+            raise ProcedureConflictError("stored current procedure state is not an object")
+        return {
+            "logical_id": row["logical_id"],
+            "partition_id": row["partition_id"],
+            "designation_id": row["current_id"],
+            "revision_id": row["revision_id"],
+            "generation": row["generation"],
+            "state": row["state"],
+            "record": source_record,
+            "content_hash": row["content_hash"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def get_current_procedure_designation(
+        self, logical_id: str, partition: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        normalized = contracts.normalize_procedure_partition(partition)
+        partition_id = contracts.procedure_partition_id(normalized)
+        connection = self._require_connection()
+        row = connection.execute(
+            """
+            SELECT * FROM procedure_current_designations
+            WHERE logical_id = ? AND partition_id = ?
+            """,
+            (logical_id, partition_id),
+        ).fetchone()
+        return self._current_procedure_from_row(row) if row is not None else None
+
+    def get_procedure_designation(self, designation_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM procedure_designations WHERE designation_id = ?", (designation_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"procedure designation not found: {designation_id}")
+        designation = self._stored_record(row, contracts.validate_procedure_designation)
+        procedure = self.get_procedure_revision(str(designation["revision_id"]))
+        approval = self.get_procedure_approval(str(designation["approval_id"]))
+        try:
+            contracts.validate_procedure_designation(
+                designation, procedure=procedure, approval=approval
+            )
+        except contracts.ContractError as exc:
+            raise ProcedureConflictError("stored designation lacks durable procedure evidence") from exc
+        return designation
+
+    def record_procedure_designation(
+        self, designation: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        contracts.validate_procedure_designation(designation)
+        procedure = self.get_procedure_revision(str(designation["revision_id"]))
+        approval = self.get_procedure_approval(str(designation["approval_id"]))
+        try:
+            contracts.validate_procedure_designation(
+                designation, procedure=procedure, approval=approval
+            )
+        except contracts.ContractError as exc:
+            raise ProcedureConflictError("designation does not bind durable evidence") from exc
+        if self.is_procedure_revoked(str(designation["revision_id"])):
+            raise ProcedureConflictError("a revoked procedure revision cannot become current")
+        connection = self._require_connection()
+        designation_id = str(designation["designation_id"])
+        with connection:
+            existing = connection.execute(
+                "SELECT * FROM procedure_designations WHERE designation_id = ?",
+                (designation_id,),
+            ).fetchone()
+            if existing is not None:
+                restored = self._stored_record(existing, contracts.validate_procedure_designation)
+                if restored["content_hash"] != designation["content_hash"]:
+                    raise ProcedureDesignationConflictError(
+                        f"procedure designation conflict for {designation_id}"
+                    )
+                return restored
+            current_row = connection.execute(
+                """
+                SELECT * FROM procedure_current_designations
+                WHERE logical_id = ? AND partition_id = ?
+                """,
+                (designation["logical_id"], designation["partition_id"]),
+            ).fetchone()
+            generation = int(designation["generation"])
+            if current_row is None:
+                if generation != 1 or designation["predecessor_generation"] is not None:
+                    raise ProcedureDesignationConflictError(
+                        "initial designation must begin at generation one"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO procedure_current_designations (
+                        logical_id, partition_id, current_id, revision_id, generation, state,
+                        record, content_hash, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+                    """,
+                    (
+                        designation["logical_id"], designation["partition_id"],
+                        designation["designation_id"], designation["revision_id"], generation,
+                        self._serialize_record(designation), designation["content_hash"],
+                        designation["created_at"], designation["created_at"],
+                    ),
+                )
+            else:
+                current = self._current_procedure_from_row(current_row)
+                if generation <= int(current["generation"]):
+                    raise ProcedureDesignationConflictError(
+                        "delayed procedure designation cannot replace newer current state"
+                    )
+                if designation["predecessor_generation"] != current["generation"]:
+                    raise ProcedureDesignationConflictError(
+                        "procedure designation predecessor is not current"
+                    )
+                cursor = connection.execute(
+                    """
+                    UPDATE procedure_current_designations
+                    SET current_id = ?, revision_id = ?, generation = ?, state = 'active',
+                        record = ?, content_hash = ?, updated_at = ?
+                    WHERE logical_id = ? AND partition_id = ? AND generation = ?
+                    """,
+                    (
+                        designation["designation_id"], designation["revision_id"], generation,
+                        self._serialize_record(designation), designation["content_hash"],
+                        designation["created_at"], designation["logical_id"],
+                        designation["partition_id"], current["generation"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ProcedureDesignationConflictError("stale procedure designation update")
+            connection.execute(
+                """
+                INSERT INTO procedure_designations (
+                    designation_id, logical_id, revision_id, partition_id, generation,
+                    record, content_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    designation["designation_id"], designation["logical_id"], designation["revision_id"],
+                    designation["partition_id"], designation["generation"],
+                    self._serialize_record(designation), designation["content_hash"], designation["created_at"],
+                ),
+            )
+        return self.get_procedure_designation(designation_id)
+
+    def get_procedure_withdrawal(self, withdrawal_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM procedure_withdrawals WHERE withdrawal_id = ?", (withdrawal_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"procedure withdrawal not found: {withdrawal_id}")
+        return self._stored_record(row, contracts.validate_procedure_withdrawal)
+
+    def record_procedure_withdrawal(
+        self, withdrawal: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        contracts.validate_procedure_withdrawal(withdrawal)
+        connection = self._require_connection()
+        withdrawal_id = str(withdrawal["withdrawal_id"])
+        with connection:
+            existing = connection.execute(
+                "SELECT * FROM procedure_withdrawals WHERE withdrawal_id = ?",
+                (withdrawal_id,),
+            ).fetchone()
+            if existing is not None:
+                restored = self._stored_record(existing, contracts.validate_procedure_withdrawal)
+                if restored["content_hash"] != withdrawal["content_hash"]:
+                    raise ProcedureDesignationConflictError(
+                        f"procedure withdrawal conflict for {withdrawal_id}"
+                    )
+                return restored
+            current_row = connection.execute(
+                """
+                SELECT * FROM procedure_current_designations
+                WHERE logical_id = ? AND partition_id = ?
+                """,
+                (withdrawal["logical_id"], withdrawal["partition_id"]),
+            ).fetchone()
+            if current_row is None:
+                raise ProcedureDesignationConflictError("withdrawal has no current designation")
+            current = self._current_procedure_from_row(current_row)
+            if current["state"] != "active":
+                raise ProcedureDesignationConflictError("procedure partition is already withdrawn")
+            if (
+                current["designation_id"] != withdrawal["predecessor_designation_id"]
+                or current["generation"] != withdrawal["predecessor_generation"]
+                or current["revision_id"] != withdrawal["revision_id"]
+            ):
+                raise ProcedureDesignationConflictError(
+                    "withdrawal predecessor is no longer the current designation"
+                )
+            cursor = connection.execute(
+                """
+                UPDATE procedure_current_designations
+                SET current_id = ?, generation = ?, state = 'withdrawn', record = ?,
+                    content_hash = ?, updated_at = ?
+                WHERE logical_id = ? AND partition_id = ? AND generation = ? AND state = 'active'
+                """,
+                (
+                    withdrawal["withdrawal_id"], withdrawal["generation"],
+                    self._serialize_record(withdrawal), withdrawal["content_hash"],
+                    withdrawal["created_at"], withdrawal["logical_id"], withdrawal["partition_id"],
+                    withdrawal["predecessor_generation"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ProcedureDesignationConflictError("stale procedure withdrawal update")
+            connection.execute(
+                """
+                INSERT INTO procedure_withdrawals (
+                    withdrawal_id, logical_id, revision_id, partition_id, generation,
+                    record, content_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    withdrawal["withdrawal_id"], withdrawal["logical_id"], withdrawal["revision_id"],
+                    withdrawal["partition_id"], withdrawal["generation"],
+                    self._serialize_record(withdrawal), withdrawal["content_hash"], withdrawal["created_at"],
+                ),
+            )
+            self._fence_publications_in_transaction(
+                connection,
+                logical_id=str(withdrawal["logical_id"]),
+                partition_id=str(withdrawal["partition_id"]),
+                status="fenced",
+            )
+        return self.get_procedure_withdrawal(withdrawal_id)
+
+    def _fence_publications_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        logical_id: str,
+        partition_id: str | None = None,
+        revision_id: str | None = None,
+        status: str,
+    ) -> None:
+        clauses = ["logical_id = ?"]
+        values: list[Any] = [logical_id]
+        if partition_id is not None:
+            clauses.append("partition_id = ?")
+            values.append(partition_id)
+        if revision_id is not None:
+            clauses.append("revision_id = ?")
+            values.append(revision_id)
+        rows = connection.execute(
+            "SELECT * FROM procedure_publications WHERE " + " AND ".join(clauses), values
+        ).fetchall()
+        for row in rows:
+            existing = self._stored_record(row, contracts.validate_procedure_publication)
+            if existing["status"] in {"revoked", "withdrawn", "blocked", "revocation_pending"}:
+                continue
+            updated = contracts.revise_procedure_publication(existing, status=status)
+            connection.execute(
+                """
+                UPDATE procedure_publications
+                SET status = ?, version = ?, record = ?, content_hash = ?, updated_at = ?
+                WHERE publication_id = ? AND version = ?
+                """,
+                (
+                    updated["status"], updated["version"], self._serialize_record(updated),
+                    updated["content_hash"], contracts.utc_now(), updated["publication_id"],
+                    existing["version"],
+                ),
+            )
+
+    def get_procedure_publication(self, publication_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM procedure_publications WHERE publication_id = ?", (publication_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"procedure publication not found: {publication_id}")
+        return self._stored_record(row, contracts.validate_procedure_publication)
+
+    def list_procedure_publications(
+        self,
+        *,
+        logical_id: str | None = None,
+        revision_id: str | None = None,
+        partition: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        connection = self._require_connection()
+        clauses: list[str] = []
+        values: list[Any] = []
+        if logical_id is not None:
+            clauses.append("logical_id = ?")
+            values.append(logical_id)
+        if revision_id is not None:
+            clauses.append("revision_id = ?")
+            values.append(revision_id)
+        if partition is not None:
+            clauses.append("partition_id = ?")
+            values.append(contracts.procedure_partition_id(partition))
+        query = "SELECT * FROM procedure_publications"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, publication_id"
+        return [
+            self._stored_record(row, contracts.validate_procedure_publication)
+            for row in connection.execute(query, values).fetchall()
+        ]
+
+    def create_procedure_publication(
+        self, publication: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        """Durably create a publication intent before any remote side effect."""
+
+        contracts.validate_procedure_publication(publication)
+        procedure = self.get_procedure_revision(str(publication["revision_id"]))
+        approval = self.get_procedure_approval(str(publication["approval"]["approval_id"]))
+        representation = self.get_procedure_representation(
+            str(publication["representation"]["representation_id"])
+        )
+        designation = self.get_procedure_designation(
+            str(publication["designation"]["designation_id"])
+        )
+        expected = contracts.make_procedure_publication(
+            procedure=procedure,
+            approval=approval,
+            representation=representation,
+            designation=designation,
+            created_at=publication["created_at"],
+        )
+        if expected["payload_digest"] != publication["payload_digest"]:
+            raise ProcedureConflictError("publication does not match durable procedure evidence")
+        current = self.get_current_procedure_designation(
+            str(publication["logical_id"]), publication["partition"]
+        )
+        if current is None or current["state"] != "active":
+            raise ProcedureConflictError("publication partition has no active current designation")
+        if (
+            current["designation_id"] != publication["designation"]["designation_id"]
+            or current["generation"] != publication["designation"]["generation"]
+            or current["revision_id"] != publication["revision_id"]
+        ):
+            raise ProcedureDesignationConflictError(
+                "publication designation is no longer current"
+            )
+        if self.is_procedure_revoked(str(publication["revision_id"])):
+            raise ProcedureConflictError("revoked procedure revision cannot be published")
+        connection = self._require_connection()
+        publication_id = str(publication["publication_id"])
+        with connection:
+            existing = connection.execute(
+                "SELECT * FROM procedure_publications WHERE publication_id = ?",
+                (publication_id,),
+            ).fetchone()
+            if existing is not None:
+                restored = self._stored_record(existing, contracts.validate_procedure_publication)
+                if restored["payload_digest"] != publication["payload_digest"]:
+                    raise ProcedureConflictError(
+                        f"procedure publication conflict for {publication_id}"
+                    )
+                return restored, False
+            connection.execute(
+                """
+                INSERT INTO procedure_publications (
+                    publication_id, logical_id, revision_id, partition_id, designation_id,
+                    status, version, record, content_hash, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    publication["publication_id"], publication["logical_id"], publication["revision_id"],
+                    publication["partition_id"], publication["designation"]["designation_id"],
+                    publication["status"], publication["version"], self._serialize_record(publication),
+                    publication["content_hash"], publication["created_at"], publication["created_at"],
+                ),
+            )
+        return self.get_procedure_publication(publication_id), True
+
+    def update_procedure_publication(
+        self,
+        publication_id: str,
+        *,
+        status: str,
+        expected_version: int,
+        remote_receipt: Mapping[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_procedure_publication(publication_id)
+        if existing["version"] != expected_version:
+            raise ProcedureConflictError(f"stale procedure publication update for {publication_id}")
+        allowed = {
+            "intent": {"ambiguous", "remote_committed", "fenced", "withdrawn", "revoked", "blocked", "revocation_pending"},
+            "ambiguous": {"remote_committed", "fenced", "withdrawn", "revoked", "blocked", "revocation_pending"},
+            "remote_committed": {"acknowledged", "fenced", "withdrawn", "revoked", "revocation_pending"},
+            "acknowledged": {"fenced", "withdrawn", "revoked", "revocation_pending"},
+            "fenced": {"withdrawn", "revoked", "revocation_pending"},
+            "revocation_pending": {"revoked", "withdrawn"},
+            "withdrawn": {"revoked"},
+            "revoked": set(),
+            "blocked": set(),
+        }
+        if status == existing["status"] and (
+            remote_receipt == existing.get("remote_receipt") and error == existing.get("error")
+        ):
+            return existing
+        if status not in allowed.get(existing["status"], set()):
+            raise ProcedureConflictError(
+                f"procedure publication {publication_id} cannot transition from "
+                f"{existing['status']!r} to {status!r}"
+            )
+        updated = contracts.revise_procedure_publication(
+            existing, status=status, remote_receipt=remote_receipt, error=error
+        )
+        connection = self._require_connection()
+        with connection:
+            cursor = connection.execute(
+                """
+                UPDATE procedure_publications
+                SET status = ?, version = ?, record = ?, content_hash = ?, updated_at = ?
+                WHERE publication_id = ? AND version = ?
+                """,
+                (
+                    updated["status"], updated["version"], self._serialize_record(updated),
+                    updated["content_hash"], contracts.utc_now(), publication_id, expected_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ProcedureConflictError(
+                    f"stale procedure publication update for {publication_id}"
+                )
+        return self.get_procedure_publication(publication_id)
+
+    def get_procedure_revocation(self, revision_id: str) -> dict[str, Any] | None:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM procedure_revocations WHERE revision_id = ?", (revision_id,)
+        ).fetchone()
+        return self._stored_record(row, contracts.validate_procedure_revocation) if row is not None else None
+
+    def is_procedure_revoked(self, revision_id: str) -> bool:
+        return self.get_procedure_revocation(revision_id) is not None
+
+    def record_procedure_revocation(
+        self, revocation: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        contracts.validate_procedure_revocation(revocation)
+        procedure = self.get_procedure_revision(str(revocation["revision_id"]))
+        try:
+            contracts.validate_procedure_revocation(revocation, procedure=procedure)
+        except contracts.ContractError as exc:
+            raise ProcedureConflictError("revocation does not bind durable procedure") from exc
+        connection = self._require_connection()
+        revocation_id = str(revocation["revocation_id"])
+        with connection:
+            prior_revision = connection.execute(
+                "SELECT * FROM procedure_revocations WHERE revision_id = ?",
+                (revocation["revision_id"],),
+            ).fetchone()
+            if prior_revision is not None:
+                restored = self._stored_record(prior_revision, contracts.validate_procedure_revocation)
+                if restored["content_hash"] != revocation["content_hash"]:
+                    raise ProcedureConflictError(
+                        "procedure revision already has a different revocation tombstone"
+                    )
+                return restored
+            connection.execute(
+                """
+                INSERT INTO procedure_revocations (
+                    revocation_id, logical_id, revision_id, record, content_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    revocation["revocation_id"], revocation["logical_id"], revocation["revision_id"],
+                    self._serialize_record(revocation), revocation["content_hash"], revocation["created_at"],
+                ),
+            )
+            self._fence_publications_in_transaction(
+                connection,
+                logical_id=str(revocation["logical_id"]),
+                revision_id=str(revocation["revision_id"]),
+                status="revocation_pending",
+            )
+        restored = self.get_procedure_revocation(str(revocation["revision_id"]))
+        assert restored is not None
+        return restored
+
+    def get_procedure_remote_operation(self, operation_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM procedure_remote_operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"procedure remote operation not found: {operation_id}")
+        return self._stored_record(row, contracts.validate_procedure_remote_operation)
+
+    def create_procedure_remote_operation(
+        self, operation: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        contracts.validate_procedure_remote_operation(operation)
+        connection = self._require_connection()
+        operation_id = str(operation["operation_id"])
+        with connection:
+            existing = connection.execute(
+                "SELECT * FROM procedure_remote_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if existing is not None:
+                restored = self._stored_record(existing, contracts.validate_procedure_remote_operation)
+                immutable_fields = (
+                    "kind", "logical_id", "revision_id", "partition_id", "payload_id", "payload_digest",
+                )
+                if any(restored[field] != operation[field] for field in immutable_fields):
+                    raise ProcedureConflictError(
+                        f"procedure remote operation conflict for {operation_id}"
+                    )
+                return restored, False
+            connection.execute(
+                """
+                INSERT INTO procedure_remote_operations (
+                    operation_id, kind, logical_id, revision_id, partition_id, payload_id,
+                    status, version, record, content_hash, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation["operation_id"], operation["kind"], operation["logical_id"],
+                    operation["revision_id"], operation["partition_id"], operation["payload_id"],
+                    operation["status"], operation["version"], self._serialize_record(operation),
+                    operation["content_hash"], operation["created_at"], operation["created_at"],
+                ),
+            )
+        return self.get_procedure_remote_operation(operation_id), True
+
+    def update_procedure_remote_operation(
+        self,
+        operation_id: str,
+        *,
+        status: str,
+        expected_version: int,
+        remote_receipt: Mapping[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_procedure_remote_operation(operation_id)
+        if existing["version"] != expected_version:
+            raise ProcedureConflictError(f"stale procedure remote operation update for {operation_id}")
+        allowed = {
+            "intent": {"ambiguous", "remote_committed", "fenced", "withdrawn", "revoked", "blocked"},
+            "ambiguous": {"remote_committed", "fenced", "withdrawn", "revoked", "blocked"},
+            "remote_committed": {"acknowledged", "fenced", "withdrawn", "revoked"},
+            "acknowledged": {"fenced", "withdrawn", "revoked"},
+            "fenced": {"withdrawn", "revoked"},
+            "withdrawn": {"revoked"},
+            "revoked": set(),
+            "blocked": set(),
+            "revocation_pending": {"revoked", "withdrawn"},
+        }
+        if status == existing["status"] and (
+            remote_receipt == existing.get("remote_receipt") and error == existing.get("error")
+        ):
+            return existing
+        if status not in allowed.get(existing["status"], set()):
+            raise ProcedureConflictError(
+                f"procedure remote operation {operation_id} cannot transition from "
+                f"{existing['status']!r} to {status!r}"
+            )
+        updated = contracts.revise_procedure_remote_operation(
+            existing, status=status, remote_receipt=remote_receipt, error=error
+        )
+        connection = self._require_connection()
+        with connection:
+            cursor = connection.execute(
+                """
+                UPDATE procedure_remote_operations
+                SET status = ?, version = ?, record = ?, content_hash = ?, updated_at = ?
+                WHERE operation_id = ? AND version = ?
+                """,
+                (
+                    updated["status"], updated["version"], self._serialize_record(updated),
+                    updated["content_hash"], contracts.utc_now(), operation_id, expected_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ProcedureConflictError(
+                    f"stale procedure remote operation update for {operation_id}"
+                )
+        return self.get_procedure_remote_operation(operation_id)
+
+    def list_procedure_remote_operations(
+        self,
+        *,
+        revision_id: str | None = None,
+        payload_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        connection = self._require_connection()
+        clauses: list[str] = []
+        values: list[Any] = []
+        if revision_id is not None:
+            clauses.append("revision_id = ?")
+            values.append(revision_id)
+        if payload_id is not None:
+            clauses.append("payload_id = ?")
+            values.append(payload_id)
+        query = "SELECT * FROM procedure_remote_operations"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, operation_id"
+        return [
+            self._stored_record(row, contracts.validate_procedure_remote_operation)
+            for row in connection.execute(query, values).fetchall()
+        ]
+
+    def record_procedure_exposure(self, exposure: Mapping[str, Any]) -> dict[str, Any]:
+        contracts.validate_procedure_exposure(exposure)
+        publication = self.get_procedure_publication(str(exposure["publication_id"]))
+        if (
+            publication["logical_id"] != exposure["logical_id"]
+            or publication["revision_id"] != exposure["revision_id"]
+        ):
+            raise ProcedureConflictError("procedure exposure does not bind its publication")
+        connection = self._require_connection()
+        exposure_id = str(exposure["exposure_id"])
+        existing = connection.execute(
+            "SELECT * FROM procedure_exposures WHERE exposure_id = ?", (exposure_id,)
+        ).fetchone()
+        if existing is not None:
+            restored = self._stored_record(existing, contracts.validate_procedure_exposure)
+            if restored["content_hash"] != exposure["content_hash"]:
+                raise ProcedureConflictError(f"procedure exposure conflict for {exposure_id}")
+            return restored
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO procedure_exposures (
+                    exposure_id, publication_id, revision_id, record, content_hash, delivered_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    exposure["exposure_id"], exposure["publication_id"], exposure["revision_id"],
+                    self._serialize_record(exposure), exposure["content_hash"], exposure["delivered_at"],
+                ),
+            )
+        return self.get_procedure_exposure(exposure_id)
+
+    def get_procedure_exposure(self, exposure_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT * FROM procedure_exposures WHERE exposure_id = ?", (exposure_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"procedure exposure not found: {exposure_id}")
+        return self._stored_record(row, contracts.validate_procedure_exposure)
+
+    def list_procedure_exposures(self, revision_id: str) -> list[dict[str, Any]]:
+        connection = self._require_connection()
+        rows = connection.execute(
+            """
+            SELECT * FROM procedure_exposures
+            WHERE revision_id = ?
+            ORDER BY delivered_at, exposure_id
+            """,
+            (revision_id,),
+        ).fetchall()
+        return [self._stored_record(row, contracts.validate_procedure_exposure) for row in rows]
+
 
 __all__ = [
     "MemoryStore", "StoreError", "OperationConflictError", "OutcomeConflictError",
-    "TrajectoryConflictError", "ExperienceConflictError",
+    "TrajectoryConflictError", "ExperienceConflictError", "ProcedureConflictError",
+    "ProcedureDesignationConflictError",
 ]

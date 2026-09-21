@@ -1,0 +1,986 @@
+"""Trusted procedure lifecycle coordination.
+
+The module owns product policy around immutable procedure evidence.  It does
+not create a scheduler, review system, or launcher: callers supply their
+trusted approval and, when enabled, a narrow Atlas adapter.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Iterable, Mapping
+
+from . import atlas, contracts
+from .privacy import (
+    PrivacyPolicy,
+    RemotePayloadPrivacyError,
+    guard_remote_payload,
+    sanitize_payload,
+)
+from .store import MemoryStore, ProcedureConflictError, StoreError
+
+
+class ProcedureError(ValueError):
+    """A trusted-procedure lifecycle request is invalid or unsafe."""
+
+
+class ProcedureAuthorizationError(ProcedureError):
+    """A caller or receiver lacks configured procedure authority."""
+
+
+class ProcedureRemoteAmbiguityError(ProcedureError):
+    """A remote operation must be exact-read before it can be retried."""
+
+
+class ProcedureIneligibleError(ProcedureError):
+    """A discovered procedure did not pass authoritative delivery checks."""
+
+
+class TrustedProcedureService:
+    """Coordinate local approval, designation, and durable procedure state.
+
+    Trusted issuer configuration is intentionally explicit and fail-closed.
+    Approval evidence is stored verbatim and checked again by remote receivers;
+    a candidate-supplied issuer string is never treated as authority by itself.
+    """
+
+    def __init__(
+        self,
+        memory_store: MemoryStore,
+        *,
+        trusted_issuers: Iterable[str],
+        privacy_policy: PrivacyPolicy | None = None,
+    ) -> None:
+        issuers = frozenset(
+            issuer for issuer in trusted_issuers if isinstance(issuer, str) and issuer
+        )
+        if not issuers:
+            raise ProcedureAuthorizationError("trusted procedure issuers must be configured")
+        self.store = memory_store
+        self.trusted_issuers = issuers
+        self.privacy_policy = privacy_policy or PrivacyPolicy()
+
+    def _require_trusted_issuer(self, issuer: Any) -> str:
+        if not isinstance(issuer, str) or not issuer:
+            raise ProcedureAuthorizationError("procedure issuer must be a nonempty identity")
+        if issuer not in self.trusted_issuers:
+            raise ProcedureAuthorizationError("procedure issuer is not trusted by this deployment")
+        return issuer
+
+    def record_approved_revision(
+        self,
+        procedure: Mapping[str, Any],
+        approval: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Persist an approved immutable revision without changing current state."""
+
+        try:
+            contracts.validate_procedure_revision(procedure)
+            contracts.validate_procedure_approval(approval, procedure=procedure)
+        except contracts.ContractError as exc:
+            raise ProcedureError("procedure approval does not bind exact content") from exc
+        self._require_trusted_issuer(approval["issuer"])
+        try:
+            persisted_procedure = self.store.record_procedure_revision(procedure)
+            return self.store.record_procedure_approval(
+                contracts.make_procedure_approval(
+                    approval_id=approval["approval_id"],
+                    procedure=persisted_procedure,
+                    issuer=approval["issuer"],
+                    recipients=approval["recipients"],
+                    authority_evidence=approval["authority_evidence"],
+                    approved_at=approval["approved_at"],
+                )
+            )
+        except (contracts.ContractError, ProcedureConflictError) as exc:
+            raise ProcedureError("could not durably record approved procedure revision") from exc
+
+    def record_representation(
+        self, representation: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            return self.store.record_procedure_representation(representation)
+        except (contracts.ContractError, ProcedureConflictError) as exc:
+            raise ProcedureError("representation does not bind durable procedure content") from exc
+
+    def designate(
+        self,
+        *,
+        procedure: Mapping[str, Any],
+        approval: Mapping[str, Any],
+        partition: Mapping[str, Any],
+        issuer: str,
+    ) -> dict[str, Any]:
+        """Explicitly select one revision as local current for one partition."""
+
+        selected_issuer = self._require_trusted_issuer(issuer)
+        self.record_approved_revision(procedure, approval)
+        current = self.store.get_current_procedure_designation(
+            str(procedure["logical_id"]), partition
+        )
+        if current is not None and current["state"] == "active":
+            try:
+                active_designation = self.store.get_procedure_designation(
+                    str(current["designation_id"])
+                )
+            except StoreError as exc:
+                raise ProcedureError("current procedure designation is not durable") from exc
+            normalized_partition = contracts.normalize_procedure_partition(partition)
+            if (
+                active_designation["revision_id"] == procedure["revision_id"]
+                and active_designation["procedure_digest"] == procedure["content_hash"]
+                and active_designation["approval_id"] == approval["approval_id"]
+                and active_designation["approval_digest"] == approval["content_hash"]
+                and active_designation["partition"] == normalized_partition
+                and active_designation["issuer"] == selected_issuer
+            ):
+                # The exact local current operation survived a caller crash;
+                # return it instead of allocating a meaningless successor.
+                return active_designation
+        generation = 1 if current is None else int(current["generation"]) + 1
+        predecessor = None if current is None else int(current["generation"])
+        try:
+            designation = contracts.make_procedure_designation(
+                procedure=procedure,
+                approval=approval,
+                partition=partition,
+                generation=generation,
+                predecessor_generation=predecessor,
+                issuer=selected_issuer,
+            )
+            return self.store.record_procedure_designation(designation)
+        except (contracts.ContractError, ProcedureConflictError) as exc:
+            raise ProcedureError("could not record ordered procedure designation") from exc
+
+    def procedure_from_generated_skill(
+        self,
+        *,
+        candidate_id: str,
+        skill_approval_id: str,
+        logical_name: str,
+        references: Iterable[Mapping[str, Any]],
+        predicates: Mapping[str, Any],
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a revision that retains exact Step-02 candidate provenance."""
+
+        try:
+            candidate = self.store.get_generated_skill_candidate(candidate_id)
+            source_approval = self.store.get_skill_approval(skill_approval_id)
+        except StoreError as exc:
+            raise ProcedureError("generated procedure source cannot resolve Step-02 approval") from exc
+        if source_approval["candidate_id"] != candidate["candidate_id"]:
+            raise ProcedureError("generated procedure source approval names another candidate")
+        source = {
+            "kind": "generated_skill",
+            "candidate_id": candidate["candidate_id"],
+            "candidate_digest": candidate["content_hash"],
+            "skill_approval_id": source_approval["approval_id"],
+            "skill_approval_digest": source_approval["content_hash"],
+            "source_cases": [dict(item) for item in candidate["source_cases"]],
+        }
+        try:
+            return contracts.make_procedure_revision(
+                logical_name=logical_name,
+                origin="generated",
+                origin_scope=candidate["scope"],
+                body=candidate["content"],
+                references=references,
+                predicates=predicates,
+                source=source,
+                metadata=metadata,
+            )
+        except contracts.ContractError as exc:
+            raise ProcedureError("generated procedure source could not form a revision") from exc
+
+    def approve_revision(
+        self,
+        *,
+        procedure: Mapping[str, Any],
+        approval_id: str,
+        issuer: str,
+        recipients: Iterable[Mapping[str, Any]],
+        authority_evidence: Mapping[str, Any],
+        approved_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Create and persist an explicit trusted approval for a revision."""
+
+        selected_issuer = self._require_trusted_issuer(issuer)
+        try:
+            approval = contracts.make_procedure_approval(
+                approval_id=approval_id,
+                procedure=procedure,
+                issuer=selected_issuer,
+                recipients=recipients,
+                authority_evidence=authority_evidence,
+                approved_at=approved_at,
+            )
+        except contracts.ContractError as exc:
+            raise ProcedureError("could not create content-bound procedure approval") from exc
+        return self.record_approved_revision(procedure, approval)
+
+    def _create_remote_operation(
+        self,
+        *,
+        kind: str,
+        logical_id: str,
+        revision_id: str,
+        payload_id: str,
+        payload_digest: str,
+        partition_id: str | None,
+    ) -> dict[str, Any]:
+        operation = contracts.make_procedure_remote_operation(
+            kind=kind,
+            logical_id=logical_id,
+            revision_id=revision_id,
+            payload_id=payload_id,
+            payload_digest=payload_digest,
+            partition_id=partition_id,
+        )
+        persisted, _ = self.store.create_procedure_remote_operation(operation)
+        return persisted
+
+    def _update_remote_operation(
+        self,
+        operation: Mapping[str, Any],
+        *,
+        status: str,
+        remote_receipt: Mapping[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        if (
+            operation["status"] == status
+            and operation.get("remote_receipt") == remote_receipt
+            and operation.get("error") == error
+        ):
+            return dict(operation)
+        try:
+            return self.store.update_procedure_remote_operation(
+                str(operation["operation_id"]),
+                status=status,
+                expected_version=int(operation["version"]),
+                remote_receipt=remote_receipt,
+                error=error,
+            )
+        except ProcedureConflictError as exc:
+            raise ProcedureError("procedure remote operation changed concurrently") from exc
+
+    def _update_publication(
+        self,
+        publication: Mapping[str, Any],
+        *,
+        status: str,
+        remote_receipt: Mapping[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        if (
+            publication["status"] == status
+            and publication.get("remote_receipt") == remote_receipt
+            and publication.get("error") == error
+        ):
+            return dict(publication)
+        try:
+            return self.store.update_procedure_publication(
+                str(publication["publication_id"]),
+                status=status,
+                expected_version=int(publication["version"]),
+                remote_receipt=remote_receipt,
+                error=error,
+            )
+        except ProcedureConflictError as exc:
+            raise ProcedureError("procedure publication changed concurrently") from exc
+
+    @staticmethod
+    def _receipt(document: Mapping[str, Any]) -> dict[str, Any]:
+        identifier = document.get("_id")
+        digest = document.get("content_hash")
+        if not isinstance(identifier, str) or not identifier or not isinstance(digest, str) or not digest:
+            raise ProcedureError("remote receipt lacks an exact identity")
+        return {"remote_id": identifier, "remote_digest": digest}
+
+    @staticmethod
+    def _current_matches_designation(
+        current: Mapping[str, Any] | None, designation: Mapping[str, Any]
+    ) -> bool:
+        return bool(
+            current
+            and current.get("state") == "active"
+            and current.get("logical_id") == designation.get("logical_id")
+            and current.get("partition_id") == designation.get("partition_id")
+            and current.get("revision_id") == designation.get("revision_id")
+            and current.get("designation_id") == designation.get("designation_id")
+            and current.get("generation") == designation.get("generation")
+            and current.get("source_digest") == designation.get("content_hash")
+        )
+
+    def publish_designation(
+        self,
+        designation: Mapping[str, Any],
+        adapter: atlas.AtlasProcedureAdapter,
+    ) -> dict[str, Any]:
+        """Durably accept a shared current designation before publication claim."""
+
+        try:
+            stored = self.store.get_procedure_designation(str(designation["designation_id"]))
+        except StoreError as exc:
+            raise ProcedureError("designation must be durable before remote publication") from exc
+        if stored["content_hash"] != designation.get("content_hash"):
+            raise ProcedureError("designation does not match durable local evidence")
+        self._require_trusted_issuer(stored["issuer"])
+        if stored["partition"]["scope"] == "private":
+            raise ProcedureIneligibleError(
+                "private procedure partitions remain local and cannot be published"
+            )
+        operation = self._create_remote_operation(
+            kind="designation",
+            logical_id=stored["logical_id"],
+            revision_id=stored["revision_id"],
+            payload_id=stored["designation_id"],
+            payload_digest=stored["content_hash"],
+            partition_id=stored["partition_id"],
+        )
+        current = adapter.exact_current(stored["logical_id"], stored["partition_id"])
+        if operation["status"] in {"acknowledged", "remote_committed"}:
+            if self._current_matches_designation(current, stored):
+                if operation["status"] == "remote_committed":
+                    self._update_remote_operation(
+                        operation,
+                        status="acknowledged",
+                        remote_receipt=self._receipt(current),
+                    )
+                return current  # type: ignore[return-value]
+            if operation["status"] == "remote_committed":
+                if current is not None:
+                    self._update_remote_operation(
+                        operation, status="fenced", error="remote current changed"
+                    )
+                    raise ProcedureIneligibleError(
+                        "remote current designation is no longer exact"
+                    )
+                raise ProcedureRemoteAmbiguityError(
+                    "remote designation commit lacks exact current evidence"
+                )
+            raise ProcedureIneligibleError("remote current designation is no longer exact")
+        if operation["status"] == "ambiguous":
+            if self._current_matches_designation(current, stored):
+                operation = self._update_remote_operation(
+                    operation, status="remote_committed", remote_receipt=self._receipt(current)
+                )
+                self._update_remote_operation(
+                    operation, status="acknowledged", remote_receipt=self._receipt(current)
+                )
+                return current  # type: ignore[return-value]
+            raise ProcedureRemoteAmbiguityError(
+                "ambiguous designation must not be retried until its exact current state resolves"
+            )
+        if operation["status"] != "intent":
+            raise ProcedureIneligibleError("designation remote operation is no longer publishable")
+        try:
+            remote = adapter.write_designation(stored)
+            current = adapter.exact_current(stored["logical_id"], stored["partition_id"])
+        except atlas.AtlasProcedureFencedError as exc:
+            self._update_remote_operation(operation, status="fenced", error="remote designation fenced")
+            raise ProcedureIneligibleError("remote designation was fenced") from exc
+        except atlas.AtlasProcedureAmbiguityError as exc:
+            self._update_remote_operation(operation, status="ambiguous", error="remote acknowledgement lost")
+            raise ProcedureRemoteAmbiguityError(
+                "remote designation acknowledgement is ambiguous; exact reconciliation is required"
+            ) from exc
+        except atlas.AtlasProcedureError as exc:
+            self._update_remote_operation(operation, status="blocked", error="remote designation failed")
+            raise ProcedureError("remote designation failed") from exc
+        if not self._current_matches_designation(current, stored):
+            self._update_remote_operation(operation, status="fenced", error="remote current changed")
+            raise ProcedureIneligibleError("remote designation did not become exact current")
+        operation = self._update_remote_operation(
+            operation, status="remote_committed", remote_receipt=self._receipt(remote)
+        )
+        self._update_remote_operation(
+            operation, status="acknowledged", remote_receipt=self._receipt(remote)
+        )
+        return remote
+
+    def _snapshot_matches_publication(
+        self,
+        snapshot: atlas.AtlasExactProcedureSnapshot | None,
+        publication: Mapping[str, Any],
+    ) -> bool:
+        if snapshot is None:
+            return False
+        try:
+            atlas.validate_atlas_procedure_document(snapshot.document)
+        except atlas.AtlasProcedureError:
+            return False
+        remote_publication = snapshot.document["publication"]
+        if remote_publication.get("payload_digest") != publication.get("payload_digest"):
+            return False
+        current = snapshot.current
+        state = snapshot.publication_state
+        designation = publication["designation"]
+        return bool(
+            snapshot.revocation is None
+            and current is not None
+            and state is not None
+            and self._current_matches_designation(current, designation)
+            and state.get("state") == "active"
+            and state.get("publication_id") == publication.get("publication_id")
+            and state.get("source_digest") == publication.get("payload_digest")
+            and state.get("designation_id") == designation.get("designation_id")
+            and state.get("designation_generation") == designation.get("generation")
+        )
+
+    def publish(
+        self,
+        *,
+        procedure: Mapping[str, Any],
+        approval: Mapping[str, Any],
+        representation: Mapping[str, Any],
+        designation: Mapping[str, Any],
+        adapter: atlas.AtlasProcedureAdapter,
+    ) -> dict[str, Any]:
+        """Publish one authorized partition after privacy and lifecycle checks."""
+
+        self._require_trusted_issuer(approval.get("issuer"))
+        self.publish_designation(designation, adapter)
+        try:
+            publication = contracts.make_procedure_publication(
+                procedure=procedure,
+                approval=approval,
+                representation=representation,
+                designation=designation,
+            )
+            if publication["representation"]["metric"] != adapter.metric:
+                raise ProcedureIneligibleError(
+                    "procedure representation metric does not match the configured Atlas index"
+                )
+            publication, _ = self.store.create_procedure_publication(publication)
+        except (contracts.ContractError, ProcedureConflictError) as exc:
+            raise ProcedureError("could not create a durable publication intent") from exc
+        if publication["status"] == "acknowledged":
+            return publication
+        operation = self._create_remote_operation(
+            kind="publication",
+            logical_id=publication["logical_id"],
+            revision_id=publication["revision_id"],
+            payload_id=publication["publication_id"],
+            payload_digest=publication["payload_digest"],
+            partition_id=publication["partition_id"],
+        )
+        if publication["status"] in {"ambiguous", "remote_committed"} or operation[
+            "status"
+        ] in {"ambiguous", "remote_committed"}:
+            reconciled = self.reconcile_publication(publication["publication_id"], adapter)
+            if reconciled["status"] == "acknowledged":
+                return reconciled
+            raise ProcedureRemoteAmbiguityError(
+                "remote publication remains unresolved after exact read"
+            )
+        if publication["status"] != "intent" or operation["status"] not in {"intent", "remote_committed"}:
+            raise ProcedureIneligibleError("publication is no longer eligible for remote submission")
+        try:
+            # The Atlas document carries all of this immutable evidence, not
+            # merely the indexed text.  Scan the exact outbound payload so a
+            # source or approval field cannot become an unexamined egress path.
+            guard_remote_payload(
+                publication,
+                self.privacy_policy,
+            )
+        except RemotePayloadPrivacyError as exc:
+            self._update_publication(publication, status="blocked", error="privacy scan rejected publication")
+            self._update_remote_operation(operation, status="blocked", error="privacy scan rejected publication")
+            raise ProcedureError("privacy scan rejected procedure publication") from exc
+        try:
+            remote = adapter.write_publication(publication)
+            snapshot = adapter.exact_read(publication["publication_id"])
+        except atlas.AtlasProcedureFencedError as exc:
+            self._update_publication(publication, status="fenced", error="remote publication fenced")
+            self._update_remote_operation(operation, status="fenced", error="remote publication fenced")
+            raise ProcedureIneligibleError("remote publication was fenced") from exc
+        except atlas.AtlasProcedureAmbiguityError as exc:
+            self._update_publication(publication, status="ambiguous", error="remote acknowledgement lost")
+            self._update_remote_operation(operation, status="ambiguous", error="remote acknowledgement lost")
+            raise ProcedureRemoteAmbiguityError(
+                "remote publication acknowledgement is ambiguous; exact reconciliation is required"
+            ) from exc
+        except atlas.AtlasProcedureError as exc:
+            self._update_publication(publication, status="blocked", error="remote publication failed")
+            self._update_remote_operation(operation, status="blocked", error="remote publication failed")
+            raise ProcedureError("remote publication failed") from exc
+        if not self._snapshot_matches_publication(snapshot, publication):
+            self._update_publication(publication, status="fenced", error="remote lifecycle changed")
+            self._update_remote_operation(operation, status="fenced", error="remote lifecycle changed")
+            raise ProcedureIneligibleError("remote publication failed exact lifecycle validation")
+        if operation["status"] == "intent":
+            operation = self._update_remote_operation(
+                operation, status="remote_committed", remote_receipt=self._receipt(remote)
+            )
+        if publication["status"] == "intent":
+            publication = self._update_publication(
+                publication, status="remote_committed", remote_receipt=self._receipt(remote)
+            )
+        current = self.store.get_current_procedure_designation(
+            publication["logical_id"], publication["partition"]
+        )
+        if (
+            self.store.is_procedure_revoked(publication["revision_id"])
+            or current is None
+            or current["state"] != "active"
+            or current["designation_id"] != publication["designation"]["designation_id"]
+        ):
+            self._update_publication(publication, status="fenced", error="local lifecycle changed")
+            self._update_remote_operation(operation, status="fenced", error="local lifecycle changed")
+            raise ProcedureIneligibleError("local lifecycle fenced publication acknowledgement")
+        operation = self._update_remote_operation(
+            operation, status="acknowledged", remote_receipt=self._receipt(remote)
+        )
+        return self._update_publication(
+            publication, status="acknowledged", remote_receipt=self._receipt(remote)
+        )
+
+    def reconcile_publication(
+        self, publication_id: str, adapter: atlas.AtlasProcedureAdapter
+    ) -> dict[str, Any]:
+        """Resolve a lost acknowledgement through exact read, never blind replay."""
+
+        publication = self.store.get_procedure_publication(publication_id)
+        operations = [
+            operation
+            for operation in self.store.list_procedure_remote_operations(payload_id=publication_id)
+            if operation["kind"] == "publication"
+        ]
+        if len(operations) != 1:
+            raise ProcedureError("publication has no unique stable remote operation")
+        operation = operations[0]
+        snapshot = adapter.exact_read(publication_id)
+        if self._snapshot_matches_publication(snapshot, publication):
+            receipt = self._receipt(snapshot.document)  # type: ignore[union-attr]
+            if operation["status"] in {"intent", "ambiguous"}:
+                operation = self._update_remote_operation(
+                    operation, status="remote_committed", remote_receipt=receipt
+                )
+            if publication["status"] in {"intent", "ambiguous"}:
+                publication = self._update_publication(
+                    publication, status="remote_committed", remote_receipt=receipt
+                )
+            if operation["status"] == "remote_committed":
+                operation = self._update_remote_operation(
+                    operation, status="acknowledged", remote_receipt=receipt
+                )
+            if publication["status"] == "remote_committed":
+                publication = self._update_publication(
+                    publication, status="acknowledged", remote_receipt=receipt
+                )
+            return publication
+        if snapshot is not None and snapshot.revocation is not None:
+            target = "revoked"
+        elif snapshot is not None and (
+            snapshot.current is not None and snapshot.current.get("state") == "withdrawn"
+        ):
+            target = "withdrawn"
+        else:
+            # No exact remote evidence means retain the uncertainty as-is.
+            return publication
+        if operation["status"] in {"intent", "ambiguous", "remote_committed", "acknowledged"}:
+            self._update_remote_operation(operation, status=target, error="remote lifecycle fenced")
+        if publication["status"] in {"intent", "ambiguous", "remote_committed", "acknowledged", "fenced", "revocation_pending"}:
+            return self._update_publication(publication, status=target, error="remote lifecycle fenced")
+        return publication
+
+    @staticmethod
+    def _current_matches_withdrawal(
+        current: Mapping[str, Any] | None, withdrawal: Mapping[str, Any]
+    ) -> bool:
+        return bool(
+            current
+            and current.get("state") == "withdrawn"
+            and current.get("logical_id") == withdrawal.get("logical_id")
+            and current.get("partition_id") == withdrawal.get("partition_id")
+            and current.get("revision_id") == withdrawal.get("revision_id")
+            and current.get("designation_id") == withdrawal.get("withdrawal_id")
+            and current.get("generation") == withdrawal.get("generation")
+            and current.get("source_digest") == withdrawal.get("content_hash")
+        )
+
+    def _complete_withdrawn_publications(
+        self,
+        withdrawal: Mapping[str, Any],
+        adapter: atlas.AtlasProcedureAdapter,
+    ) -> bool:
+        """Advance tracked copies only after the remote current fence is exact."""
+
+        complete = True
+        for publication in self.store.list_procedure_publications(
+            logical_id=withdrawal["logical_id"], partition=withdrawal["partition"]
+        ):
+            if publication["status"] in {"withdrawn", "revoked"}:
+                continue
+            publication_operation = self._create_remote_operation(
+                kind="withdraw_publication",
+                logical_id=publication["logical_id"],
+                revision_id=publication["revision_id"],
+                payload_id=publication["publication_id"],
+                payload_digest=publication["payload_digest"],
+                partition_id=publication["partition_id"],
+            )
+            try:
+                # The adapter exact-reads the stable publication-state id
+                # before issuing its conditional update, so this is a
+                # reconciliation of the same operation rather than a replay
+                # under a replacement identity.
+                remote_state = adapter.write_publication_state(publication, state="withdrawn")
+                receipt = self._receipt(remote_state)
+                if publication_operation["status"] in {"intent", "ambiguous"}:
+                    publication_operation = self._update_remote_operation(
+                        publication_operation,
+                        status="remote_committed",
+                        remote_receipt=receipt,
+                    )
+                if publication_operation["status"] == "remote_committed":
+                    self._update_remote_operation(
+                        publication_operation,
+                        status="acknowledged",
+                        remote_receipt=receipt,
+                    )
+                self._update_publication(
+                    publication, status="withdrawn", remote_receipt=receipt
+                )
+            except atlas.AtlasProcedureAmbiguityError:
+                complete = False
+                if publication_operation["status"] == "intent":
+                    self._update_remote_operation(
+                        publication_operation,
+                        status="ambiguous",
+                        error="withdrawal acknowledgement lost",
+                    )
+            except atlas.AtlasProcedureError:
+                complete = False
+                if publication_operation["status"] == "intent":
+                    self._update_remote_operation(
+                        publication_operation,
+                        status="blocked",
+                        error="remote withdrawal failed",
+                    )
+        return complete and all(
+            publication["status"] in {"withdrawn", "revoked"}
+            for publication in self.store.list_procedure_publications(
+                logical_id=withdrawal["logical_id"], partition=withdrawal["partition"]
+            )
+        )
+
+    def _reconcile_withdrawal_record(
+        self,
+        withdrawal: Mapping[str, Any],
+        adapter: atlas.AtlasProcedureAdapter,
+    ) -> dict[str, Any]:
+        """Exact-read one durable withdrawal before deciding whether it is safe to write."""
+
+        if withdrawal["partition"]["scope"] == "private":
+            return {"withdrawal": dict(withdrawal), "managed_complete": True}
+        operation = self._create_remote_operation(
+            kind="withdrawal",
+            logical_id=withdrawal["logical_id"],
+            revision_id=withdrawal["revision_id"],
+            payload_id=withdrawal["withdrawal_id"],
+            payload_digest=withdrawal["content_hash"],
+            partition_id=withdrawal["partition_id"],
+        )
+        remote_current = adapter.exact_current(
+            withdrawal["logical_id"], withdrawal["partition_id"]
+        )
+        if self._current_matches_withdrawal(remote_current, withdrawal):
+            receipt = self._receipt(remote_current)
+            if operation["status"] in {"intent", "ambiguous"}:
+                operation = self._update_remote_operation(
+                    operation, status="remote_committed", remote_receipt=receipt
+                )
+            if operation["status"] == "remote_committed":
+                self._update_remote_operation(
+                    operation, status="acknowledged", remote_receipt=receipt
+                )
+        elif operation["status"] == "intent":
+            try:
+                remote = adapter.write_withdrawal(withdrawal)
+                remote_current = adapter.exact_current(
+                    withdrawal["logical_id"], withdrawal["partition_id"]
+                )
+            except atlas.AtlasProcedureAmbiguityError as exc:
+                self._update_remote_operation(
+                    operation, status="ambiguous", error="withdrawal acknowledgement lost"
+                )
+                raise ProcedureRemoteAmbiguityError(
+                    "remote withdrawal acknowledgement is ambiguous; exact reconciliation is required"
+                ) from exc
+            except atlas.AtlasProcedureFencedError as exc:
+                self._update_remote_operation(
+                    operation, status="fenced", error="remote withdrawal fenced"
+                )
+                raise ProcedureIneligibleError("remote withdrawal was fenced") from exc
+            except atlas.AtlasProcedureError as exc:
+                self._update_remote_operation(
+                    operation, status="blocked", error="remote withdrawal failed"
+                )
+                raise ProcedureError("remote withdrawal failed") from exc
+            if not self._current_matches_withdrawal(remote_current, withdrawal):
+                self._update_remote_operation(
+                    operation, status="fenced", error="remote current changed"
+                )
+                raise ProcedureIneligibleError("remote withdrawal did not become exact current")
+            receipt = self._receipt(remote)
+            operation = self._update_remote_operation(
+                operation, status="remote_committed", remote_receipt=receipt
+            )
+            self._update_remote_operation(
+                operation, status="acknowledged", remote_receipt=receipt
+            )
+        else:
+            if remote_current is not None and int(remote_current["generation"]) >= int(
+                withdrawal["generation"]
+            ):
+                if operation["status"] != "fenced":
+                    self._update_remote_operation(
+                        operation, status="fenced", error="remote current changed"
+                    )
+                raise ProcedureIneligibleError("remote withdrawal is fenced by newer state")
+            raise ProcedureRemoteAmbiguityError(
+                "withdrawal remains uncertain until exact current evidence resolves"
+            )
+        return {
+            "withdrawal": dict(withdrawal),
+            "managed_complete": self._complete_withdrawn_publications(withdrawal, adapter),
+        }
+
+    def withdraw_partition(
+        self,
+        *,
+        logical_id: str,
+        partition: Mapping[str, Any],
+        issuer: str,
+        adapter: atlas.AtlasProcedureAdapter,
+    ) -> dict[str, Any]:
+        """Withdraw one partition without revoking other authorized copies."""
+
+        selected_issuer = self._require_trusted_issuer(issuer)
+        current = self.store.get_current_procedure_designation(logical_id, partition)
+        if current is None or current["state"] != "active":
+            raise ProcedureIneligibleError("partition has no active designation to withdraw")
+        try:
+            predecessor = self.store.get_procedure_designation(current["designation_id"])
+            withdrawal = contracts.make_procedure_withdrawal(
+                predecessor_designation=predecessor, issuer=selected_issuer
+            )
+            withdrawal = self.store.record_procedure_withdrawal(withdrawal)
+        except (contracts.ContractError, ProcedureConflictError, StoreError) as exc:
+            raise ProcedureError("could not durably fence the partition withdrawal") from exc
+        return self._reconcile_withdrawal_record(withdrawal, adapter)
+
+    def reconcile_withdrawal(
+        self,
+        *,
+        logical_id: str,
+        partition: Mapping[str, Any],
+        adapter: atlas.AtlasProcedureAdapter,
+    ) -> dict[str, Any]:
+        """Reconcile a locally fenced withdrawal through the exact current id."""
+
+        current = self.store.get_current_procedure_designation(logical_id, partition)
+        if current is None or current["state"] != "withdrawn":
+            raise ProcedureIneligibleError("partition has no durable withdrawal to reconcile")
+        withdrawal = current.get("record")
+        try:
+            contracts.validate_procedure_withdrawal(withdrawal)
+        except contracts.ContractError as exc:
+            raise ProcedureError("current withdrawal state is not valid durable evidence") from exc
+        self._require_trusted_issuer(withdrawal["issuer"])
+        return self._reconcile_withdrawal_record(withdrawal, adapter)
+
+    def revoke(
+        self,
+        *,
+        procedure: Mapping[str, Any],
+        issuer: str,
+        reason: str,
+        adapter: atlas.AtlasProcedureAdapter,
+    ) -> dict[str, Any]:
+        """Tombstone a revision and fence every tracked publication before completion."""
+
+        selected_issuer = self._require_trusted_issuer(issuer)
+        try:
+            existing = self.store.get_procedure_revocation(str(procedure["revision_id"]))
+            if existing is None:
+                revocation = contracts.make_procedure_revocation(
+                    procedure=procedure, issuer=selected_issuer, reason=reason
+                )
+                revocation = self.store.record_procedure_revocation(revocation)
+            else:
+                contracts.validate_procedure_revocation(existing, procedure=procedure)
+                if existing["issuer"] != selected_issuer or existing["reason"] != reason:
+                    raise ProcedureIneligibleError(
+                        "procedure revision already has a different durable revocation"
+                    )
+                revocation = existing
+        except (contracts.ContractError, ProcedureConflictError) as exc:
+            raise ProcedureError("could not durably record procedure revocation") from exc
+        operation = self._create_remote_operation(
+            kind="revocation",
+            logical_id=revocation["logical_id"],
+            revision_id=revocation["revision_id"],
+            payload_id=revocation["revocation_id"],
+            payload_digest=revocation["content_hash"],
+            partition_id=None,
+        )
+        remote_ready = False
+        try:
+            remote = adapter.write_revocation(revocation)
+            if operation["status"] in {"intent", "ambiguous"}:
+                operation = self._update_remote_operation(
+                    operation, status="remote_committed", remote_receipt=self._receipt(remote)
+                )
+            if operation["status"] == "remote_committed":
+                self._update_remote_operation(
+                    operation, status="acknowledged", remote_receipt=self._receipt(remote)
+                )
+            remote_ready = True
+        except atlas.AtlasProcedureAmbiguityError:
+            if operation["status"] == "intent":
+                self._update_remote_operation(
+                    operation, status="ambiguous", error="revocation acknowledgement lost"
+                )
+        except atlas.AtlasProcedureError:
+            if operation["status"] == "intent":
+                self._update_remote_operation(operation, status="blocked", error="remote revocation failed")
+        if remote_ready:
+            for publication in self.store.list_procedure_publications(
+                revision_id=revocation["revision_id"]
+            ):
+                if publication["status"] in {"revoked", "blocked"}:
+                    continue
+                publication_operation = self._create_remote_operation(
+                    kind="revoke_publication",
+                    logical_id=publication["logical_id"],
+                    revision_id=publication["revision_id"],
+                    payload_id=publication["publication_id"],
+                    payload_digest=publication["payload_digest"],
+                    partition_id=publication["partition_id"],
+                )
+                try:
+                    remote_state = adapter.write_publication_state(publication, state="revoked")
+                    if publication_operation["status"] in {"intent", "ambiguous"}:
+                        publication_operation = self._update_remote_operation(
+                            publication_operation,
+                            status="remote_committed",
+                            remote_receipt=self._receipt(remote_state),
+                        )
+                    if publication_operation["status"] == "remote_committed":
+                        self._update_remote_operation(
+                            publication_operation,
+                            status="acknowledged",
+                            remote_receipt=self._receipt(remote_state),
+                        )
+                    self._update_publication(
+                        publication, status="revoked", remote_receipt=self._receipt(remote_state)
+                    )
+                except atlas.AtlasProcedureAmbiguityError:
+                    if publication_operation["status"] == "intent":
+                        self._update_remote_operation(
+                            publication_operation, status="ambiguous", error="revocation acknowledgement lost"
+                        )
+                except atlas.AtlasProcedureError:
+                    if publication_operation["status"] == "intent":
+                        self._update_remote_operation(
+                            publication_operation, status="blocked", error="remote revocation failed"
+                        )
+        publications = self.store.list_procedure_publications(revision_id=revocation["revision_id"])
+        revocation_operation = self.store.get_procedure_remote_operation(operation["operation_id"])
+        return {
+            "revocation": revocation,
+            "managed_complete": (
+                revocation_operation["status"] == "acknowledged"
+                and all(publication["status"] in {"revoked", "withdrawn"} for publication in publications)
+            ),
+            "exposures": self.store.list_procedure_exposures(revocation["revision_id"]),
+        }
+
+    def record_exposure(
+        self,
+        *,
+        publication_id: str,
+        recipient: Mapping[str, Any],
+        delivery_id: str,
+    ) -> dict[str, Any]:
+        """Retain already delivered exposure without treating it as revocable."""
+
+        publication = self.store.get_procedure_publication(publication_id)
+        try:
+            exposure = contracts.make_procedure_exposure(
+                publication=publication, recipient=recipient, delivery_id=delivery_id
+            )
+            return self.store.record_procedure_exposure(exposure)
+        except (contracts.ContractError, ProcedureConflictError) as exc:
+            raise ProcedureError("could not record known procedure exposure") from exc
+
+    def resolve_atlas(
+        self,
+        query_text: str,
+        *,
+        receiver: Mapping[str, Any],
+        facts: Mapping[str, Any],
+        route: str,
+        adapter: atlas.AtlasProcedureAdapter,
+        representation: Mapping[str, Any] | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Discover ids through Vector Search, then exact-read every delivery candidate."""
+
+        # Search order and duplicate physical copies are discovery artifacts,
+        # not authority.  The contract permits one delivered revision per
+        # logical procedure, preferring the narrower remote scope; score only
+        # orders equally specific, independently authorized partitions.
+        scope_rank = {"private": 0, "project": 1, "shared": 2}
+        selected: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+        sanitized_query = sanitize_payload(query_text, self.privacy_policy)
+        if not isinstance(sanitized_query, str) or not sanitized_query.strip():
+            raise ProcedureError("Atlas discovery query must be a nonempty string")
+        for hit in adapter.discover(sanitized_query, receiver=receiver, limit=limit):
+            try:
+                snapshot = adapter.exact_read(hit.publication_id)
+                if snapshot is None:
+                    continue
+                delivery = atlas.validate_atlas_snapshot_for_delivery(
+                    snapshot,
+                    receiver=receiver,
+                    facts=facts,
+                    route=route,
+                    trusted_issuers=self.trusted_issuers,
+                    representation=representation,
+                )
+                if delivery["representation"]["metric"] != adapter.metric:
+                    continue
+            except (atlas.AtlasProcedureError, contracts.ContractError):
+                # A bad vector result is not evidence against a separate hit;
+                # it simply cannot become optional procedural guidance.
+                continue
+            candidate = {**delivery, "discovery_score": hit.score}
+            key = (
+                scope_rank.get(candidate["partition"]["scope"], 99),
+                -hit.score,
+                candidate["revision_id"],
+                candidate["publication_id"],
+            )
+            logical_id = candidate["logical_id"]
+            prior = selected.get(logical_id)
+            if prior is None or key < prior[0]:
+                selected[logical_id] = (key, candidate)
+        return [
+            candidate
+            for _, candidate in sorted(
+                selected.values(), key=lambda item: (item[0], item[1]["logical_id"])
+            )
+        ]
+
+
+__all__ = [
+    "ProcedureError",
+    "ProcedureAuthorizationError",
+    "ProcedureRemoteAmbiguityError",
+    "ProcedureIneligibleError",
+    "TrustedProcedureService",
+]

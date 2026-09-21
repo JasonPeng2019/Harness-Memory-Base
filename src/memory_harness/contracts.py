@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
@@ -21,6 +22,15 @@ EXPERIENCE_INGESTION_SCHEMA = "reviewed-experience-ingestion/v1"
 CASE_RECEIPT_SCHEMA = "reviewed-case-receipt/v1"
 GENERATED_SKILL_SCHEMA = "generated-skill-candidate/v1"
 SKILL_APPROVAL_SCHEMA = "generated-skill-approval/v1"
+PROCEDURE_REVISION_SCHEMA = "trusted-procedure-revision/v1"
+PROCEDURE_APPROVAL_SCHEMA = "trusted-procedure-approval/v1"
+PROCEDURE_REPRESENTATION_SCHEMA = "trusted-procedure-representation/v1"
+PROCEDURE_DESIGNATION_SCHEMA = "trusted-procedure-designation/v1"
+PROCEDURE_WITHDRAWAL_SCHEMA = "trusted-procedure-withdrawal/v1"
+PROCEDURE_PUBLICATION_SCHEMA = "trusted-procedure-publication/v1"
+PROCEDURE_REVOCATION_SCHEMA = "trusted-procedure-revocation/v1"
+PROCEDURE_REMOTE_OPERATION_SCHEMA = "trusted-procedure-remote-operation/v1"
+PROCEDURE_EXPOSURE_SCHEMA = "trusted-procedure-exposure/v1"
 APC_REQUEST_SCHEMA = "apc-request/v1"
 APC_RESULT_SCHEMA = "apc-result/v1"
 
@@ -36,6 +46,20 @@ EXPERIENCE_INGESTION_STATUSES = frozenset({
     "uncertain",
     "confirmed",
     "blocked",
+})
+PROCEDURE_ORIGINS = frozenset({"generated", "curated", "builtin"})
+PROCEDURE_PARTITION_SCOPES = frozenset({"private", "project", "shared"})
+PROCEDURE_METRICS = frozenset({"cosine", "dot_product", "euclidean"})
+PROCEDURE_OPERATION_STATUSES = frozenset({
+    "intent",
+    "ambiguous",
+    "remote_committed",
+    "acknowledged",
+    "fenced",
+    "withdrawn",
+    "revoked",
+    "blocked",
+    "revocation_pending",
 })
 
 
@@ -1354,6 +1378,1256 @@ def validate_skill_approval(record: Mapping[str, Any]) -> None:
             _require_nonempty_str(source.get(field), f"source_case.{field}")
 
 
+# Trusted procedures deliberately use records separate from generated-skill
+# candidates.  A Step-02 approval proves the source candidate; it does not
+# approve a later change to references, predicates, or representation policy.
+
+
+def _normalize_json_value(value: Any, field: str) -> Any:
+    try:
+        return json.loads(canonical_json(value).decode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise ContractError(f"{field} must be JSON serializable") from exc
+
+
+def _normalize_recipient_scopes(values: Iterable[Mapping[str, Any]]) -> list[dict[str, str]]:
+    if isinstance(values, (str, bytes)):
+        raise ContractError("procedure recipients must be a collection of scopes")
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for value in values:
+        scope = normalize_experience_scope(value)
+        key = canonical_json(scope).decode("utf-8")
+        if key in seen:
+            raise ContractError("procedure recipients must not contain duplicate scopes")
+        seen.add(key)
+        result.append(scope)
+    if not result:
+        raise ContractError("procedure recipients must not be empty")
+    return sorted(result, key=canonical_json)
+
+
+def normalize_procedure_partition(partition: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize a full authorization partition, not just a scope label.
+
+    ``private`` has one exact owner recipient, ``project`` stays within one
+    project, and ``shared`` can name explicit cross-project recipients while
+    remaining inside one application/namespace.  This intentionally keeps the
+    destination boundary distinct from the source procedure's origin scope.
+    """
+
+    if not isinstance(partition, Mapping):
+        raise ContractError("procedure partition must be an object")
+    scope = _require_nonempty_str(partition.get("scope"), "partition.scope")
+    if scope not in PROCEDURE_PARTITION_SCOPES:
+        raise ContractError(f"unknown procedure partition scope: {scope!r}")
+    application = _require_nonempty_str(
+        partition.get("application"), "partition.application"
+    )
+    project = _require_nonempty_str(partition.get("project"), "partition.project")
+    namespace = _require_nonempty_str(
+        partition.get("namespace"), "partition.namespace"
+    )
+    recipients = _normalize_recipient_scopes(partition.get("recipients", ()))
+    for recipient in recipients:
+        if recipient["application"] != application or recipient["namespace"] != namespace:
+            raise ContractError("procedure partition recipients cross application or namespace")
+    owner = partition.get("owner")
+    if scope == "private":
+        owner = _require_nonempty_str(owner, "partition.owner")
+        if len(recipients) != 1:
+            raise ContractError("private procedure partition requires exactly one recipient")
+        recipient = recipients[0]
+        if recipient["project"] != project or recipient["owner"] != owner:
+            raise ContractError("private procedure partition recipient must match owner and project")
+    else:
+        if owner is not None:
+            raise ContractError("only private procedure partitions may include an owner")
+        if scope == "project" and any(
+            recipient["project"] != project for recipient in recipients
+        ):
+            raise ContractError("project procedure partition recipients must stay in its project")
+    normalized: dict[str, Any] = {
+        "scope": scope,
+        "application": application,
+        "project": project,
+        "namespace": namespace,
+        "recipients": recipients,
+    }
+    if scope == "private":
+        normalized["owner"] = owner
+    return normalized
+
+
+def procedure_partition_id(partition: Mapping[str, Any]) -> str:
+    return sha256_hex(
+        {
+            "domain": "trusted-procedure-partition/v1",
+            "partition": normalize_procedure_partition(partition),
+        }
+    )
+
+
+def _normalize_reference_list(values: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    if isinstance(values, (str, bytes)):
+        raise ContractError("procedure references must be a list")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, Mapping):
+            raise ContractError("procedure references must contain objects")
+        reference_id = _require_nonempty_str(value.get("id"), "procedure reference id")
+        content = _require_nonempty_str(value.get("content"), "procedure reference content")
+        if reference_id in seen:
+            raise ContractError("procedure references must not contain duplicate ids")
+        seen.add(reference_id)
+        item = _normalize_json_value(value, "procedure reference")
+        if not isinstance(item, dict):
+            raise ContractError("procedure reference must remain an object")
+        item["id"] = reference_id
+        item["content"] = content
+        normalized.append(item)
+    return sorted(normalized, key=lambda item: str(item["id"]))
+
+
+_PREDICATE_OPERATORS = frozenset({"equals", "in", "contains", "present", "absent"})
+_PREDICATE_GROUPS = ("all", "any", "none")
+_PROCEDURE_PREDICATE_KINDS = ("applicability", "conflicts", "capabilities", "routes")
+
+
+def _normalize_predicate_condition(value: Any, field: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ContractError(f"{field} entries must be objects")
+    name = _require_nonempty_str(value.get("field"), f"{field}.field")
+    operator = _require_nonempty_str(value.get("operator"), f"{field}.operator")
+    if operator not in _PREDICATE_OPERATORS:
+        raise ContractError(f"unsupported predicate operator: {operator!r}")
+    if operator in {"present", "absent"}:
+        if "value" in value and value["value"] is not None:
+            raise ContractError(f"{operator} predicate must not carry a value")
+        return {"field": name, "operator": operator}
+    if "value" not in value:
+        raise ContractError(f"{operator} predicate requires a value")
+    expected = _normalize_json_value(value["value"], f"{field}.value")
+    if operator == "in":
+        if not isinstance(expected, list) or not expected:
+            raise ContractError("in predicate value must be a nonempty list")
+    return {"field": name, "operator": operator, "value": expected}
+
+
+def _normalize_predicate_expression(value: Any, field: str) -> dict[str, list[dict[str, Any]]]:
+    if value is None:
+        raise ContractError(f"{field} must be an object; use an empty object for no constraint")
+    if not isinstance(value, Mapping):
+        raise ContractError(f"{field} must be an object")
+    unexpected = set(value) - set(_PREDICATE_GROUPS)
+    if unexpected:
+        raise ContractError(f"{field} contains unknown predicate groups")
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    for group in _PREDICATE_GROUPS:
+        entries = value.get(group, [])
+        if not isinstance(entries, list):
+            raise ContractError(f"{field}.{group} must be a list")
+        conditions = [
+            _normalize_predicate_condition(item, f"{field}.{group}") for item in entries
+        ]
+        deduplicated = {canonical_json(item).decode("utf-8") for item in conditions}
+        if len(deduplicated) != len(conditions):
+            raise ContractError(f"{field}.{group} must not contain duplicate conditions")
+        normalized[group] = sorted(conditions, key=canonical_json)
+    return normalized
+
+
+def normalize_procedure_predicates(value: Mapping[str, Any]) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    if not isinstance(value, Mapping):
+        raise ContractError("procedure predicates must be an object")
+    if set(value) != set(_PROCEDURE_PREDICATE_KINDS):
+        raise ContractError("procedure predicates must define applicability, conflicts, capabilities, and routes")
+    return {
+        kind: _normalize_predicate_expression(value[kind], f"predicates.{kind}")
+        for kind in _PROCEDURE_PREDICATE_KINDS
+    }
+
+
+def _predicate_expression_is_empty(expression: Mapping[str, Any]) -> bool:
+    return all(not expression.get(group) for group in _PREDICATE_GROUPS)
+
+
+def _lookup_predicate_fact(facts: Mapping[str, Any], field: str) -> tuple[bool, Any]:
+    if field in facts:
+        return True, facts[field]
+    current: Any = facts
+    for part in field.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            return False, None
+        current = current[part]
+    return True, current
+
+
+def _evaluate_predicate_condition(condition: Mapping[str, Any], facts: Mapping[str, Any]) -> bool | None:
+    present, actual = _lookup_predicate_fact(facts, str(condition["field"]))
+    operator = condition["operator"]
+    if operator == "present":
+        return present
+    if operator == "absent":
+        return not present
+    if not present:
+        return None
+    expected = condition["value"]
+    if operator == "equals":
+        return actual == expected
+    if operator == "in":
+        return actual in expected
+    if operator == "contains":
+        try:
+            return expected in actual
+        except TypeError:
+            return False
+    raise ContractError(f"unsupported predicate operator: {operator!r}")
+
+
+def _evaluate_predicate_expression(
+    expression: Mapping[str, Any], facts: Mapping[str, Any]
+) -> bool | None:
+    normalized = _normalize_predicate_expression(expression, "predicate expression")
+    all_values = [_evaluate_predicate_condition(item, facts) for item in normalized["all"]]
+    if any(value is False for value in all_values):
+        return False
+    if any(value is None for value in all_values):
+        return None
+    any_values = [_evaluate_predicate_condition(item, facts) for item in normalized["any"]]
+    if any_values:
+        if any(value is True for value in any_values):
+            any_result: bool | None = True
+        elif any(value is None for value in any_values):
+            any_result = None
+        else:
+            any_result = False
+        if any_result is not True:
+            return any_result
+    none_values = [_evaluate_predicate_condition(item, facts) for item in normalized["none"]]
+    if any(value is True for value in none_values):
+        return False
+    if any(value is None for value in none_values):
+        return None
+    return True
+
+
+def procedure_predicates_match(
+    predicates: Mapping[str, Any],
+    facts: Mapping[str, Any],
+    *,
+    route: str,
+) -> bool:
+    """Evaluate structured procedure predicates with explicit fail-closed unknowns."""
+
+    normalized = normalize_procedure_predicates(predicates)
+    if not isinstance(facts, Mapping):
+        raise ContractError("procedure facts must be an object")
+    if route not in ROUTES:
+        raise ContractError(f"unknown route: {route!r}")
+    effective_facts = dict(facts)
+    effective_facts["route"] = route
+    for kind in ("applicability", "capabilities", "routes"):
+        if _evaluate_predicate_expression(normalized[kind], effective_facts) is not True:
+            return False
+    conflicts = normalized["conflicts"]
+    if not _predicate_expression_is_empty(conflicts):
+        # A conflict with an unknown required fact cannot safely be ignored.
+        if _evaluate_predicate_expression(conflicts, effective_facts) is not False:
+            return False
+    return True
+
+
+def make_procedure_revision(
+    *,
+    logical_name: str,
+    origin: str,
+    origin_scope: Mapping[str, Any],
+    body: str,
+    references: Iterable[Mapping[str, Any]],
+    predicates: Mapping[str, Any],
+    source: Mapping[str, Any],
+    metadata: Mapping[str, Any] | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Create an immutable, origin-qualified behavior revision.
+
+    Derived search representations deliberately do not participate in the
+    behavior revision identity.  They are immutable sibling projections that
+    can be rebuilt without rewriting approved procedure meaning.
+    """
+
+    name = _require_nonempty_str(logical_name, "logical_name")
+    selected_origin = _require_nonempty_str(origin, "origin")
+    if selected_origin not in PROCEDURE_ORIGINS:
+        raise ContractError(f"unknown procedure origin: {selected_origin!r}")
+    normalized_scope = normalize_experience_scope(origin_scope)
+    selected_body = _require_nonempty_str(body, "procedure body")
+    normalized_references = _normalize_reference_list(references)
+    normalized_predicates = normalize_procedure_predicates(predicates)
+    normalized_source = _normalize_json_object(source, "procedure source")
+    if not isinstance(normalized_source.get("kind"), str) or not normalized_source["kind"].strip():
+        raise ContractError("procedure source requires a nonempty kind")
+    normalized_metadata = _normalize_json_value(metadata or {}, "procedure metadata")
+    if not isinstance(normalized_metadata, dict):
+        raise ContractError("procedure metadata must be an object")
+    logical_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-logical/v1",
+            "logical_name": name,
+            "origin": selected_origin,
+            "origin_scope": normalized_scope,
+        }
+    )
+    behavior = {
+        "body": selected_body,
+        "references": normalized_references,
+        "predicates": normalized_predicates,
+        "metadata": normalized_metadata,
+    }
+    behavior_digest = sha256_hex(behavior)
+    revision_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-revision/v1",
+            "logical_id": logical_id,
+            "behavior_digest": behavior_digest,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": PROCEDURE_REVISION_SCHEMA,
+        "logical_id": logical_id,
+        "logical_name": name,
+        "origin": selected_origin,
+        "origin_scope": normalized_scope,
+        "origin_scope_digest": sha256_hex(normalized_scope),
+        "revision_id": revision_id,
+        "behavior": behavior,
+        "behavior_digest": behavior_digest,
+        "source": normalized_source,
+        "source_digest": sha256_hex(normalized_source),
+        "created_at": created_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_procedure_revision(record)
+    return record
+
+
+def validate_procedure_revision(record: Mapping[str, Any]) -> None:
+    validate_record(record, PROCEDURE_REVISION_SCHEMA)
+    for field in (
+        "logical_id",
+        "logical_name",
+        "origin",
+        "origin_scope_digest",
+        "revision_id",
+        "behavior_digest",
+        "source_digest",
+        "created_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    origin = record["origin"]
+    if origin not in PROCEDURE_ORIGINS:
+        raise ContractError(f"unknown procedure origin: {origin!r}")
+    scope = normalize_experience_scope(record.get("origin_scope"))
+    if record["origin_scope_digest"] != sha256_hex(scope):
+        raise ContractError("procedure origin scope digest mismatch")
+    expected_logical_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-logical/v1",
+            "logical_name": record["logical_name"],
+            "origin": origin,
+            "origin_scope": scope,
+        }
+    )
+    if record["logical_id"] != expected_logical_id:
+        raise ContractError("procedure logical identity does not match its origin")
+    behavior = record.get("behavior")
+    if not isinstance(behavior, Mapping):
+        raise ContractError("procedure behavior must be an object")
+    normalized_behavior = {
+        "body": _require_nonempty_str(behavior.get("body"), "procedure body"),
+        "references": _normalize_reference_list(behavior.get("references", ())),
+        "predicates": normalize_procedure_predicates(behavior.get("predicates")),
+        "metadata": _normalize_json_value(behavior.get("metadata"), "procedure metadata"),
+    }
+    if not isinstance(normalized_behavior["metadata"], dict):
+        raise ContractError("procedure metadata must be an object")
+    if dict(behavior) != normalized_behavior:
+        raise ContractError("procedure behavior must use canonical representation")
+    if record["behavior_digest"] != sha256_hex(normalized_behavior):
+        raise ContractError("procedure behavior digest mismatch")
+    expected_revision_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-revision/v1",
+            "logical_id": record["logical_id"],
+            "behavior_digest": record["behavior_digest"],
+        }
+    )
+    if record["revision_id"] != expected_revision_id:
+        raise ContractError("procedure revision identity does not match its behavior")
+    source = _normalize_json_object(record.get("source"), "procedure source")
+    if not isinstance(source.get("kind"), str) or not source["kind"].strip():
+        raise ContractError("procedure source requires a nonempty kind")
+    if record["source"] != source:
+        raise ContractError("procedure source must use canonical JSON values")
+    if record["source_digest"] != sha256_hex(source):
+        raise ContractError("procedure source digest mismatch")
+
+
+def make_procedure_approval(
+    *,
+    approval_id: str,
+    procedure: Mapping[str, Any],
+    issuer: str,
+    recipients: Iterable[Mapping[str, Any]],
+    authority_evidence: Mapping[str, Any],
+    approved_at: str | None = None,
+) -> dict[str, Any]:
+    """Bind trusted approval to one exact immutable procedure revision."""
+
+    validate_procedure_revision(procedure)
+    selected_approval_id = _require_nonempty_str(approval_id, "approval_id")
+    selected_issuer = _require_nonempty_str(issuer, "issuer")
+    normalized_recipients = _normalize_recipient_scopes(recipients)
+    if any(
+        recipient["application"] != procedure["origin_scope"]["application"]
+        or recipient["namespace"] != procedure["origin_scope"]["namespace"]
+        for recipient in normalized_recipients
+    ):
+        raise ContractError(
+            "procedure approval recipients must remain in the origin application and namespace"
+        )
+    evidence = _normalize_json_object(authority_evidence, "authority_evidence")
+    record: dict[str, Any] = {
+        "schema": PROCEDURE_APPROVAL_SCHEMA,
+        "approval_id": selected_approval_id,
+        "logical_id": procedure["logical_id"],
+        "revision_id": procedure["revision_id"],
+        "procedure_digest": procedure["content_hash"],
+        "behavior_digest": procedure["behavior_digest"],
+        "source_digest": procedure["source_digest"],
+        "origin": procedure["origin"],
+        "origin_scope": dict(procedure["origin_scope"]),
+        "origin_scope_digest": procedure["origin_scope_digest"],
+        "issuer": selected_issuer,
+        "recipients": normalized_recipients,
+        "authority_evidence": evidence,
+        "approved_at": approved_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_procedure_approval(record, procedure=procedure)
+    return record
+
+
+def validate_procedure_approval(
+    record: Mapping[str, Any],
+    *,
+    procedure: Mapping[str, Any] | None = None,
+) -> None:
+    validate_record(record, PROCEDURE_APPROVAL_SCHEMA)
+    for field in (
+        "approval_id",
+        "logical_id",
+        "revision_id",
+        "procedure_digest",
+        "behavior_digest",
+        "source_digest",
+        "origin",
+        "origin_scope_digest",
+        "issuer",
+        "approved_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    if record["origin"] not in PROCEDURE_ORIGINS:
+        raise ContractError("procedure approval has an unknown origin")
+    scope = normalize_experience_scope(record.get("origin_scope"))
+    if record["origin_scope_digest"] != sha256_hex(scope):
+        raise ContractError("procedure approval origin scope digest mismatch")
+    recipients = _normalize_recipient_scopes(record.get("recipients", ()))
+    if record.get("recipients") != recipients:
+        raise ContractError("procedure approval recipients must use canonical ordering")
+    if any(
+        recipient["application"] != scope["application"]
+        or recipient["namespace"] != scope["namespace"]
+        for recipient in recipients
+    ):
+        raise ContractError(
+            "procedure approval recipients must remain in the origin application and namespace"
+        )
+    evidence = _normalize_json_object(record.get("authority_evidence"), "authority_evidence")
+    if record.get("authority_evidence") != evidence:
+        raise ContractError("procedure approval authority evidence must use canonical JSON values")
+    if procedure is not None:
+        validate_procedure_revision(procedure)
+        expected = {
+            "logical_id": procedure["logical_id"],
+            "revision_id": procedure["revision_id"],
+            "procedure_digest": procedure["content_hash"],
+            "behavior_digest": procedure["behavior_digest"],
+            "source_digest": procedure["source_digest"],
+            "origin": procedure["origin"],
+            "origin_scope": procedure["origin_scope"],
+            "origin_scope_digest": procedure["origin_scope_digest"],
+        }
+        for field, expected_value in expected.items():
+            if record.get(field) != expected_value:
+                raise ContractError(
+                    f"procedure approval does not bind the exact procedure {field}"
+                )
+
+
+def partition_is_authorized(
+    approval: Mapping[str, Any], partition: Mapping[str, Any]
+) -> bool:
+    """Return whether a partition narrows, rather than broadens, approval."""
+
+    validate_procedure_approval(approval)
+    normalized = normalize_procedure_partition(partition)
+    approval_recipients = {
+        canonical_json(item).decode("utf-8") for item in approval["recipients"]
+    }
+    return all(
+        canonical_json(recipient).decode("utf-8") in approval_recipients
+        for recipient in normalized["recipients"]
+    )
+
+
+def make_procedure_representation(
+    *,
+    procedure: Mapping[str, Any],
+    model: str,
+    dimensions: int,
+    metric: str,
+    sanitizer_version: str,
+    search_text: str,
+    vector: Iterable[float],
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Create one immutable, separately identified search projection."""
+
+    validate_procedure_revision(procedure)
+    selected_model = _require_nonempty_str(model, "representation model")
+    if not isinstance(dimensions, int) or isinstance(dimensions, bool) or dimensions < 1:
+        raise ContractError("representation dimensions must be a positive integer")
+    selected_metric = _require_nonempty_str(metric, "representation metric")
+    if selected_metric not in PROCEDURE_METRICS:
+        raise ContractError(f"unknown representation metric: {selected_metric!r}")
+    selected_sanitizer = _require_nonempty_str(
+        sanitizer_version, "representation sanitizer_version"
+    )
+    selected_search_text = _require_nonempty_str(search_text, "representation search_text")
+    if isinstance(vector, (str, bytes)):
+        raise ContractError("representation vector must be a list of finite numbers")
+    normalized_vector: list[float] = []
+    for item in vector:
+        if not isinstance(item, (int, float)) or isinstance(item, bool) or not math.isfinite(item):
+            raise ContractError("representation vector must contain finite numbers")
+        normalized_vector.append(float(item))
+    if len(normalized_vector) != dimensions:
+        raise ContractError("representation dimensions do not match vector length")
+    payload = {
+        "model": selected_model,
+        "dimensions": dimensions,
+        "metric": selected_metric,
+        "sanitizer_version": selected_sanitizer,
+        "search_text": selected_search_text,
+        "vector": normalized_vector,
+    }
+    representation_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-representation/v1",
+            "revision_id": procedure["revision_id"],
+            "payload": payload,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": PROCEDURE_REPRESENTATION_SCHEMA,
+        "representation_id": representation_id,
+        "logical_id": procedure["logical_id"],
+        "revision_id": procedure["revision_id"],
+        "procedure_digest": procedure["content_hash"],
+        "behavior_digest": procedure["behavior_digest"],
+        **payload,
+        "payload_digest": sha256_hex(payload),
+        "created_at": created_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_procedure_representation(record, procedure=procedure)
+    return record
+
+
+def validate_procedure_representation(
+    record: Mapping[str, Any],
+    *,
+    procedure: Mapping[str, Any] | None = None,
+) -> None:
+    validate_record(record, PROCEDURE_REPRESENTATION_SCHEMA)
+    for field in (
+        "representation_id",
+        "logical_id",
+        "revision_id",
+        "procedure_digest",
+        "behavior_digest",
+        "model",
+        "metric",
+        "sanitizer_version",
+        "search_text",
+        "payload_digest",
+        "created_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    dimensions = record.get("dimensions")
+    if not isinstance(dimensions, int) or isinstance(dimensions, bool) or dimensions < 1:
+        raise ContractError("representation dimensions must be a positive integer")
+    if record["metric"] not in PROCEDURE_METRICS:
+        raise ContractError("representation metric is unsupported")
+    vector = record.get("vector")
+    if not isinstance(vector, list) or len(vector) != dimensions:
+        raise ContractError("representation vector dimensions mismatch")
+    normalized_vector: list[float] = []
+    for item in vector:
+        if not isinstance(item, (int, float)) or isinstance(item, bool) or not math.isfinite(item):
+            raise ContractError("representation vector must contain finite numbers")
+        normalized_vector.append(float(item))
+    payload = {
+        "model": record["model"],
+        "dimensions": dimensions,
+        "metric": record["metric"],
+        "sanitizer_version": record["sanitizer_version"],
+        "search_text": record["search_text"],
+        "vector": normalized_vector,
+    }
+    if record["vector"] != normalized_vector:
+        raise ContractError("representation vector must use canonical float values")
+    if record["payload_digest"] != sha256_hex(payload):
+        raise ContractError("representation payload digest mismatch")
+    expected_representation_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-representation/v1",
+            "revision_id": record["revision_id"],
+            "payload": payload,
+        }
+    )
+    if record["representation_id"] != expected_representation_id:
+        raise ContractError("representation identity does not match its payload")
+    if procedure is not None:
+        validate_procedure_revision(procedure)
+        for field, expected_value in {
+            "logical_id": procedure["logical_id"],
+            "revision_id": procedure["revision_id"],
+            "procedure_digest": procedure["content_hash"],
+            "behavior_digest": procedure["behavior_digest"],
+        }.items():
+            if record.get(field) != expected_value:
+                raise ContractError(f"representation does not bind exact procedure {field}")
+
+
+def make_procedure_designation(
+    *,
+    procedure: Mapping[str, Any],
+    approval: Mapping[str, Any],
+    partition: Mapping[str, Any],
+    generation: int,
+    predecessor_generation: int | None,
+    issuer: str,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Create one ordered explicit current-designation operation.
+
+    This does not publish anything and does not claim that a remote current
+    document has accepted the designation.  The generation is a causal fence,
+    independent from the opaque content-derived revision identifier.
+    """
+
+    validate_procedure_revision(procedure)
+    validate_procedure_approval(approval, procedure=procedure)
+    normalized_partition = normalize_procedure_partition(partition)
+    if not partition_is_authorized(approval, normalized_partition):
+        raise ContractError("procedure designation partition broadens approval recipients")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise ContractError("procedure designation generation must be a positive integer")
+    if generation == 1:
+        if predecessor_generation is not None:
+            raise ContractError("initial procedure designation must not name a predecessor")
+    elif predecessor_generation != generation - 1:
+        raise ContractError("procedure designation must name its immediate predecessor generation")
+    selected_issuer = _require_nonempty_str(issuer, "designation issuer")
+    partition_id = procedure_partition_id(normalized_partition)
+    designation_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-designation/v1",
+            "logical_id": procedure["logical_id"],
+            "revision_id": procedure["revision_id"],
+            "approval_id": approval["approval_id"],
+            "partition_id": partition_id,
+            "generation": generation,
+            "predecessor_generation": predecessor_generation,
+            "issuer": selected_issuer,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": PROCEDURE_DESIGNATION_SCHEMA,
+        "designation_id": designation_id,
+        "logical_id": procedure["logical_id"],
+        "revision_id": procedure["revision_id"],
+        "procedure_digest": procedure["content_hash"],
+        "approval_id": approval["approval_id"],
+        "approval_digest": approval["content_hash"],
+        "partition": normalized_partition,
+        "partition_id": partition_id,
+        "generation": generation,
+        "predecessor_generation": predecessor_generation,
+        "issuer": selected_issuer,
+        "created_at": created_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_procedure_designation(record, procedure=procedure, approval=approval)
+    return record
+
+
+def validate_procedure_designation(
+    record: Mapping[str, Any],
+    *,
+    procedure: Mapping[str, Any] | None = None,
+    approval: Mapping[str, Any] | None = None,
+) -> None:
+    validate_record(record, PROCEDURE_DESIGNATION_SCHEMA)
+    for field in (
+        "designation_id",
+        "logical_id",
+        "revision_id",
+        "procedure_digest",
+        "approval_id",
+        "approval_digest",
+        "partition_id",
+        "issuer",
+        "created_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    partition = normalize_procedure_partition(record.get("partition"))
+    if record["partition"] != partition:
+        raise ContractError("procedure designation partition must use canonical values")
+    if record["partition_id"] != procedure_partition_id(partition):
+        raise ContractError("procedure designation partition identity mismatch")
+    generation = record.get("generation")
+    predecessor = record.get("predecessor_generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise ContractError("procedure designation generation must be a positive integer")
+    if generation == 1:
+        if predecessor is not None:
+            raise ContractError("initial procedure designation must not name a predecessor")
+    elif not isinstance(predecessor, int) or isinstance(predecessor, bool) or predecessor != generation - 1:
+        raise ContractError("procedure designation must name its immediate predecessor generation")
+    expected_designation_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-designation/v1",
+            "logical_id": record["logical_id"],
+            "revision_id": record["revision_id"],
+            "approval_id": record["approval_id"],
+            "partition_id": record["partition_id"],
+            "generation": generation,
+            "predecessor_generation": predecessor,
+            "issuer": record["issuer"],
+        }
+    )
+    if record["designation_id"] != expected_designation_id:
+        raise ContractError("procedure designation identity mismatch")
+    if procedure is not None:
+        validate_procedure_revision(procedure)
+        for field, expected_value in {
+            "logical_id": procedure["logical_id"],
+            "revision_id": procedure["revision_id"],
+            "procedure_digest": procedure["content_hash"],
+        }.items():
+            if record.get(field) != expected_value:
+                raise ContractError(f"designation does not bind exact procedure {field}")
+    if approval is not None:
+        if procedure is not None:
+            validate_procedure_approval(approval, procedure=procedure)
+        else:
+            validate_procedure_approval(approval)
+        if record["approval_id"] != approval["approval_id"] or record["approval_digest"] != approval["content_hash"]:
+            raise ContractError("designation does not bind exact approval")
+        if not partition_is_authorized(approval, partition):
+            raise ContractError("designation partition broadens approval recipients")
+
+
+def make_procedure_withdrawal(
+    *,
+    predecessor_designation: Mapping[str, Any],
+    issuer: str,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Create a narrow partition withdrawal with a newer lifecycle fence."""
+
+    validate_procedure_designation(predecessor_designation)
+    selected_issuer = _require_nonempty_str(issuer, "withdrawal issuer")
+    generation = int(predecessor_designation["generation"]) + 1
+    withdrawal_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-withdrawal/v1",
+            "logical_id": predecessor_designation["logical_id"],
+            "partition_id": predecessor_designation["partition_id"],
+            "predecessor_designation_id": predecessor_designation["designation_id"],
+            "generation": generation,
+            "issuer": selected_issuer,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": PROCEDURE_WITHDRAWAL_SCHEMA,
+        "withdrawal_id": withdrawal_id,
+        "logical_id": predecessor_designation["logical_id"],
+        "revision_id": predecessor_designation["revision_id"],
+        "partition": _normalize_json_value(
+            predecessor_designation["partition"], "withdrawal partition"
+        ),
+        "partition_id": predecessor_designation["partition_id"],
+        "predecessor_designation_id": predecessor_designation["designation_id"],
+        "predecessor_generation": predecessor_designation["generation"],
+        "generation": generation,
+        "issuer": selected_issuer,
+        "created_at": created_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_procedure_withdrawal(record)
+    return record
+
+
+def validate_procedure_withdrawal(record: Mapping[str, Any]) -> None:
+    validate_record(record, PROCEDURE_WITHDRAWAL_SCHEMA)
+    for field in (
+        "withdrawal_id",
+        "logical_id",
+        "revision_id",
+        "partition_id",
+        "predecessor_designation_id",
+        "issuer",
+        "created_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    partition = normalize_procedure_partition(record.get("partition"))
+    if record.get("partition") != partition or record["partition_id"] != procedure_partition_id(partition):
+        raise ContractError("procedure withdrawal partition identity mismatch")
+    predecessor = record.get("predecessor_generation")
+    generation = record.get("generation")
+    if not isinstance(predecessor, int) or isinstance(predecessor, bool) or predecessor < 1:
+        raise ContractError("procedure withdrawal predecessor generation must be positive")
+    if generation != predecessor + 1:
+        raise ContractError("procedure withdrawal must use the next generation")
+    expected_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-withdrawal/v1",
+            "logical_id": record["logical_id"],
+            "partition_id": record["partition_id"],
+            "predecessor_designation_id": record["predecessor_designation_id"],
+            "generation": generation,
+            "issuer": record["issuer"],
+        }
+    )
+    if record["withdrawal_id"] != expected_id:
+        raise ContractError("procedure withdrawal identity mismatch")
+
+
+def _publication_payload(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "logical_id": record["logical_id"],
+        "revision_id": record["revision_id"],
+        "partition": record["partition"],
+        "partition_id": record["partition_id"],
+        "procedure": record["procedure"],
+        "approval": record["approval"],
+        "representation": record["representation"],
+        "designation": record["designation"],
+    }
+
+
+def make_procedure_publication(
+    *,
+    procedure: Mapping[str, Any],
+    approval: Mapping[str, Any],
+    representation: Mapping[str, Any],
+    designation: Mapping[str, Any],
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Create one stable partition publication intent before a remote call."""
+
+    validate_procedure_revision(procedure)
+    validate_procedure_approval(approval, procedure=procedure)
+    validate_procedure_representation(representation, procedure=procedure)
+    validate_procedure_designation(
+        designation, procedure=procedure, approval=approval
+    )
+    partition = normalize_procedure_partition(designation["partition"])
+    publication_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-publication/v1",
+            "designation_id": designation["designation_id"],
+            "representation_id": representation["representation_id"],
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": PROCEDURE_PUBLICATION_SCHEMA,
+        "publication_id": publication_id,
+        "logical_id": procedure["logical_id"],
+        "revision_id": procedure["revision_id"],
+        "partition": partition,
+        "partition_id": designation["partition_id"],
+        "procedure": _normalize_json_value(procedure, "publication procedure"),
+        "approval": _normalize_json_value(approval, "publication approval"),
+        "representation": _normalize_json_value(
+            representation, "publication representation"
+        ),
+        "designation": _normalize_json_value(designation, "publication designation"),
+        "payload_digest": "",
+        "status": "intent",
+        "remote_receipt": None,
+        "error": None,
+        "version": 0,
+        "created_at": created_at or utc_now(),
+    }
+    record["payload_digest"] = sha256_hex(_publication_payload(record))
+    record["content_hash"] = content_hash(record)
+    validate_procedure_publication(record)
+    return record
+
+
+def validate_procedure_publication(record: Mapping[str, Any]) -> None:
+    validate_record(record, PROCEDURE_PUBLICATION_SCHEMA)
+    for field in (
+        "publication_id",
+        "logical_id",
+        "revision_id",
+        "partition_id",
+        "payload_digest",
+        "status",
+        "created_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    procedure = record.get("procedure")
+    approval = record.get("approval")
+    representation = record.get("representation")
+    designation = record.get("designation")
+    if not all(isinstance(value, Mapping) for value in (procedure, approval, representation, designation)):
+        raise ContractError("procedure publication requires complete procedure evidence")
+    validate_procedure_revision(procedure)
+    validate_procedure_approval(approval, procedure=procedure)
+    validate_procedure_representation(representation, procedure=procedure)
+    validate_procedure_designation(designation, procedure=procedure, approval=approval)
+    partition = normalize_procedure_partition(record.get("partition"))
+    if record.get("partition") != partition or record["partition_id"] != procedure_partition_id(partition):
+        raise ContractError("procedure publication partition identity mismatch")
+    if partition != designation["partition"] or record["partition_id"] != designation["partition_id"]:
+        raise ContractError("procedure publication partition does not match designation")
+    expected_fields = {
+        "logical_id": procedure["logical_id"],
+        "revision_id": procedure["revision_id"],
+    }
+    for field, expected_value in expected_fields.items():
+        if record.get(field) != expected_value:
+            raise ContractError(f"procedure publication does not bind exact procedure {field}")
+    expected_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-publication/v1",
+            "designation_id": designation["designation_id"],
+            "representation_id": representation["representation_id"],
+        }
+    )
+    if record["publication_id"] != expected_id:
+        raise ContractError("procedure publication identity mismatch")
+    if record["payload_digest"] != sha256_hex(_publication_payload(record)):
+        raise ContractError("procedure publication payload digest mismatch")
+    if record["status"] not in PROCEDURE_OPERATION_STATUSES:
+        raise ContractError("unknown procedure publication status")
+    if record.get("remote_receipt") is not None and not isinstance(record["remote_receipt"], Mapping):
+        raise ContractError("procedure publication remote receipt must be an object or null")
+    if record.get("error") is not None and not isinstance(record["error"], str):
+        raise ContractError("procedure publication error must be a string or null")
+    version = record.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        raise ContractError("procedure publication version must be nonnegative")
+
+
+def revise_procedure_publication(
+    record: Mapping[str, Any],
+    *,
+    status: str,
+    remote_receipt: Mapping[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    validate_procedure_publication(record)
+    if status not in PROCEDURE_OPERATION_STATUSES:
+        raise ContractError("unknown procedure publication status")
+    updated = _normalize_json_value(record, "procedure publication")
+    assert isinstance(updated, dict)
+    updated["status"] = status
+    updated["remote_receipt"] = (
+        _normalize_json_object(remote_receipt, "procedure remote receipt")
+        if remote_receipt is not None
+        else None
+    )
+    updated["error"] = error
+    updated["version"] = int(record["version"]) + 1
+    updated["content_hash"] = content_hash(updated)
+    validate_procedure_publication(updated)
+    return updated
+
+
+def make_procedure_revocation(
+    *,
+    procedure: Mapping[str, Any],
+    issuer: str,
+    reason: str,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Create an immutable revision tombstone; it never chooses an older revision."""
+
+    validate_procedure_revision(procedure)
+    selected_issuer = _require_nonempty_str(issuer, "revocation issuer")
+    selected_reason = _require_nonempty_str(reason, "revocation reason")
+    revocation_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-revocation/v1",
+            "logical_id": procedure["logical_id"],
+            "revision_id": procedure["revision_id"],
+            "issuer": selected_issuer,
+            "reason": selected_reason,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": PROCEDURE_REVOCATION_SCHEMA,
+        "revocation_id": revocation_id,
+        "logical_id": procedure["logical_id"],
+        "revision_id": procedure["revision_id"],
+        "procedure_digest": procedure["content_hash"],
+        "issuer": selected_issuer,
+        "reason": selected_reason,
+        "created_at": created_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_procedure_revocation(record, procedure=procedure)
+    return record
+
+
+def validate_procedure_revocation(
+    record: Mapping[str, Any],
+    *,
+    procedure: Mapping[str, Any] | None = None,
+) -> None:
+    validate_record(record, PROCEDURE_REVOCATION_SCHEMA)
+    for field in (
+        "revocation_id",
+        "logical_id",
+        "revision_id",
+        "procedure_digest",
+        "issuer",
+        "reason",
+        "created_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    expected_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-revocation/v1",
+            "logical_id": record["logical_id"],
+            "revision_id": record["revision_id"],
+            "issuer": record["issuer"],
+            "reason": record["reason"],
+        }
+    )
+    if record["revocation_id"] != expected_id:
+        raise ContractError("procedure revocation identity mismatch")
+    if procedure is not None:
+        validate_procedure_revision(procedure)
+        for field, expected_value in {
+            "logical_id": procedure["logical_id"],
+            "revision_id": procedure["revision_id"],
+            "procedure_digest": procedure["content_hash"],
+        }.items():
+            if record.get(field) != expected_value:
+                raise ContractError(f"procedure revocation does not bind exact procedure {field}")
+
+
+def make_procedure_remote_operation(
+    *,
+    kind: str,
+    logical_id: str,
+    revision_id: str,
+    payload_id: str,
+    payload_digest: str,
+    partition_id: str | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Create a stable outbox operation with intent/remote/ack phases."""
+
+    selected_kind = _require_nonempty_str(kind, "procedure operation kind")
+    selected_logical_id = _require_nonempty_str(logical_id, "logical_id")
+    selected_revision_id = _require_nonempty_str(revision_id, "revision_id")
+    selected_payload_id = _require_nonempty_str(payload_id, "payload_id")
+    selected_payload_digest = _require_nonempty_str(payload_digest, "payload_digest")
+    if partition_id is not None:
+        partition_id = _require_nonempty_str(partition_id, "partition_id")
+    operation_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-remote-operation/v1",
+            "kind": selected_kind,
+            "logical_id": selected_logical_id,
+            "revision_id": selected_revision_id,
+            "payload_id": selected_payload_id,
+            "payload_digest": selected_payload_digest,
+            "partition_id": partition_id,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": PROCEDURE_REMOTE_OPERATION_SCHEMA,
+        "operation_id": operation_id,
+        "kind": selected_kind,
+        "logical_id": selected_logical_id,
+        "revision_id": selected_revision_id,
+        "partition_id": partition_id,
+        "payload_id": selected_payload_id,
+        "payload_digest": selected_payload_digest,
+        "status": "intent",
+        "remote_receipt": None,
+        "error": None,
+        "version": 0,
+        "created_at": created_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_procedure_remote_operation(record)
+    return record
+
+
+def validate_procedure_remote_operation(record: Mapping[str, Any]) -> None:
+    validate_record(record, PROCEDURE_REMOTE_OPERATION_SCHEMA)
+    for field in (
+        "operation_id",
+        "kind",
+        "logical_id",
+        "revision_id",
+        "payload_id",
+        "payload_digest",
+        "status",
+        "created_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    partition_id = record.get("partition_id")
+    if partition_id is not None:
+        _require_nonempty_str(partition_id, "partition_id")
+    expected_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-remote-operation/v1",
+            "kind": record["kind"],
+            "logical_id": record["logical_id"],
+            "revision_id": record["revision_id"],
+            "payload_id": record["payload_id"],
+            "payload_digest": record["payload_digest"],
+            "partition_id": partition_id,
+        }
+    )
+    if record["operation_id"] != expected_id:
+        raise ContractError("procedure remote operation identity mismatch")
+    if record["status"] not in PROCEDURE_OPERATION_STATUSES:
+        raise ContractError("unknown procedure remote operation status")
+    receipt = record.get("remote_receipt")
+    if receipt is not None and not isinstance(receipt, Mapping):
+        raise ContractError("procedure remote operation receipt must be an object or null")
+    if record.get("error") is not None and not isinstance(record["error"], str):
+        raise ContractError("procedure remote operation error must be a string or null")
+    version = record.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        raise ContractError("procedure remote operation version must be nonnegative")
+
+
+def revise_procedure_remote_operation(
+    record: Mapping[str, Any],
+    *,
+    status: str,
+    remote_receipt: Mapping[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    validate_procedure_remote_operation(record)
+    if status not in PROCEDURE_OPERATION_STATUSES:
+        raise ContractError("unknown procedure remote operation status")
+    updated = _normalize_json_value(record, "procedure remote operation")
+    assert isinstance(updated, dict)
+    updated["status"] = status
+    updated["remote_receipt"] = (
+        _normalize_json_object(remote_receipt, "procedure remote receipt")
+        if remote_receipt is not None
+        else None
+    )
+    updated["error"] = error
+    updated["version"] = int(record["version"]) + 1
+    updated["content_hash"] = content_hash(updated)
+    validate_procedure_remote_operation(updated)
+    return updated
+
+
+def make_procedure_exposure(
+    *,
+    publication: Mapping[str, Any],
+    recipient: Mapping[str, Any],
+    delivery_id: str,
+    delivered_at: str | None = None,
+) -> dict[str, Any]:
+    """Record known historical exposure; revocation cannot erase it."""
+
+    validate_procedure_publication(publication)
+    normalized_recipient = normalize_experience_scope(recipient)
+    if canonical_json(normalized_recipient).decode("utf-8") not in {
+        canonical_json(item).decode("utf-8") for item in publication["partition"]["recipients"]
+    }:
+        raise ContractError("procedure exposure recipient is outside publication partition")
+    selected_delivery_id = _require_nonempty_str(delivery_id, "delivery_id")
+    exposure_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-exposure/v1",
+            "publication_id": publication["publication_id"],
+            "recipient": normalized_recipient,
+            "delivery_id": selected_delivery_id,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": PROCEDURE_EXPOSURE_SCHEMA,
+        "exposure_id": exposure_id,
+        "publication_id": publication["publication_id"],
+        "logical_id": publication["logical_id"],
+        "revision_id": publication["revision_id"],
+        "recipient": normalized_recipient,
+        "delivery_id": selected_delivery_id,
+        "delivered_at": delivered_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_procedure_exposure(record)
+    return record
+
+
+def validate_procedure_exposure(record: Mapping[str, Any]) -> None:
+    validate_record(record, PROCEDURE_EXPOSURE_SCHEMA)
+    for field in (
+        "exposure_id",
+        "publication_id",
+        "logical_id",
+        "revision_id",
+        "delivery_id",
+        "delivered_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    recipient = normalize_experience_scope(record.get("recipient"))
+    if record["recipient"] != recipient:
+        raise ContractError("procedure exposure recipient must use canonical scope")
+    expected_id = sha256_hex(
+        {
+            "domain": "trusted-procedure-exposure/v1",
+            "publication_id": record["publication_id"],
+            "recipient": recipient,
+            "delivery_id": record["delivery_id"],
+        }
+    )
+    if record["exposure_id"] != expected_id:
+        raise ContractError("procedure exposure identity mismatch")
+
+
 __all__ = [
     "ContractError",
     "TASK_CARD_SCHEMA",
@@ -1369,6 +2643,15 @@ __all__ = [
     "CASE_RECEIPT_SCHEMA",
     "GENERATED_SKILL_SCHEMA",
     "SKILL_APPROVAL_SCHEMA",
+    "PROCEDURE_REVISION_SCHEMA",
+    "PROCEDURE_APPROVAL_SCHEMA",
+    "PROCEDURE_REPRESENTATION_SCHEMA",
+    "PROCEDURE_DESIGNATION_SCHEMA",
+    "PROCEDURE_WITHDRAWAL_SCHEMA",
+    "PROCEDURE_PUBLICATION_SCHEMA",
+    "PROCEDURE_REVOCATION_SCHEMA",
+    "PROCEDURE_REMOTE_OPERATION_SCHEMA",
+    "PROCEDURE_EXPOSURE_SCHEMA",
     "APC_REQUEST_SCHEMA",
     "APC_RESULT_SCHEMA",
     "PLAN_STATES",
@@ -1379,6 +2662,10 @@ __all__ = [
     "REVIEWED_TRAJECTORY_STATUSES",
     "GENERATED_SKILL_STATES",
     "EXPERIENCE_INGESTION_STATUSES",
+    "PROCEDURE_ORIGINS",
+    "PROCEDURE_PARTITION_SCOPES",
+    "PROCEDURE_METRICS",
+    "PROCEDURE_OPERATION_STATUSES",
     "canonical_json",
     "sha256_hex",
     "content_hash",
@@ -1412,4 +2699,29 @@ __all__ = [
     "validate_generated_skill_candidate",
     "make_skill_approval",
     "validate_skill_approval",
+    "normalize_procedure_partition",
+    "procedure_partition_id",
+    "normalize_procedure_predicates",
+    "procedure_predicates_match",
+    "make_procedure_revision",
+    "validate_procedure_revision",
+    "make_procedure_approval",
+    "validate_procedure_approval",
+    "partition_is_authorized",
+    "make_procedure_representation",
+    "validate_procedure_representation",
+    "make_procedure_designation",
+    "validate_procedure_designation",
+    "make_procedure_withdrawal",
+    "validate_procedure_withdrawal",
+    "make_procedure_publication",
+    "validate_procedure_publication",
+    "revise_procedure_publication",
+    "make_procedure_revocation",
+    "validate_procedure_revocation",
+    "make_procedure_remote_operation",
+    "validate_procedure_remote_operation",
+    "revise_procedure_remote_operation",
+    "make_procedure_exposure",
+    "validate_procedure_exposure",
 ]
