@@ -15,6 +15,12 @@ DECISION_SCHEMA = "memory-decision/v1"
 ENVELOPE_SCHEMA = "memory-dispatch/v1"
 OPERATION_SCHEMA = "memory-operation/v1"
 OUTCOME_SCHEMA = "memory-outcome/v1"
+REVIEW_RECEIPT_SCHEMA = "memory-review-receipt/v1"
+REVIEWED_TRAJECTORY_SCHEMA = "reviewed-trajectory/v1"
+EXPERIENCE_INGESTION_SCHEMA = "reviewed-experience-ingestion/v1"
+CASE_RECEIPT_SCHEMA = "reviewed-case-receipt/v1"
+GENERATED_SKILL_SCHEMA = "generated-skill-candidate/v1"
+SKILL_APPROVAL_SCHEMA = "generated-skill-approval/v1"
 APC_REQUEST_SCHEMA = "apc-request/v1"
 APC_RESULT_SCHEMA = "apc-result/v1"
 
@@ -22,6 +28,15 @@ PLAN_STATES = frozenset({"candidate", "accepted", "proposed", "fresh"})
 ROUTES = frozenset({"ordinary", "problem_focused", "deeper"})
 OUTCOME_STATUSES = frozenset({"PASS", "FAIL", "BLOCKED", "UNKNOWN"})
 OPERATION_STATUSES = frozenset({"pending", "ambiguous", "delivered"})
+REVIEW_STATES = frozenset({"reviewed", "accepted"})
+REVIEWED_TRAJECTORY_STATUSES = frozenset({"reviewed_success", "reviewed_failure"})
+GENERATED_SKILL_STATES = frozenset({"proposed"})
+EXPERIENCE_INGESTION_STATUSES = frozenset({
+    "pending",
+    "uncertain",
+    "confirmed",
+    "blocked",
+})
 
 
 class ContractError(ValueError):
@@ -603,6 +618,699 @@ def validate_outcome(record: Mapping[str, Any]) -> None:
         raise ContractError(f"unknown outcome status: {record['status']!r}")
 
 
+def normalize_experience_scope(scope: Mapping[str, Any]) -> dict[str, str]:
+    """Validate the exact application/project/namespace/owner boundary."""
+
+    if not isinstance(scope, Mapping):
+        raise ContractError("experience scope must be an object")
+    return {
+        field: _require_nonempty_str(scope.get(field), f"scope.{field}")
+        for field in ("application", "project", "namespace", "owner")
+    }
+
+
+def _normalize_string_refs(
+    values: Iterable[str], field: str, *, sort_values: bool = True
+) -> list[str]:
+    if isinstance(values, (str, bytes)):
+        raise ContractError(f"{field} must be a list of strings")
+    result: list[str] = []
+    for value in values:
+        normalized = _require_nonempty_str(value, field)
+        if normalized in result:
+            raise ContractError(f"{field} must not contain duplicate values")
+        result.append(normalized)
+    return sorted(result) if sort_values else result
+
+
+def _validate_outcome_provenance(
+    *,
+    task_card: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    outcome: Mapping[str, Any],
+) -> None:
+    validate_task_plan_binding(task_card, plan)
+    validate_decision(decision)
+    validate_outcome(outcome)
+    expected = {
+        "decision_id": decision["decision_id"],
+        "task_card_digest": task_card["content_hash"],
+        "objective_id": plan["objective_id"],
+        "plan_id": plan["plan_id"],
+        "plan_digest": plan["content_hash"],
+    }
+    for field, value in expected.items():
+        if outcome.get(field) != value:
+            raise ContractError(f"outcome {field.replace('_', ' ')} does not match provenance")
+    if decision["task_card_digest"] != task_card["content_hash"]:
+        raise ContractError("decision task card digest does not match provenance")
+    if decision["objective_id"] != plan["objective_id"]:
+        raise ContractError("decision objective does not match provenance")
+    if decision["plan_id"] != plan["plan_id"]:
+        raise ContractError("decision plan does not match provenance")
+    if decision["plan_digest"] != plan["content_hash"]:
+        raise ContractError("decision plan digest does not match provenance")
+    if plan.get("state") != "accepted":
+        raise ContractError("reviewed trajectory requires an accepted plan")
+
+
+def make_review_receipt(
+    *,
+    review_id: str,
+    outcome: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    task_card: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    reviewed_by: str,
+    evidence_refs: Iterable[str],
+    state: str = "reviewed",
+    protected_source_refs: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Bind existing review evidence to one exact terminal product outcome.
+
+    This record retains references to ROOT/harness review evidence.  It does
+    not create a replacement review workflow or treat a worker narrative as
+    authoritative evidence.
+    """
+
+    _validate_outcome_provenance(
+        task_card=task_card, plan=plan, decision=decision, outcome=outcome
+    )
+    selected_review_id = _require_nonempty_str(review_id, "review_id")
+    reviewer = _require_nonempty_str(reviewed_by, "reviewed_by")
+    if reviewer != "ROOT":
+        raise ContractError("only ROOT may review a reusable trajectory")
+    if state not in REVIEW_STATES:
+        raise ContractError(f"unknown review state: {state!r}")
+    references = _normalize_string_refs(evidence_refs, "evidence_refs")
+    if not references:
+        raise ContractError("evidence_refs must not be empty")
+    protected = _normalize_string_refs(
+        protected_source_refs, "protected_source_refs"
+    )
+    receipt_id = sha256_hex(
+        {
+            "review_id": selected_review_id,
+            "outcome_id": outcome["outcome_id"],
+            "decision_id": decision["decision_id"],
+            "task_card_digest": task_card["content_hash"],
+            "objective_id": plan["objective_id"],
+            "run_id": outcome["linked_run_id"],
+            "plan_id": plan["plan_id"],
+            "plan_digest": plan["content_hash"],
+            "reviewed_by": reviewer,
+            "state": state,
+            "evidence_refs": references,
+            "protected_source_refs": protected,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": REVIEW_RECEIPT_SCHEMA,
+        "review_receipt_id": receipt_id,
+        "review_id": selected_review_id,
+        "outcome_id": outcome["outcome_id"],
+        "decision_id": decision["decision_id"],
+        "task_card_digest": task_card["content_hash"],
+        "objective_id": plan["objective_id"],
+        "run_id": outcome["linked_run_id"],
+        "plan_id": plan["plan_id"],
+        "plan_digest": plan["content_hash"],
+        "reviewed_by": reviewer,
+        "state": state,
+        "evidence_refs": references,
+        "protected_source_refs": protected,
+        "reviewed_at": outcome["observed_at"],
+    }
+    record["content_hash"] = content_hash(record)
+    validate_review_receipt(record)
+    return record
+
+
+def validate_review_receipt(record: Mapping[str, Any]) -> None:
+    validate_record(record, REVIEW_RECEIPT_SCHEMA)
+    for field in (
+        "review_receipt_id",
+        "review_id",
+        "outcome_id",
+        "decision_id",
+        "task_card_digest",
+        "objective_id",
+        "run_id",
+        "plan_id",
+        "plan_digest",
+        "reviewed_by",
+        "state",
+        "reviewed_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    if record["state"] not in REVIEW_STATES:
+        raise ContractError(f"unknown review state: {record['state']!r}")
+    if record["reviewed_by"] != "ROOT":
+        raise ContractError("only ROOT may review a reusable trajectory")
+    evidence_refs = record.get("evidence_refs")
+    if not isinstance(evidence_refs, list) or not evidence_refs:
+        raise ContractError("evidence_refs must be a nonempty list")
+    normalized_evidence_refs = _normalize_string_refs(evidence_refs, "evidence_refs")
+    if evidence_refs != normalized_evidence_refs:
+        raise ContractError("evidence_refs must use canonical ordering")
+    protected = record.get("protected_source_refs")
+    if not isinstance(protected, list):
+        raise ContractError("protected_source_refs must be a list")
+    normalized_protected = _normalize_string_refs(protected, "protected_source_refs")
+    if protected != normalized_protected:
+        raise ContractError("protected_source_refs must use canonical ordering")
+    expected_receipt_id = sha256_hex(
+        {
+            "review_id": record["review_id"],
+            "outcome_id": record["outcome_id"],
+            "decision_id": record["decision_id"],
+            "task_card_digest": record["task_card_digest"],
+            "objective_id": record["objective_id"],
+            "run_id": record["run_id"],
+            "plan_id": record["plan_id"],
+            "plan_digest": record["plan_digest"],
+            "reviewed_by": record["reviewed_by"],
+            "state": record["state"],
+            "evidence_refs": normalized_evidence_refs,
+            "protected_source_refs": normalized_protected,
+        }
+    )
+    if record["review_receipt_id"] != expected_receipt_id:
+        raise ContractError("review receipt identity does not match its provenance")
+
+
+def make_reviewed_trajectory(
+    *,
+    task_card: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    outcome: Mapping[str, Any],
+    review_receipt: Mapping[str, Any],
+    scope: Mapping[str, Any],
+    raw_evidence: str,
+    failed_hypotheses: Iterable[str] = (),
+    protected_source_refs: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Create one immutable reviewed trajectory from linked terminal evidence."""
+
+    _validate_outcome_provenance(
+        task_card=task_card, plan=plan, decision=decision, outcome=outcome
+    )
+    validate_review_receipt(review_receipt)
+    for field, expected in {
+        "outcome_id": outcome["outcome_id"],
+        "decision_id": decision["decision_id"],
+        "task_card_digest": task_card["content_hash"],
+        "objective_id": plan["objective_id"],
+        "run_id": outcome["linked_run_id"],
+        "plan_id": plan["plan_id"],
+        "plan_digest": plan["content_hash"],
+    }.items():
+        if review_receipt.get(field) != expected:
+            raise ContractError(
+                f"review receipt {field.replace('_', ' ')} does not match terminal outcome"
+            )
+    if outcome["status"] == "PASS":
+        trajectory_status = "reviewed_success"
+    elif outcome["status"] in {"FAIL", "BLOCKED"}:
+        trajectory_status = "reviewed_failure"
+    else:
+        raise ContractError("terminal UNKNOWN outcome cannot become reviewed experience")
+    normalized_scope = normalize_experience_scope(scope)
+    evidence = _require_nonempty_str(raw_evidence, "raw_evidence")
+    hypotheses = _normalize_string_refs(
+        failed_hypotheses, "failed_hypotheses", sort_values=False
+    )
+    protected = _normalize_string_refs(
+        protected_source_refs, "protected_source_refs"
+    )
+    all_protected = _normalize_string_refs(
+        [*review_receipt["protected_source_refs"], *protected],
+        "protected_source_refs",
+    )
+    trajectory_id = sha256_hex(
+        {
+            "outcome_id": outcome["outcome_id"],
+            "review_receipt_id": review_receipt["review_receipt_id"],
+            "scope": normalized_scope,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": REVIEWED_TRAJECTORY_SCHEMA,
+        "trajectory_id": trajectory_id,
+        "outcome_id": outcome["outcome_id"],
+        "task_card_digest": task_card["content_hash"],
+        "task_text": task_card["task"],
+        "objective_id": plan["objective_id"],
+        "decision_id": decision["decision_id"],
+        "run_id": outcome["linked_run_id"],
+        "accepted_plan_id": plan["plan_id"],
+        "accepted_plan_digest": plan["content_hash"],
+        "route": plan["route"],
+        "scope": normalized_scope,
+        "scope_digest": sha256_hex(normalized_scope),
+        "status": trajectory_status,
+        "review_receipt_id": review_receipt["review_receipt_id"],
+        "review_id": review_receipt["review_id"],
+        "review_receipt_digest": review_receipt["content_hash"],
+        "review_state": review_receipt["state"],
+        "reviewed_by": review_receipt["reviewed_by"],
+        "reviewed_at": review_receipt["reviewed_at"],
+        "evidence_refs": list(review_receipt["evidence_refs"]),
+        "protected_source_refs": all_protected,
+        "failed_hypotheses": hypotheses,
+        "raw_evidence": evidence,
+        "evidence_digest": outcome["evidence_digest"],
+        "recorded_at": outcome["observed_at"],
+    }
+    record["content_hash"] = content_hash(record)
+    validate_reviewed_trajectory(record)
+    return record
+
+
+def validate_reviewed_trajectory(record: Mapping[str, Any]) -> None:
+    validate_record(record, REVIEWED_TRAJECTORY_SCHEMA)
+    for field in (
+        "trajectory_id",
+        "outcome_id",
+        "task_card_digest",
+        "task_text",
+        "objective_id",
+        "decision_id",
+        "run_id",
+        "accepted_plan_id",
+        "accepted_plan_digest",
+        "route",
+        "scope_digest",
+        "status",
+        "review_receipt_id",
+        "review_id",
+        "review_receipt_digest",
+        "review_state",
+        "reviewed_by",
+        "reviewed_at",
+        "raw_evidence",
+        "evidence_digest",
+        "recorded_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    if record["route"] not in ROUTES:
+        raise ContractError(f"unknown route: {record['route']!r}")
+    if record["status"] not in REVIEWED_TRAJECTORY_STATUSES:
+        raise ContractError(f"unknown reviewed trajectory status: {record['status']!r}")
+    if record["review_state"] not in REVIEW_STATES:
+        raise ContractError(f"unknown review state: {record['review_state']!r}")
+    scope = normalize_experience_scope(record.get("scope"))
+    if record["scope_digest"] != sha256_hex(scope):
+        raise ContractError("reviewed trajectory scope digest mismatch")
+    expected_trajectory_id = sha256_hex(
+        {
+            "outcome_id": record["outcome_id"],
+            "review_receipt_id": record["review_receipt_id"],
+            "scope": scope,
+        }
+    )
+    if record["trajectory_id"] != expected_trajectory_id:
+        raise ContractError("reviewed trajectory identity does not match its provenance")
+    for field in ("evidence_refs", "protected_source_refs", "failed_hypotheses"):
+        values = record.get(field)
+        if not isinstance(values, list):
+            raise ContractError(f"{field} must be a list")
+        _normalize_string_refs(values, field, sort_values=field != "failed_hypotheses")
+
+
+def make_experience_ingestion(
+    *,
+    trajectory: Mapping[str, Any],
+    destination: str,
+    session_id: str,
+    payload_digest: str,
+) -> dict[str, Any]:
+    """Create the durable intent for one optional EverOS representation write."""
+
+    validate_reviewed_trajectory(trajectory)
+    selected_destination = _require_nonempty_str(destination, "destination")
+    selected_session = _require_nonempty_str(session_id, "session_id")
+    selected_payload_digest = _require_nonempty_str(payload_digest, "payload_digest")
+    ingestion_id = sha256_hex(
+        {
+            "trajectory_id": trajectory["trajectory_id"],
+            "destination": selected_destination,
+            "session_id": selected_session,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": EXPERIENCE_INGESTION_SCHEMA,
+        "ingestion_id": ingestion_id,
+        "trajectory_id": trajectory["trajectory_id"],
+        "scope": dict(trajectory["scope"]),
+        "scope_digest": trajectory["scope_digest"],
+        "destination": selected_destination,
+        "session_id": selected_session,
+        "payload_digest": selected_payload_digest,
+        "status": "pending",
+        "case_ids": [],
+        "error": None,
+        "created_at": trajectory["recorded_at"],
+    }
+    record["content_hash"] = content_hash(record)
+    validate_experience_ingestion(record)
+    return record
+
+
+def validate_experience_ingestion(record: Mapping[str, Any]) -> None:
+    validate_record(record, EXPERIENCE_INGESTION_SCHEMA)
+    for field in (
+        "ingestion_id",
+        "trajectory_id",
+        "scope_digest",
+        "destination",
+        "session_id",
+        "payload_digest",
+        "status",
+        "created_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    scope = normalize_experience_scope(record.get("scope"))
+    if record["scope_digest"] != sha256_hex(scope):
+        raise ContractError("experience ingestion scope digest mismatch")
+    expected_ingestion_id = sha256_hex(
+        {
+            "trajectory_id": record["trajectory_id"],
+            "destination": record["destination"],
+            "session_id": record["session_id"],
+        }
+    )
+    if record["ingestion_id"] != expected_ingestion_id:
+        raise ContractError("experience ingestion identity does not match its receipt")
+    if record["status"] not in EXPERIENCE_INGESTION_STATUSES:
+        raise ContractError(f"unknown experience ingestion status: {record['status']!r}")
+    case_ids = record.get("case_ids")
+    if not isinstance(case_ids, list):
+        raise ContractError("case_ids must be a list")
+    _normalize_string_refs(case_ids, "case_ids")
+    if record.get("error") is not None and not isinstance(record["error"], str):
+        raise ContractError("experience ingestion error must be a string or null")
+    if record["status"] == "confirmed" and not case_ids:
+        raise ContractError("confirmed experience ingestion requires case_ids")
+
+
+def make_case_receipt(
+    *,
+    trajectory: Mapping[str, Any],
+    ingestion: Mapping[str, Any],
+    source_case: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind one exact returned EverOS case to its reviewed local receipt."""
+
+    validate_reviewed_trajectory(trajectory)
+    validate_experience_ingestion(ingestion)
+    if ingestion["trajectory_id"] != trajectory["trajectory_id"]:
+        raise ContractError("case receipt ingestion does not belong to trajectory")
+    if ingestion["scope_digest"] != trajectory["scope_digest"]:
+        raise ContractError("case receipt ingestion scope does not match trajectory")
+    if not isinstance(source_case, Mapping):
+        raise ContractError("source_case must be an object")
+    case_id = _require_nonempty_str(source_case.get("id"), "source_case.id")
+    case_receipt_id = sha256_hex(
+        {
+            "case_id": case_id,
+            "trajectory_id": trajectory["trajectory_id"],
+            "scope_digest": trajectory["scope_digest"],
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": CASE_RECEIPT_SCHEMA,
+        "case_receipt_id": case_receipt_id,
+        "case_id": case_id,
+        "trajectory_id": trajectory["trajectory_id"],
+        "ingestion_id": ingestion["ingestion_id"],
+        "scope": dict(trajectory["scope"]),
+        "scope_digest": trajectory["scope_digest"],
+        "review_receipt_id": trajectory["review_receipt_id"],
+        "review_receipt_digest": trajectory["review_receipt_digest"],
+        "source_case": dict(source_case),
+        "source_case_digest": sha256_hex(source_case),
+        "created_at": trajectory["recorded_at"],
+    }
+    record["content_hash"] = content_hash(record)
+    validate_case_receipt(record)
+    return record
+
+
+def validate_case_receipt(record: Mapping[str, Any]) -> None:
+    validate_record(record, CASE_RECEIPT_SCHEMA)
+    for field in (
+        "case_receipt_id",
+        "case_id",
+        "trajectory_id",
+        "ingestion_id",
+        "scope_digest",
+        "review_receipt_id",
+        "review_receipt_digest",
+        "source_case_digest",
+        "created_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    scope = normalize_experience_scope(record.get("scope"))
+    if record["scope_digest"] != sha256_hex(scope):
+        raise ContractError("case receipt scope digest mismatch")
+    source_case = record.get("source_case")
+    if not isinstance(source_case, Mapping):
+        raise ContractError("source_case must be an object")
+    if source_case.get("id") != record["case_id"]:
+        raise ContractError("case receipt source case id mismatch")
+    if record["source_case_digest"] != sha256_hex(source_case):
+        raise ContractError("case receipt source case digest mismatch")
+    expected_case_receipt_id = sha256_hex(
+        {
+            "case_id": record["case_id"],
+            "trajectory_id": record["trajectory_id"],
+            "scope_digest": record["scope_digest"],
+        }
+    )
+    if record["case_receipt_id"] != expected_case_receipt_id:
+        raise ContractError("case receipt identity does not match its provenance")
+
+
+def make_generated_skill_candidate(
+    *,
+    scope: Mapping[str, Any],
+    skill_id: str,
+    content: str,
+    source_cases: Iterable[Mapping[str, Any]],
+    metadata: Mapping[str, Any] | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Record generated EverOS guidance as non-authoritative evidence."""
+
+    normalized_scope = normalize_experience_scope(scope)
+    selected_skill_id = _require_nonempty_str(skill_id, "skill_id")
+    selected_content = _require_nonempty_str(content, "content")
+    seen_case_ids: set[str] = set()
+    normalized_sources: list[dict[str, str]] = []
+    for source in source_cases:
+        if not isinstance(source, Mapping):
+            raise ContractError("generated skill source_cases must contain objects")
+        normalized = {
+            field: _require_nonempty_str(source.get(field), f"source_case.{field}")
+            for field in (
+                "case_id",
+                "case_receipt_id",
+                "trajectory_id",
+                "review_receipt_id",
+                "review_receipt_digest",
+            )
+        }
+        if normalized["case_id"] in seen_case_ids:
+            raise ContractError("generated skill source case ids must resolve uniquely")
+        seen_case_ids.add(normalized["case_id"])
+        normalized_sources.append(normalized)
+    if not normalized_sources:
+        raise ContractError("generated skill requires at least one source case")
+    normalized_sources.sort(key=lambda source: source["case_id"])
+    content_digest = sha256_hex({"content": selected_content})
+    candidate_id = sha256_hex(
+        {
+            "scope": normalized_scope,
+            "skill_id": selected_skill_id,
+            "content_digest": content_digest,
+            "source_cases": normalized_sources,
+            "state": "proposed",
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": GENERATED_SKILL_SCHEMA,
+        "candidate_id": candidate_id,
+        "skill_id": selected_skill_id,
+        "origin": "generated",
+        "state": "proposed",
+        "scope": normalized_scope,
+        "scope_digest": sha256_hex(normalized_scope),
+        "content": selected_content,
+        "content_digest": content_digest,
+        "source_cases": normalized_sources,
+        "metadata": dict(metadata or {}),
+        "created_at": created_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_generated_skill_candidate(record)
+    return record
+
+
+def validate_generated_skill_candidate(record: Mapping[str, Any]) -> None:
+    validate_record(record, GENERATED_SKILL_SCHEMA)
+    for field in (
+        "candidate_id",
+        "skill_id",
+        "origin",
+        "state",
+        "scope_digest",
+        "content",
+        "content_digest",
+        "created_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    if record["origin"] != "generated":
+        raise ContractError("generated skill candidate origin must remain generated")
+    if record["state"] not in GENERATED_SKILL_STATES:
+        raise ContractError("generated skill candidate must remain proposed")
+    scope = normalize_experience_scope(record.get("scope"))
+    if record["scope_digest"] != sha256_hex(scope):
+        raise ContractError("generated skill candidate scope digest mismatch")
+    if record["content_digest"] != sha256_hex({"content": record["content"]}):
+        raise ContractError("generated skill candidate content digest mismatch")
+    source_cases = record.get("source_cases")
+    if not isinstance(source_cases, list) or not source_cases:
+        raise ContractError("generated skill candidate requires source cases")
+    if not isinstance(record.get("metadata"), Mapping):
+        raise ContractError("generated skill candidate metadata must be an object")
+    seen_case_ids: set[str] = set()
+    normalized_sources: list[dict[str, str]] = []
+    for source in source_cases:
+        if not isinstance(source, Mapping):
+            raise ContractError("generated skill source_cases must contain objects")
+        case_id = _require_nonempty_str(source.get("case_id"), "source_case.case_id")
+        if case_id in seen_case_ids:
+            raise ContractError("generated skill source case ids must resolve uniquely")
+        seen_case_ids.add(case_id)
+        normalized_sources.append(
+            {
+                "case_id": case_id,
+                "case_receipt_id": _require_nonempty_str(
+                    source.get("case_receipt_id"), "source_case.case_receipt_id"
+                ),
+                "trajectory_id": _require_nonempty_str(
+                    source.get("trajectory_id"), "source_case.trajectory_id"
+                ),
+                "review_receipt_id": _require_nonempty_str(
+                    source.get("review_receipt_id"), "source_case.review_receipt_id"
+                ),
+                "review_receipt_digest": _require_nonempty_str(
+                    source.get("review_receipt_digest"),
+                    "source_case.review_receipt_digest",
+                ),
+            }
+        )
+    canonical_sources = sorted(normalized_sources, key=lambda source: source["case_id"])
+    if source_cases != canonical_sources:
+        raise ContractError("generated skill source cases must use canonical ordering")
+    expected_candidate_id = sha256_hex(
+        {
+            "scope": scope,
+            "skill_id": record["skill_id"],
+            "content_digest": record["content_digest"],
+            "source_cases": canonical_sources,
+            "state": record["state"],
+        }
+    )
+    if record["candidate_id"] != expected_candidate_id:
+        raise ContractError("generated skill candidate identity does not match its provenance")
+
+
+def make_skill_approval(
+    *,
+    approval_id: str,
+    candidate: Mapping[str, Any],
+    issuer: str,
+    recipients: Iterable[str],
+    approved_at: str,
+) -> dict[str, Any]:
+    """Bind explicit trusted approval to one immutable generated candidate."""
+
+    validate_generated_skill_candidate(candidate)
+    selected_approval_id = _require_nonempty_str(approval_id, "approval_id")
+    selected_issuer = _require_nonempty_str(issuer, "issuer")
+    if selected_issuer != "ROOT":
+        raise ContractError("only ROOT may approve a generated skill candidate")
+    selected_recipients = _normalize_string_refs(recipients, "recipients")
+    if not selected_recipients:
+        raise ContractError("approval recipients must not be empty")
+    selected_approved_at = _require_nonempty_str(approved_at, "approved_at")
+    record: dict[str, Any] = {
+        "schema": SKILL_APPROVAL_SCHEMA,
+        "approval_id": selected_approval_id,
+        "candidate_id": candidate["candidate_id"],
+        "skill_id": candidate["skill_id"],
+        "origin": candidate["origin"],
+        "scope": dict(candidate["scope"]),
+        "scope_digest": candidate["scope_digest"],
+        "content_digest": candidate["content_digest"],
+        "issuer": selected_issuer,
+        "recipients": selected_recipients,
+        "source_cases": [dict(item) for item in candidate["source_cases"]],
+        "approved_at": selected_approved_at,
+    }
+    record["content_hash"] = content_hash(record)
+    validate_skill_approval(record)
+    return record
+
+
+def validate_skill_approval(record: Mapping[str, Any]) -> None:
+    validate_record(record, SKILL_APPROVAL_SCHEMA)
+    for field in (
+        "approval_id",
+        "candidate_id",
+        "skill_id",
+        "origin",
+        "scope_digest",
+        "content_digest",
+        "issuer",
+        "approved_at",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    if record["origin"] != "generated":
+        raise ContractError("approval cannot rewrite generated origin")
+    if record["issuer"] != "ROOT":
+        raise ContractError("only ROOT may approve a generated skill candidate")
+    scope = normalize_experience_scope(record.get("scope"))
+    if record["scope_digest"] != sha256_hex(scope):
+        raise ContractError("approval scope digest mismatch")
+    recipients = record.get("recipients")
+    if not isinstance(recipients, list) or not recipients:
+        raise ContractError("approval recipients must be a nonempty list")
+    _normalize_string_refs(recipients, "recipients")
+    source_cases = record.get("source_cases")
+    if not isinstance(source_cases, list) or not source_cases:
+        raise ContractError("approval source cases must be a nonempty list")
+    seen_case_ids: set[str] = set()
+    for source in source_cases:
+        if not isinstance(source, Mapping):
+            raise ContractError("approval source cases must contain objects")
+        case_id = _require_nonempty_str(source.get("case_id"), "source_case.case_id")
+        if case_id in seen_case_ids:
+            raise ContractError("approval source case ids must resolve uniquely")
+        seen_case_ids.add(case_id)
+        for field in (
+            "case_receipt_id",
+            "trajectory_id",
+            "review_receipt_id",
+            "review_receipt_digest",
+        ):
+            _require_nonempty_str(source.get(field), f"source_case.{field}")
+
+
 __all__ = [
     "ContractError",
     "TASK_CARD_SCHEMA",
@@ -612,12 +1320,22 @@ __all__ = [
     "ENVELOPE_SCHEMA",
     "OPERATION_SCHEMA",
     "OUTCOME_SCHEMA",
+    "REVIEW_RECEIPT_SCHEMA",
+    "REVIEWED_TRAJECTORY_SCHEMA",
+    "EXPERIENCE_INGESTION_SCHEMA",
+    "CASE_RECEIPT_SCHEMA",
+    "GENERATED_SKILL_SCHEMA",
+    "SKILL_APPROVAL_SCHEMA",
     "APC_REQUEST_SCHEMA",
     "APC_RESULT_SCHEMA",
     "PLAN_STATES",
     "ROUTES",
     "OUTCOME_STATUSES",
     "OPERATION_STATUSES",
+    "REVIEW_STATES",
+    "REVIEWED_TRAJECTORY_STATUSES",
+    "GENERATED_SKILL_STATES",
+    "EXPERIENCE_INGESTION_STATUSES",
     "canonical_json",
     "sha256_hex",
     "content_hash",
@@ -638,4 +1356,17 @@ __all__ = [
     "validate_operation",
     "make_outcome",
     "validate_outcome",
+    "normalize_experience_scope",
+    "make_review_receipt",
+    "validate_review_receipt",
+    "make_reviewed_trajectory",
+    "validate_reviewed_trajectory",
+    "make_experience_ingestion",
+    "validate_experience_ingestion",
+    "make_case_receipt",
+    "validate_case_receipt",
+    "make_generated_skill_candidate",
+    "validate_generated_skill_candidate",
+    "make_skill_approval",
+    "validate_skill_approval",
 ]
