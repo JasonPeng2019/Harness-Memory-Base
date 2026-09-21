@@ -85,6 +85,9 @@ class GeneratedSkillTrustTests(unittest.TestCase):
                 memory_root=experience.EverOSAdapter.memory_root_for_scope(
                     self.root / "everos", self.scope
                 ),
+                resolve_memory_root=lambda: experience.EverOSAdapter.memory_root_for_scope(
+                    self.root / "everos", self.scope
+                ),
             ),
             privacy_policy=self.policy,
         )

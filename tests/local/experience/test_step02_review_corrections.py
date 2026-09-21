@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -26,7 +28,95 @@ class _FakeEverOS:
         return {"data": {"agent_cases": [], "agent_skills": []}}
 
 
+class _CountingEverOS:
+    """Public-surface double that records calls which a root check must block."""
+
+    def __init__(self) -> None:
+        self.memorize_calls = 0
+        self.search_calls = 0
+        self.search_request_calls = 0
+
+    async def memorize(self, _: dict, **__: object) -> dict:
+        self.memorize_calls += 1
+        return {"status": "extracted"}
+
+    def make_search_request(self, **kwargs: object) -> dict:
+        self.search_request_calls += 1
+        return dict(kwargs)
+
+    async def search(self, _: object) -> dict:
+        self.search_calls += 1
+        return {"data": {"agent_cases": [], "agent_skills": []}}
+
+
 class EverOSRootBindingRegressionTests(unittest.TestCase):
+    @staticmethod
+    def _dynamic_memory_root_type(default_root: Path) -> type:
+        """Build a public ``MemoryRoot`` double that reads current environment."""
+
+        class DynamicMemoryRoot:
+            resolve_calls = 0
+
+            def __init__(self, root: str | Path) -> None:
+                self.root = Path(root).resolve()
+
+            @classmethod
+            def resolve(cls) -> "DynamicMemoryRoot":
+                cls.resolve_calls += 1
+                return cls(os.environ.get("EVEROS_ROOT") or default_root)
+
+        return DynamicMemoryRoot
+
+    @staticmethod
+    def _public_everos_modules(
+        memory_root_type: type, public: _CountingEverOS
+    ) -> dict[str, types.ModuleType]:
+        """Expose only the imports the production loader is allowed to use."""
+
+        everos = types.ModuleType("everos")
+        everos.__path__ = []  # type: ignore[attr-defined]
+        core = types.ModuleType("everos.core")
+        core.__path__ = []  # type: ignore[attr-defined]
+        persistence = types.ModuleType("everos.core.persistence")
+        persistence.MemoryRoot = memory_root_type
+        memory = types.ModuleType("everos.memory")
+        memory.__path__ = []  # type: ignore[attr-defined]
+        search = types.ModuleType("everos.memory.search")
+        search.SearchRequest = public.make_search_request
+        service = types.ModuleType("everos.service")
+        service.memorize = public.memorize
+        service.search = public.search
+        everos.core = core
+        everos.memory = memory
+        everos.service = service
+        core.persistence = persistence
+        memory.search = search
+        return {
+            "everos": everos,
+            "everos.core": core,
+            "everos.core.persistence": persistence,
+            "everos.memory": memory,
+            "everos.memory.search": search,
+            "everos.service": service,
+        }
+
+    def _load_adapter_with_fake_public_surface(
+        self,
+        *,
+        base_root: Path,
+        scope: experience.ExperienceScope,
+        public: _CountingEverOS,
+        memory_root_type: type,
+    ) -> experience.EverOSAdapter:
+        memory_root = experience.EverOSAdapter.memory_root_for_scope(base_root, scope)
+        os.environ["EVEROS_ROOT"] = str(memory_root)
+        surface = experience.load_vendored_everos_public_surface(memory_root=memory_root)
+        return experience.EverOSAdapter(
+            scope=scope,
+            base_root=base_root,
+            surface=surface,
+        )
+
     def test_loader_fails_closed_when_root_is_absent_or_mismatched(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -59,7 +149,9 @@ class EverOSRootBindingRegressionTests(unittest.TestCase):
         first_root = experience.EverOSAdapter.memory_root_for_scope(base_root, first_scope)
         stale_root = experience.EverOSAdapter.memory_root_for_scope(base_root, stale_scope)
         surface = experience.EverOSPublicSurface.from_object(
-            _FakeEverOS(), memory_root=first_root
+            _FakeEverOS(),
+            memory_root=first_root,
+            resolve_memory_root=lambda: first_root,
         )
 
         with patch.dict(os.environ, {"EVEROS_ROOT": str(stale_root)}, clear=True):
@@ -75,6 +167,98 @@ class EverOSRootBindingRegressionTests(unittest.TestCase):
                     base_root=base_root,
                     surface=surface,
                 )
+
+    def test_root_change_or_unset_blocks_payload_and_public_calls(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        base_root = Path(temporary.name) / "everos"
+        scope = experience.ExperienceScope(
+            application="harness",
+            project="product",
+            namespace="root-guard",
+            owner="root-agent",
+        )
+        expected_root = experience.EverOSAdapter.memory_root_for_scope(base_root, scope)
+        changed_root = Path(temporary.name) / "different-root"
+        trajectory = {
+            "scope": scope.to_record(),
+            "task_text": "reject a changed EverOS root",
+            "raw_evidence": "the public operation must not run",
+            "failed_hypotheses": [],
+            "recorded_at": "2026-09-21T00:00:00Z",
+        }
+
+        for replacement in (str(changed_root), None):
+            with self.subTest(replacement=replacement):
+                public = _CountingEverOS()
+                memory_root_type = self._dynamic_memory_root_type(
+                    Path(temporary.name) / "everos-default"
+                )
+                modules = self._public_everos_modules(memory_root_type, public)
+                with patch.dict(sys.modules, modules):
+                    with patch.object(
+                        experience, "_everos_process_root", None, create=True
+                    ):
+                        with patch.dict(
+                            os.environ, {"EVEROS_ROOT": str(expected_root)}, clear=True
+                        ):
+                            adapter = self._load_adapter_with_fake_public_surface(
+                                base_root=base_root,
+                                scope=scope,
+                                public=public,
+                                memory_root_type=memory_root_type,
+                            )
+                            if replacement is None:
+                                os.environ.pop("EVEROS_ROOT")
+                            else:
+                                os.environ["EVEROS_ROOT"] = replacement
+
+                            with self.assertRaisesRegex(
+                                experience.ScopeBoundaryError, "current EverOS root"
+                            ):
+                                adapter.add_payload(trajectory, session_id="receipt-1")
+                            with self.assertRaisesRegex(
+                                experience.ScopeBoundaryError, "current EverOS root"
+                            ):
+                                asyncio.run(adapter.memorize({"session_id": "receipt-1"}))
+                            with self.assertRaisesRegex(
+                                experience.ScopeBoundaryError, "current EverOS root"
+                            ):
+                                asyncio.run(
+                                    adapter.search_representation(
+                                        session_id="receipt-1", query="root guard"
+                                    )
+                                )
+                self.assertEqual(0, public.memorize_calls)
+                self.assertEqual(0, public.search_request_calls)
+                self.assertEqual(0, public.search_calls)
+
+    def test_loader_rejects_a_second_different_root_in_one_process(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        first_root = Path(temporary.name) / "first"
+        second_root = Path(temporary.name) / "second"
+        public = _CountingEverOS()
+        memory_root_type = self._dynamic_memory_root_type(
+            Path(temporary.name) / "everos-default"
+        )
+        modules = self._public_everos_modules(memory_root_type, public)
+
+        with patch.dict(sys.modules, modules):
+            with patch.object(experience, "_everos_process_root", None, create=True):
+                with patch.dict(os.environ, {"EVEROS_ROOT": str(first_root)}, clear=True):
+                    surface = experience.load_vendored_everos_public_surface(
+                        memory_root=first_root
+                    )
+                    self.assertEqual(first_root.resolve(), surface.memory_root)
+                    os.environ["EVEROS_ROOT"] = str(second_root)
+                    with self.assertRaisesRegex(
+                        experience.ScopeBoundaryError, "fresh process"
+                    ):
+                        experience.load_vendored_everos_public_surface(
+                            memory_root=second_root
+                        )
+        self.assertEqual(1, memory_root_type.resolve_calls)
 
 
 class ReviewReceiptBindingRegressionTests(unittest.TestCase):

@@ -127,6 +127,9 @@ class ReviewedExperienceIngestionTests(unittest.TestCase):
                 memory_root=experience.EverOSAdapter.memory_root_for_scope(
                     self.root / "everos", self.scope
                 ),
+                resolve_memory_root=lambda: experience.EverOSAdapter.memory_root_for_scope(
+                    self.root / "everos", self.scope
+                ),
             ),
             privacy_policy=self.policy,
         )
@@ -154,6 +157,9 @@ class ReviewedExperienceIngestionTests(unittest.TestCase):
             surface=experience.EverOSPublicSurface.from_object(
                 recovery_surface,
                 memory_root=experience.EverOSAdapter.memory_root_for_scope(
+                    self.root / "everos", self.scope
+                ),
+                resolve_memory_root=lambda: experience.EverOSAdapter.memory_root_for_scope(
                     self.root / "everos", self.scope
                 ),
             ),
@@ -209,6 +215,9 @@ class ReviewedExperienceIngestionTests(unittest.TestCase):
             surface=experience.EverOSPublicSurface.from_object(
                 source,
                 memory_root=experience.EverOSAdapter.memory_root_for_scope(
+                    self.root / "everos", self.scope
+                ),
+                resolve_memory_root=lambda: experience.EverOSAdapter.memory_root_for_scope(
                     self.root / "everos", self.scope
                 ),
             ),

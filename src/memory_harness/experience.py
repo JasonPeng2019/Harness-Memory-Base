@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,14 @@ from .privacy import PrivacyPolicy
 from .store import ExperienceConflictError, MemoryStore
 
 SYNTHETIC_SECRET = "synthetic-secret-alpha-1234567890"
+
+
+# EverOS owns lazy process-global service singletons.  The adapter cannot safely
+# switch their backing root, so the first successful public surface claims the
+# one root this Python process may use.  A fresh process is the supported
+# boundary for a different root.
+_everos_process_root: Path | None = None
+_everos_process_root_lock = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -180,21 +189,29 @@ class EverOSPublicSurface:
     search: Callable[[Any], Awaitable[Any]]
     make_search_request: Callable[..., Any]
     memory_root: Path
+    resolve_memory_root: Callable[[], str | Path]
 
     @classmethod
     def from_object(
-        cls, value: object, *, memory_root: str | Path
+        cls,
+        value: object,
+        *,
+        memory_root: str | Path,
+        resolve_memory_root: Callable[[], str | Path],
     ) -> "EverOSPublicSurface":
         memorize = getattr(value, "memorize", None)
         search = getattr(value, "search", None)
         make_search_request = getattr(value, "make_search_request", None)
         if not callable(memorize) or not callable(search) or not callable(make_search_request):
             raise TypeError("EverOS public surface requires memorize, search, and SearchRequest")
+        if not callable(resolve_memory_root):
+            raise TypeError("EverOS public surface requires a MemoryRoot resolver")
         return cls(
             memorize=memorize,
             search=search,
             make_search_request=make_search_request,
             memory_root=_normalize_memory_root(memory_root, "captured EverOS root"),
+            resolve_memory_root=resolve_memory_root,
         )
 
 
@@ -212,42 +229,61 @@ def load_vendored_everos_public_surface(
     The product package keeps this import lazy so ordinary all-off installs do
     not acquire EverOS's optional runtime dependency set.  The caller must
     configure ``EVEROS_ROOT`` for this exact namespace *before* loading the
-    public surface.  We then capture EverOS's own public ``MemoryRoot`` once;
-    later environment changes cannot rebind this surface.
+    public surface.  We then capture EverOS's own public ``MemoryRoot`` and
+    retain its public resolver. Every adapter operation re-resolves that root
+    and fails closed if it changed.  EverOS has lazy process-global services,
+    so a process may load only one root; use a fresh process to change roots.
     """
 
     expected_root = _normalize_memory_root(memory_root, "requested EverOS root")
-    configured_root = os.environ.get("EVEROS_ROOT")
-    if configured_root is None or not configured_root.strip():
-        raise ScopeBoundaryError(
-            "EVEROS_ROOT must be configured before loading the EverOS surface"
+    global _everos_process_root
+    with _everos_process_root_lock:
+        if (
+            _everos_process_root is not None
+            and _everos_process_root != expected_root
+        ):
+            raise ScopeBoundaryError(
+                "EverOS is already bound to a different root in this process; "
+                "start a fresh process before loading another root"
+            )
+
+        configured_root = os.environ.get("EVEROS_ROOT")
+        if configured_root is None or not configured_root.strip():
+            raise ScopeBoundaryError(
+                "EVEROS_ROOT must be configured before loading the EverOS surface"
+            )
+        if _normalize_memory_root(configured_root, "EVEROS_ROOT") != expected_root:
+            raise ScopeBoundaryError(
+                "configured EverOS root is outside the requested namespace"
+            )
+        try:
+            from everos.core.persistence import MemoryRoot
+            from everos.memory.search import SearchRequest
+            from everos.service import memorize, search
+        except ModuleNotFoundError as exc:
+            raise EverOSUnavailableError(
+                "EverOS is unavailable; install the vendored EverOS runtime before "
+                "enabling reviewed-experience extraction"
+            ) from exc
+
+        def resolve_memory_root() -> Path:
+            return MemoryRoot.resolve().root
+
+        captured_root = _normalize_memory_root(
+            resolve_memory_root(), "captured EverOS root"
         )
-    if _normalize_memory_root(configured_root, "EVEROS_ROOT") != expected_root:
-        raise ScopeBoundaryError(
-            "configured EverOS root is outside the requested namespace"
+        if captured_root != expected_root:
+            raise ScopeBoundaryError(
+                "loaded EverOS public surface captured a root outside the requested namespace"
+            )
+        _everos_process_root = captured_root
+        return EverOSPublicSurface(
+            memorize=memorize,
+            search=search,
+            make_search_request=SearchRequest,
+            memory_root=captured_root,
+            resolve_memory_root=resolve_memory_root,
         )
-    try:
-        from everos.core.persistence import MemoryRoot
-        from everos.memory.search import SearchRequest
-        from everos.service import memorize, search
-    except ModuleNotFoundError as exc:
-        raise EverOSUnavailableError(
-            "EverOS is unavailable; install the vendored EverOS runtime before "
-            "enabling reviewed-experience extraction"
-        ) from exc
-    captured_root = _normalize_memory_root(
-        MemoryRoot.resolve().root, "captured EverOS root"
-    )
-    if captured_root != expected_root:
-        raise ScopeBoundaryError(
-            "loaded EverOS public surface captured a root outside the requested namespace"
-        )
-    return EverOSPublicSurface(
-        memorize=memorize,
-        search=search,
-        make_search_request=SearchRequest,
-        memory_root=captured_root,
-    )
 
 
 class EverOSAdapter:
@@ -257,8 +293,9 @@ class EverOSAdapter:
     product namespace is isolated by a deterministic EverOS root, so one
     adapter is intentionally bound to one four-part scope.  Callers configure
     the EverOS service process before loading the public surface; this adapter
-    checks the root captured by that surface rather than trusting a mutable
-    process environment or vendor singleton afterward.
+    checks both the captured root and EverOS's current public ``MemoryRoot``
+    resolution before every payload or service operation.  One process may use
+    only one EverOS root, and changing it requires a fresh process.
     """
 
     destination = "everos-agent-memory/v1"
@@ -317,11 +354,25 @@ class EverOSAdapter:
             raise ScopeBoundaryError("EverOS adapter is bound to a different scope")
 
     def _assert_bound_memory_root(self) -> None:
-        """Reject a scope that differs from the root captured at surface load."""
+        """Fail closed unless captured, adapter, and public current roots agree."""
 
         if self.surface.memory_root != self.memory_root:
             raise ScopeBoundaryError(
                 "captured EverOS root is outside the adapter namespace"
+            )
+        try:
+            current_root = _normalize_memory_root(
+                self.surface.resolve_memory_root(), "current EverOS root"
+            )
+        except ScopeBoundaryError:
+            raise
+        except Exception as exc:
+            raise ScopeBoundaryError(
+                "current EverOS root could not be resolved"
+            ) from exc
+        if current_root != self.memory_root:
+            raise ScopeBoundaryError(
+                "current EverOS root differs from the captured adapter root"
             )
 
     def add_payload(

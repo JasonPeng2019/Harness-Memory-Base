@@ -62,11 +62,13 @@ surface = load_vendored_everos_public_surface(memory_root=root)
 adapter = EverOSAdapter(scope=scope, base_root=Path(".memory") / "everos", surface=surface)
 ```
 
-Load a fresh public surface after deliberately changing a process's EverOS
-root; one captured surface cannot be rebound to another application or
-namespace by changing environment variables.  The dependency-light local suite
-honestly skips the real EverOS integration when this optional installation is
-absent.
+An EverOS root is process-bound.  Once a public surface is loaded, do not
+change or unset `EVEROS_ROOT`: payload, memorize, and search operations fail
+closed if the current public `MemoryRoot` differs from the captured root, and a
+second different root is rejected in the same process.  To use another root,
+start a fresh Python process, configure that root before import, then load its
+surface.  The dependency-light local suite honestly skips the real EverOS
+integration when this optional installation is absent.
 
 Generated EverOS skills remain proposed historical candidates.  Approval is
 deny-by-default: `ReviewedExperienceService` requires a configured
