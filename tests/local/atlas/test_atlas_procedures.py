@@ -95,6 +95,41 @@ class _LostWithdrawalAcknowledgementAdapter(atlas.AtlasProcedureAdapter):
         return document
 
 
+class _BlockedThenSuccessPublicationStateAdapter(atlas.AtlasProcedureAdapter):
+    """One stable lifecycle operation fails once, then can be reconciled."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.fail_next_state_write = True
+        self.state_write_calls = 0
+
+    def write_publication_state(self, publication: dict, *, state: str) -> dict:
+        self.state_write_calls += 1
+        if self.fail_next_state_write:
+            self.fail_next_state_write = False
+            raise atlas.AtlasProcedureError("synthetic publication-state outage")
+        return super().write_publication_state(publication, state=state)
+
+
+class _LostPublicationStateAcknowledgementAdapter(atlas.AtlasProcedureAdapter):
+    """The remote lifecycle state committed, but the response was lost."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.lose_next_state_ack = True
+        self.state_write_calls = 0
+
+    def write_publication_state(self, publication: dict, *, state: str) -> dict:
+        self.state_write_calls += 1
+        document = super().write_publication_state(publication, state=state)
+        if self.lose_next_state_ack:
+            self.lose_next_state_ack = False
+            raise atlas.AtlasProcedureAmbiguityError(
+                "synthetic publication-state acknowledgement loss"
+            )
+        return document
+
+
 class AtlasProcedureBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -146,6 +181,12 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
             vector=[0.1, 0.2, 0.3],
             created_at="2026-09-21T00:00:02Z",
         )
+        self.query_representation = {
+            "model": self.representation["model"],
+            "dimensions": self.representation["dimensions"],
+            "metric": self.representation["metric"],
+            "sanitizer_version": self.representation["sanitizer_version"],
+        }
         self.service = procedures.TrustedProcedureService(
             self.memory_store, trusted_issuers={"ROOT"}
         )
@@ -184,12 +225,7 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
             facts={"language": "python"},
             route="ordinary",
             adapter=self.adapter,
-            representation={
-                "model": "deterministic-test-embedding/v1",
-                "dimensions": 3,
-                "metric": "cosine",
-                "sanitizer_version": "known-secret/v1",
-            },
+            representation=self.query_representation,
         )
         self.assertEqual([publication["publication_id"]], [item["publication_id"] for item in delivered])
         self.assertTrue(self.vector_store.calls)
@@ -202,6 +238,7 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
                 facts={"language": "python"},
                 route="ordinary",
                 adapter=self.adapter,
+                representation=self.query_representation,
             ),
         )
         for wrong_scope in (
@@ -217,6 +254,7 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
                     facts={"language": "python"},
                     route="ordinary",
                     adapter=self.adapter,
+                    representation=self.query_representation,
                 ),
             )
         self.assertEqual(
@@ -246,6 +284,7 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
                 facts={"language": "python"},
                 route="ordinary",
                 adapter=self.adapter,
+                representation=self.query_representation,
             ),
         )
 
@@ -264,8 +303,54 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
                 facts={"language": "python"},
                 route="ordinary",
                 adapter=self.adapter,
+                representation=self.query_representation,
             ),
         )
+
+    def test_delivery_requires_the_exact_query_representation_identity(self) -> None:
+        self.service.publish_designation(self.designation, self.adapter)
+        publication = self.service.publish(
+            procedure=self.procedure,
+            approval=self.approval,
+            representation=self.representation,
+            designation=self.designation,
+            adapter=self.adapter,
+        )
+        self.vector_store.publication_ids = [publication["publication_id"]]
+
+        calls_before = len(self.vector_store.calls)
+        self.assertEqual(
+            [],
+            self.service.resolve_atlas(
+                "parser lock recovery",
+                receiver=self.scope,
+                facts={"language": "python"},
+                route="ordinary",
+                adapter=self.adapter,
+            ),
+        )
+        self.assertEqual(calls_before, len(self.vector_store.calls))
+
+        for field, incompatible_value in {
+            "model": "different-embedding/v2",
+            "dimensions": 4,
+            "metric": "dot_product",
+            "sanitizer_version": "known-secret/v2",
+        }.items():
+            with self.subTest(field=field):
+                incompatible = dict(self.query_representation)
+                incompatible[field] = incompatible_value
+                self.assertEqual(
+                    [],
+                    self.service.resolve_atlas(
+                        "parser lock recovery",
+                        receiver=self.scope,
+                        facts={"language": "python"},
+                        route="ordinary",
+                        adapter=self.adapter,
+                        representation=incompatible,
+                    ),
+                )
 
     def test_resolution_delivers_one_most_specific_partition_per_logical_procedure(self) -> None:
         """A shared replica cannot add a second delivery or outrank project scope."""
@@ -311,6 +396,7 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
             facts={"language": "python"},
             route="ordinary",
             adapter=self.adapter,
+            representation=self.query_representation,
         )
         self.assertEqual([project_publication["publication_id"]], [
             item["publication_id"] for item in delivered
@@ -481,6 +567,160 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
         )
         self.assertEqual("acknowledged", withdrawal_operation["status"])
 
+    def test_withdrawal_waits_for_the_same_blocked_publication_state_operation(self) -> None:
+        self.service.publish_designation(self.designation, self.adapter)
+        publication = self.service.publish(
+            procedure=self.procedure,
+            approval=self.approval,
+            representation=self.representation,
+            designation=self.designation,
+            adapter=self.adapter,
+        )
+        retry_adapter = _BlockedThenSuccessPublicationStateAdapter(
+            collection=self.collection, vector_store=self.vector_store
+        )
+
+        first = self.service.withdraw_partition(
+            logical_id=self.procedure["logical_id"],
+            partition=self.partition,
+            issuer="ROOT",
+            adapter=retry_adapter,
+        )
+        self.assertFalse(first["managed_complete"])
+        self.assertEqual(
+            "fenced",
+            self.memory_store.get_procedure_publication(publication["publication_id"])["status"],
+        )
+        publication_operations = [
+            operation
+            for operation in self.memory_store.list_procedure_remote_operations(
+                payload_id=publication["publication_id"]
+            )
+            if operation["kind"] == "withdraw_publication"
+        ]
+        self.assertEqual(1, len(publication_operations))
+        operation_id = publication_operations[0]["operation_id"]
+        self.assertEqual("blocked", publication_operations[0]["status"])
+
+        second = self.service.reconcile_withdrawal(
+            logical_id=self.procedure["logical_id"],
+            partition=self.partition,
+            adapter=retry_adapter,
+        )
+        self.assertTrue(second["managed_complete"])
+        self.assertEqual(2, retry_adapter.state_write_calls)
+        self.assertEqual(
+            "acknowledged",
+            self.memory_store.get_procedure_remote_operation(operation_id)["status"],
+        )
+        self.assertEqual(
+            "withdrawn",
+            self.memory_store.get_procedure_publication(publication["publication_id"])["status"],
+        )
+
+    def test_withdrawal_exactly_reconciles_an_ambiguous_publication_state_operation(self) -> None:
+        self.service.publish_designation(self.designation, self.adapter)
+        publication = self.service.publish(
+            procedure=self.procedure,
+            approval=self.approval,
+            representation=self.representation,
+            designation=self.designation,
+            adapter=self.adapter,
+        )
+        retry_adapter = _LostPublicationStateAcknowledgementAdapter(
+            collection=self.collection, vector_store=self.vector_store
+        )
+
+        first = self.service.withdraw_partition(
+            logical_id=self.procedure["logical_id"],
+            partition=self.partition,
+            issuer="ROOT",
+            adapter=retry_adapter,
+        )
+        self.assertFalse(first["managed_complete"])
+        self.assertEqual(
+            "fenced",
+            self.memory_store.get_procedure_publication(publication["publication_id"])["status"],
+        )
+        publication_operation = next(
+            operation
+            for operation in self.memory_store.list_procedure_remote_operations(
+                payload_id=publication["publication_id"]
+            )
+            if operation["kind"] == "withdraw_publication"
+        )
+        self.assertEqual("ambiguous", publication_operation["status"])
+
+        second = self.service.reconcile_withdrawal(
+            logical_id=self.procedure["logical_id"],
+            partition=self.partition,
+            adapter=retry_adapter,
+        )
+        self.assertTrue(second["managed_complete"])
+        self.assertEqual(1, retry_adapter.state_write_calls)
+        self.assertEqual(
+            "acknowledged",
+            self.memory_store.get_procedure_remote_operation(
+                publication_operation["operation_id"]
+            )["status"],
+        )
+        self.assertEqual(
+            "withdrawn",
+            self.memory_store.get_procedure_publication(publication["publication_id"])["status"],
+        )
+
+    def test_revocation_waits_for_the_same_blocked_publication_state_operation(self) -> None:
+        self.service.publish_designation(self.designation, self.adapter)
+        publication = self.service.publish(
+            procedure=self.procedure,
+            approval=self.approval,
+            representation=self.representation,
+            designation=self.designation,
+            adapter=self.adapter,
+        )
+        retry_adapter = _BlockedThenSuccessPublicationStateAdapter(
+            collection=self.collection, vector_store=self.vector_store
+        )
+
+        first = self.service.revoke(
+            procedure=self.procedure,
+            issuer="ROOT",
+            reason="synthetic blocked publication state",
+            adapter=retry_adapter,
+        )
+        self.assertFalse(first["managed_complete"])
+        self.assertEqual(
+            "revocation_pending",
+            self.memory_store.get_procedure_publication(publication["publication_id"])["status"],
+        )
+        publication_operations = [
+            operation
+            for operation in self.memory_store.list_procedure_remote_operations(
+                payload_id=publication["publication_id"]
+            )
+            if operation["kind"] == "revoke_publication"
+        ]
+        self.assertEqual(1, len(publication_operations))
+        operation_id = publication_operations[0]["operation_id"]
+        self.assertEqual("blocked", publication_operations[0]["status"])
+
+        second = self.service.revoke(
+            procedure=self.procedure,
+            issuer="ROOT",
+            reason="synthetic blocked publication state",
+            adapter=retry_adapter,
+        )
+        self.assertTrue(second["managed_complete"])
+        self.assertEqual(2, retry_adapter.state_write_calls)
+        self.assertEqual(
+            "acknowledged",
+            self.memory_store.get_procedure_remote_operation(operation_id)["status"],
+        )
+        self.assertEqual(
+            "revoked",
+            self.memory_store.get_procedure_publication(publication["publication_id"])["status"],
+        )
+
     def test_repeat_revocation_reuses_the_durable_tombstone_and_operation(self) -> None:
         first = self.service.revoke(
             procedure=self.procedure,
@@ -625,6 +865,7 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
                     facts={"language": "python"},
                     route="ordinary",
                     adapter=self.adapter,
+                    representation=self.query_representation,
                 )
             ],
         )
@@ -687,7 +928,6 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
             partition=self.partition,
             issuer="ROOT",
         )
-        guarded.publish_designation(designation, self.adapter)
         with self.assertRaisesRegex(procedures.ProcedureError, "privacy scan"):
             guarded.publish(
                 procedure=procedure,
@@ -697,11 +937,19 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
                 adapter=self.adapter,
             )
         self.assertIn(secret, procedure["behavior"]["body"])
-        self.assertFalse(any(
-            document.get("publication_id")
-            for document in self.collection.documents.values()
-            if document.get("logical_id") == procedure["logical_id"]
-        ))
+        self.assertEqual({}, self.collection.documents)
+        publication = self.memory_store.list_procedure_publications(
+            revision_id=procedure["revision_id"]
+        )[0]
+        self.assertEqual("blocked", publication["status"])
+        publication_operation = next(
+            operation
+            for operation in self.memory_store.list_procedure_remote_operations(
+                payload_id=publication["publication_id"]
+            )
+            if operation["kind"] == "publication"
+        )
+        self.assertEqual("blocked", publication_operation["status"])
 
     def test_service_policy_sanitizes_discovery_query_before_atlas(self) -> None:
         self.service.publish_designation(self.designation, self.adapter)
@@ -725,6 +973,7 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
             facts={"language": "python"},
             route="ordinary",
             adapter=self.adapter,
+            representation=self.query_representation,
         )
         self.assertEqual([publication["publication_id"]], [
             item["publication_id"] for item in delivered
@@ -751,6 +1000,16 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(procedures.ProcedureIneligibleError, "private"):
             self.service.publish_designation(private_designation, self.adapter)
 
+        with self.assertRaisesRegex(procedures.ProcedureError, "durable publication intent"):
+            self.service.publish(
+                procedure=self.procedure,
+                approval=self.approval,
+                representation={},
+                designation=self.designation,
+                adapter=self.adapter,
+            )
+        self.assertEqual({}, self.collection.documents)
+
         dot_representation = contracts.make_procedure_representation(
             procedure=self.procedure,
             model="deterministic-test-embedding/v1",
@@ -762,7 +1021,6 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
             created_at="2026-09-21T00:00:15Z",
         )
         self.service.record_representation(dot_representation)
-        self.service.publish_designation(self.designation, self.adapter)
         with self.assertRaisesRegex(procedures.ProcedureIneligibleError, "metric"):
             self.service.publish(
                 procedure=self.procedure,
@@ -771,10 +1029,7 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
                 designation=self.designation,
                 adapter=self.adapter,
             )
-        self.assertFalse(any(
-            document.get("document_kind") == "trusted_procedure_publication"
-            for document in self.collection.documents.values()
-        ))
+        self.assertEqual({}, self.collection.documents)
 
 
 if __name__ == "__main__":

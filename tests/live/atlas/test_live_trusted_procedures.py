@@ -117,6 +117,12 @@ class LiveAtlasTrustedProcedureTests(unittest.TestCase):
                 search_text="parser lock recovery",
                 vector=_DeterministicEmbeddings._vector("parser lock recovery"),
             )
+            query_representation = {
+                "model": representation["model"],
+                "dimensions": representation["dimensions"],
+                "metric": representation["metric"],
+                "sanitizer_version": representation["sanitizer_version"],
+            }
             service = procedures.TrustedProcedureService(
                 memory_store, trusted_issuers={"ROOT"}
             )
@@ -152,6 +158,7 @@ class LiveAtlasTrustedProcedureTests(unittest.TestCase):
                 facts={"language": "python"},
                 route="ordinary",
                 adapter=adapter,
+                representation=query_representation,
             )
             self.assertEqual([publication["publication_id"]], [item["publication_id"] for item in delivered])
             exact = adapter.exact_read(publication["publication_id"])
@@ -173,6 +180,7 @@ class LiveAtlasTrustedProcedureTests(unittest.TestCase):
                     facts={"language": "python"},
                     route="ordinary",
                     adapter=adapter,
+                    representation=query_representation,
                 ),
             )
         finally:

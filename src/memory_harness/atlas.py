@@ -142,6 +142,12 @@ ATLAS_PROCEDURE_DOCUMENT_SCHEMA = "atlas-trusted-procedure-document/v1"
 ATLAS_CURRENT_DOCUMENT_SCHEMA = "atlas-trusted-procedure-current/v1"
 ATLAS_PUBLICATION_STATE_SCHEMA = "atlas-trusted-procedure-publication-state/v1"
 ATLAS_REVOCATION_DOCUMENT_SCHEMA = "atlas-trusted-procedure-revocation/v1"
+ATLAS_QUERY_REPRESENTATION_IDENTITY_FIELDS = (
+    "model",
+    "dimensions",
+    "metric",
+    "sanitizer_version",
+)
 
 # ``MongoDBAtlasVectorSearch`` uses the Atlas spelling for dot product while
 # the product contract keeps a portable, snake-case metric name.
@@ -883,10 +889,16 @@ def validate_atlas_snapshot_for_delivery(
         procedure["behavior"]["predicates"], facts, route=route
     ):
         raise AtlasProcedureFencedError("Atlas procedure predicates are not currently eligible")
-    if representation is not None:
-        for field in ("model", "dimensions", "metric", "sanitizer_version"):
-            if representation.get(field) != selected_representation.get(field):
-                raise AtlasProcedureFencedError("Atlas procedure representation is incompatible")
+    if not isinstance(representation, Mapping) or any(
+        field not in representation
+        for field in ATLAS_QUERY_REPRESENTATION_IDENTITY_FIELDS
+    ):
+        raise AtlasProcedureFencedError(
+            "Atlas procedure delivery requires an exact query representation identity"
+        )
+    for field in ATLAS_QUERY_REPRESENTATION_IDENTITY_FIELDS:
+        if representation.get(field) != selected_representation.get(field):
+            raise AtlasProcedureFencedError("Atlas procedure representation is incompatible")
     return {
         "publication_id": publication["publication_id"],
         "logical_id": procedure["logical_id"],
@@ -909,6 +921,7 @@ __all__ = [
     "ATLAS_CURRENT_DOCUMENT_SCHEMA",
     "ATLAS_PUBLICATION_STATE_SCHEMA",
     "ATLAS_REVOCATION_DOCUMENT_SCHEMA",
+    "ATLAS_QUERY_REPRESENTATION_IDENTITY_FIELDS",
     "AtlasProcedureError",
     "AtlasProcedureDependencyError",
     "AtlasProcedureAmbiguityError",

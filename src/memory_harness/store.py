@@ -2189,7 +2189,10 @@ class MemoryStore:
             "fenced": {"withdrawn", "revoked"},
             "withdrawn": {"revoked"},
             "revoked": set(),
-            "blocked": set(),
+            # A stable operation that was blocked locally can be reconciled
+            # only by later exact remote evidence, which promotes it through
+            # remote_committed before a normal acknowledgement.
+            "blocked": {"remote_committed", "fenced", "withdrawn", "revoked"},
             "revocation_pending": {"revoked", "withdrawn"},
         }
         if status == existing["status"] and (
