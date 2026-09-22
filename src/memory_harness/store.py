@@ -1,4 +1,4 @@
-﻿"""Small standard-library SQLite store for Stage-A decisions and operations."""
+"""Small standard-library SQLite store for Stage-A decisions and operations."""
 
 from __future__ import annotations
 
@@ -327,8 +327,82 @@ _SCHEMA = [
         delivered_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS preparations (
+        preparation_id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL,
+        task_card_digest TEXT NOT NULL,
+        objective_id TEXT NOT NULL,
+        route TEXT NOT NULL,
+        strategy TEXT NOT NULL,
+        current_plan_state TEXT NOT NULL,
+        status TEXT NOT NULL,
+        supersedes TEXT,
+        superseded_by TEXT,
+        record TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS search_traces (
+        preparation_id TEXT PRIMARY KEY,
+        outcome TEXT NOT NULL,
+        record TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS search_candidates (
+        candidate_id TEXT NOT NULL,
+        preparation_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        logical_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        disposition TEXT NOT NULL,
+        score REAL NOT NULL,
+        record TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (candidate_id, preparation_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS plan_dispositions (
+        disposition_id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL,
+        objective_id TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        record TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS apc_child_operations (
+        child_operation_id TEXT PRIMARY KEY,
+        parent_decision_id TEXT NOT NULL,
+        parent_objective_id TEXT NOT NULL,
+        request_digest TEXT NOT NULL,
+        status TEXT NOT NULL,
+        observed_invocation TEXT,
+        result_digest TEXT,
+        record TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS final_contexts (
+        context_id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL,
+        plan_id TEXT NOT NULL,
+        plan_digest TEXT NOT NULL,
+        envelope_digest TEXT NOT NULL,
+        record TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
 ]
-
 
 class MemoryStore:
     """A minimal durable store with explicit outcome conflict semantics."""
@@ -2302,6 +2376,372 @@ class MemoryStore:
             (revision_id,),
         ).fetchall()
         return [self._stored_record(row, contracts.validate_procedure_exposure) for row in rows]
+
+    # -- STEP-04 preparation, search, disposition, child, and context state --
+
+    def record_preparation(self, preparation: Mapping[str, Any]) -> dict[str, Any]:
+        contracts.validate_preparation(preparation)
+        connection = self._require_connection()
+        payload = self._serialize_record(preparation)
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO preparations (
+                    preparation_id, decision_id, task_card_digest, objective_id,
+                    route, strategy, current_plan_state, status, supersedes,
+                    superseded_by, record, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(preparation_id) DO UPDATE SET
+                    status=excluded.status,
+                    superseded_by=excluded.superseded_by,
+                    record=excluded.record,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    preparation["preparation_id"],
+                    preparation["decision_id"],
+                    preparation["task_card_digest"],
+                    preparation["objective_id"],
+                    preparation["route"],
+                    preparation["strategy"],
+                    preparation["current_plan_state"],
+                    preparation["status"],
+                    preparation.get("supersedes"),
+                    preparation.get("superseded_by"),
+                    payload,
+                    preparation["created_at"],
+                    preparation["created_at"],
+                ),
+            )
+        return self.get_preparation(str(preparation["preparation_id"]))
+
+    def get_preparation(self, preparation_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT record FROM preparations WHERE preparation_id = ?", (preparation_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"preparation not found: {preparation_id}")
+        return self._stored_record(row, contracts.validate_preparation)
+
+    def list_preparations(self, decision_id: str) -> list[dict[str, Any]]:
+        connection = self._require_connection()
+        rows = connection.execute(
+            "SELECT record FROM preparations WHERE decision_id = ? ORDER BY created_at, preparation_id",
+            (decision_id,),
+        ).fetchall()
+        return [self._stored_record(row, contracts.validate_preparation) for row in rows]
+
+    def mark_preparation_superseded(
+        self, preparation_id: str, *, superseded_by: str
+    ) -> dict[str, Any]:
+        if not isinstance(superseded_by, str) or not superseded_by:
+            raise StoreError("superseded_by must be a nonempty string")
+        current = self.get_preparation(preparation_id)
+        superseded = dict(current)
+        superseded["status"] = "superseded"
+        superseded["superseded_by"] = superseded_by
+        superseded["content_hash"] = contracts.content_hash(superseded)
+        return self.record_preparation(superseded)
+
+    def record_search_trace(self, trace: Mapping[str, Any]) -> dict[str, Any]:
+        contracts.validate_search_trace(trace)
+        connection = self._require_connection()
+        payload = self._serialize_record(trace)
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO search_traces (preparation_id, outcome, record, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(preparation_id) DO UPDATE SET
+                    outcome=excluded.outcome,
+                    record=excluded.record
+                """,
+                (
+                    trace["preparation_id"],
+                    trace["outcome"],
+                    payload,
+                    contracts.utc_now(),
+                ),
+            )
+        return self.get_search_trace(str(trace["preparation_id"]))
+
+    def get_search_trace(self, preparation_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT record FROM search_traces WHERE preparation_id = ?", (preparation_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"search trace not found: {preparation_id}")
+        return self._stored_record(row, contracts.validate_search_trace)
+
+    def record_search_candidate(
+        self, preparation_id: str, candidate: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        contracts.validate_candidate(candidate)
+        connection = self._require_connection()
+        payload = self._serialize_record(candidate)
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO search_candidates (
+                    candidate_id, preparation_id, kind, logical_id, revision_id,
+                    disposition, score, record, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(candidate_id, preparation_id) DO UPDATE SET
+                    disposition=excluded.disposition,
+                    score=excluded.score,
+                    record=excluded.record
+                """,
+                (
+                    candidate["candidate_id"],
+                    preparation_id,
+                    candidate["kind"],
+                    candidate["logical_id"],
+                    candidate["revision_id"],
+                    candidate["disposition"],
+                    float(candidate["score"]),
+                    payload,
+                    contracts.utc_now(),
+                ),
+            )
+        return dict(candidate)
+
+    def list_search_candidates(self, preparation_id: str) -> list[dict[str, Any]]:
+        connection = self._require_connection()
+        rows = connection.execute(
+            """
+            SELECT record FROM search_candidates
+            WHERE preparation_id = ?
+            ORDER BY score DESC, kind, logical_id, revision_id
+            """,
+            (preparation_id,),
+        ).fetchall()
+        return [self._stored_record(row, contracts.validate_candidate) for row in rows]
+
+    def record_plan_disposition(self, disposition: Mapping[str, Any]) -> dict[str, Any]:
+        contracts.validate_plan_disposition(disposition)
+        connection = self._require_connection()
+        payload = self._serialize_record(disposition)
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO plan_dispositions (
+                    disposition_id, decision_id, objective_id, branch, record,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(disposition_id) DO UPDATE SET
+                    branch=excluded.branch,
+                    record=excluded.record,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    disposition["disposition_id"],
+                    disposition["decision_id"],
+                    disposition["objective_id"],
+                    disposition["branch"],
+                    payload,
+                    disposition["created_at"],
+                    disposition["created_at"],
+                ),
+            )
+        return self.get_plan_disposition(str(disposition["disposition_id"]))
+
+    def get_plan_disposition(self, disposition_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT record FROM plan_dispositions WHERE disposition_id = ?", (disposition_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"plan disposition not found: {disposition_id}")
+        return self._stored_record(row, contracts.validate_plan_disposition)
+
+    def list_plan_dispositions(self, decision_id: str) -> list[dict[str, Any]]:
+        connection = self._require_connection()
+        rows = connection.execute(
+            """
+            SELECT record FROM plan_dispositions
+            WHERE decision_id = ?
+            ORDER BY created_at, disposition_id
+            """,
+            (decision_id,),
+        ).fetchall()
+        return [self._stored_record(row, contracts.validate_plan_disposition) for row in rows]
+
+    def create_apc_child_operation(
+        self, child_operation: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        """Claim one exact child operation identity exactly once.
+
+        ``created`` is ``False`` when that exact attempt identity already
+        exists; callers must then inspect the durable status and only continue
+        with a *new* bounded attempt when the existing claim is terminal.
+        """
+
+        contracts.validate_apc_child_operation(child_operation)
+        connection = self._require_connection()
+        payload = self._serialize_record(child_operation)
+        observed = child_operation.get("observed_invocation")
+        with connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO apc_child_operations (
+                    child_operation_id, parent_decision_id, parent_objective_id,
+                    request_digest, status, observed_invocation, result_digest,
+                    record, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    child_operation["child_operation_id"],
+                    child_operation.get("parent_decision_id"),
+                    child_operation.get("parent_objective_id"),
+                    child_operation["request_digest"],
+                    child_operation["status"],
+                    json.dumps(observed, sort_keys=True) if observed is not None else None,
+                    child_operation.get("result_digest"),
+                    payload,
+                    child_operation["created_at"],
+                    child_operation["created_at"],
+                ),
+            )
+        return (
+            self.get_apc_child_operation(str(child_operation["child_operation_id"])),
+            cursor.rowcount == 1,
+        )
+
+    def list_apc_child_operations_by_request(
+        self, request_digest: str
+    ) -> list[dict[str, Any]]:
+        """Return the ordered bounded attempts for one exact child request."""
+
+        if not isinstance(request_digest, str) or not request_digest:
+            raise StoreError("request_digest must be a nonempty string")
+        connection = self._require_connection()
+        rows = connection.execute(
+            """
+            SELECT record FROM apc_child_operations
+            WHERE request_digest = ?
+            ORDER BY created_at, child_operation_id
+            """,
+            (request_digest,),
+        ).fetchall()
+        return [
+            self._stored_record(row, contracts.validate_apc_child_operation)
+            for row in rows
+        ]
+
+    def record_apc_child_operation(self, child_operation: Mapping[str, Any]) -> dict[str, Any]:
+        contracts.validate_apc_child_operation(child_operation)
+        connection = self._require_connection()
+        payload = self._serialize_record(child_operation)
+        observed = child_operation.get("observed_invocation")
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO apc_child_operations (
+                    child_operation_id, parent_decision_id, parent_objective_id,
+                    request_digest, status, observed_invocation, result_digest,
+                    record, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(child_operation_id) DO UPDATE SET
+                    status=excluded.status,
+                    observed_invocation=excluded.observed_invocation,
+                    result_digest=excluded.result_digest,
+                    record=excluded.record,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    child_operation["child_operation_id"],
+                    child_operation.get("parent_decision_id"),
+                    child_operation.get("parent_objective_id"),
+                    child_operation["request_digest"],
+                    child_operation["status"],
+                    json.dumps(observed, sort_keys=True) if observed is not None else None,
+                    child_operation.get("result_digest"),
+                    payload,
+                    child_operation["created_at"],
+                    child_operation["created_at"],
+                ),
+            )
+        return self.get_apc_child_operation(str(child_operation["child_operation_id"]))
+
+    def get_apc_child_operation(self, child_operation_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT record FROM apc_child_operations WHERE child_operation_id = ?",
+            (child_operation_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"APC child operation not found: {child_operation_id}")
+        return self._stored_record(row, contracts.validate_apc_child_operation)
+
+    def list_apc_child_operations(self, decision_id: str) -> list[dict[str, Any]]:
+        connection = self._require_connection()
+        rows = connection.execute(
+            """
+            SELECT record FROM apc_child_operations
+            WHERE parent_decision_id = ?
+            ORDER BY created_at, child_operation_id
+            """,
+            (decision_id,),
+        ).fetchall()
+        return [self._stored_record(row, contracts.validate_apc_child_operation) for row in rows]
+
+    def record_final_context(
+        self, context: Mapping[str, Any], *, envelope_digest: str
+    ) -> dict[str, Any]:
+        contracts.validate_finalized_context(context)
+        if not isinstance(envelope_digest, str) or not envelope_digest:
+            raise StoreError("a finalized context requires its exact envelope digest")
+        connection = self._require_connection()
+        payload = self._serialize_record(context)
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO final_contexts (
+                    context_id, decision_id, plan_id, plan_digest,
+                    envelope_digest, record, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(context_id) DO UPDATE SET
+                    envelope_digest=excluded.envelope_digest,
+                    record=excluded.record
+                """,
+                (
+                    context["context_id"],
+                    context["decision_id"],
+                    context["plan_id"],
+                    context["plan_digest"],
+                    envelope_digest,
+                    payload,
+                    context["created_at"],
+                ),
+            )
+        return self.get_final_context(str(context["context_id"]))
+
+    def get_final_context(self, context_id: str) -> dict[str, Any]:
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT record FROM final_contexts WHERE context_id = ?", (context_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"final context not found: {context_id}")
+        return self._stored_record(row, contracts.validate_finalized_context)
+
+    def get_final_context_for_decision(self, decision_id: str) -> dict[str, Any] | None:
+        connection = self._require_connection()
+        row = connection.execute(
+            """
+            SELECT record FROM final_contexts
+            WHERE decision_id = ?
+            ORDER BY created_at DESC, context_id DESC
+            LIMIT 1
+            """,
+            (decision_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._stored_record(row, contracts.validate_finalized_context)
+
 
 
 __all__ = [

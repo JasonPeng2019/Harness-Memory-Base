@@ -126,6 +126,85 @@ def prepare_resume_envelope(
     )
 
 
+def finalize_envelope(
+    *,
+    task_card: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    decision_id: str,
+    lane_id: str,
+    run_id: str,
+    worktree_path: str | Path,
+    base_commit: str,
+    mandatory_content: list[Mapping[str, Any]] | None = None,
+    optional_items: list[Mapping[str, Any]] | None = None,
+    configuration: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Finalize one exact safe context and write it for this worktree.
+
+    Returns the finalized envelope, or ``None`` when the resolved configuration
+    is all-off so the inherited harness path applies unchanged.
+    """
+
+    from memory_harness import config as memory_config
+    from memory_harness import context as memory_context
+
+    resolved = memory_config.resolve_config(configuration)
+    if resolved.all_off:
+        _, envelope_path = memory_paths(worktree_path)
+        envelope_path.unlink(missing_ok=True)
+        return None
+    limits = memory_config.resolve_limits(None)
+    finalized = memory_context.finalize_context(
+        task_card=task_card,
+        plan=plan,
+        decision_id=decision_id,
+        lane_id=lane_id,
+        run_id=run_id,
+        worktree_path=str(worktree_path),
+        base_commit=base_commit,
+        strategy=resolved.strategy,
+        configuration={**dict(configuration or {}), "strategy": resolved.strategy},
+        mandatory_content=list(mandatory_content or []),
+        optional_items=list(optional_items or []),
+        limits=limits,
+    )
+    _write_envelope(worktree_path, finalized.envelope)
+    return finalized.envelope
+
+
+def validate_final_context_for_launch(
+    *,
+    context: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    task_card: Mapping[str, Any],
+    lane_id: str,
+    run_id: str,
+    worktree_path: str | Path,
+    base_commit: str,
+) -> dict[str, Any]:
+    """Validate a finalized context against the actual dispatch target."""
+
+    from memory_harness import context as memory_context
+
+    handoff = handoff_from_task_card(task_card)
+    if handoff is None:
+        raise MemoryHandoffError("task card has no memory_handoff")
+    try:
+        memory_context.validate_final_context(
+            context,
+            envelope=envelope,
+            task_card=task_card,
+            plan=handoff["plan"],
+            lane_id=lane_id,
+            run_id=run_id,
+            base_commit=base_commit,
+            worktree_path=str(worktree_path),
+        )
+    except Exception as exc:
+        raise MemoryHandoffError(f"invalid finalized context: {exc}") from exc
+    return dict(context)
+
+
 def load_envelope(worktree_path: str | Path) -> dict[str, Any] | None:
     _, envelope_path = memory_paths(worktree_path)
     if not envelope_path.is_file():
@@ -272,6 +351,7 @@ def omit_optional_content(
 __all__ = [
     "MemoryHandoffError",
     "dispatch",
+    "finalize_envelope",
     "handoff_from_task_card",
     "load_envelope",
     "memory_paths",
@@ -282,6 +362,7 @@ __all__ = [
     "record_dispatch_intent",
     "record_observed_invocation",
     "validate_envelope_for_launch",
+    "validate_final_context_for_launch",
     "validate_task_card",
     "worker_environment",
 ]

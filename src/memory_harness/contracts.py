@@ -2628,6 +2628,694 @@ def validate_procedure_exposure(record: Mapping[str, Any]) -> None:
         raise ContractError("procedure exposure identity mismatch")
 
 
+# ---------------------------------------------------------------------------
+# STEP-04 preparation, search, plan-disposition, child-operation, and
+# finalized-context records.  These extend the accepted baseline compatibly.
+# ---------------------------------------------------------------------------
+
+PREPARATION_SCHEMA = "memory-preparation/v1"
+CANDIDATE_SCHEMA = "memory-search-candidate/v1"
+SEARCH_TRACE_SCHEMA = "memory-search-trace/v1"
+PLAN_DISPOSITION_SCHEMA = "memory-plan-disposition/v1"
+FINAL_CONTEXT_SCHEMA = "memory-final-context/v1"
+APC_CHILD_OPERATION_SCHEMA = "memory-apc-child-operation/v1"
+
+CURRENT_PLAN_STATES = frozenset(
+    {"absent", "candidate_review", "execution_accepted", "inconsistent"}
+)
+CANDIDATE_KINDS = frozenset({"historical_evidence", "procedure", "template"})
+CANDIDATE_DISPOSITIONS = frozenset(
+    {"eligible", "selected", "rejected", "invalid", "deduplicated", "unattempted"}
+)
+ATTEMPT_STATUSES = frozenset(
+    {
+        "disabled",
+        "unavailable",
+        "unattempted-by-budget",
+        "attempted",
+        "timed-out",
+        "invalid",
+        "completed",
+    }
+)
+PLAN_BRANCHES = frozenset(
+    {"preserved_accepted", "candidate_review", "direct_fill", "apc_proposal", "fresh"}
+)
+APC_CHILD_STATUSES = frozenset(
+    {
+        "intent_recorded",
+        "launched",
+        "ambiguous",
+        "reconciled",
+        "failed",
+        "cancelled",
+        "refused",
+    }
+)
+# Ownership is only unresolved while the exact child may still be live or its
+# identity is unknown.  A terminal disposition is durable evidence, not an
+# outstanding claim, so ordinary reuse work may continue from a fresh attempt.
+APC_CHILD_UNRESOLVED_STATUSES = frozenset({"intent_recorded", "launched", "ambiguous"})
+APC_CHILD_TERMINAL_STATUSES = frozenset({"reconciled", "failed", "cancelled", "refused"})
+SEARCH_OUTCOMES = frozenset({"no_optional_memory", "optional_memory", "blocked"})
+
+
+class PlanStateError(ContractError):
+    """A nonempty current plan is inconsistent with the exact task state."""
+
+
+def classify_current_plan(
+    record: Mapping[str, Any] | None,
+    *,
+    expected_objective_id: str,
+    expected_route: str | None = None,
+    expected_base_commit: str | None = None,
+) -> str:
+    """Return the explicit current-plan state for one exact objective."""
+
+    if record is None:
+        return "absent"
+    if not isinstance(record, Mapping):
+        raise PlanStateError("nonempty current plan reference is not an object")
+    try:
+        validate_plan(record)
+    except ContractError as exc:
+        raise PlanStateError(f"nonempty current plan is unreadable: {exc}") from exc
+    if record["objective_id"] != expected_objective_id:
+        raise PlanStateError(
+            "current plan is bound to another objective: "
+            f"expected {expected_objective_id!r}, got {record['objective_id']!r}"
+        )
+    if expected_route is not None and record["route"] != expected_route:
+        raise PlanStateError(
+            "current plan is bound to another route: "
+            f"expected {expected_route!r}, got {record['route']!r}"
+        )
+    if expected_base_commit is not None:
+        bound_base = record.get("base_commit")
+        if bound_base is not None and bound_base != expected_base_commit:
+            raise PlanStateError("current plan is bound to another repository baseline")
+    if record["state"] == "accepted":
+        return "execution_accepted"
+    return "candidate_review"
+
+
+def make_preparation(
+    *,
+    task_card: Mapping[str, Any],
+    decision_id: str,
+    objective_id: str,
+    route: str,
+    plan_id: str,
+    plan_digest: str,
+    plan_state: str,
+    current_plan_state: str,
+    strategy: str,
+    requested_strategy: str,
+    configuration: Mapping[str, Any],
+    network_mode: str,
+    budget_source: str,
+    remaining_seconds: float | None,
+    execution_reserve_seconds: float,
+    stage_allowance_seconds: float,
+    deadline_monotonic: float | None = None,
+    preparation_id: str | None = None,
+    supersedes: str | None = None,
+    superseded_by: str | None = None,
+    status: str = "prepared",
+    route_correction: Mapping[str, Any] | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    validate_task_card(task_card)
+    if current_plan_state not in CURRENT_PLAN_STATES:
+        raise ContractError(f"unknown current plan state: {current_plan_state!r}")
+    if route not in ROUTES:
+        raise ContractError(f"unknown route: {route!r}")
+    for field, value in (
+        ("decision_id", decision_id),
+        ("objective_id", objective_id),
+        ("plan_id", plan_id),
+        ("plan_digest", plan_digest),
+        ("plan_state", plan_state),
+        ("strategy", strategy),
+        ("network_mode", network_mode),
+        ("budget_source", budget_source),
+    ):
+        _require_nonempty_str(value, field)
+    resolved_configuration = _normalize_json_object(configuration, "configuration")
+    if remaining_seconds is not None and not isinstance(remaining_seconds, (int, float)):
+        raise ContractError("remaining_seconds must be a number or null")
+    if execution_reserve_seconds < 0:
+        raise ContractError("execution reserve must not be negative")
+    if stage_allowance_seconds < 0:
+        raise ContractError("stage allowance must not be negative")
+    identity = preparation_id or sha256_hex(
+        {
+            "domain": "memory-preparation/v1",
+            "task_card_digest": task_card["content_hash"],
+            "decision_id": decision_id,
+            "objective_id": objective_id,
+            "route": route,
+            "strategy": strategy,
+            "configuration_digest": sha256_hex(resolved_configuration),
+            "supersedes": supersedes,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": PREPARATION_SCHEMA,
+        "preparation_id": identity,
+        "decision_id": decision_id,
+        "task_card_digest": task_card["content_hash"],
+        "objective_id": objective_id,
+        "route": route,
+        "plan_id": plan_id,
+        "plan_digest": plan_digest,
+        "plan_state": plan_state,
+        "current_plan_state": current_plan_state,
+        "requested_strategy": requested_strategy,
+        "strategy": strategy,
+        "configuration": resolved_configuration,
+        "configuration_digest": sha256_hex(resolved_configuration),
+        "network_mode": network_mode,
+        "budget_source": budget_source,
+        "remaining_seconds": remaining_seconds,
+        "deadline_monotonic": deadline_monotonic,
+        "execution_reserve_seconds": float(execution_reserve_seconds),
+        "stage_allowance_seconds": float(stage_allowance_seconds),
+        "supersedes": supersedes,
+        "superseded_by": superseded_by,
+        "route_correction": dict(route_correction) if route_correction else None,
+        "status": status,
+        "created_at": created_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_preparation(record)
+    return record
+
+
+def validate_preparation(record: Mapping[str, Any]) -> None:
+    validate_record(record, PREPARATION_SCHEMA)
+    for field in (
+        "preparation_id",
+        "decision_id",
+        "task_card_digest",
+        "objective_id",
+        "route",
+        "plan_id",
+        "plan_digest",
+        "plan_state",
+        "current_plan_state",
+        "strategy",
+        "configuration_digest",
+        "network_mode",
+        "budget_source",
+        "status",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    if record["route"] not in ROUTES:
+        raise ContractError(f"unknown route: {record['route']!r}")
+    if record["current_plan_state"] not in CURRENT_PLAN_STATES:
+        raise ContractError("unknown current plan state")
+    configuration = record.get("configuration")
+    if not isinstance(configuration, Mapping):
+        raise ContractError("preparation configuration must be an object")
+    if configuration.get("strategy") != record["strategy"]:
+        raise ContractError("preparation strategy does not match its configuration")
+    if record["configuration_digest"] != sha256_hex(configuration):
+        raise ContractError("preparation configuration digest mismatch")
+    if record.get("supersedes") is not None:
+        _require_nonempty_str(record["supersedes"], "supersedes")
+        if record["supersedes"] == record["preparation_id"]:
+            raise ContractError("a preparation cannot supersede itself")
+
+
+def make_candidate(
+    *,
+    kind: str,
+    logical_id: str,
+    revision_id: str,
+    origin: str,
+    source_id: str,
+    payload_digest: str,
+    payload: Mapping[str, Any],
+    scope: Mapping[str, Any] | None = None,
+    provenance: Iterable[Mapping[str, Any]] = (),
+    freshness: str = "live",
+    representation: Mapping[str, Any] | None = None,
+    score: float = 0.0,
+    comparable: bool = True,
+    disposition: str = "eligible",
+    reasons: Iterable[str] = (),
+    candidate_id: str | None = None,
+) -> dict[str, Any]:
+    selected_kind = _require_nonempty_str(kind, "kind")
+    if selected_kind not in CANDIDATE_KINDS:
+        raise ContractError(f"unknown candidate kind: {selected_kind!r}")
+    if disposition not in CANDIDATE_DISPOSITIONS:
+        raise ContractError(f"unknown candidate disposition: {disposition!r}")
+    for field, value in (
+        ("logical_id", logical_id),
+        ("revision_id", revision_id),
+        ("origin", origin),
+        ("source_id", source_id),
+        ("payload_digest", payload_digest),
+    ):
+        _require_nonempty_str(value, field)
+    identity = candidate_id or sha256_hex(
+        {
+            "domain": "memory-search-candidate/v1",
+            "kind": selected_kind,
+            "logical_id": logical_id,
+            "revision_id": revision_id,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": CANDIDATE_SCHEMA,
+        "candidate_id": identity,
+        "kind": selected_kind,
+        "logical_id": logical_id,
+        "revision_id": revision_id,
+        "origin": origin,
+        "source_id": source_id,
+        "payload_digest": payload_digest,
+        "payload": dict(payload),
+        "scope": dict(scope) if scope else None,
+        "provenance": [dict(item) for item in provenance],
+        "freshness": freshness,
+        "representation": dict(representation) if representation else None,
+        "score": float(score),
+        "comparable": bool(comparable),
+        "disposition": disposition,
+        "reasons": [str(item) for item in reasons],
+    }
+    record["content_hash"] = content_hash(record)
+    validate_candidate(record)
+    return record
+
+
+def validate_candidate(record: Mapping[str, Any]) -> None:
+    validate_record(record, CANDIDATE_SCHEMA)
+    for field in (
+        "candidate_id",
+        "kind",
+        "logical_id",
+        "revision_id",
+        "origin",
+        "source_id",
+        "payload_digest",
+        "freshness",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    if record["kind"] not in CANDIDATE_KINDS:
+        raise ContractError(f"unknown candidate kind: {record['kind']!r}")
+    if record["disposition"] not in CANDIDATE_DISPOSITIONS:
+        raise ContractError(f"unknown candidate disposition: {record['disposition']!r}")
+    payload = record.get("payload")
+    if not isinstance(payload, Mapping):
+        raise ContractError("candidate payload must be an object")
+    if record["payload_digest"] != sha256_hex(payload):
+        raise ContractError("candidate payload digest mismatch")
+    provenance = record.get("provenance")
+    if not isinstance(provenance, list):
+        raise ContractError("candidate provenance must be a list")
+
+
+def make_search_trace(
+    *,
+    preparation_id: str,
+    strategy: str,
+    rounds: int,
+    attempts: Iterable[Mapping[str, Any]],
+    candidates: Iterable[Mapping[str, Any]],
+    selected_ids: Iterable[str],
+    delivered_ids: Iterable[str],
+    outcome: str,
+) -> dict[str, Any]:
+    _require_nonempty_str(preparation_id, "preparation_id")
+    _require_nonempty_str(strategy, "strategy")
+    if outcome not in SEARCH_OUTCOMES:
+        raise ContractError(f"unknown search outcome: {outcome!r}")
+    normalized_attempts: list[dict[str, Any]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            raise ContractError("search attempts must be objects")
+        entry = dict(attempt)
+        for field in ("store_id", "kind", "status"):
+            _require_nonempty_str(entry.get(field), field)
+        if entry["status"] not in ATTEMPT_STATUSES:
+            raise ContractError(f"unknown attempt status: {entry['status']!r}")
+        if entry["kind"] not in CANDIDATE_KINDS:
+            raise ContractError(f"unknown attempt kind: {entry['kind']!r}")
+        normalized_attempts.append(entry)
+    normalized_candidates = [dict(item) for item in candidates]
+    for candidate in normalized_candidates:
+        validate_candidate(candidate)
+    record: dict[str, Any] = {
+        "schema": SEARCH_TRACE_SCHEMA,
+        "preparation_id": preparation_id,
+        "strategy": strategy,
+        "rounds": int(rounds),
+        "attempts": normalized_attempts,
+        "candidates": normalized_candidates,
+        "selected": [str(item) for item in selected_ids],
+        "delivered": [str(item) for item in delivered_ids],
+        "outcome": outcome,
+    }
+    record["content_hash"] = content_hash(record)
+    validate_search_trace(record)
+    return record
+
+
+def validate_search_trace(record: Mapping[str, Any]) -> None:
+    validate_record(record, SEARCH_TRACE_SCHEMA)
+    for field in ("preparation_id", "strategy", "outcome"):
+        _require_nonempty_str(record.get(field), field)
+    if record["outcome"] not in SEARCH_OUTCOMES:
+        raise ContractError("unknown search outcome")
+    if not isinstance(record.get("rounds"), int) or record["rounds"] < 0:
+        raise ContractError("search rounds must be a non-negative integer")
+    for field in ("attempts", "candidates", "selected", "delivered"):
+        if not isinstance(record.get(field), list):
+            raise ContractError(f"search trace {field} must be a list")
+
+
+def make_plan_disposition(
+    *,
+    decision_id: str,
+    objective_id: str,
+    route: str,
+    branch: str,
+    reason: str,
+    template: Mapping[str, Any] | None = None,
+    proposal: Mapping[str, Any] | None = None,
+    apc: Mapping[str, Any] | None = None,
+    reuse_attempts: Iterable[Mapping[str, Any]] = (),
+    fresh: Mapping[str, Any] | None = None,
+    root_acceptance: Mapping[str, Any] | None = None,
+    disposition_id: str | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    for field, value in (
+        ("decision_id", decision_id),
+        ("objective_id", objective_id),
+        ("reason", reason),
+    ):
+        _require_nonempty_str(value, field)
+    if route not in ROUTES:
+        raise ContractError(f"unknown route: {route!r}")
+    if branch not in PLAN_BRANCHES:
+        raise ContractError(f"unknown plan branch: {branch!r}")
+    if proposal is not None:
+        validate_plan(proposal)
+    if fresh is not None:
+        validate_plan(fresh)
+    identity = disposition_id or sha256_hex(
+        {"domain": "memory-plan-disposition/v1", "decision_id": decision_id, "branch": branch}
+    )
+    record: dict[str, Any] = {
+        "schema": PLAN_DISPOSITION_SCHEMA,
+        "disposition_id": identity,
+        "decision_id": decision_id,
+        "objective_id": objective_id,
+        "route": route,
+        "branch": branch,
+        "reason": reason,
+        "template": dict(template) if template else None,
+        "proposal": dict(proposal) if proposal else None,
+        "apc": dict(apc) if apc else None,
+        "reuse_attempts": [dict(item) for item in reuse_attempts],
+        "fresh": dict(fresh) if fresh else None,
+        "root_acceptance": dict(root_acceptance) if root_acceptance else None,
+        "created_at": created_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_plan_disposition(record)
+    return record
+
+
+def validate_plan_disposition(record: Mapping[str, Any]) -> None:
+    validate_record(record, PLAN_DISPOSITION_SCHEMA)
+    for field in ("disposition_id", "decision_id", "objective_id", "route", "branch", "reason"):
+        _require_nonempty_str(record.get(field), field)
+    if record["branch"] not in PLAN_BRANCHES:
+        raise ContractError("unknown plan disposition branch")
+    if record["route"] not in ROUTES:
+        raise ContractError("unknown plan disposition route")
+    if record["branch"] in {"direct_fill", "apc_proposal", "fresh"}:
+        if not isinstance(record.get("proposal") if record["branch"] != "fresh" else record.get("fresh"), Mapping):
+            raise ContractError("plan disposition branch requires an exact proposal")
+    if record["branch"] == "direct_fill":
+        template = record.get("template")
+        if not isinstance(template, Mapping) or not template.get("template_id"):
+            raise ContractError("direct fill disposition requires the selected template")
+    for field in ("reuse_attempts",):
+        if not isinstance(record.get(field), list):
+            raise ContractError(f"plan disposition {field} must be a list")
+
+
+def make_finalized_context(
+    *,
+    lane_id: str,
+    run_id: str,
+    decision_id: str,
+    task_card_digest: str,
+    objective_id: str,
+    route: str,
+    plan_id: str,
+    plan_digest: str,
+    base_commit: str,
+    worktree_path: str,
+    strategy: str,
+    configuration: Mapping[str, Any],
+    mandatory_items: Iterable[Mapping[str, Any]],
+    optional_items: Iterable[Mapping[str, Any]],
+    omitted: Iterable[str],
+    role_separation: Mapping[str, Any],
+    freshness: Mapping[str, Any],
+    context_limit: int,
+    context_id: str | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    mandatory = [dict(item) for item in mandatory_items]
+    optional = [dict(item) for item in optional_items]
+    for item in mandatory + optional:
+        _require_nonempty_str(item.get("id"), "rendered item id")
+    for field, value in (
+        ("lane_id", lane_id),
+        ("run_id", run_id),
+        ("decision_id", decision_id),
+        ("task_card_digest", task_card_digest),
+        ("objective_id", objective_id),
+        ("plan_id", plan_id),
+        ("plan_digest", plan_digest),
+        ("base_commit", base_commit),
+        ("worktree_path", worktree_path),
+        ("strategy", strategy),
+    ):
+        _require_nonempty_str(value, field)
+    if route not in ROUTES:
+        raise ContractError(f"unknown route: {route!r}")
+    resolved_configuration = _normalize_json_object(configuration, "configuration")
+    if not isinstance(context_limit, int) or isinstance(context_limit, bool) or context_limit < 1:
+        raise ContractError("context_limit must be a positive integer")
+    integrity = sha256_hex(
+        {
+            "domain": "memory-final-context/v1",
+            "task_card_digest": task_card_digest,
+            "objective_id": objective_id,
+            "route": route,
+            "plan_id": plan_id,
+            "plan_digest": plan_digest,
+            "base_commit": base_commit,
+            "worktree_path": worktree_path,
+            "strategy": strategy,
+            "configuration_digest": sha256_hex(resolved_configuration),
+            "mandatory": [item["id"] for item in mandatory],
+            "optional": [item["id"] for item in optional],
+            "omitted": sorted(str(item) for item in omitted),
+            "role_separation": dict(role_separation),
+            "context_limit": context_limit,
+        }
+    )
+    identity = context_id or sha256_hex(
+        {
+            "domain": "memory-final-context-identity/v1",
+            "decision_id": decision_id,
+            "integrity": integrity,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": FINAL_CONTEXT_SCHEMA,
+        "context_id": identity,
+        "lane_id": lane_id,
+        "run_id": run_id,
+        "decision_id": decision_id,
+        "task_card_digest": task_card_digest,
+        "objective_id": objective_id,
+        "route": route,
+        "plan_id": plan_id,
+        "plan_digest": plan_digest,
+        "base_commit": base_commit,
+        "worktree_path": worktree_path,
+        "strategy": strategy,
+        "configuration": resolved_configuration,
+        "configuration_digest": sha256_hex(resolved_configuration),
+        "mandatory_items": [item["id"] for item in mandatory],
+        "mandatory_digest": sha256_hex(mandatory),
+        "optional_items": [item["id"] for item in optional],
+        "optional_digest": sha256_hex(optional),
+        "omitted": [str(item) for item in omitted],
+        "role_separation": dict(role_separation),
+        "freshness": dict(freshness),
+        "context_limit": context_limit,
+        "integrity": integrity,
+        "created_at": created_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_finalized_context(record)
+    return record
+
+
+def validate_finalized_context(record: Mapping[str, Any]) -> None:
+    validate_record(record, FINAL_CONTEXT_SCHEMA)
+    for field in (
+        "context_id",
+        "lane_id",
+        "run_id",
+        "decision_id",
+        "task_card_digest",
+        "objective_id",
+        "plan_id",
+        "plan_digest",
+        "base_commit",
+        "worktree_path",
+        "strategy",
+        "configuration_digest",
+        "mandatory_digest",
+        "optional_digest",
+        "integrity",
+    ):
+        _require_nonempty_str(record.get(field), field)
+    if record["route"] not in ROUTES:
+        raise ContractError("unknown finalized-context route")
+    configuration = record.get("configuration")
+    if not isinstance(configuration, Mapping):
+        raise ContractError("finalized context configuration must be an object")
+    if record["configuration_digest"] != sha256_hex(configuration):
+        raise ContractError("finalized context configuration digest mismatch")
+    for field in ("mandatory_items", "optional_items", "omitted"):
+        if not isinstance(record.get(field), list):
+            raise ContractError(f"finalized context {field} must be a list")
+    for field in ("role_separation", "freshness"):
+        if not isinstance(record.get(field), Mapping):
+            raise ContractError(f"finalized context {field} must be an object")
+
+
+def make_apc_child_operation(
+    *,
+    request: Mapping[str, Any],
+    status: str,
+    binding: Mapping[str, Any] | None = None,
+    launch_intent: Mapping[str, Any] | None = None,
+    observed_invocation: Mapping[str, Any] | None = None,
+    result: Mapping[str, Any] | None = None,
+    cleanup: Mapping[str, Any] | None = None,
+    operation_id: str | None = None,
+    attempt: int = 1,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(request, Mapping):
+        raise ContractError("APC child operation requires its exact request")
+    request_digest = _require_nonempty_str(request.get("content_hash"), "APC request digest")
+    if status not in APC_CHILD_STATUSES:
+        raise ContractError(f"unknown APC child status: {status!r}")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise ContractError("APC child attempt must be a positive integer")
+    if status in {"launched", "reconciled"} and observed_invocation is None:
+        raise ContractError("a launched APC child requires its observed invocation")
+    identity = operation_id or sha256_hex(
+        {
+            "domain": "apc-child-operation/v1",
+            "request_digest": request_digest,
+            "attempt": attempt,
+        }
+    )
+    record: dict[str, Any] = {
+        "schema": APC_CHILD_OPERATION_SCHEMA,
+        "child_operation_id": identity,
+        "request_digest": request_digest,
+        "parent_decision_id": request.get("parent_decision_id"),
+        "parent_objective_id": request.get("parent_objective_id"),
+        "template_id": request.get("template_id"),
+        "template_version": request.get("template_version"),
+        "binding": dict(binding) if binding else dict(request.get("binding") or {}),
+        "status": status,
+        "launch_intent": dict(launch_intent) if launch_intent else None,
+        "observed_invocation": dict(observed_invocation) if observed_invocation else None,
+        "result_digest": result.get("content_hash") if isinstance(result, Mapping) else None,
+        "cleanup": dict(cleanup) if cleanup else None,
+        "attempt": attempt,
+        "created_at": created_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_apc_child_operation(record)
+    return record
+
+
+def validate_apc_child_operation(record: Mapping[str, Any]) -> None:
+    validate_record(record, APC_CHILD_OPERATION_SCHEMA)
+    for field in ("child_operation_id", "request_digest", "status"):
+        _require_nonempty_str(record.get(field), field)
+    if record["status"] not in APC_CHILD_STATUSES:
+        raise ContractError("unknown APC child status")
+    attempt = record.get("attempt", 1)
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise ContractError("APC child attempt must be a positive integer")
+    if record["status"] in {"launched", "reconciled"} and record.get("observed_invocation") is None:
+        raise ContractError("launched APC child operation requires an observed invocation")
+
+
+def accept_plan(
+    proposal: Mapping[str, Any],
+    *,
+    accepted_plan_id: str | None = None,
+    accepted_content: Any | None = None,
+    accepted_by: str = "ROOT",
+) -> dict[str, Any]:
+    """ROOT acceptance is a distinct, exact revision of a proposal."""
+
+    validate_plan(proposal)
+    if proposal["state"] == "accepted":
+        if accepted_plan_id is not None and accepted_plan_id != proposal["plan_id"]:
+            raise ContractError("an accepted plan cannot be re-accepted under a new identity")
+        return dict(proposal)
+    if accepted_by != "ROOT":
+        raise ContractError("only ROOT may accept a plan")
+    if accepted_content is None:
+        content = proposal["content"]
+        plan_id = proposal["plan_id"]
+    else:
+        content = accepted_content
+        plan_id = accepted_plan_id
+        if not plan_id:
+            raise ContractError("a revised accepted plan requires its exact new identity")
+        plan_id = _require_nonempty_str(plan_id, "accepted_plan_id")
+        if plan_id == proposal["plan_id"]:
+            raise ContractError("a revised plan must be a distinct exact revision")
+    return make_plan(
+        plan_id=plan_id,
+        objective_id=proposal["objective_id"],
+        route=proposal["route"],
+        state="accepted",
+        content=content,
+        revision=int(proposal["revision"]) + (0 if accepted_content is None else 1),
+        accepted_by="ROOT",
+        supersedes=None if accepted_content is None else proposal["plan_id"],
+        source=proposal.get("source"),
+    )
+
+
+
 __all__ = [
     "ContractError",
     "TASK_CARD_SCHEMA",
@@ -2724,4 +3412,32 @@ __all__ = [
     "revise_procedure_remote_operation",
     "make_procedure_exposure",
     "validate_procedure_exposure",
+    "PREPARATION_SCHEMA",
+    "CANDIDATE_SCHEMA",
+    "SEARCH_TRACE_SCHEMA",
+    "PLAN_DISPOSITION_SCHEMA",
+    "FINAL_CONTEXT_SCHEMA",
+    "APC_CHILD_OPERATION_SCHEMA",
+    "CURRENT_PLAN_STATES",
+    "CANDIDATE_KINDS",
+    "CANDIDATE_DISPOSITIONS",
+    "ATTEMPT_STATUSES",
+    "PLAN_BRANCHES",
+    "APC_CHILD_STATUSES",
+    "SEARCH_OUTCOMES",
+    "PlanStateError",
+    "classify_current_plan",
+    "make_preparation",
+    "validate_preparation",
+    "make_candidate",
+    "validate_candidate",
+    "make_search_trace",
+    "validate_search_trace",
+    "make_plan_disposition",
+    "validate_plan_disposition",
+    "make_finalized_context",
+    "validate_finalized_context",
+    "make_apc_child_operation",
+    "validate_apc_child_operation",
+    "accept_plan",
 ]

@@ -12,11 +12,35 @@ plan-reuse contracts.  It provides:
 - versioned local templates with direct-fill and fresh-plan fallback;
 - a thin APC request/result contract that requires an explicit
   `apc_adaptation_binding`;
-- deterministic reviewed-experience and Atlas fixture adapters.
+- deterministic reviewed-experience and Atlas fixture adapters;
+- one bounded preparation, final context, and at-most-once reconciled dispatch.
 
 The package intentionally does **not** provide a second launcher, scheduler,
 review system, evidence ledger, secret manager, learned selector, or benchmark
 runner.
+
+## Bounded preparation and one safe dispatch
+
+preparation.PreparationService.prepare owns one logical decision: it resolves
+the exact task/plan state, fixed strategy, network mode, stage allowance, and
+positive execution reserve *before* any optional call, then runs one bounded
+fault-isolated search over the enabled local/Atlas/EverOS adapters.  The one
+selected template becomes a typed direct fill, one bounded product-harness APC
+drafting child (through an explicit `apc_adaptation_binding`), or the normal
+fresh-plan fallback.  A late Level 0 admission permanently supersedes the old
+packet and permits at most one bounded ordinary re-prepare without replenishing
+spent time.
+
+`context.finalize_context` renders mandatory task/accepted-plan state first,
+packs whole eligible optional items inside the configured allowance, rechecks
+plan-affecting freshness, and binds one integrity over the actual task,
+objective, repository base, accepted plan, rendered items, and role separation.
+`runtime.MemoryRuntime.dispatch` (and the harness `memory_handoff` seam)
+persists launch intent before the existing product-harness launcher runs and
+records the exact observed invocation afterwards; a lost acknowledgement leaves
+one visibly ambiguous operation that must be reconciled before any retry.
+All-off configuration returns through the inherited harness path and performs
+no optional call, no APC launch, and no background effect.
 
 ## Optional EverOS reviewed-experience adapter
 

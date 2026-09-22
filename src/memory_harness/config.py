@@ -1,8 +1,9 @@
-﻿"""Fixed-strategy configuration and the deferred learned-selector boundary."""
+"""Fixed-strategy configuration and the deferred learned-selector boundary."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import Any, Mapping
 
 STANDARD = "standard"
@@ -178,6 +179,147 @@ def deeper() -> MemoryConfig:
     return resolve_config({"strategy": DEEPER})
 
 
+# ---------------------------------------------------------------------------
+# STEP-04 central preparation limits and calibrated thresholds.
+# Implementation Section 16 starting values live here and nowhere else.
+# ---------------------------------------------------------------------------
+
+REPRESENTATION_MODEL = "local-token-overlap/v1"
+REPRESENTATION_DIMENSIONS = 512
+REPRESENTATION_METRIC = "cosine"
+REPRESENTATION_SANITIZER_VERSION = "v1"
+
+
+class LimitsError(ValueError):
+    """A resolved preparation limit is missing or invalid."""
+
+
+@dataclass(frozen=True)
+class PreparationLimits:
+    """One resolved, centrally-owned set of preparation bounds."""
+
+    default_deadline_seconds: float = 120.0
+    execution_reserve_seconds: float = 30.0
+    unknown_time_budget_seconds: float = 20.0
+    minimum_optional_slice_seconds: float = 1.0
+    standard_stage_seconds: float = 20.0
+    problem_focused_stage_seconds: float = 40.0
+    deeper_stage_seconds: float = 60.0
+    deeper_rounds: int = 3
+    store_seconds: float = 8.0
+    apc_stage_seconds: float = 45.0
+    candidate_capacity: Mapping[str, int] = field(
+        default_factory=lambda: MappingProxyType(
+            {"historical_evidence": 4, "procedure": 4, "template": 5}
+        )
+    )
+    direct_fill_threshold: float = 0.6
+    near_match_threshold: float = 0.25
+    minimum_comparable_score: float = 0.2
+    context_limit: int = 12000
+    context_char_limit: int = 200000
+    apc_output_char_limit: int = 40000
+    representation_model: str = REPRESENTATION_MODEL
+    representation_dimensions: int = REPRESENTATION_DIMENSIONS
+    representation_metric: str = REPRESENTATION_METRIC
+    representation_sanitizer_version: str = REPRESENTATION_SANITIZER_VERSION
+
+    @property
+    def representation_identity(self) -> dict[str, Any]:
+        return {
+            "model": self.representation_model,
+            "dimensions": self.representation_dimensions,
+            "metric": self.representation_metric,
+            "sanitizer_version": self.representation_sanitizer_version,
+        }
+
+    def stage_seconds_for(self, strategy: str) -> float:
+        if strategy == PROBLEM_FOCUSED:
+            return self.problem_focused_stage_seconds
+        if strategy == DEEPER:
+            return self.deeper_stage_seconds
+        return self.standard_stage_seconds
+
+    def capacity_for(self, kind: str) -> int:
+        capacity = self.candidate_capacity.get(kind)
+        if not isinstance(capacity, int) or capacity < 0:
+            raise LimitsError(f"no candidate capacity is configured for {kind!r}")
+        return capacity
+
+    def rounds_for(self, strategy: str) -> int:
+        if strategy == DEEPER:
+            return self.deeper_rounds
+        return 1
+
+
+_LIMIT_FIELDS = (
+    "default_deadline_seconds",
+    "execution_reserve_seconds",
+    "unknown_time_budget_seconds",
+    "minimum_optional_slice_seconds",
+    "context_char_limit",
+    "apc_output_char_limit",
+    "standard_stage_seconds",
+    "problem_focused_stage_seconds",
+    "deeper_stage_seconds",
+    "deeper_rounds",
+    "store_seconds",
+    "apc_stage_seconds",
+    "direct_fill_threshold",
+    "near_match_threshold",
+    "minimum_comparable_score",
+    "context_limit",
+)
+
+
+def resolve_limits(raw: Mapping[str, Any] | None = None) -> PreparationLimits:
+    """Resolve one central limit set; malformed values fail closed."""
+
+    if raw is None:
+        return PreparationLimits()
+    if not isinstance(raw, Mapping):
+        raise LimitsError("preparation limits must be an object")
+    values: dict[str, Any] = {}
+    for name in _LIMIT_FIELDS:
+        if name not in raw:
+            continue
+        candidate = raw[name]
+        if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+            raise LimitsError(f"preparation limit {name} must be a number")
+        if candidate < 0:
+            raise LimitsError(f"preparation limit {name} must not be negative")
+        values[name] = candidate
+    if "stage_seconds" in raw:
+        alias = raw["stage_seconds"]
+        if isinstance(alias, bool) or not isinstance(alias, (int, float)) or alias < 0:
+            raise LimitsError("preparation limit stage_seconds must be a non-negative number")
+        values.setdefault("standard_stage_seconds", alias)
+    if "deeper_rounds" in values and int(values["deeper_rounds"]) != values["deeper_rounds"]:
+        raise LimitsError("deeper_rounds must be a whole number")
+    capacity = raw.get("candidate_capacity")
+    if capacity is not None:
+        if not isinstance(capacity, Mapping):
+            raise LimitsError("candidate_capacity must be an object")
+        resolved: dict[str, int] = dict(PreparationLimits().candidate_capacity)
+        for kind, value in capacity.items():
+            if not isinstance(kind, str) or not kind:
+                raise LimitsError("candidate capacity keys must be nonempty strings")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise LimitsError(f"candidate capacity for {kind!r} must be a non-negative integer")
+            resolved[kind] = value
+        capacity_value: Mapping[str, int] = MappingProxyType(resolved)
+    else:
+        capacity_value = PreparationLimits().candidate_capacity
+    if values.get("execution_reserve_seconds", 0.0) < 0:
+        raise LimitsError("the execution reserve must not be negative")
+    return PreparationLimits(
+        candidate_capacity=capacity_value,
+        **{name: (int(value) if name == "deeper_rounds" else value) for name, value in values.items()},
+    )
+
+
+
+
 __all__ = [
     "DeferredCapabilityError",
     "MemoryConfig",
@@ -190,4 +332,10 @@ __all__ = [
     "problem_focused",
     "deeper",
     "resolve_config",
-]
+    "LimitsError",
+    "PreparationLimits",
+    "REPRESENTATION_MODEL",
+    "REPRESENTATION_DIMENSIONS",
+    "REPRESENTATION_METRIC",
+    "REPRESENTATION_SANITIZER_VERSION",
+    "resolve_limits",]

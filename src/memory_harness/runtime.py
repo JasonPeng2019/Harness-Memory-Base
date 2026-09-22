@@ -244,6 +244,70 @@ class MemoryRuntime:
         )
         return self.store.record_outcome(outcome)
 
+    # -- STEP-04 preparation, finalization, and safe dispatch ---------------
+
+    def prepare_with_memory(self, **kwargs: Any) -> Any:
+        """Delegate one bounded preparation to the STEP-04 coordinator."""
+
+        from . import preparation
+        from .config import resolve_limits
+
+        limits = kwargs.pop("limits", None) or resolve_limits()
+        service = preparation.PreparationService(
+            store=self.store,
+            config=kwargs.pop("config", self.config),
+            limits=limits,
+            privacy_policy=self.privacy_policy,
+            clock=kwargs.pop("clock", None),
+            registry=kwargs.pop("registry", None),
+        )
+        return service.prepare(**kwargs)
+
+    def dispatch_finalized(
+        self,
+        *,
+        envelope: Mapping[str, Any],
+        context: Mapping[str, Any] | None,
+        task_card: Mapping[str, Any],
+        plan: Mapping[str, Any],
+        lane_id: str,
+        run_id: str,
+        worktree_path: str,
+        base_commit: str,
+        launcher: Callable[[Mapping[str, Any]], Mapping[str, Any] | None],
+    ) -> dict[str, Any]:
+        """Validate against the actual target, then dispatch exactly once."""
+
+        from . import context as context_module
+
+        try:
+            contracts.validate_envelope(
+                envelope,
+                task_card=task_card,
+                plan=plan,
+                lane_id=lane_id,
+                run_id=run_id,
+                base_commit=base_commit,
+                worktree_path=str(worktree_path),
+            )
+            if context is not None:
+                context_module.validate_final_context(
+                    context,
+                    envelope=envelope,
+                    task_card=task_card,
+                    plan=plan,
+                    lane_id=lane_id,
+                    run_id=run_id,
+                    base_commit=base_commit,
+                    worktree_path=str(worktree_path),
+                )
+        except Exception as exc:
+            raise RuntimeError(f"finalized dispatch does not match its target: {exc}") from exc
+        return self.dispatch(envelope, launcher)
+
+    def record_apc_child_operation(self, child_operation: Mapping[str, Any]) -> dict[str, Any]:
+        return self.store.record_apc_child_operation(child_operation)
+
     def _try_get_operation(self, operation_id: str) -> dict[str, Any] | None:
         try:
             return self.store.get_operation(operation_id)
