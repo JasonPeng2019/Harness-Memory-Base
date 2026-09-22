@@ -7,8 +7,10 @@ from another store are preserved.  The same deadline covers the complete
 consumption of a store's result, normalization, trust gating, scoring, final
 deduplication, ranking, and capacity selection, so late values never enter the
 packet and a blocked phase returns control at its deadline.  Candidates are normalized and gated
-*before* ranking, and one logical revision is delivered once no matter how many
-stores saw it.
+*before* ranking, one logical revision is delivered once no matter how many
+stores saw it, and one logical procedure delivers at most one revision: the
+narrower authorized scope wins before the discovery score, with the revision
+id as the deterministic tie.
 """
 
 from __future__ import annotations
@@ -668,6 +670,44 @@ class BoundedSearch:
                         merged_reasons.append(reason)
                 prior["reasons"] = merged_reasons
         ranked = [deduplicated[key] for key in order]
+        # One logical procedure delivers at most one revision.  Eligible
+        # competitors of the same logical identity are compared by the default
+        # scope specificity order (private, local, project, shared) *before*
+        # the discovery score, exactly like the accepted
+        # ``TrustedProcedureService.resolve_atlas`` policy, with the revision
+        # id as the deterministic tie.  Duplicate sightings of one revision
+        # already merged above, so every remaining competitor is a distinct
+        # revision identity; a rejected or invalid revision never competes and
+        # can never suppress an independently eligible one.
+        procedure_winners: dict[str, tuple[tuple[Any, ...], str]] = {}
+        for item in ranked:
+            if item["kind"] != "procedure" or item["disposition"] != "eligible":
+                continue
+            key = (
+                _SPECIFICITY_ORDER.get(str(item.get("specificity")), 9),
+                -float(item.get("score", 0.0)),
+                item["revision_id"],
+            )
+            prior = procedure_winners.get(item["logical_id"])
+            if prior is None or key < prior[0]:
+                procedure_winners[item["logical_id"]] = (key, item["revision_id"])
+        for item in ranked:
+            if item["kind"] != "procedure" or item["disposition"] != "eligible":
+                continue
+            winner = procedure_winners.get(item["logical_id"])
+            if winner is None or item["revision_id"] == winner[1]:
+                continue
+            item["disposition"] = "rejected"
+            selection_reason = (
+                "competing revision of the same logical procedure: "
+                f"revision {winner[1]!r} is the deterministic winner "
+                "(narrower authorized scope before the discovery score, "
+                "then the revision id)"
+            )
+            reasons = list(item.get("reasons", []))
+            if selection_reason not in reasons:
+                reasons.append(selection_reason)
+            item["reasons"] = reasons
         ranked.sort(
             key=lambda item: (
                 item["disposition"] != "eligible",
