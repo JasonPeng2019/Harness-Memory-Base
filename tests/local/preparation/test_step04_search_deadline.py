@@ -310,5 +310,93 @@ class SearchStageDeadlineTests(unittest.TestCase):
         self.assertTrue(durable["attempts"][0]["reason"])
 
 
+    # -- blocking normalization and finalization ---------------------------
+
+    def test_blocking_normalization_returns_at_the_deadline(self) -> None:
+        """ROOT reproduction: a 2.0s normalizer must not hold a 0.1s stage."""
+
+        class BlockingPayload(Mapping):
+            def __getitem__(self, key):
+                time.sleep(2.0)
+                return {"summary": "late evidence"}[key]
+
+            def __iter__(self):
+                return iter(("summary",))
+
+            def __len__(self) -> int:
+                return 1
+
+        item = self._evidence(logical_id="case-blocking")
+        item["payload"] = BlockingPayload()
+        limits = self._limits(
+            standard_stage_seconds=0.1,
+            store_seconds=0.1,
+            minimum_optional_slice_seconds=0.01,
+        )
+        started = time.monotonic()
+        outcome = self._prepare(
+            [self._store("everos", "historical_evidence", [item])], limits=limits
+        )
+        elapsed = time.monotonic() - started
+        attempts = self._attempts(outcome)
+        self.assertLess(elapsed, 1.0, "a blocking normalizer must not hold the stage")
+        self.assertEqual("timed-out", attempts["everos"]["status"])
+        self.assertEqual([], self._logical_ids(outcome))
+        self._assert_abandoned_work_is_daemon()
+        published = outcome.trace["candidates"]
+        # Let the abandoned normalization finish: its late values must never
+        # reach the packet that was already published.
+        time.sleep(2.5)
+        self.assertEqual([], published, "late normalization must not publish")
+        self.assertEqual([], self._logical_ids(outcome))
+
+    def test_blocking_finalization_returns_at_the_deadline(self) -> None:
+        """Deduplication, ranking, and capacity selection share the same bound."""
+
+        class BlockingFinalization(search.BoundedSearch):
+            def _finalize(self, *args, **kwargs):
+                time.sleep(2.0)
+                finalized, delivered = super()._finalize(*args, **kwargs)
+                return finalized, delivered
+
+        limits = self._limits(
+            standard_stage_seconds=0.1,
+            store_seconds=0.1,
+            minimum_optional_slice_seconds=0.01,
+        )
+        engine = BlockingFinalization(limits=limits)
+        objective = templates.objective_representation(
+            "Fix the regression failure in the parser test",
+            route="ordinary",
+            limits=limits,
+        )
+        started = time.monotonic()
+        result = engine.run(
+            objective=objective,
+            stores=[
+                search.SearchStore(
+                    store_id="everos",
+                    kind="historical_evidence",
+                    query=lambda query: [self._evidence()],
+                )
+            ],
+            route="ordinary",
+            stage_seconds=0.1,
+            rounds=1,
+        )
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0, "blocking finalization must not hold the stage")
+        self.assertEqual([], result.candidates)
+        self.assertEqual([], result.delivered)
+        self.assertEqual("no_optional_memory", result.outcome)
+        self.assertTrue(result.reason, "the overrun must be recorded truthfully")
+        attempts = {entry["store_id"]: entry for entry in result.attempts}
+        self.assertEqual("completed", attempts["everos"]["status"])
+        published = result.candidates
+        # The abandoned finalization may only write to its own discarded copy.
+        time.sleep(2.5)
+        self.assertEqual([], published, "late finalization must not publish")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,8 +4,9 @@ One logical preparation owns one absolute deadline.  Every enabled store gets
 a bounded, independent chance to start inside its own sub-budget; a slow,
 lazily blocking, or malformed store is isolated and valid completed results
 from another store are preserved.  The same deadline covers the complete
-consumption of a store's result, normalization, trust gating, and scoring, so
-late values never enter the packet.  Candidates are normalized and gated
+consumption of a store's result, normalization, trust gating, scoring, final
+deduplication, ranking, and capacity selection, so late values never enter the
+packet and a blocked phase returns control at its deadline.  Candidates are normalized and gated
 *before* ranking, and one logical revision is delivered once no matter how many
 stores saw it.
 """
@@ -56,6 +57,7 @@ class SearchResult:
     attempts: list[dict[str, Any]]
     rounds: int
     delivered: list[str]
+    reason: str | None = None
 
     @property
     def delivered_candidates(self) -> list[dict[str, Any]]:
@@ -132,8 +134,83 @@ class BoundedSearch:
                         collected.append(raw)
                     entry["candidates"] = len(accepted)
                 attempts.append(entry)
+        # Deduplication, ranking, capacity selection, and result publication
+        # belong to the same absolute stage bound: a blocking finalization
+        # returns control at the deadline and publishes nothing late, and the
+        # abandoned worker only ever writes to its own discarded copy.
+        finalization_reason: str | None = None
+        if not collected:
+            finalized, delivered_ids = self._finalize(
+                [],
+                objective=objective,
+                route=route,
+                capacity=capacity,
+                enabled_kinds=enabled_kinds,
+            )
+        else:
+            remaining = stage_deadline - time.monotonic()
+            if remaining < self.limits.minimum_optional_slice_seconds:
+                finalized, delivered_ids = [], []
+                finalization_reason = (
+                    "the stage allowance expired before finalization; no candidates were published"
+                )
+            else:
+                try:
+                    published, bounded = self._call_bounded(
+                        lambda: self._finalize(
+                            collected,
+                            objective=objective,
+                            route=route,
+                            capacity=capacity,
+                            enabled_kinds=enabled_kinds,
+                        ),
+                        remaining,
+                        label="finalization",
+                    )
+                except Exception as exc:  # isolated finalization failure
+                    published, bounded = None, "failed"
+                    finalization_reason = f"finalization failed closed: {type(exc).__name__}"
+                if bounded == "timed-out":
+                    finalized, delivered_ids = [], []
+                    finalization_reason = (
+                        "the stage allowance expired during deduplication and ranking; "
+                        "no candidates were published"
+                    )
+                elif published is None:
+                    finalized, delivered_ids = [], []
+                else:
+                    finalized, delivered_ids = published
+        outcome = (
+            "optional_memory"
+            if any(item["disposition"] == "selected" for item in finalized)
+            else "no_optional_memory"
+        )
+        return SearchResult(
+            outcome=outcome,
+            candidates=finalized,
+            attempts=attempts,
+            rounds=completed_rounds,
+            delivered=delivered_ids,
+            reason=finalization_reason,
+        )
+
+    def _finalize(
+        self,
+        collected: list[dict[str, Any]],
+        *,
+        objective: Mapping[str, Any],
+        route: str,
+        capacity: Mapping[str, int],
+        enabled_kinds: Any,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Deduplicate, rank, select by capacity, and publish one packet.
+
+        Every returned record is freshly built, so an abandoned worker that
+        times out mid-finalization can never mutate what was published.
+        """
+
         ranked = self._normalize_and_rank(collected, objective=objective, route=route)
-        delivered = []
+        delivered: list[dict[str, Any]] = []
         delivered_ids: list[str] = []
         per_kind_count: dict[str, int] = {kind: 0 for kind in enabled_kinds}
         finalized: list[dict[str, Any]] = []
@@ -159,30 +236,22 @@ class BoundedSearch:
                     finalized[index] = self._dispositioned(
                         candidate, "selected", "selected within its kind capacity", delivered=True
                     )
-        delivered = [item for item in finalized if item["disposition"] == "selected"]
-        outcome = "optional_memory" if delivered else "no_optional_memory"
-        return SearchResult(
-            outcome=outcome,
-            candidates=finalized,
-            attempts=attempts,
-            rounds=completed_rounds,
-            delivered=delivered_ids,
-        )
+        return finalized, delivered_ids
 
     # -- attempt scheduling -------------------------------------------------
 
     def _call_bounded(
-        self, query: Callable[[Mapping[str, Any]], Any], payload: Mapping[str, Any], timeout: float
+        self, work: Callable[[], Any], timeout: float, *, label: str = "work"
     ) -> tuple[Any, str | None]:
-        """Run one store call under a real wall-clock bound.
+        """Run one bounded unit of stage work on a daemon worker thread.
 
-        The enclosing stage owns an absolute deadline, so a store that blocks
-        on the clock (a hung socket or a slow driver) must not consume the
-        whole opportunity.  The complete consumption of its result happens in
-        the same worker thread, so a lazy iterable that yields once and then
-        blocks is bounded exactly like a blocking call.  Late or
+        The enclosing stage owns one real absolute deadline, so neither a
+        store call, the complete consumption of its lazy result, its
+        normalization, trust gating and scoring, nor final deduplication and
+        ranking may hold the caller past the slice it was given.  Late or
         non-cancellable work stays attributable in the trace but can never
-        enter this packet after finalization.
+        enter this packet after finalization, and every abandoned worker is a
+        daemon thread that cannot keep the process alive.
         """
 
         import threading
@@ -191,23 +260,27 @@ class BoundedSearch:
 
         def target() -> None:
             try:
-                produced = query(payload)
-                # Materializing the returned iterable is part of the bounded
-                # attempt, never a caller-side wait.
-                box["items"] = [] if produced is None else list(produced)
-            except BaseException as exc:  # isolated store failure
+                box["value"] = work()
+            except BaseException as exc:  # isolated failure
                 box["error"] = exc
 
-        thread = threading.Thread(
-            target=target, name=f"memory-store:{getattr(query, '__name__', 'query')}", daemon=True
-        )
+        thread = threading.Thread(target=target, name=f"memory-store:{label}", daemon=True)
         thread.start()
         thread.join(max(0.0, float(timeout)))
         if thread.is_alive():
             return None, "timed-out"
         if "error" in box:
             raise box["error"]
-        return box.get("items"), None
+        return box.get("value"), None
+
+    @staticmethod
+    def _materialize(
+        query: Callable[[Mapping[str, Any]], Any], payload: Mapping[str, Any]
+    ) -> list[Any]:
+        """Call one store and consume its complete result inside the worker."""
+
+        produced = query(payload)
+        return [] if produced is None else list(produced)
 
     def _attempt(
         self,
@@ -241,7 +314,13 @@ class BoundedSearch:
         entry["status"] = "attempted"
         started = self.clock()
         try:
-            produced, bounded = self._call_bounded(store.query, query, slice_budget)
+            # The store call and the complete consumption of its result both
+            # run inside the bounded worker, never on the caller thread.
+            produced, bounded = self._call_bounded(
+                lambda: self._materialize(store.query, query),
+                slice_budget,
+                label=store.store_id,
+            )
         except Exception as exc:  # isolated store failure
             entry["status"] = "invalid" if isinstance(exc, (TypeError, ValueError)) else "unavailable"
             entry["reason"] = f"{type(exc).__name__}"
@@ -255,19 +334,89 @@ class BoundedSearch:
             entry["reason"] = "store exceeded its bounded sub-budget"
             return entry
         raw_items = produced or []
+        remaining = slice_budget - (self.clock() - started)
+        if remaining < self.limits.minimum_optional_slice_seconds:
+            return self._late_attempt(
+                entry,
+                [],
+                started,
+                reason=(
+                    "no slice of the stage allowance remained to normalize the store "
+                    "results; late values were dropped"
+                ),
+            )
+        try:
+            # Normalization, trust gating, and scoring of every candidate of
+            # this store run on the bounded worker too, so a blocking
+            # candidate can never hold the caller past the deadline.
+            normalized, bounded = self._call_bounded(
+                lambda: self._normalize_items(
+                    store,
+                    raw_items,
+                    objective=objective,
+                    route=route,
+                    attempt_limit=attempt_limit,
+                    started=started,
+                    slice_budget=slice_budget,
+                ),
+                remaining,
+                label=f"{store.store_id}:normalize",
+            )
+        except Exception as exc:  # isolated store failure
+            entry["status"] = "invalid" if isinstance(exc, (TypeError, ValueError)) else "unavailable"
+            entry["reason"] = f"{type(exc).__name__}"
+            entry["elapsed_seconds"] = self.clock() - started
+            return entry
+        if bounded == "timed-out":
+            return self._late_attempt(
+                entry,
+                [],
+                started,
+                reason=(
+                    "normalization exceeded the assigned slice; late values were dropped"
+                ),
+            )
+        accepted, rejected, late = normalized
+        if late:
+            return self._late_attempt(entry, rejected, started)
+        entry["status"] = "completed"
+        entry["accepted"] = len(accepted)
+        entry["candidates"] = accepted
+        entry["rejected"] = rejected
+        return entry
+
+    def _normalize_items(
+        self,
+        store: SearchStore,
+        raw_items: Sequence[Any],
+        *,
+        objective: Mapping[str, Any],
+        route: str,
+        attempt_limit: int,
+        started: float,
+        slice_budget: float,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+        """Normalize, gate, and score one store's candidates inside its slice.
+
+        This runs on the bounded worker thread.  The returned collections are
+        freshly built locals, so an abandoned worker can never mutate the
+        packet that was already published.  ``late`` reports that the work
+        crossed the assigned slice, which makes the whole attempt late.
+        """
+
         accepted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
         for raw in raw_items:
             if self.clock() - started > slice_budget:
-                return self._late_attempt(entry, rejected, started)
+                return accepted, rejected, True
             try:
                 record, rejection = self._normalize(store, raw, objective=objective, route=route)
             except Exception as exc:  # one malformed item never breaks the store
                 record, rejection = None, f"{type(exc).__name__}: {exc}"
             if self.clock() - started > slice_budget:
-                # Normalization, trust gating, or scoring ran past the
-                # assigned slice: this value and everything behind it are late.
-                return self._late_attempt(entry, rejected, started)
+                # Trust gating or scoring ran past the assigned slice: this
+                # value and everything behind it are late.
+                return accepted, rejected, True
             if record is None:
                 logical_id = raw.get("logical_id") if isinstance(raw, Mapping) else None
                 rejected.append(
@@ -293,14 +442,15 @@ class BoundedSearch:
             accepted.append(record)
             if len(accepted) >= attempt_limit:
                 break
-        entry["status"] = "completed"
-        entry["accepted"] = len(accepted)
-        entry["candidates"] = accepted
-        entry["rejected"] = rejected
-        return entry
+        return accepted, rejected, False
 
     def _late_attempt(
-        self, entry: dict[str, Any], rejected: list[dict[str, Any]], started: float
+        self,
+        entry: dict[str, Any],
+        rejected: list[dict[str, Any]],
+        started: float,
+        *,
+        reason: str | None = None,
     ) -> dict[str, Any]:
         """Close one attempt whose work ran past its assigned slice.
 
@@ -308,7 +458,9 @@ class BoundedSearch:
         rejections recorded so far) but can never contribute to the packet.
         """
         entry["status"] = "timed-out"
-        entry["reason"] = "normalization exceeded the assigned slice; late values were dropped"
+        entry["reason"] = (
+            reason or "normalization exceeded the assigned slice; late values were dropped"
+        )
         entry["elapsed_seconds"] = self.clock() - started
         entry["candidates"] = 0
         entry["accepted"] = 0
