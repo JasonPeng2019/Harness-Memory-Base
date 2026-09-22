@@ -10,7 +10,10 @@ packet and a blocked phase returns control at its deadline.  Candidates are norm
 *before* ranking, one logical revision is delivered once no matter how many
 stores saw it, and one logical procedure delivers at most one revision: the
 narrower authorized scope wins before the discovery score, with the revision
-id as the deterministic tie.
+id as the deterministic tie.  Duplicate sightings of one revision merge
+their provenance and any ineligible attribution on the narrower eligible
+sighting without lending it a score, so no sighting can be boosted by
+another.
 """
 
 from __future__ import annotations
@@ -68,6 +71,23 @@ class SearchResult:
 
 _SPECIFICITY_ORDER = {"private": 0, "local": 1, "project": 2, "shared": 3}
 _KIND_ORDER = {"procedure": 0, "historical_evidence": 1, "template": 2}
+
+
+def _sighting_rank(sighting: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Order duplicate sightings of one revision deterministically.
+
+    The narrower authorized scope wins before the discovery score, and the
+    source identity (then origin) is the deterministic tie, so the same set
+    of sightings always elects the same representative no matter in which
+    store or order they were observed.
+    """
+
+    return (
+        _SPECIFICITY_ORDER.get(str(sighting.get("specificity")), 9),
+        -float(sighting.get("score", 0.0)),
+        str(sighting.get("source_id", "")),
+        str(sighting.get("origin", "")),
+    )
 
 
 class BoundedSearch:
@@ -649,26 +669,45 @@ class BoundedSearch:
                 deduplicated[key] = candidate
                 order.append(key)
                 continue
-            merged_provenance = list(prior["provenance"])
-            for entry in candidate["provenance"]:
+            # One logical revision keeps exactly one representative sighting.
+            # Among eligible sightings the narrower authorized scope wins
+            # before the discovery score, with the sighting identity as the
+            # deterministic tie, so no arrival order can change the outcome.
+            # An ineligible duplicate contributes only provenance and
+            # attributable reasons: it never lends its score, specificity,
+            # source identity, or payload to the eligible representative, and
+            # it can never suppress an independently eligible sighting.
+            if prior["disposition"] != "eligible" and candidate["disposition"] == "eligible":
+                representative, duplicate = candidate, prior
+            elif prior["disposition"] == "eligible" and candidate["disposition"] != "eligible":
+                representative, duplicate = prior, candidate
+            elif prior["disposition"] == "eligible":
+                representative, duplicate = (
+                    (candidate, prior)
+                    if _sighting_rank(candidate) < _sighting_rank(prior)
+                    else (prior, candidate)
+                )
+            else:
+                # Two ineligible sightings keep the first as representative.
+                representative, duplicate = prior, candidate
+            merged_provenance = list(representative["provenance"])
+            for entry in duplicate["provenance"]:
                 if entry not in merged_provenance:
                     merged_provenance.append(entry)
-            prior["provenance"] = merged_provenance
-            # One logical revision never receives a relevance bonus for being
-            # visible in several stores; the maximum observed score stands.
-            if candidate["score"] > prior["score"]:
-                prior["score"] = candidate["score"]
-                prior["source_id"] = candidate["source_id"]
-            if candidate["disposition"] == "eligible" and prior["disposition"] != "eligible":
-                candidate["provenance"] = merged_provenance
-                deduplicated[key] = candidate
-                prior = candidate
-            if prior["disposition"] != "eligible":
-                merged_reasons = list(prior.get("reasons", []))
-                for reason in candidate.get("reasons", []):
-                    if reason not in merged_reasons:
-                        merged_reasons.append(reason)
-                prior["reasons"] = merged_reasons
+            merged_reasons = list(representative.get("reasons", []))
+            for reason in duplicate.get("reasons", []):
+                attributed = (
+                    f"duplicate sighting: {reason}"
+                    if representative["disposition"] == "eligible"
+                    else reason
+                )
+                if attributed not in merged_reasons:
+                    merged_reasons.append(attributed)
+            merged_record = dict(representative)
+            merged_record["provenance"] = merged_provenance
+            merged_record["reasons"] = merged_reasons
+            deduplicated[key] = merged_record
+            prior = merged_record
         ranked = [deduplicated[key] for key in order]
         # One logical procedure delivers at most one revision.  Eligible
         # competitors of the same logical identity are compared by the default

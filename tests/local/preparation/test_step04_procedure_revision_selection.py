@@ -184,6 +184,109 @@ class ProcedureRevisionSelectionTests(unittest.TestCase):
         # One sighting never adds relevance: the maximum observed score stands.
         self.assertEqual(0.35, record["score"])
 
+    def test_mixed_scope_duplicate_sightings_keep_the_narrower_scope(self) -> None:
+        """One revision seen at two authorized scopes keeps the narrower one.
+
+        The shared sighting was discovered at a higher score, but the narrower
+        authorized scope wins before the discovery score, and no sighting may
+        borrow relevance from another: the representative keeps the score and
+        the source identity of its own narrower sighting, in either sighting
+        order.
+        """
+
+        for order in ("shared-first", "local-first"):
+            with self.subTest(order=order):
+                shared = self._procedure(
+                    "procedure-1", "rev-a", specificity="shared", score=0.8
+                )
+                local = self._procedure(
+                    "procedure-1", "rev-a", specificity="local", score=0.1
+                )
+                competitor = self._procedure(
+                    "procedure-1", "rev-b", specificity="project", score=0.7
+                )
+                stores = (
+                    [
+                        self._store("atlas-shared", [shared, competitor]),
+                        self._store("local-atlas", [local]),
+                    ]
+                    if order == "shared-first"
+                    else [
+                        self._store("local-atlas", [local]),
+                        self._store("atlas-shared", [shared, competitor]),
+                    ]
+                )
+                outcome = self._prepare(stores)
+                records = self._by_revision(outcome)
+                self.assertEqual(["rev-a"], self._selected_revisions(outcome))
+                representative = records["rev-a"]
+                self.assertEqual("selected", representative["disposition"])
+                # The representative is the narrower local sighting: it keeps
+                # its own discovered score and source identity instead of the
+                # shared sighting's 0.8.
+                self.assertEqual("local-atlas", representative["source_id"])
+                self.assertEqual(0.1, representative["score"])
+                store_ids = {
+                    entry["store_id"] for entry in representative["provenance"]
+                }
+                self.assertEqual({"atlas-shared", "local-atlas"}, store_ids)
+                loser = records["rev-b"]
+                self.assertEqual("rejected", loser["disposition"])
+                self.assertIn("rev-a", " ".join(loser["reasons"]))
+
+    def test_revoked_duplicate_sighting_cannot_boost_an_eligible_revision(self) -> None:
+        """An ineligible duplicate never changes the eligible representative.
+
+        The revoked sighting carries a much higher score and a different
+        payload; the eligible representative keeps its own score, source
+        identity, and payload in either sighting order, the revoked value
+        stays attributable in the trace, and the independently eligible
+        competitor is still delivered.
+        """
+
+        for order in ("eligible-first", "revoked-first"):
+            with self.subTest(order=order):
+                eligible = self._procedure(
+                    "procedure-1", "rev-a", specificity="local", score=0.2
+                )
+                revoked = self._procedure(
+                    "procedure-1",
+                    "rev-a",
+                    specificity="local",
+                    score=0.99,
+                    revoked=True,
+                    payload={"steps": ["revoked-copy"]},
+                )
+                competitor = self._procedure(
+                    "procedure-1", "rev-b", specificity="local", score=0.8
+                )
+                unrelated = self._procedure(
+                    "procedure-2", "rev-c", specificity="local", score=0.3
+                )
+                eligible_store = self._store("atlas-mirror", [eligible, unrelated])
+                revoked_store = self._store("atlas", [revoked, competitor])
+                outcome = self._prepare(
+                    [eligible_store, revoked_store]
+                    if order == "eligible-first"
+                    else [revoked_store, eligible_store]
+                )
+                records = self._by_revision(outcome)
+                self.assertEqual(["rev-b", "rev-c"], self._selected_revisions(outcome))
+                self.assertEqual(
+                    {"procedure-1": 1, "procedure-2": 1},
+                    self._selected_per_logical(outcome),
+                )
+                duplicate = records["rev-a"]
+                self.assertEqual("rejected", duplicate["disposition"])
+                self.assertEqual(0.2, duplicate["score"])
+                self.assertEqual("atlas-mirror", duplicate["source_id"])
+                self.assertEqual(
+                    {"steps": ["procedure-1:rev-a"]}, duplicate["payload"]
+                )
+                reason_text = " ".join(duplicate["reasons"])
+                self.assertIn("revoked", reason_text)
+                self.assertIn("rev-b", reason_text)
+
     def test_a_rejected_revision_never_suppresses_an_independent_procedure(self) -> None:
         contested_local = self._procedure(
             "procedure-1", "rev-local", specificity="local", score=0.2
