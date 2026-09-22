@@ -350,6 +350,94 @@ class SearchStageDeadlineTests(unittest.TestCase):
         self.assertEqual([], published, "late normalization must not publish")
         self.assertEqual([], self._logical_ids(outcome))
 
+    def test_static_injected_clock_cannot_replenish_the_real_stage_allowance(self) -> None:
+        """ROOT reproduction: one real stage bound covers materialization and normalization.
+
+        With the injected clock frozen at 1000.0, a 0.1-second stage that
+        spends about 0.08 seconds materializing a store and about 0.08 seconds
+        normalizing its single candidate used to return after roughly 0.157
+        real seconds and still report the attempt as completed, because the
+        normalization allowance was recomputed from the injected clock.  Both
+        phases must consume one real absolute stage deadline: the frozen clock
+        may record logical facts but may never replenish real phase time.
+        """
+
+        class SlowPayload(Mapping):
+            """A payload that consumes real wall-clock time when normalized."""
+
+            def __getitem__(self, key):
+                time.sleep(0.08)
+                return {"summary": "late evidence"}[key]
+
+            def __iter__(self):
+                return iter(("summary",))
+
+            def __len__(self) -> int:
+                return 1
+
+        def slow_store(query):
+            # About 0.08s of real materialization inside a 0.1s stage.
+            time.sleep(0.08)
+            item = self._evidence(logical_id="case-two-phase")
+            item["payload"] = SlowPayload()
+            return [item]
+
+        # The normalization phase must always be admitted into whatever real
+        # slice is left, so the abandoned-worker evidence below is
+        # deterministic even when the materialization sleep overshoots.
+        limits = self._limits(
+            standard_stage_seconds=0.1,
+            store_seconds=0.1,
+            minimum_optional_slice_seconds=0.0,
+        )
+        engine = search.BoundedSearch(limits=limits, clock=self.clock)
+        objective = templates.objective_representation(
+            "Fix the regression failure in the parser test",
+            route="ordinary",
+            limits=limits,
+        )
+        started = time.monotonic()
+        result = engine.run(
+            objective=objective,
+            stores=[
+                search.SearchStore(
+                    store_id="everos", kind="historical_evidence", query=slow_store
+                )
+            ],
+            route="ordinary",
+            stage_seconds=0.1,
+            rounds=1,
+        )
+        elapsed = time.monotonic() - started
+        attempts = {entry["store_id"]: entry for entry in result.attempts}
+        # The injected clock must not hand normalization a second fresh slice:
+        # the stage costs about its one real 0.1s allowance, never the ~0.16s
+        # sum of two independent phase allowances.
+        self.assertGreaterEqual(elapsed, 0.05, "the store really consumed wall-clock time")
+        self.assertLess(
+            elapsed,
+            0.14,
+            "materialization and normalization must share one real stage allowance",
+        )
+        self.assertEqual("timed-out", attempts["everos"]["status"])
+        # Either the normalization phase overran the remaining real slice or
+        # the store consumed the whole slice itself; both are late, and both
+        # must be recorded truthfully instead of passing as completed.
+        self.assertTrue(attempts["everos"]["reason"], "the late attempt needs its real reason")
+        self.assertEqual(0, attempts["everos"]["accepted"])
+        self.assertEqual(0, attempts["everos"]["candidates"])
+        self.assertEqual([], result.candidates)
+        self.assertEqual([], result.delivered)
+        self.assertEqual("no_optional_memory", result.outcome)
+        # Daemon ownership of abandoned workers is asserted by the
+        # blocking-store, lazy-materialization, and blocking-normalizer
+        # regressions; here only the shared real bound is asserted.
+        published = result.candidates
+        # Let the abandoned normalization finish: its late values must never
+        # reach the packet that was already published.
+        time.sleep(0.4)
+        self.assertEqual([], published, "late normalization must not publish")
+
     def test_blocking_finalization_returns_at_the_deadline(self) -> None:
         """Deduplication, ranking, and capacity selection share the same bound."""
 

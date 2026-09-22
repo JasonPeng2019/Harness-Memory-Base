@@ -111,19 +111,29 @@ class BoundedSearch:
         # late values never enter this packet.  Each enabled store is scheduled
         # a bounded slice of the *remaining real* time, so an early store
         # returns its unused slice to the stores behind it and one slow store
-        # can never remove another store's own chance to start.
+        # can never remove another store's own chance to start.  The injected
+        # logical clock is never consulted for phase allowance, so a frozen
+        # logical clock cannot hand a phase a fresh slice of real time.
         stage_deadline = time.monotonic() + float(stage_seconds)
         for round_index in range(max(1, int(rounds))):
             if stage_deadline - time.monotonic() < self.limits.minimum_optional_slice_seconds:
                 break
             completed_rounds += 1
             for store in stores:
-                slice_budget = min(self.limits.store_seconds, stage_deadline - time.monotonic())
+                # One real absolute slice deadline per attempt, itself bounded
+                # by the enclosing stage: the store call, the complete
+                # consumption of its result, and the normalization, trust
+                # gating, and scoring of every candidate share it.  The
+                # injected logical clock may describe budget but never
+                # replenishes real phase time.
+                slice_deadline = min(
+                    stage_deadline, time.monotonic() + self.limits.store_seconds
+                )
                 entry = self._attempt(
                     store,
                     objective=objective,
                     route=route,
-                    slice_budget=slice_budget,
+                    slice_deadline=slice_deadline,
                     attempt_limit=self._attempt_limit(capacity[store.kind]),
                 )
                 if entry["status"] == "completed":
@@ -164,7 +174,7 @@ class BoundedSearch:
                             capacity=capacity,
                             enabled_kinds=enabled_kinds,
                         ),
-                        remaining,
+                        deadline=stage_deadline,
                         label="finalization",
                     )
                 except Exception as exc:  # isolated finalization failure
@@ -241,17 +251,18 @@ class BoundedSearch:
     # -- attempt scheduling -------------------------------------------------
 
     def _call_bounded(
-        self, work: Callable[[], Any], timeout: float, *, label: str = "work"
+        self, work: Callable[[], Any], *, deadline: float, label: str = "work"
     ) -> tuple[Any, str | None]:
         """Run one bounded unit of stage work on a daemon worker thread.
 
-        The enclosing stage owns one real absolute deadline, so neither a
-        store call, the complete consumption of its lazy result, its
-        normalization, trust gating and scoring, nor final deduplication and
-        ranking may hold the caller past the slice it was given.  Late or
-        non-cancellable work stays attributable in the trace but can never
-        enter this packet after finalization, and every abandoned worker is a
-        daemon thread that cannot keep the process alive.
+        ``deadline`` is one absolute real monotonic instant shared with the
+        enclosing stage, so neither a store call, the complete consumption of
+        its lazy result, its normalization, trust gating and scoring, nor final
+        deduplication and ranking may hold the caller past it.  Work that is
+        still running at the deadline and work that finishes after it are both
+        reported as timed-out, so late values can never enter this packet;
+        every abandoned worker is a daemon thread that cannot keep the process
+        alive.
         """
 
         import threading
@@ -263,11 +274,14 @@ class BoundedSearch:
                 box["value"] = work()
             except BaseException as exc:  # isolated failure
                 box["error"] = exc
+            finally:
+                box["finished"] = time.monotonic()
 
         thread = threading.Thread(target=target, name=f"memory-store:{label}", daemon=True)
         thread.start()
-        thread.join(max(0.0, float(timeout)))
-        if thread.is_alive():
+        thread.join(max(0.0, float(deadline) - time.monotonic()))
+        finished = box.get("finished")
+        if thread.is_alive() or finished is None or float(finished) > float(deadline):
             return None, "timed-out"
         if "error" in box:
             raise box["error"]
@@ -288,7 +302,7 @@ class BoundedSearch:
         *,
         objective: Mapping[str, Any],
         route: str,
-        slice_budget: float,
+        slice_deadline: float,
         attempt_limit: int,
     ) -> dict[str, Any]:
         entry: dict[str, Any] = {
@@ -300,7 +314,7 @@ class BoundedSearch:
             "rejected": [],
             "reason": None,
         }
-        if slice_budget < self.limits.minimum_optional_slice_seconds:
+        if slice_deadline - time.monotonic() < self.limits.minimum_optional_slice_seconds:
             entry["reason"] = "no remaining time inside the enclosing stage bound"
             return entry
         query = safe_query_payload(
@@ -313,12 +327,18 @@ class BoundedSearch:
         )
         entry["status"] = "attempted"
         started = self.clock()
+        # The injected logical clock still owns logical budget semantics, but
+        # every real phase allowance is derived from the one absolute slice
+        # deadline, so a frozen logical clock cannot replenish real time.
+        logical_budget = slice_deadline - time.monotonic()
         try:
             # The store call and the complete consumption of its result both
-            # run inside the bounded worker, never on the caller thread.
+            # run inside the bounded worker, never on the caller thread, and
+            # they may spend no more than the one real slice deadline they
+            # share with the normalization phase behind them.
             produced, bounded = self._call_bounded(
                 lambda: self._materialize(store.query, query),
-                slice_budget,
+                deadline=slice_deadline,
                 label=store.store_id,
             )
         except Exception as exc:  # isolated store failure
@@ -328,13 +348,13 @@ class BoundedSearch:
             return entry
         elapsed = self.clock() - started
         entry["elapsed_seconds"] = elapsed
-        if bounded == "timed-out" or elapsed > slice_budget:
+        if bounded == "timed-out" or elapsed > logical_budget:
             # Late work stays attributable but can never enter this packet.
             entry["status"] = "timed-out"
             entry["reason"] = "store exceeded its bounded sub-budget"
             return entry
         raw_items = produced or []
-        remaining = slice_budget - (self.clock() - started)
+        remaining = slice_deadline - time.monotonic()
         if remaining < self.limits.minimum_optional_slice_seconds:
             return self._late_attempt(
                 entry,
@@ -357,9 +377,10 @@ class BoundedSearch:
                     route=route,
                     attempt_limit=attempt_limit,
                     started=started,
-                    slice_budget=slice_budget,
+                    logical_budget=logical_budget,
+                    slice_deadline=slice_deadline,
                 ),
-                remaining,
+                deadline=slice_deadline,
                 label=f"{store.store_id}:normalize",
             )
         except Exception as exc:  # isolated store failure
@@ -394,26 +415,35 @@ class BoundedSearch:
         route: str,
         attempt_limit: int,
         started: float,
-        slice_budget: float,
+        logical_budget: float,
+        slice_deadline: float,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
         """Normalize, gate, and score one store's candidates inside its slice.
 
         This runs on the bounded worker thread.  The returned collections are
         freshly built locals, so an abandoned worker can never mutate the
         packet that was already published.  ``late`` reports that the work
-        crossed the assigned slice, which makes the whole attempt late.
+        crossed the one real absolute slice deadline (or the injected logical
+        budget), which makes the whole attempt late.
         """
 
         accepted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
+
+        def expired() -> bool:
+            return (
+                self.clock() - started > logical_budget
+                or time.monotonic() > slice_deadline
+            )
+
         for raw in raw_items:
-            if self.clock() - started > slice_budget:
+            if expired():
                 return accepted, rejected, True
             try:
                 record, rejection = self._normalize(store, raw, objective=objective, route=route)
             except Exception as exc:  # one malformed item never breaks the store
                 record, rejection = None, f"{type(exc).__name__}: {exc}"
-            if self.clock() - started > slice_budget:
+            if expired():
                 # Trust gating or scoring ran past the assigned slice: this
                 # value and everything behind it are late.
                 return accepted, rejected, True
