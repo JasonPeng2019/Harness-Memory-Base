@@ -2666,6 +2666,9 @@ APC_CHILD_STATUSES = frozenset(
         "intent_recorded",
         "launched",
         "ambiguous",
+        # Ownership is still unresolved: the exact child may be live and its
+        # cleanup has not been proven, so a retry must reconcile it first.
+        "cleanup_pending",
         "reconciled",
         "failed",
         "cancelled",
@@ -2675,7 +2678,9 @@ APC_CHILD_STATUSES = frozenset(
 # Ownership is only unresolved while the exact child may still be live or its
 # identity is unknown.  A terminal disposition is durable evidence, not an
 # outstanding claim, so ordinary reuse work may continue from a fresh attempt.
-APC_CHILD_UNRESOLVED_STATUSES = frozenset({"intent_recorded", "launched", "ambiguous"})
+APC_CHILD_UNRESOLVED_STATUSES = frozenset(
+    {"intent_recorded", "launched", "ambiguous", "cleanup_pending"}
+)
 APC_CHILD_TERMINAL_STATUSES = frozenset({"reconciled", "failed", "cancelled", "refused"})
 SEARCH_OUTCOMES = frozenset({"no_optional_memory", "optional_memory", "blocked"})
 
@@ -2739,6 +2744,8 @@ def make_preparation(
     execution_reserve_seconds: float,
     stage_allowance_seconds: float,
     deadline_monotonic: float | None = None,
+    spent_seconds: float = 0.0,
+    attempt: int = 1,
     preparation_id: str | None = None,
     supersedes: str | None = None,
     superseded_by: str | None = None,
@@ -2769,6 +2776,12 @@ def make_preparation(
         raise ContractError("execution reserve must not be negative")
     if stage_allowance_seconds < 0:
         raise ContractError("stage allowance must not be negative")
+    if isinstance(spent_seconds, bool) or not isinstance(spent_seconds, (int, float)):
+        raise ContractError("spent_seconds must be a number")
+    if spent_seconds < 0:
+        raise ContractError("spent_seconds must not be negative")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise ContractError("attempt must be a positive integer")
     identity = preparation_id or sha256_hex(
         {
             "domain": "memory-preparation/v1",
@@ -2779,6 +2792,7 @@ def make_preparation(
             "strategy": strategy,
             "configuration_digest": sha256_hex(resolved_configuration),
             "supersedes": supersedes,
+            "attempt": attempt,
         }
     )
     record: dict[str, Any] = {
@@ -2802,6 +2816,8 @@ def make_preparation(
         "deadline_monotonic": deadline_monotonic,
         "execution_reserve_seconds": float(execution_reserve_seconds),
         "stage_allowance_seconds": float(stage_allowance_seconds),
+        "spent_seconds": float(spent_seconds),
+        "attempt": int(attempt),
         "supersedes": supersedes,
         "superseded_by": superseded_by,
         "route_correction": dict(route_correction) if route_correction else None,

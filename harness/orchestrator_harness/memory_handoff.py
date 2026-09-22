@@ -1,4 +1,4 @@
-﻿"""Narrow optional-memory handoff seam for bootstrap, resume, and launch.
+"""Narrow optional-memory handoff seam for bootstrap, resume, and launch.
 
 This module is the only harness integration point for the Stage-A memory
 slice.  Legacy task cards without ``memory_handoff`` take the ordinary path.
@@ -13,6 +13,11 @@ from typing import Any, Callable, Mapping
 
 from .core import read_json
 from .records import atomic_write_json
+
+try:  # the product package is optional for the ordinary harness path
+    from memory_harness import store as store_module
+except Exception:  # pragma: no cover - legacy path without the product package
+    store_module = None
 
 
 class MemoryHandoffError(RuntimeError):
@@ -52,6 +57,51 @@ def _write_envelope(worktree: str | Path, envelope: Mapping[str, Any]) -> Path:
     return envelope_path
 
 
+def _prepare_memory_outcome(
+    *,
+    task_card: Mapping[str, Any],
+    handoff: Mapping[str, Any],
+    resolved_config: Any,
+    lane_id: str,
+    run_id: str,
+    worktree_path: str | Path,
+    base_commit: str,
+    finalize: bool,
+):
+    """Run one bounded preparation and return its outcome, or ``None`` all-off."""
+
+    from memory_harness import runtime
+
+    store_path, _ = memory_paths(worktree_path)
+    memory_store = store_module.MemoryStore(store_path)
+    memory_store.initialize()
+    try:
+        memory_runtime = runtime.MemoryRuntime(memory_store, config=resolved_config)
+        plan = handoff["plan"]
+        return memory_runtime.prepare_with_memory(
+            task_card=task_card,
+            plan=plan,
+            objective_id=handoff["objective_id"],
+            route=handoff.get("route", "ordinary"),
+            request=handoff.get("configuration"),
+            lane_id=lane_id,
+            run_id=run_id,
+            worktree_path=str(worktree_path),
+            base_commit=base_commit,
+            mandatory_content=[
+                {"id": "task", "kind": "task", "content": task_card["task"]},
+                {
+                    "id": "accepted-plan",
+                    "kind": "accepted-plan",
+                    "content": plan["content"],
+                },
+            ],
+            finalize=finalize,
+        )
+    finally:
+        memory_store.close()
+
+
 def prepare_bootstrap_envelope(
     *,
     task_card: Mapping[str, Any],
@@ -60,13 +110,20 @@ def prepare_bootstrap_envelope(
     worktree_path: str | Path,
     base_commit: str,
 ) -> dict[str, Any] | None:
-    """Prepare the finalized envelope for bootstrap, or return ``None``."""
+    """Prepare the finalized envelope for bootstrap, or return ``None``.
+
+    The bounded STEP-04 preparation runs over the real task card, objective,
+    plan, and dispatch identity.  Only an exact ROOT-accepted plan is
+    finalized and written for dispatch: a candidate or absent plan still gets
+    one durable preparation decision, trace, and disposition, but no envelope
+    is created and the ordinary harness path proceeds without optional memory.
+    """
 
     handoff = validate_task_card(task_card)
     if handoff is None:
         return None
     try:
-        from memory_harness import config, runtime, store
+        from memory_harness import config
 
         resolved_config = config.resolve_config(handoff.get("configuration"))
         if resolved_config.all_off:
@@ -74,33 +131,24 @@ def prepare_bootstrap_envelope(
             envelope_path.unlink(missing_ok=True)
             return None
 
-        store_path, _ = memory_paths(worktree_path)
-        memory_store = store.MemoryStore(store_path)
-        memory_store.initialize()
-        try:
-            memory_runtime = runtime.MemoryRuntime(memory_store, config=resolved_config)
-            prepared = memory_runtime.prepare(
-                plan=handoff["plan"],
-                task_card=task_card,
-                lane_id=lane_id,
-                run_id=run_id,
-                worktree_path=str(worktree_path),
-                base_commit=base_commit,
-                mandatory_content=[
-                    {"id": "task", "kind": "task", "content": task_card["task"]},
-                    {
-                        "id": "accepted-plan",
-                        "kind": "accepted-plan",
-                        "content": handoff["plan"]["content"],
-                    },
-                ],
-            )
-        finally:
-            memory_store.close()
-        if prepared.envelope is None:
+        plan = handoff["plan"]
+        accepted = plan.get("state") == "accepted"
+        outcome = _prepare_memory_outcome(
+            task_card=task_card,
+            handoff=handoff,
+            resolved_config=resolved_config,
+            lane_id=lane_id,
+            run_id=run_id,
+            worktree_path=worktree_path,
+            base_commit=base_commit,
+            finalize=accepted,
+        )
+        if not accepted or outcome is None or outcome.envelope is None:
+            _, envelope_path = memory_paths(worktree_path)
+            envelope_path.unlink(missing_ok=True)
             return None
-        _write_envelope(worktree_path, prepared.envelope)
-        return prepared.envelope
+        _write_envelope(worktree_path, outcome.envelope)
+        return outcome.envelope
     except MemoryHandoffError:
         raise
     except Exception as exc:
@@ -115,7 +163,12 @@ def prepare_resume_envelope(
     worktree_path: str | Path,
     base_commit: str,
 ) -> dict[str, Any] | None:
-    """Prepare the resumed envelope with bootstrap-equivalent validation."""
+    """Prepare the resumed envelope with bootstrap-equivalent validation.
+
+    A resume is the same logical decision as the original bootstrap, so it
+    reuses the durable decision identity and its absolute deadline instead of
+    replenishing the objective's budget.
+    """
 
     return prepare_bootstrap_envelope(
         task_card=task_card,

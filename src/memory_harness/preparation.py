@@ -109,6 +109,42 @@ class PreparationService:
             f"mandatory current-plan state is inconsistent for {objective_id!r}: {exc}"
         )
 
+    def _recover_budget(
+        self, decision_id: str, budget_source: str
+    ) -> tuple[float, str, float] | None:
+        """Reuse the durable absolute deadline and granted budget once.
+
+        Restart, resume, and route correction all share one logical decision, so
+        they must not hand out a fresh deadline.  The granted budget is the
+        remaining time that decision originally recorded plus whatever it had
+        already spent; elapsed cost is then recomputed against the current
+        clock instead of being reset to zero.
+        """
+
+        if budget_source == "unknown_time" or self.store is None:
+            return None
+        try:
+            prior = self.store.list_preparations(decision_id)
+        except Exception:
+            return None
+        for record in reversed(prior):
+            deadline = record.get("deadline_monotonic")
+            if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+                continue
+            remaining = float(record.get("remaining_seconds") or 0.0)
+            spent = float(record.get("spent_seconds") or 0.0)
+            source = record.get("budget_source")
+            return float(deadline), str(source or "trusted_deadline"), remaining + spent
+        return None
+
+    def _next_attempt(self, decision_id: str) -> int:
+        if self.store is None:
+            return 1
+        try:
+            return len(self.store.list_preparations(decision_id)) + 1
+        except Exception:
+            return 1
+
     # -- preparation -------------------------------------------------------
 
     def _effective_config(
@@ -189,14 +225,19 @@ class PreparationService:
             failure_context=failure_context,
             unknown_time=unknown_time,
         )
-        if plan is None:
-            raise MandatoryStateFailure("an enabled preparation requires the exact current plan")
         try:
             current_plan_state = contracts.classify_current_plan(
                 plan, expected_objective_id=objective_id, expected_route=route
             )
         except contracts.PlanStateError as exc:
             raise self._plan_state_error(exc, objective_id) from exc
+        # An absent plan is an ordinary fresh-planning state: it keeps its
+        # exact identity in the record and never invents an inherited plan.
+        plan_of_record = (
+            dict(plan)
+            if plan is not None
+            else templates.fresh_plan(objective_id=objective_id, route=route)
+        )
 
         now = self.clock()
         if deadline is not None:
@@ -208,19 +249,57 @@ class PreparationService:
         else:
             absolute_deadline = now + self.limits.default_deadline_seconds
             budget_source = "trusted_deadline"
-        remaining = absolute_deadline - now
+
+        # The provisional identity only exists to recover the durable deadline
+        # captured configuration for this objective's logical decision; it is
+        # never persisted as-is.
+        explicit_deadline = deadline is not None
+        provisional = contracts.make_decision(
+            task_card,
+            plan_of_record,
+            strategy=resolved_config.strategy,
+            configuration=asdict(resolved_config),
+        )
+        # One decision owns one deadline.  A restart, resume, or route
+        # correction reuses the durable absolute deadline, the budget that was
+        # originally granted, and the cost already paid, instead of
+        # replenishing the objective's budget.  An explicitly injected
+        # deadline is trusted input for this call and is honoured as given.
+        recovered = (
+            None
+            if explicit_deadline
+            else self._recover_budget(provisional["decision_id"], budget_source)
+        )
+        if recovered is not None:
+            absolute_deadline, budget_source, granted_budget = recovered
+        else:
+            granted_budget = None
+        remaining = max(0.0, absolute_deadline - now) if not unknown_time else 0.0
+        if granted_budget is None:
+            granted_budget = remaining
+        spent_seconds = max(0.0, granted_budget - remaining)
+        # One logical decision owns one captured configuration.  Stage
+        # admission only demotes the *packet*; it must not mint a fresh
+        # decision identity, because a later call with less remaining time
+        # would otherwise silently become a new decision with new ownership.
+        ownership_decision = contracts.make_decision(
+            task_card,
+            plan_of_record,
+            strategy=resolved_config.strategy,
+            configuration=asdict(resolved_config),
+        )
         resolved_config, admitted, admission_reason = self._admit_config(
             resolved_config, remaining=remaining, unknown_time=unknown_time
         )
         stage_allowance = self._stage_allowance(
             resolved_config.strategy, remaining, unknown_time, admitted=admitted
         )
-
         decision = contracts.make_decision(
             task_card,
-            plan,
+            plan_of_record,
             strategy=resolved_config.strategy,
             configuration=asdict(resolved_config),
+            decision_id=ownership_decision["decision_id"],
         )
         if self.store is not None:
             self.store.record_decision(decision)
@@ -230,9 +309,9 @@ class PreparationService:
             decision_id=decision["decision_id"],
             objective_id=objective_id,
             route=route,
-            plan_id=plan["plan_id"],
-            plan_digest=plan["content_hash"],
-            plan_state=plan["state"],
+            plan_id=plan_of_record["plan_id"],
+            plan_digest=plan_of_record["content_hash"],
+            plan_state=plan_of_record["state"],
             current_plan_state=current_plan_state,
             strategy=resolved_config.strategy,
             requested_strategy=resolved_config.requested_strategy,
@@ -243,11 +322,18 @@ class PreparationService:
             deadline_monotonic=None if unknown_time else absolute_deadline,
             execution_reserve_seconds=self.limits.execution_reserve_seconds,
             stage_allowance_seconds=stage_allowance,
+            spent_seconds=spent_seconds,
+            attempt=self._next_attempt(decision["decision_id"]),
         )
         if self.store is not None:
             self.store.record_preparation(preparation)
 
         accepted_precedence = current_plan_state == "execution_accepted"
+        # Only an execution-accepted same-objective plan has precedence over
+        # template selection.  A candidate plan keeps its exact identity and
+        # state, so the ordinary reuse path still produces a non-authoritative
+        # proposal that ROOT must accept before anything can dispatch.
+        template_precedence = accepted_precedence
         search = self._run_search(
             preparation=preparation,
             route=route,
@@ -255,7 +341,7 @@ class PreparationService:
             stores=stores,
             stage_allowance=stage_allowance,
             failure_context=failure_context,
-            accepted_precedence=accepted_precedence,
+            accepted_precedence=template_precedence,
             config=resolved_config,
             budget_reason=admission_reason,
         )
@@ -287,6 +373,7 @@ class PreparationService:
             )
         else:
             disposition, produced_plan, proposal = self._produce_plan(
+                ownership_decision_id=ownership_decision["decision_id"],
                 decision=decision,
                 objective_id=objective_id,
                 route=route,
@@ -317,8 +404,13 @@ class PreparationService:
                 proposal=proposal,
                 reason=disposition["reason"],
             )
-        if not finalize or outcome.plan["state"] != "accepted":
+        if not finalize:
             return outcome
+        if outcome.plan["state"] != "accepted":
+            raise PlanAcceptanceError(
+                "only an exact ROOT-accepted plan revision may be finalized "
+                f"for dispatch; the current plan state is {outcome.plan['state']!r}"
+            )
         return self._finalize(
             outcome=outcome,
             task_card=task_card,
@@ -436,6 +528,38 @@ class PreparationService:
             remaining = max(0.0, float(deadline_monotonic) - self.clock())
         else:
             remaining = preparation.get("remaining_seconds")
+        # The correction never replenishes spent time: the granted budget is
+        # the remaining time the abandoned packet originally recorded plus the
+        # cost it had already paid, and the elapsed cost is recomputed against
+        # the current clock.
+        prior_spent = float(preparation.get("spent_seconds") or 0.0)
+        prior_remaining = preparation.get("remaining_seconds")
+        if isinstance(prior_remaining, (int, float)) and not isinstance(prior_remaining, bool):
+            granted = prior_spent + float(prior_remaining)
+        else:
+            granted = None
+        replacement_config = self._resolve(None)
+        unknown_time = preparation["budget_source"] == "unknown_time"
+        remaining_value = None if remaining is None else max(0.0, float(remaining))
+        if granted is None:
+            spent = prior_spent
+            remaining_value = prior_remaining
+        else:
+            spent = max(0.0, granted - float(remaining_value or 0.0))
+        # Re-resolve the effective fixed strategy and configuration for the one
+        # bounded ordinary re-prepare instead of replaying the abandoned
+        # packet's recorded values.
+        replacement_config, admitted, admission_reason = self._admit_config(
+            replacement_config,
+            remaining=float(remaining_value or 0.0),
+            unknown_time=unknown_time,
+        )
+        stage_allowance = self._stage_allowance(
+            replacement_config.strategy,
+            float(remaining_value or 0.0),
+            unknown_time,
+            admitted=admitted,
+        )
         replacement = contracts.make_preparation(
             task_card=task_card,
             decision_id=decision["decision_id"],
@@ -445,15 +569,17 @@ class PreparationService:
             plan_digest=plan["content_hash"],
             plan_state=plan["state"],
             current_plan_state=preparation["current_plan_state"],
-            strategy=preparation["strategy"],
-            requested_strategy=preparation["requested_strategy"],
-            configuration=preparation["configuration"],
+            strategy=replacement_config.strategy,
+            requested_strategy=replacement_config.requested_strategy,
+            configuration=asdict(replacement_config),
             network_mode=preparation["network_mode"],
             budget_source=preparation["budget_source"],
-            remaining_seconds=remaining,
+            remaining_seconds=remaining_value,
             deadline_monotonic=deadline_monotonic,
             execution_reserve_seconds=preparation["execution_reserve_seconds"],
-            stage_allowance_seconds=preparation["stage_allowance_seconds"],
+            stage_allowance_seconds=stage_allowance,
+            spent_seconds=spent,
+            attempt=self._next_attempt(decision["decision_id"]),
             preparation_id=replacement_id,
             supersedes=preparation["preparation_id"],
             route_correction={"level": 0, "action": "bounded_ordinary_reprepare"},
@@ -470,21 +596,10 @@ class PreparationService:
             old["content_hash"] = contracts.content_hash(old)
         # The one bounded ordinary re-prepare obeys the same admission rule and
         # never replenishes the time already spent on the abandoned packet.
-        replacement_config, admitted, admission_reason = self._admit_config(
-            self._resolve(None),
-            remaining=float(replacement["remaining_seconds"] or 0.0),
-            unknown_time=replacement["budget_source"] == "unknown_time",
-        )
-        stage_allowance = self._stage_allowance(
-            preparation["strategy"],
-            float(replacement["remaining_seconds"] or 0.0),
-            replacement["budget_source"] == "unknown_time",
-            admitted=admitted,
-        )
         search = self._run_search(
             preparation=replacement,
             route=route,
-            strategy=preparation["strategy"],
+            strategy=replacement_config.strategy,
             stores=stores,
             stage_allowance=stage_allowance,
             failure_context=failure_context,
@@ -616,6 +731,8 @@ class PreparationService:
                 "template": config.template_memory,
             }.get(store.kind, False)
             if accepted_precedence and store.kind == "template":
+                # Template selection never runs when an accepted or candidate
+                # plan has precedence.
                 flag = False
             if not flag:
                 attempts.append(
@@ -692,6 +809,25 @@ class PreparationService:
                 )
         return {"trace": trace, "selected": list(result.delivered)}
 
+    def _unresolved_child_operation(self, decision_id: str) -> dict[str, Any] | None:
+        """Return one exact child of this decision that is still unresolved.
+
+        Launch intent, a live child, an ambiguous acknowledgement, and pending
+        cleanup all keep ownership unresolved until the exact child is
+        reconciled, so nothing may relaunch while one is visible.
+        """
+
+        if self.store is None:
+            return None
+        try:
+            operations = self.store.list_apc_child_operations(decision_id)
+        except Exception:
+            return None
+        for operation in reversed(list(operations)):
+            if operation.get("status") in contracts.APC_CHILD_UNRESOLVED_STATUSES:
+                return dict(operation)
+        return None
+
     def _objective_text(self, preparation: Mapping[str, Any], objective_id: str) -> str:
         requested = preparation.get("requested_strategy")
         return f"{objective_id} {requested}" if isinstance(requested, str) else objective_id
@@ -700,6 +836,7 @@ class PreparationService:
     def _produce_plan(
         self,
         *,
+        ownership_decision_id: str,
         decision: Mapping[str, Any],
         objective_id: str,
         route: str,
@@ -779,8 +916,26 @@ class PreparationService:
         )
         if near and adaptation_available:
             match = near[0]
+            record = match.template.to_record()
+            pending = self._unresolved_child_operation(ownership_decision_id)
             remaining = deadline - self.clock()
-            if remaining <= self.limits.execution_reserve_seconds:
+            if pending is not None:
+                # An earlier child may still be live and its cleanup is not
+                # proven.  Refuse to relaunch anything until that exact child is
+                # reconciled; unresolved ownership is reported, never hidden
+                # behind a budget excuse.
+                reuse_attempts.append(
+                    {
+                        "template_id": match.template.template_id,
+                        "branch": "apc_proposal",
+                        "status": "rejected",
+                        "reason": (
+                            f"{pending['status']} APC child already exists; "
+                            "reconcile the exact child before any retry"
+                        ),
+                    }
+                )
+            elif remaining <= self.limits.execution_reserve_seconds:
                 reuse_attempts.append(
                     {
                         "template_id": match.template.template_id,
@@ -790,7 +945,6 @@ class PreparationService:
                     }
                 )
             else:
-                record = match.template.to_record()
                 try:
                     request = apc.make_apc_request(
                         template=record,

@@ -165,6 +165,38 @@ class BoundedSearch:
 
     # -- attempt scheduling -------------------------------------------------
 
+    def _call_bounded(
+        self, query: Callable[[Mapping[str, Any]], Any], payload: Mapping[str, Any], timeout: float
+    ) -> tuple[Any, str | None]:
+        """Run one store call under a real wall-clock bound.
+
+        The enclosing stage owns an absolute deadline, so a store that blocks
+        on the clock (a hung socket or a slow driver) must not consume the
+        whole opportunity.  Late or non-cancellable work stays attributable in
+        the trace but can never enter this packet after finalization.
+        """
+
+        import threading
+
+        box: dict[str, Any] = {}
+
+        def target() -> None:
+            try:
+                box["value"] = query(payload)
+            except BaseException as exc:  # isolated store failure
+                box["error"] = exc
+
+        thread = threading.Thread(
+            target=target, name=f"memory-store:{getattr(query, '__name__', 'query')}", daemon=True
+        )
+        thread.start()
+        thread.join(max(0.0, float(timeout)))
+        if thread.is_alive():
+            return None, "timed-out"
+        if "error" in box:
+            raise box["error"]
+        return box.get("value"), None
+
     def _attempt(
         self,
         store: SearchStore,
@@ -180,6 +212,7 @@ class BoundedSearch:
             "status": "unattempted-by-budget",
             "candidates": 0,
             "accepted": 0,
+            "rejected": [],
             "reason": None,
         }
         if slice_budget < self.limits.minimum_optional_slice_seconds:
@@ -196,8 +229,7 @@ class BoundedSearch:
         entry["status"] = "attempted"
         started = self.clock()
         try:
-            produced = store.query(query)
-            raw_items = list(produced) if produced is not None else []
+            produced, bounded = self._call_bounded(store.query, query, slice_budget)
         except Exception as exc:  # isolated store failure
             entry["status"] = "invalid" if isinstance(exc, (TypeError, ValueError)) else "unavailable"
             entry["reason"] = f"{type(exc).__name__}"
@@ -205,22 +237,53 @@ class BoundedSearch:
             return entry
         elapsed = self.clock() - started
         entry["elapsed_seconds"] = elapsed
-        if elapsed > slice_budget:
+        if bounded == "timed-out" or elapsed > slice_budget:
             # Late work stays attributable but can never enter this packet.
             entry["status"] = "timed-out"
             entry["reason"] = "store exceeded its bounded sub-budget"
             return entry
+        try:
+            raw_items = list(produced) if produced is not None else []
+        except TypeError:
+            entry["status"] = "invalid"
+            entry["reason"] = "store returned a non-iterable result"
+            return entry
         accepted: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
         for raw in raw_items:
-            record = self._normalize(store, raw, objective=objective, route=route)
+            try:
+                record, rejection = self._normalize(store, raw, objective=objective, route=route)
+            except Exception as exc:  # one malformed item never breaks the store
+                record, rejection = None, f"{type(exc).__name__}: {exc}"
             if record is None:
+                logical_id = raw.get("logical_id") if isinstance(raw, Mapping) else None
+                rejected.append(
+                    {
+                        "logical_id": logical_id if isinstance(logical_id, str) else None,
+                        "revision_id": (
+                            raw.get("revision_id")
+                            if isinstance(raw, Mapping) and isinstance(raw.get("revision_id"), str)
+                            else None
+                        ),
+                        "reason": rejection or "candidate is not usable",
+                    }
+                )
                 continue
+            if record["disposition"] != "eligible":
+                rejected.append(
+                    {
+                        "logical_id": record["logical_id"],
+                        "revision_id": record["revision_id"],
+                        "reason": "; ".join(record["reasons"]) or "candidate is not eligible",
+                    }
+                )
             accepted.append(record)
             if len(accepted) >= attempt_limit:
                 break
         entry["status"] = "completed"
         entry["accepted"] = len(accepted)
         entry["candidates"] = accepted
+        entry["rejected"] = rejected
         return entry
 
     @staticmethod
@@ -239,69 +302,123 @@ class BoundedSearch:
         *,
         objective: Mapping[str, Any],
         route: str,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Return a normalized candidate or an explicit rejection reason.
+
+        Mandatory trust gates fail closed *before* ranking.  A well-formed but
+        untrusted candidate keeps its exact identity and reason so it stays
+        visible in the trace without ever being delivered.
+        """
+
         if not isinstance(raw, Mapping):
-            return None
+            return None, "candidate is not an object"
         required = ("kind", "logical_id", "revision_id", "payload", "scope", "representation")
-        if any(key not in raw for key in required):
-            return None
+        missing = [key for key in required if key not in raw]
+        if missing:
+            return None, "candidate is missing required fields: " + ", ".join(missing)
         if raw["kind"] != store.kind:
-            return None
+            return None, "candidate kind does not match its store"
+        logical_id = raw["logical_id"]
+        revision_id = raw["revision_id"]
+        if not isinstance(logical_id, str) or not logical_id:
+            return None, "candidate logical_id must be a nonempty string"
+        if not isinstance(revision_id, str) or not revision_id:
+            return None, "candidate revision_id must be a nonempty string"
         try:
             payload = dict(raw["payload"])
         except (TypeError, ValueError):
-            return None
+            return None, "candidate payload is not an object"
         scope = raw["scope"]
-        if store.scope is not None and dict(scope) != dict(store.scope):
-            return None
-        if raw.get("approval_status") not in (None, "approved"):
-            return None
-        if raw.get("designation") not in (None, "current"):
-            return None
-        if raw.get("revoked") is True or raw.get("withdrawn") is True:
-            return None
-        if raw.get("predicates_ok") is False:
-            return None
-        candidate_routes = raw.get("routes")
-        if candidate_routes is not None and route not in tuple(candidate_routes):
-            return None
-        declared_digest = raw.get("payload_digest")
-        payload_digest = contracts.sha256_hex(payload)
-        if declared_digest is not None and declared_digest != payload_digest:
-            return None
-        representation = raw.get("representation")
-        from .templates import representations_comparable
+        if not isinstance(scope, Mapping):
+            return None, "candidate scope is not an object"
+        representation = raw["representation"]
+        if not isinstance(representation, Mapping):
+            return None, "candidate representation is not an object"
 
-        comparable = representations_comparable(objective, representation)
-        score = float(raw.get("score", 0.0)) if isinstance(raw.get("score", 0.0), (int, float)) else 0.0
+        reasons: list[str] = []
+        invalid = False
+        if store.scope is not None and dict(scope) != dict(store.scope):
+            reasons.append("candidate scope is outside the authorized recipient boundary")
+        if raw.get("revoked") is True:
+            reasons.append("candidate revision is revoked")
+        if raw.get("withdrawn") is True:
+            reasons.append("candidate revision is withdrawn")
+        approval = raw.get("approval_status")
+        designation = raw.get("designation")
+        if store.kind == "procedure":
+            if approval != "approved":
+                reasons.append("procedure approval is not current and approved")
+            if designation != "current":
+                reasons.append("procedure designation is not current")
+            if raw.get("predicates_ok") is not True:
+                reasons.append("procedure predicates are not satisfied")
+        else:
+            if approval is not None and approval != "approved":
+                reasons.append("candidate approval is not approved")
+            if designation is not None and designation != "current":
+                reasons.append("candidate designation is not current")
+            if raw.get("predicates_ok") is False:
+                reasons.append("candidate predicates are not satisfied")
+        candidate_routes = raw.get("routes")
+        if candidate_routes is not None:
+            if not isinstance(candidate_routes, (list, tuple, set, frozenset, str)):
+                return None, "candidate routes must be a list of routes"
+            if route not in tuple(candidate_routes):
+                reasons.append("candidate is not applicable to this route")
+        payload_digest = contracts.sha256_hex(payload)
+        declared_digest = raw.get("payload_digest")
+        if declared_digest is not None and declared_digest != payload_digest:
+            reasons.append("candidate payload digest does not match its payload")
+        if store.kind == "procedure" and declared_digest is None:
+            reasons.append("procedure candidate carries no integrity digest")
+        if representation.get("declared") is False:
+            comparable = False
+            reasons.append("incomparable representation: candidate is not declared")
+        else:
+            from .templates import representations_comparable
+
+            comparable = representations_comparable(objective, representation)
+            if not comparable:
+                reasons.append("incomparable representation")
+        raw_score = raw.get("score", 0.0)
+        score = (
+            float(raw_score)
+            if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool)
+            else 0.0
+        )
         if not comparable:
             score = 0.0
         freshness = str(raw.get("freshness", store.freshness))
         if freshness not in {"live", "frozen"}:
-            return None
-        return {
-            "kind": store.kind,
-            "logical_id": str(raw["logical_id"]),
-            "revision_id": str(raw["revision_id"]),
-            "origin": str(raw.get("origin", store.store_id)),
-            "source_id": str(raw.get("source_id", store.store_id)),
-            "payload": payload,
-            "payload_digest": payload_digest,
-            "scope": dict(scope) if isinstance(scope, Mapping) else None,
-            "freshness": freshness,
-            "representation": dict(representation),
-            "comparable": comparable,
-            "score": score,
-            "specificity": str(raw.get("specificity", store.specificity)),
-            "provenance": [
-                {
-                    "store_id": store.store_id,
-                    "origin": str(raw.get("origin", store.store_id)),
-                    "specificity": str(raw.get("specificity", store.specificity)),
-                }
-            ],
-            "reason": "eligible" if comparable else "incomparable representation",
-        }
+            return None, f"candidate declares an unknown freshness: {freshness!r}"
+        disposition = "eligible" if not reasons else ("invalid" if invalid else "rejected")
+        return (
+            {
+                "kind": store.kind,
+                "logical_id": logical_id,
+                "revision_id": revision_id,
+                "origin": str(raw.get("origin", store.store_id)),
+                "source_id": str(raw.get("source_id", store.store_id)),
+                "payload": payload,
+                "payload_digest": payload_digest,
+                "scope": dict(scope),
+                "freshness": freshness,
+                "representation": dict(representation),
+                "comparable": comparable,
+                "score": score,
+                "specificity": str(raw.get("specificity", store.specificity)),
+                "provenance": [
+                    {
+                        "store_id": store.store_id,
+                        "origin": str(raw.get("origin", store.store_id)),
+                        "specificity": str(raw.get("specificity", store.specificity)),
+                    }
+                ],
+                "disposition": disposition,
+                "reasons": reasons,
+            },
+            None,
+        )
 
     def _normalize_and_rank(
         self,
@@ -329,10 +446,20 @@ class BoundedSearch:
             if candidate["score"] > prior["score"]:
                 prior["score"] = candidate["score"]
                 prior["source_id"] = candidate["source_id"]
+            if candidate["disposition"] == "eligible" and prior["disposition"] != "eligible":
+                candidate["provenance"] = merged_provenance
+                deduplicated[key] = candidate
+                prior = candidate
+            if prior["disposition"] != "eligible":
+                merged_reasons = list(prior.get("reasons", []))
+                for reason in candidate.get("reasons", []):
+                    if reason not in merged_reasons:
+                        merged_reasons.append(reason)
+                prior["reasons"] = merged_reasons
         ranked = [deduplicated[key] for key in order]
         ranked.sort(
             key=lambda item: (
-                not item["comparable"],
+                item["disposition"] != "eligible",
                 -item["score"],
                 _KIND_ORDER.get(item["kind"], 9),
                 _SPECIFICITY_ORDER.get(item["specificity"], 9),
@@ -342,7 +469,6 @@ class BoundedSearch:
         )
         records: list[dict[str, Any]] = []
         for item in ranked:
-            disposition = "eligible" if item["comparable"] else "rejected"
             records.append(
                 contracts.make_candidate(
                     kind=item["kind"],
@@ -358,8 +484,8 @@ class BoundedSearch:
                     representation=item["representation"],
                     score=item["score"],
                     comparable=item["comparable"],
-                    disposition=disposition,
-                    reasons=[item["reason"]] if not item["comparable"] else [],
+                    disposition=item["disposition"],
+                    reasons=item["reasons"],
                 )
             )
         return records

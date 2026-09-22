@@ -202,16 +202,27 @@ def run_apc_child(
         store.record_apc_child_operation(launched)
 
     if deadline is not None and now() > deadline:
-        timed_out = contracts.make_apc_child_operation(
+        # The child was already launched, so its exact identity is live and its
+        # cleanup is not yet proven.  Persist that unresolved ownership instead
+        # of a terminal failure; a retry must reconcile this exact child.
+        cleanup_pending = contracts.make_apc_child_operation(
             request=request,
-            status="failed",
+            status="cleanup_pending",
+            launch_intent={"binding": dict(request["binding"])},
             observed_invocation=launched["observed_invocation"],
-            cleanup={"reason": "deadline exceeded after launch"},
+            result=result if isinstance(result, Mapping) else None,
+            cleanup={
+                "state": "cleanup pending on the product harness",
+                "reason": "the child exceeded the enclosing absolute deadline after launch",
+            },
             attempt=attempt_number,
         )
         if store is not None:
-            store.record_apc_child_operation(timed_out)
-        raise ApcChildTimeoutError("the child exceeded the enclosing absolute deadline")
+            store.record_apc_child_operation(cleanup_pending)
+        raise ApcChildTimeoutError(
+            "the child exceeded the enclosing absolute deadline; "
+            "reconcile its exact owned child before any retry"
+        )
 
     def _reject(reason: str) -> ApcChildRejectedError:
         failure = ApcChildRejectedError(reason)

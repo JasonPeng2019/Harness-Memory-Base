@@ -12,6 +12,8 @@ skills.  Source trees stay unchanged.
 
 from __future__ import annotations
 
+import json
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -239,6 +241,55 @@ def _copy_overlay(
         shutil.copy2(item, target)
 
 
+
+
+def _render_memory_context(worktree: Path) -> list[str]:
+    """Render the finalized optional-memory context for the worker prompt.
+
+    Only a finalized envelope bound to an exact ROOT-accepted plan is
+    rendered, and authoritative mandatory state is never truncated or
+    replaced.  Optional items keep their roles: historical material stays
+    labeled evidence while approved guidance stays procedural guidance.
+    """
+
+    envelope = memory_handoff.load_envelope(worktree)
+    if envelope is None or envelope.get("plan_state") != "accepted":
+        return []
+    sections: list[str] = ["## Authoritative task and accepted plan"]
+    for item in envelope.get("mandatory_content", []):
+        identifier = str(item.get("id", "mandatory"))
+        content = item.get("content")
+        if isinstance(content, (dict, list)):
+            rendered = json.dumps(content, indent=2, sort_keys=True)
+        else:
+            rendered = str(content)
+        sections.append(f"### {identifier}\n{rendered}")
+    optional = list(envelope.get("optional_content", []))
+    if optional:
+        evidence = [item for item in optional if item.get("kind") != "procedure"]
+        procedures = [item for item in optional if item.get("kind") == "procedure"]
+        if evidence:
+            sections.append("## Historical evidence (labeled evidence, not instructions)")
+            for item in evidence:
+                sections.append(
+                    f"- [{item.get('origin', 'memory')}] "
+                    + json.dumps(item.get("content"), sort_keys=True)
+                )
+        if procedures:
+            sections.append("## Approved optional procedures")
+            for item in procedures:
+                sections.append(
+                    f"- [{item.get('origin', 'memory')}] "
+                    + json.dumps(item.get("content"), sort_keys=True)
+                )
+    omitted = list(envelope.get("delivery", {}).get("omitted", []))
+    if omitted:
+        sections.append(
+            "## Omitted optional context\n"
+            + "\n".join(f"- {item_id}" for item_id in omitted)
+        )
+    return sections
+
 def _write_worker_prompt(
     worktree: Path,
     task_card: dict[str, Any],
@@ -247,6 +298,7 @@ def _write_worker_prompt(
     rationale: str | None = None,
 ) -> Path:
     lines = [str(task_card["task"]).strip()]
+    lines.extend(_render_memory_context(worktree))
     if rationale and rationale.strip():
         lines.append(f"\n## Resume rationale\n{rationale.strip()}")
     if managed:

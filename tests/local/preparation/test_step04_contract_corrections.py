@@ -1,0 +1,639 @@
+﻿"""STEP-04 contract corrections: plan precedence, budget durability, bounds.
+
+These tests pin the validated STEP-04 defects discovered after the rejected
+implementation: absent versus candidate plan precedence, accepted-plan-only
+finalization, truly bounded independent store calls, durable fail-closed trust
+gates, the bounded APC lifecycle with cleanup-pending reconciliation, restart
+budget recovery, and durable configuration reuse after a late Level 0.
+"""
+
+from __future__ import annotations
+
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "src"))
+
+from memory_harness import (
+    apc,
+    config,
+    contracts,
+    harness_bridge,
+    preparation,
+    search,
+    store,
+    templates,
+)
+
+
+BINDING = {
+    "provider": "synthetic",
+    "model": "synthetic/drafter",
+    "cli": "synthetic-cli",
+    "effort": "low",
+    "source": "explicit",
+}
+
+
+class FakeClock:
+    def __init__(self, start: float = 1000.0) -> None:
+        self.value = float(start)
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += float(seconds)
+
+
+def representation(limits: config.PreparationLimits, tokens: list[str]) -> dict:
+    return templates.representation_identity(limits=limits) | {
+        "tokens": tokens,
+        "route": "ordinary",
+    }
+
+
+class Step04ContractCorrectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.clock = FakeClock()
+        self.limits = config.resolve_limits(
+            {
+                "default_deadline_seconds": 300.0,
+                "execution_reserve_seconds": 10.0,
+                "store_seconds": 8.0,
+                "minimum_optional_slice_seconds": 1.0,
+                "standard_stage_seconds": 20.0,
+            }
+        )
+        self.store_path = self.root / "memory-state.sqlite3"
+        self.memory_store = store.MemoryStore(self.store_path)
+        self.memory_store.initialize()
+        self.service = preparation.PreparationService(
+            store=self.memory_store, limits=self.limits, clock=self.clock
+        )
+        self.card = contracts.make_task_card(
+            task="Fix the regression failure in the parser test",
+            base_commit="base-1",
+        )
+        self.candidate = contracts.make_plan(
+            plan_id="candidate-plan",
+            objective_id="objective-1",
+            route="ordinary",
+            state="candidate",
+            content={"steps": ["draft"]},
+        )
+
+    def tearDown(self) -> None:
+        self.memory_store.close()
+        self.temporary.cleanup()
+
+    # -- helpers -----------------------------------------------------------
+
+    def _evidence(self, logical_id="case-1", revision="r1", **overrides):
+        item = {
+            "kind": "historical_evidence",
+            "logical_id": logical_id,
+            "revision_id": revision,
+            "payload": {"summary": "prior regression evidence"},
+            "scope": {
+                "app": "demo",
+                "project": "p",
+                "namespace": "reviewed",
+                "owner": "owner-1",
+            },
+            "origin": "everos",
+            "representation": representation(self.limits, ["regression", "failure"]),
+            "score": 0.5,
+            "freshness": "live",
+        }
+        item.update(overrides)
+        return item
+
+    def _store(self, store_id, kind, items, *, scope=None, freshness="live"):
+        return search.SearchStore(
+            store_id=store_id,
+            kind=kind,
+            query=lambda query, items=items: items,
+            scope=scope,
+            freshness=freshness,
+        )
+
+    def _proposal_for(self, request):
+        record = request["template"]
+        content = {
+            "fixed_steps": list(record["fixed_steps"]),
+            "verification_intent": record["verification_intent"],
+            "bindings": {"failure": "parser", "component": "parser"},
+        }
+        return contracts.make_plan(
+            plan_id="apc-proposal-1",
+            objective_id=request["parent_objective_id"],
+            route="ordinary",
+            state="proposed",
+            content=content,
+            source={
+                "template_id": request["template_id"],
+                "template_version": request["template_version"],
+                "branch": "apc_proposal",
+                "apc_request": request["content_hash"],
+            },
+        )
+
+    # -- absent and candidate plan precedence ------------------------------
+
+    def test_absent_current_plan_is_classified_and_planned(self) -> None:
+        outcome = self.service.prepare(
+            task_card=self.card, plan=None, objective_id="objective-1", route="ordinary"
+        )
+        self.assertEqual("absent", outcome.preparation["current_plan_state"])
+        self.assertIn("fresh", outcome.plan["state"])
+        self.assertIsNone(outcome.envelope)
+
+    def test_candidate_plan_keeps_precedence_and_is_never_replaced(self) -> None:
+        """A candidate plan keeps its exact identity and is never auto-accepted.
+
+        The ordinary reuse path may still propose a bounded plan around the
+        pending candidate, but nothing substitutes for ROOT acceptance: the
+        recorded current-plan state stays ``candidate_review`` and no envelope
+        becomes dispatchable.
+        """
+
+        scored: list[object] = []
+
+        def recording(query):
+            scored.append(query)
+            return []
+
+        outcome = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            route="ordinary",
+            stores=[
+                search.SearchStore(store_id="templates", kind="template", query=recording)
+            ],
+        )
+        self.assertEqual("candidate_review", outcome.preparation["current_plan_state"])
+        self.assertEqual("candidate", outcome.preparation["plan_state"])
+        self.assertEqual(
+            self.candidate["content_hash"], outcome.preparation["plan_digest"]
+        )
+        # The pending candidate never becomes authority by itself.
+        self.assertIsNone(outcome.disposition.get("root_acceptance"))
+        self.assertNotEqual("accepted", outcome.plan["state"])
+        self.assertIsNone(outcome.envelope)
+        self.assertFalse(outcome.dispatchable)
+        durable = self.memory_store.get_preparation(
+            outcome.preparation["preparation_id"]
+        )
+        self.assertEqual("candidate_review", durable["current_plan_state"])
+        self.assertEqual(self.candidate["content_hash"], durable["plan_digest"])
+
+    def test_absent_and_accepted_plan_states_are_distinct_from_candidate(self) -> None:
+        absent = self.service.prepare(
+            task_card=self.card, plan=None, objective_id="objective-1", route="ordinary"
+        )
+        self.assertEqual("absent", absent.preparation["current_plan_state"])
+        accepted = contracts.make_plan(
+            plan_id="accepted-plan-2",
+            objective_id="objective-1",
+            route="ordinary",
+            state="accepted",
+            accepted_by="ROOT",
+            content={"steps": ["execute"]},
+        )
+        preserved = self.service.prepare(
+            task_card=self.card,
+            plan=accepted,
+            objective_id="objective-1",
+            route="ordinary",
+        )
+        self.assertEqual(
+            "execution_accepted", preserved.preparation["current_plan_state"]
+        )
+        self.assertEqual("preserved_accepted", preserved.disposition["branch"])
+        self.assertEqual("accepted", preserved.plan["state"])
+
+    def test_finalize_refuses_a_plan_root_has_not_accepted(self) -> None:
+        for plan in (None, self.candidate):
+            with self.subTest(plan=plan):
+                with self.assertRaisesRegex(
+                    preparation.PlanAcceptanceError, "accepted"
+                ):
+                    self.service.prepare(
+                        task_card=self.card,
+                        plan=plan,
+                        objective_id="objective-1",
+                        route="ordinary",
+                        lane_id="lane-1",
+                        run_id="run-1",
+                        worktree_path=str(self.root),
+                        base_commit="base-1",
+                        finalize=True,
+                    )
+
+    def test_finalize_needs_the_exact_lane_run_worktree_and_base(self) -> None:
+        accepted = contracts.make_plan(
+            plan_id="accepted-plan",
+            objective_id="objective-1",
+            route="ordinary",
+            state="accepted",
+            accepted_by="ROOT",
+            content={"steps": ["execute"]},
+        )
+        with self.assertRaises(preparation.PreparationError):
+            self.service.prepare(
+                task_card=self.card,
+                plan=accepted,
+                objective_id="objective-1",
+                route="ordinary",
+                finalize=True,
+            )
+
+    # -- bounded independent store calls -----------------------------------
+
+    def test_blocking_store_is_bounded_by_wall_clock_and_other_stores_deliver(
+        self,
+    ) -> None:
+        limits = config.resolve_limits(
+            {
+                "default_deadline_seconds": 300.0,
+                "execution_reserve_seconds": 10.0,
+                "standard_stage_seconds": 1.0,
+                "store_seconds": 0.5,
+                "minimum_optional_slice_seconds": 0.05,
+            }
+        )
+
+        def blocking(query):
+            time.sleep(5.0)
+            return [self._evidence(logical_id="case-slow")]
+
+        service = preparation.PreparationService(
+            store=self.memory_store, limits=limits
+        )
+        started = time.monotonic()
+        outcome = service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            route="ordinary",
+            stores=[
+                search.SearchStore(store_id="slow", kind="historical_evidence", query=blocking),
+                self._store("everos", "historical_evidence", [self._evidence()]),
+            ],
+        )
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.5, "a blocking store must not consume the stage")
+        attempts = {entry["store_id"]: entry for entry in outcome.trace["attempts"]}
+        self.assertEqual("timed-out", attempts["slow"]["status"])
+        self.assertEqual("completed", attempts["everos"]["status"])
+        selected = [
+            item
+            for item in outcome.trace["candidates"]
+            if item["disposition"] == "selected"
+        ]
+        self.assertEqual(["case-1"], [item["logical_id"] for item in selected])
+
+    def test_malformed_store_results_are_recorded_not_dropped(self) -> None:
+        malformed = [
+            "not-a-mapping",
+            {"kind": "historical_evidence"},
+            {
+                "kind": "historical_evidence",
+                "logical_id": "case-routes",
+                "revision_id": "r1",
+                "payload": {"a": 1},
+                "scope": {"app": "demo"},
+                "representation": representation(self.limits, ["regression"]),
+                "routes": 5,
+            },
+            {
+                "kind": "historical_evidence",
+                "logical_id": "case-undeclared",
+                "revision_id": "r1",
+                "payload": {"a": 1},
+                "scope": {"app": "demo"},
+                "representation": representation(self.limits, ["regression"]),
+                "freshness": "cached",
+            },
+        ]
+        outcome = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            route="ordinary",
+            stores=[
+                self._store("everos", "historical_evidence", malformed + [self._evidence()])
+            ],
+        )
+        attempts = {entry["store_id"]: entry for entry in outcome.trace["attempts"]}
+        rejected = attempts["everos"].get("rejected", [])
+        self.assertGreaterEqual(len(rejected), 4)
+        self.assertTrue(all("reason" in entry for entry in rejected))
+        durable = self.memory_store.get_search_trace(
+            outcome.preparation["preparation_id"]
+        )
+        self.assertTrue(
+            durable["attempts"][0].get("rejected"),
+            "malformed rejections must be durable, not silently dropped",
+        )
+        selected = [
+            item
+            for item in outcome.trace["candidates"]
+            if item["disposition"] == "selected"
+        ]
+        self.assertEqual(["case-1"], [item["logical_id"] for item in selected])
+
+    # -- fail-closed trust gates -------------------------------------------
+
+    def test_untrusted_candidates_are_rejected_and_the_eligible_one_survives(
+        self,
+    ) -> None:
+        scope = {"app": "demo", "project": "p", "namespace": "reviewed", "owner": "owner-1"}
+        untrusted = [
+            self._evidence(logical_id="case-revoked", revoked=True),
+            self._evidence(logical_id="case-withdrawn", withdrawn=True),
+            self._evidence(logical_id="case-predicates", predicates_ok=False),
+            self._evidence(logical_id="case-designation", designation="superseded"),
+            self._evidence(logical_id="case-approval", approval_status="revoked"),
+            self._evidence(
+                logical_id="case-undeclared-representation",
+                representation=representation(self.limits, ["regression"])
+                | {"declared": False},
+            ),
+            self._evidence(logical_id="case-scope", scope={"app": "other"}),
+            self._evidence(logical_id="case-digest", payload_digest="not-the-payload-digest"),
+        ]
+        outcome = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            route="ordinary",
+            stores=[
+                self._store(
+                    "everos", "historical_evidence", untrusted + [self._evidence()], scope=scope
+                )
+            ],
+        )
+        dispositions = {
+            item["logical_id"]: item
+            for item in outcome.trace["candidates"]
+            if item["logical_id"] != "case-1"
+        }
+        self.assertEqual(8, len(dispositions))
+        for logical_id, item in dispositions.items():
+            self.assertIn(item["disposition"], {"rejected", "invalid"})
+            self.assertTrue(item["reasons"], logical_id)
+        selected = [
+            item
+            for item in outcome.trace["candidates"]
+            if item["disposition"] == "selected"
+        ]
+        self.assertEqual(["case-1"], [item["logical_id"] for item in selected])
+
+    def test_procedure_trust_requires_approval_designation_and_digest(self) -> None:
+        scope = {"app": "demo", "project": "p", "namespace": "shared", "owner": "owner-1"}
+        base = {
+            "kind": "procedure",
+            "logical_id": "procedure-1",
+            "revision_id": "rev-1",
+            "payload": {"steps": ["approved guidance"]},
+            "scope": scope,
+            "origin": "atlas",
+            "representation": representation(self.limits, ["regression"]),
+            "score": 0.5,
+            "freshness": "live",
+        }
+        incomplete = dict(base, logical_id="procedure-incomplete")
+        trusted = dict(
+            base,
+            approval_status="approved",
+            designation="current",
+            predicates_ok=True,
+            payload_digest=contracts.sha256_hex(base["payload"]),
+        )
+        outcome = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            route="ordinary",
+            stores=[self._store("atlas", "procedure", [incomplete, trusted], scope=scope)],
+        )
+        dispositions = {
+            item["logical_id"]: item for item in outcome.trace["candidates"]
+        }
+        self.assertIn(dispositions["procedure-incomplete"]["disposition"], {"rejected", "invalid"})
+        self.assertIn(dispositions["procedure-1"]["disposition"], {"eligible", "selected"})
+
+    # -- bounded APC lifecycle ---------------------------------------------
+
+    def _prepare_with_apc(self, launcher, **overrides):
+        arguments = {
+            "task_card": contracts.make_task_card(
+                task="Fix the regression failure in the parser test", base_commit="base-1"
+            ),
+            "plan": self.candidate,
+            "objective_id": "objective-1",
+            "route": "ordinary",
+            "apc_binding": BINDING,
+            "apc_launcher": launcher,
+        }
+        arguments.update(overrides)
+        return self.service.prepare(**arguments)
+
+    def test_apc_timeout_is_cleanup_pending_and_retry_is_refused(self) -> None:
+        calls: list[object] = []
+        clock = FakeClock()
+        service = preparation.PreparationService(
+            store=self.memory_store, limits=self.limits, clock=clock
+        )
+
+        def slow_launcher(request):
+            calls.append(request)
+            clock.advance(5000.0)
+            return {
+                "invocation_id": "apc-child-slow",
+                "result": apc.make_apc_result(request, self._proposal_for(request)),
+            }
+
+        first = service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            route="ordinary",
+            apc_binding=BINDING,
+            apc_launcher=slow_launcher,
+        )
+        self.assertEqual("fresh", first.disposition["branch"])
+        operations = self.memory_store.list_apc_child_operations(
+            first.decision["decision_id"]
+        )
+        self.assertEqual(["cleanup_pending"], [operation["status"] for operation in operations])
+        self.assertIn(
+            "cleanup_pending", contracts.APC_CHILD_UNRESOLVED_STATUSES
+        )
+        second = service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            route="ordinary",
+            apc_binding=BINDING,
+            apc_launcher=slow_launcher,
+        )
+        self.assertEqual(1, len(calls), "an unresolved child must not relaunch")
+        self.assertIn("reconcile", second.disposition["reuse_attempts"][0]["reason"])
+
+    def test_apc_reconciliation_clears_cleanup_pending_before_retry(self) -> None:
+        def lost_ack(request):
+            return None
+
+        first = self._prepare_with_apc(lost_ack)
+        operations = self.memory_store.list_apc_child_operations(
+            first.decision["decision_id"]
+        )
+        self.assertEqual(["ambiguous"], [operation["status"] for operation in operations])
+        reconciled = harness_bridge.reconcile_apc_child(
+            store=self.memory_store,
+            request={
+                "content_hash": operations[0]["request_digest"],
+                "parent_decision_id": operations[0]["parent_decision_id"],
+                "parent_objective_id": operations[0]["parent_objective_id"],
+                "template_id": operations[0]["template_id"],
+                "template_version": operations[0]["template_version"],
+                "permitted_edits": ["bindings"],
+                "binding": operations[0]["binding"],
+            },
+            observed_invocation={"invocation_id": "controller:1:now", "pid": 1},
+        )
+        self.assertEqual("reconciled", reconciled["status"])
+        self.assertNotIn(
+            reconciled["status"], contracts.APC_CHILD_UNRESOLVED_STATUSES
+        )
+
+    # -- restart durability -------------------------------------------------
+
+    def test_spent_budget_is_not_replenished_across_restart(self) -> None:
+        first = self.service.prepare(
+            task_card=self.card, plan=self.candidate, objective_id="objective-1", route="ordinary"
+        )
+        self.assertEqual(300.0, first.preparation["remaining_seconds"])
+        deadline = first.preparation["deadline_monotonic"]
+        self.memory_store.close()
+
+        self.clock.advance(250.0)
+        reopened = store.MemoryStore(self.store_path)
+        reopened.initialize()
+        try:
+            service = preparation.PreparationService(
+                store=reopened, limits=self.limits, clock=self.clock
+            )
+            second = service.prepare(
+                task_card=self.card,
+                plan=self.candidate,
+                objective_id="objective-1",
+                route="ordinary",
+            )
+            self.assertEqual(
+                first.decision["decision_id"], second.decision["decision_id"]
+            )
+            self.assertEqual(deadline, second.preparation["deadline_monotonic"])
+            self.assertEqual(50.0, second.preparation["remaining_seconds"])
+            self.assertEqual(250.0, second.preparation["spent_seconds"])
+            self.assertEqual("trusted_deadline", second.preparation["budget_source"])
+        finally:
+            reopened.close()
+        self.memory_store = store.MemoryStore(self.store_path)
+        self.memory_store.initialize()
+
+    def test_expired_durable_deadline_makes_no_optional_call_after_restart(self) -> None:
+        queried: list[object] = []
+
+        def recording(query):
+            queried.append(query)
+            return []
+
+        self.service.prepare(
+            task_card=self.card, plan=self.candidate, objective_id="objective-1", route="ordinary"
+        )
+        self.memory_store.close()
+        self.clock.advance(400.0)
+        reopened = store.MemoryStore(self.store_path)
+        reopened.initialize()
+        try:
+            service = preparation.PreparationService(
+                store=reopened, limits=self.limits, clock=self.clock
+            )
+            outcome = service.prepare(
+                task_card=self.card,
+                plan=self.candidate,
+                objective_id="objective-1",
+                route="ordinary",
+                stores=[
+                    search.SearchStore(
+                        store_id="everos", kind="historical_evidence", query=recording
+                    )
+                ],
+            )
+            self.assertEqual(0.0, outcome.preparation["remaining_seconds"])
+            self.assertEqual(0.0, outcome.preparation["stage_allowance_seconds"])
+            self.assertEqual([], queried)
+            self.assertEqual("no_optional_memory", outcome.trace["outcome"])
+            self.assertEqual(0, outcome.trace["rounds"])
+            attempts = {entry["store_id"]: entry for entry in outcome.trace["attempts"]}
+            self.assertEqual("unattempted-by-budget", attempts["everos"]["status"])
+        finally:
+            reopened.close()
+        self.memory_store = store.MemoryStore(self.store_path)
+        self.memory_store.initialize()
+
+    # -- late Level 0 re-admission -----------------------------------------
+
+    def test_level_zero_reuses_the_durable_recorded_configuration(self) -> None:
+        queried: list[object] = []
+
+        def recording(query):
+            queried.append(query)
+            return []
+
+        recorded = {"strategy": "standard", "template_memory": False, "atlas_shared_retrieval": False}
+        service = preparation.PreparationService(
+            store=self.memory_store,
+            limits=self.limits,
+            config=config.resolve_config(recorded),
+            clock=self.clock,
+        )
+        first = service.prepare(
+            task_card=self.card, plan=self.candidate, objective_id="objective-1", route="ordinary"
+        )
+        self.clock.advance(30.0)
+        revised = service.apply_level_zero(
+            preparation=first.preparation,
+            decision=first.decision,
+            task_card=self.card,
+            plan=first.plan,
+            objective_id="objective-1",
+            stores=[
+                search.SearchStore(store_id="templates", kind="template", query=recording)
+            ],
+        )
+        self.assertFalse(revised.preparation["configuration"]["template_memory"])
+        self.assertFalse(revised.preparation["configuration"]["atlas_shared_retrieval"])
+        attempts = {entry["store_id"]: entry for entry in revised.trace["attempts"]}
+        self.assertEqual("disabled", attempts["templates"]["status"])
+        self.assertEqual([], queried)
+        self.assertLess(revised.preparation["remaining_seconds"], 300.0)
+        self.assertEqual(
+            30.0, round(300.0 - revised.preparation["remaining_seconds"], 3)
+        )
+        self.assertEqual(30.0, revised.preparation["spent_seconds"])
+
+
+if __name__ == "__main__":
+    unittest.main()

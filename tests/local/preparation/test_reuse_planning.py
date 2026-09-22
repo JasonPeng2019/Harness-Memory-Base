@@ -348,7 +348,14 @@ class ReusePlanningTests(unittest.TestCase):
         operations = self.memory_store.list_apc_child_operations(
             outcome.decision["decision_id"]
         )
-        self.assertEqual(["failed"], [operation["status"] for operation in operations])
+        # The launched child may still be live and its cleanup is unproven, so
+        # its ownership stays unresolved until exact reconciliation.
+        self.assertEqual(
+            ["cleanup_pending"], [operation["status"] for operation in operations]
+        )
+        self.assertIn(
+            "cleanup_pending", contracts.APC_CHILD_UNRESOLVED_STATUSES
+        )
 
     def test_ambiguous_acknowledgement_is_visible_and_reconciled_exactly(self) -> None:
         calls: list[object] = []

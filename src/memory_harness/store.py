@@ -1,4 +1,4 @@
-"""Small standard-library SQLite store for Stage-A decisions and operations."""
+﻿"""Small standard-library SQLite store for Stage-A decisions and operations."""
 
 from __future__ import annotations
 
@@ -52,6 +52,7 @@ _SCHEMA = [
         configuration TEXT NOT NULL,
         configuration_digest TEXT NOT NULL,
         state TEXT NOT NULL,
+        content_hash TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )
@@ -436,6 +437,7 @@ class MemoryStore:
                 self._ensure_column("outcomes", "objective_id", "TEXT")
                 self._ensure_column("decisions", "configuration", "TEXT")
                 self._ensure_column("decisions", "configuration_digest", "TEXT")
+                self._ensure_column("decisions", "content_hash", "TEXT")
                 self._ensure_column(
                     "generated_skill_candidates",
                     "state",
@@ -493,6 +495,7 @@ class MemoryStore:
             json.dumps(decision["configuration"], sort_keys=True),
             decision["configuration_digest"],
             decision["state"],
+            decision["content_hash"],
             decision["created_at"],
             decision["created_at"],
         )
@@ -502,9 +505,9 @@ class MemoryStore:
                 INSERT INTO decisions (
                     decision_id, task_card_digest, objective_id, route, plan_id,
                     plan_state, plan_digest, strategy, configuration,
-                    configuration_digest, state, created_at, updated_at
+                    configuration_digest, state, content_hash, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(decision_id) DO UPDATE SET
                     task_card_digest=excluded.task_card_digest,
                     objective_id=excluded.objective_id,
@@ -516,6 +519,7 @@ class MemoryStore:
                     configuration=excluded.configuration,
                     configuration_digest=excluded.configuration_digest,
                     state=excluded.state,
+                    content_hash=excluded.content_hash,
                     updated_at=excluded.updated_at
                 """,
                 values,
@@ -532,6 +536,13 @@ class MemoryStore:
         result = dict(row)
         if result.get("configuration"):
             result["configuration"] = json.loads(result["configuration"])
+        if not result.get("content_hash"):
+            # An accepted-baseline row predates the additive content-hash
+            # column.  Rebuild the exact identity from its durable fields so the
+            # reopened database still round-trips as a canonical decision.
+            result["content_hash"] = contracts.content_hash(
+                {key: value for key, value in result.items() if key != "content_hash"}
+            )
         return result
 
     def record_operation(self, operation: Mapping[str, Any]) -> dict[str, Any]:
