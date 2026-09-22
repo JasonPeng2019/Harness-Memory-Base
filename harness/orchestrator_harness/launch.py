@@ -37,6 +37,7 @@ ACCEPTANCE_SCHEMA = "orchestrator-acceptance/v1"
 COMPLETION_REVIEW_SCHEMA = "completion-review/v1"
 
 LAUNCH_INVOCATION_INVALID = "LAUNCH_INVOCATION_INVALID"
+LAUNCH_PLAN_PENDING = "LAUNCH_PLAN_PENDING"
 LAUNCH_BINDING_FAILED = "LAUNCH_BINDING_FAILED"
 LAUNCH_LEASE_BUSY = "LAUNCH_LEASE_BUSY"
 LAUNCH_CONTROLLER_START_FAILED = "LAUNCH_CONTROLLER_START_FAILED"
@@ -211,11 +212,17 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                 LAUNCH_INVOCATION_INVALID,
                 "provider launch configuration is not in its validated canonical form",
             )
-        memory_envelope = memory_handoff.load_envelope(lane["worktree_path"])
-        if memory_envelope is not None:
-            task_card_path = (
-                Path(lane["worktree_path"]) / ".agent-workspace" / "task-card.json"
-            )
+        # Resolve the lane's governing enhanced-handoff state from the durable
+        # task card and the lane record.  ``None`` is the inherited ordinary
+        # path: a legacy card or an all-off enhanced card never initializes or
+        # validates optional memory here.  Every other value is an enabled
+        # enhanced lane, and it must already own its exact finalized dispatch
+        # envelope and durable final context before any dispatch intent exists.
+        task_card_path = (
+            Path(lane["worktree_path"]) / ".agent-workspace" / "task-card.json"
+        )
+        task_card: dict[str, Any] | None = None
+        if task_card_path.is_file():
             try:
                 task_card = read_json(task_card_path)
             except (OSError, ValueError) as exc:
@@ -223,14 +230,55 @@ def run_launch(lane_id: str) -> dict[str, Any]:
                     LAUNCH_INVOCATION_INVALID,
                     f"cannot read the task card for memory dispatch: {exc}",
                 ) from exc
-            memory_handoff.validate_envelope_for_launch(
-                envelope=memory_envelope,
-                task_card=task_card,
-                lane_id=lane_id,
-                run_id=str(lane.get("run_id")),
-                worktree_path=lane["worktree_path"],
-                base_commit=str(task_card.get("base_commit") or "HEAD"),
+        elif lane.get("memory_plan_state"):
+            raise LaunchError(
+                LAUNCH_PLAN_PENDING,
+                "the enhanced lane's durable task card is missing; "
+                "nothing may dispatch",
             )
+        try:
+            memory_state = memory_handoff.lane_handoff_state(task_card, lane)
+        except memory_handoff.PendingPlanError as exc:
+            raise LaunchError(LAUNCH_PLAN_PENDING, str(exc)) from exc
+        except memory_handoff.MemoryHandoffError as exc:
+            raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
+        memory_envelope: dict[str, Any] | None = None
+        if memory_state is not None:
+            memory_envelope = memory_handoff.load_envelope(lane["worktree_path"])
+            if memory_envelope is None:
+                raise LaunchError(
+                    LAUNCH_PLAN_PENDING,
+                    f"lane {lane_id} has no finalized dispatch envelope for its "
+                    f"{memory_state!r} enhanced plan state; ROOT must accept the "
+                    "exact current plan and finalize it before anything launches",
+                )
+            base_commit = str((task_card or {}).get("base_commit") or "HEAD")
+            try:
+                memory_handoff.validate_envelope_for_launch(
+                    envelope=memory_envelope,
+                    task_card=task_card,
+                    lane_id=lane_id,
+                    run_id=str(lane.get("run_id")),
+                    worktree_path=lane["worktree_path"],
+                    base_commit=base_commit,
+                )
+                final_context = memory_handoff.load_final_context(
+                    worktree_path=lane["worktree_path"],
+                    envelope=memory_envelope,
+                )
+                memory_handoff.validate_final_context_for_launch(
+                    context=final_context,
+                    envelope=memory_envelope,
+                    task_card=task_card,
+                    lane_id=lane_id,
+                    run_id=str(lane.get("run_id")),
+                    worktree_path=lane["worktree_path"],
+                    base_commit=base_commit,
+                )
+            except memory_handoff.PendingPlanError as exc:
+                raise LaunchError(LAUNCH_PLAN_PENDING, str(exc)) from exc
+            except memory_handoff.MemoryHandoffError as exc:
+                raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
             memory_handoff.record_dispatch_intent(
                 worktree_path=lane["worktree_path"],
                 envelope=memory_envelope,

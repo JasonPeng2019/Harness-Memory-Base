@@ -39,6 +39,7 @@ RESUME_WORKTREE_MISSING = "RESUME_WORKTREE_MISSING"
 NO_SAVED_SESSION_ID = "NO_SAVED_SESSION_ID"
 INVALID_RESUME_TASK_CARD = "INVALID_RESUME_TASK_CARD"
 RESUME_LANE_WRITE_FAILED = "RESUME_LANE_WRITE_FAILED"
+RESUME_PLAN_PENDING = "RESUME_PLAN_PENDING"
 
 _RESUMABLE_LIFECYCLES = frozenset(
     {"review_pending", "result_invalid", "blocked", "abandoned", "resuming"}
@@ -258,13 +259,49 @@ def run_resume(
         prior_run_id = str(lane.get("run_id") or "")
         run_id = new_id()
         managed = config.profile == "managed"
-        memory_handoff.prepare_resume_envelope(
+        # Resume is the same logical decision as the original bootstrap: it
+        # runs one bounded preparation for the exact current-plan state and
+        # only an exact ROOT-accepted plan produces a dispatchable envelope.
+        # An explicitly absent plan keeps its fresh ROOT-planning disposition
+        # and a pending candidate keeps its exact review identity, so neither
+        # one creates, prepares, or launches an execution worker here.
+        memory = memory_handoff.prepare_lane_memory(
             task_card=task_card,
             lane_id=lane_id,
             run_id=run_id,
             worktree_path=worktree,
             base_commit=str(task_card.get("base_commit") or "HEAD"),
         )
+        if memory.pending_plan:
+            update_lane(
+                rt,
+                epoch_id,
+                lane_id,
+                lambda current, value=memory: {
+                    **current,
+                    "memory_plan_state": value.state,
+                    "dispatchable": False,
+                    "memory_pending_reason": memory_handoff.plan_state_summary(
+                        str(value.state)
+                    ),
+                },
+            )
+            return {
+                "ok": False,
+                "code": RESUME_PLAN_PENDING,
+                "summary": (
+                    f"lane {lane_id} has no ROOT-accepted execution plan: "
+                    + memory_handoff.plan_state_summary(str(memory.state))
+                ),
+                "evidence_paths": [
+                    str(lane_record_dir(rt, epoch_id, lane_id) / "lane.json"),
+                    str(memory_handoff.memory_paths(worktree)[0]),
+                ],
+                "next_action": (
+                    "ROOT must review and accept the exact current plan, then "
+                    "resume the lane again; no worker was created or launched"
+                ),
+            }
         update_lane(
             rt,
             epoch_id,
@@ -321,7 +358,7 @@ def run_resume(
             rt,
             epoch_id,
             lane_id,
-            lambda current, value=run_id: {
+            lambda current, value=run_id, pending=memory: {
                 **current,
                 "run_id": value,
                 "lifecycle": "running",
@@ -330,6 +367,14 @@ def run_resume(
                 "acceptance_advancement": None,
                 "last_reported_actionable_status": None,
                 "resume_from_run_id": prior_run_id,
+                **(
+                    {
+                        "memory_plan_state": pending.state,
+                        "dispatchable": pending.dispatchable,
+                    }
+                    if pending.state is not None
+                    else {}
+                ),
             },
         )
         if managed:

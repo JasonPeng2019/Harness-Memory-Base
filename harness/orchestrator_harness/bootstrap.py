@@ -44,6 +44,7 @@ BOOTSTRAP_CACHE_COLLISION = "BOOTSTRAP_CACHE_COLLISION"
 BOOTSTRAP_ADAPTER_MISSING = "BOOTSTRAP_ADAPTER_MISSING"
 BOOTSTRAP_CACHE_MISSING = "BOOTSTRAP_CACHE_MISSING"
 BOOTSTRAP_RESOURCE_UNDECLARED = "BOOTSTRAP_RESOURCE_UNDECLARED"
+BOOTSTRAP_PLAN_PENDING = "BOOTSTRAP_PLAN_PENDING"
 
 # Managed-only helpers carried by the workspace base; plain bootstrap omits them.
 PLAIN_EXCLUDED_HELPERS = (
@@ -604,6 +605,7 @@ def run_bootstrap(
     branch: str | None = None
     worktree_created = False
     lane_record_written = False
+    memory: memory_handoff.LaneMemory | None = None
 
     def rollback_failure_summary(summary: str) -> str:
         if not worktree_created:
@@ -677,13 +679,93 @@ def run_bootstrap(
             receipt["provider_payload"] = f"adapter-payloads/{provider}"
         atomic_write_json(agent_workspace / "overlay-receipt.json", receipt)
         atomic_write_json(agent_workspace / "task-card.json", task_card)
-        memory_handoff.prepare_bootstrap_envelope(
+        memory = memory_handoff.prepare_lane_memory(
             task_card=task_card,
             lane_id=lane_id,
             run_id=run_id,
             worktree_path=worktree_path,
             base_commit=base_commit,
         )
+
+        def publish_lane(lane: dict[str, Any]) -> None:
+            """Persist one prepared-or-pending lane record and declare it active."""
+            nonlocal lane_record_written
+            write_lane(rt, epoch_id, lane_id, lane)
+            lane_record_written = True
+            entries = read_active_lanes(rt, epoch_id)
+            entries.append(
+                {
+                    "lane_id": lane_id,
+                    "lane_record_path": str(
+                        lane_record_dir(rt, epoch_id, lane_id) / "lane.json"
+                    ),
+                    "run_id": run_id,
+                }
+            )
+            write_active_lanes(rt, epoch_id, entries)
+
+        def base_lane_record() -> dict[str, Any]:
+            """Build the lane record shared by prepared and pending-plan lanes."""
+            record: dict[str, Any] = {
+                "schema": LANE_SCHEMA,
+                "lane_id": lane_id,
+                "run_id": run_id,
+                "worktree_path": str(worktree_path),
+                "result_path": str(worktree_path / "RESULT.json"),
+                "controller_status_path": str(agent_workspace / "controller.status.json"),
+                "controller_events_path": str(agent_workspace / "controller.events.jsonl"),
+                "transcript_path": str(agent_workspace / "provider-transcript.jsonl"),
+                "stderr_path": str(agent_workspace / "provider-stderr.txt"),
+                "attempts_path": str(agent_workspace / "controller.attempts.jsonl"),
+                "last_message_path": str(agent_workspace / "last-message.txt"),
+                "provider": {
+                    "id": provider,
+                    "model": model,
+                    "launch_config": configured_launch,
+                },
+                "session": {},
+                "process": {},
+                "lifecycle": "prepared",
+                "acceptance_advancement": None,
+                "last_reported_actionable_status": None,
+            }
+            if managed:
+                record["incoming_queue_path"] = str(agent_workspace / "QUEUE.json")
+                record["incoming_queue_command"] = str(agent_workspace / "lane-queue.py")
+            return record
+
+        # An enabled enhanced handoff that is not an exact ROOT-accepted plan
+        # has no execution authority at all, so this lane is materialized as a
+        # pending-plan lane: it keeps its durable preparation disposition but
+        # never receives a worker prompt, result template, or controller
+        # invocation, and it cannot be launched until ROOT decides the plan.
+        if memory.pending_plan:
+            publish_lane(
+                {
+                    **base_lane_record(),
+                    "memory_plan_state": memory.state,
+                    "dispatchable": False,
+                    "memory_pending_reason": memory_handoff.plan_state_summary(
+                        str(memory.state)
+                    ),
+                }
+            )
+            return {
+                "ok": False,
+                "code": BOOTSTRAP_PLAN_PENDING,
+                "summary": (
+                    f"lane {lane_id} has no ROOT-accepted execution plan: "
+                    + memory_handoff.plan_state_summary(str(memory.state))
+                ),
+                "evidence_paths": [
+                    str(lane_record_dir(rt, epoch_id, lane_id) / "lane.json"),
+                    str(memory_handoff.memory_paths(worktree_path)[0]),
+                ],
+                "next_action": (
+                    "ROOT must review and accept the exact current plan, then "
+                    "prepare the lane again; no worker was created or launched"
+                ),
+            }
 
         _write_worker_prompt(worktree_path, task_card, managed=managed)
         _write_result_template(worktree_path, lane_id, run_id)
@@ -697,44 +779,11 @@ def run_bootstrap(
             exclusive_resources=list(exclusive_resources),
         )
 
-        lane = {
-            "schema": LANE_SCHEMA,
-            "lane_id": lane_id,
-            "run_id": run_id,
-            "worktree_path": str(worktree_path),
-            "result_path": str(worktree_path / "RESULT.json"),
-            "controller_status_path": str(agent_workspace / "controller.status.json"),
-            "controller_events_path": str(agent_workspace / "controller.events.jsonl"),
-            "transcript_path": str(agent_workspace / "provider-transcript.jsonl"),
-            "stderr_path": str(agent_workspace / "provider-stderr.txt"),
-            "attempts_path": str(agent_workspace / "controller.attempts.jsonl"),
-            "last_message_path": str(agent_workspace / "last-message.txt"),
-            "provider": {
-                "id": provider,
-                "model": model,
-                "launch_config": configured_launch,
-            },
-            "session": {},
-            "process": {},
-            "lifecycle": "prepared",
-            "acceptance_advancement": None,
-            "last_reported_actionable_status": None,
-        }
-        if managed:
-            lane["incoming_queue_path"] = str(agent_workspace / "QUEUE.json")
-            lane["incoming_queue_command"] = str(agent_workspace / "lane-queue.py")
-        write_lane(rt, epoch_id, lane_id, lane)
-        lane_record_written = True
-
-        entries = read_active_lanes(rt, epoch_id)
-        entries.append(
-            {
-                "lane_id": lane_id,
-                "lane_record_path": str(lane_record_dir(rt, epoch_id, lane_id) / "lane.json"),
-                "run_id": run_id,
-            }
-        )
-        write_active_lanes(rt, epoch_id, entries)
+        lane = base_lane_record()
+        if memory.state is not None:
+            lane["memory_plan_state"] = memory.state
+            lane["dispatchable"] = memory.dispatchable
+        publish_lane(lane)
     except BootstrapError as exc:
         return {
             "ok": False,
