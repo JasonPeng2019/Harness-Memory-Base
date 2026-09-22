@@ -29,6 +29,13 @@ BINDING = {
     "source": "explicit",
 }
 
+# Only ROOT may replace or extend a current plan, so reuse and adaptation are
+# exercised behind one explicit ROOT replan request.
+ROOT_REPLAN = {
+    "requested_by": "ROOT",
+    "reason": "the tests exercise the explicit ROOT replan path",
+}
+
 
 class FakeClock:
     def __init__(self, start: float = 1000.0) -> None:
@@ -84,11 +91,19 @@ class ReusePlanningTests(unittest.TestCase):
         return contracts.make_task_card(task=task, base_commit="base-1")
 
     def _prepare(self, task: str, **overrides):
+        """Prepare under an explicit ROOT replan request.
+
+        A candidate plan continues its existing ROOT review and never runs
+        template selection or adaptation by itself, so BEHAVIOR-02 reuse work
+        only happens behind the explicit ROOT replan request these tests model.
+        """
+
         arguments = {
             "task_card": self._card(task),
             "plan": self.plan,
             "objective_id": "objective-1",
             "route": "ordinary",
+            "root_replan": ROOT_REPLAN,
         }
         arguments.update(overrides)
         return self.service.prepare(**arguments)
@@ -342,6 +357,7 @@ class ReusePlanningTests(unittest.TestCase):
             route="ordinary",
             apc_binding=BINDING,
             apc_launcher=slow_launcher,
+            root_replan=ROOT_REPLAN,
         )
         self.assertEqual("fresh", outcome.disposition["branch"])
         self.assertIn("deadline", outcome.disposition["reuse_attempts"][0]["reason"])

@@ -157,19 +157,49 @@ def make_memory_handoff(
     *,
     objective_id: str,
     route: str,
-    plan: Mapping[str, Any],
+    plan: Mapping[str, Any] | None = None,
+    plan_state: str | None = None,
     configuration: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Build one enhanced handoff that states its exact current-plan state.
+
+    ``plan`` may be a validated plan record or ``None`` for a truly absent
+    plan.  The record always carries the explicit current-plan state, so an
+    absent plan is never confused with a candidate still in ROOT review or an
+    exact ROOT-accepted execution plan.
+    """
+
     objective = _require_nonempty_str(objective_id, "objective_id")
     selected_route = _require_nonempty_str(route, "route")
     if selected_route not in ROUTES:
         raise ContractError(f"unknown route: {selected_route!r}")
-    validate_plan(plan)
+    if plan is None:
+        if plan_state is not None and plan_state != "absent":
+            raise ContractError(
+                "an absent plan cannot declare the current plan state "
+                f"{plan_state!r}"
+            )
+        derived_state = "absent"
+        bound_plan: dict[str, Any] | None = None
+    else:
+        validate_plan(
+            plan,
+            expected_objective_id=objective,
+            expected_route=selected_route,
+        )
+        derived_state = current_plan_state_for(plan)
+        if plan_state is not None and plan_state != derived_state:
+            raise ContractError(
+                "declared current plan state does not match the exact plan: "
+                f"expected {derived_state!r}, got {plan_state!r}"
+            )
+        bound_plan = dict(plan)
     record: dict[str, Any] = {
         "schema": MEMORY_HANDOFF_SCHEMA,
         "objective_id": objective,
         "route": selected_route,
-        "plan": dict(plan),
+        "plan_state": derived_state,
+        "plan": bound_plan,
         "configuration": dict(configuration or {}),
     }
     record["content_hash"] = content_hash(record)
@@ -183,12 +213,37 @@ def validate_memory_handoff(record: Mapping[str, Any]) -> None:
     route = _require_nonempty_str(record.get("route"), "route")
     if route not in ROUTES:
         raise ContractError(f"unknown route: {route!r}")
+    plan_state = _require_nonempty_str(record.get("plan_state"), "plan_state")
+    if plan_state not in HANDOFF_PLAN_STATES:
+        raise ContractError(f"unknown handoff plan state: {plan_state!r}")
     plan = record.get("plan")
-    if not isinstance(plan, Mapping):
-        raise ContractError("memory handoff plan must be an object")
-    validate_plan(plan, expected_objective_id=objective, expected_route=route)
+    if plan_state == "absent":
+        if plan is not None:
+            raise ContractError(
+                "an absent plan handoff must not carry a nonempty plan reference"
+            )
+    else:
+        if not isinstance(plan, Mapping):
+            raise ContractError(
+                "a handoff that declares a current plan requires its exact plan object"
+            )
+        validate_plan(plan, expected_objective_id=objective, expected_route=route)
+        derived_state = current_plan_state_for(plan)
+        if derived_state != plan_state:
+            raise ContractError(
+                "declared current plan state does not match the exact plan: "
+                f"expected {derived_state!r}, got {plan_state!r}"
+            )
     if not isinstance(record.get("configuration", {}), Mapping):
         raise ContractError("configuration must be an object")
+
+
+def handoff_plan(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the exact bound plan of a validated handoff, or ``None`` absent."""
+
+    validate_memory_handoff(record)
+    plan = record.get("plan")
+    return dict(plan) if isinstance(plan, Mapping) else None
 
 
 def make_plan(
@@ -313,14 +368,20 @@ def revise_plan(
 def validate_task_plan_binding(
     task_card: Mapping[str, Any], plan: Mapping[str, Any]
 ) -> None:
-    """Require an enhanced task card to name the same exact current plan."""
+    """Require an enhanced task card to name the same exact current plan.
+
+    A handoff that explicitly declares a truly absent plan carries no plan
+    reference, so there is no binding to compare.
+    """
 
     validate_task_card(task_card)
     validate_plan(plan)
     handoff = task_card.get("memory_handoff")
     if handoff is None:
         return
-    bound_plan = handoff["plan"]
+    bound_plan = handoff_plan(handoff)
+    if bound_plan is None:
+        return
     if bound_plan["content_hash"] != plan["content_hash"]:
         raise ContractError("task card plan does not match the supplied plan")
 
@@ -2643,6 +2704,11 @@ APC_CHILD_OPERATION_SCHEMA = "memory-apc-child-operation/v1"
 CURRENT_PLAN_STATES = frozenset(
     {"absent", "candidate_review", "execution_accepted", "inconsistent"}
 )
+# The enhanced handoff states only represent an exact current-plan fact; a
+# reported inconsistency is a mandatory-state failure, not a handoff state.
+HANDOFF_PLAN_STATES = frozenset(
+    {"absent", "candidate_review", "execution_accepted"}
+)
 CANDIDATE_KINDS = frozenset({"historical_evidence", "procedure", "template"})
 CANDIDATE_DISPOSITIONS = frozenset(
     {"eligible", "selected", "rejected", "invalid", "deduplicated", "unattempted"}
@@ -2689,14 +2755,13 @@ class PlanStateError(ContractError):
     """A nonempty current plan is inconsistent with the exact task state."""
 
 
-def classify_current_plan(
-    record: Mapping[str, Any] | None,
-    *,
-    expected_objective_id: str,
-    expected_route: str | None = None,
-    expected_base_commit: str | None = None,
-) -> str:
-    """Return the explicit current-plan state for one exact objective."""
+def current_plan_state_for(record: Mapping[str, Any] | None) -> str:
+    """Classify one exact plan reference into its explicit current-plan state.
+
+    ``None`` is a truly absent plan.  Any nonempty reference must be an exact,
+    readable plan record: a nonempty missing, unreadable, or stale reference is
+    a mandatory-state inconsistency rather than an absent plan.
+    """
 
     if record is None:
         return "absent"
@@ -2706,6 +2771,23 @@ def classify_current_plan(
         validate_plan(record)
     except ContractError as exc:
         raise PlanStateError(f"nonempty current plan is unreadable: {exc}") from exc
+    if record["state"] == "accepted":
+        return "execution_accepted"
+    return "candidate_review"
+
+
+def classify_current_plan(
+    record: Mapping[str, Any] | None,
+    *,
+    expected_objective_id: str,
+    expected_route: str | None = None,
+    expected_base_commit: str | None = None,
+) -> str:
+    """Return the explicit current-plan state for one exact objective."""
+
+    state = current_plan_state_for(record)
+    if state == "absent":
+        return state
     if record["objective_id"] != expected_objective_id:
         raise PlanStateError(
             "current plan is bound to another objective: "
@@ -2720,9 +2802,7 @@ def classify_current_plan(
         bound_base = record.get("base_commit")
         if bound_base is not None and bound_base != expected_base_commit:
             raise PlanStateError("current plan is bound to another repository baseline")
-    if record["state"] == "accepted":
-        return "execution_accepted"
-    return "candidate_review"
+    return state
 
 
 def make_preparation(
@@ -3027,6 +3107,8 @@ def make_plan_disposition(
     apc: Mapping[str, Any] | None = None,
     reuse_attempts: Iterable[Mapping[str, Any]] = (),
     fresh: Mapping[str, Any] | None = None,
+    preserved_plan: Mapping[str, Any] | None = None,
+    root_replan: Mapping[str, Any] | None = None,
     root_acceptance: Mapping[str, Any] | None = None,
     disposition_id: str | None = None,
     created_at: str | None = None,
@@ -3045,6 +3127,10 @@ def make_plan_disposition(
         validate_plan(proposal)
     if fresh is not None:
         validate_plan(fresh)
+    if preserved_plan is not None:
+        validate_plan(preserved_plan)
+    if root_replan is not None and not isinstance(root_replan, Mapping):
+        raise ContractError("root_replan must be an object")
     identity = disposition_id or sha256_hex(
         {"domain": "memory-plan-disposition/v1", "decision_id": decision_id, "branch": branch}
     )
@@ -3061,6 +3147,8 @@ def make_plan_disposition(
         "apc": dict(apc) if apc else None,
         "reuse_attempts": [dict(item) for item in reuse_attempts],
         "fresh": dict(fresh) if fresh else None,
+        "preserved_plan": dict(preserved_plan) if preserved_plan else None,
+        "root_replan": dict(root_replan) if root_replan else None,
         "root_acceptance": dict(root_acceptance) if root_acceptance else None,
         "created_at": created_at or utc_now(),
     }
@@ -3084,6 +3172,20 @@ def validate_plan_disposition(record: Mapping[str, Any]) -> None:
         template = record.get("template")
         if not isinstance(template, Mapping) or not template.get("template_id"):
             raise ContractError("direct fill disposition requires the selected template")
+    if record["branch"] == "candidate_review":
+        preserved = record.get("preserved_plan")
+        if not isinstance(preserved, Mapping) or not preserved.get("plan_id"):
+            raise ContractError(
+                "a candidate review disposition requires the exact preserved plan"
+            )
+        if record.get("root_replan"):
+            raise ContractError(
+                "a candidate review disposition cannot claim a ROOT replan request"
+            )
+    if record.get("root_replan") is not None and not isinstance(
+        record["root_replan"], Mapping
+    ):
+        raise ContractError("plan disposition root_replan must be an object")
     for field in ("reuse_attempts",):
         if not isinstance(record.get(field), list):
             raise ContractError(f"plan disposition {field} must be a list")
@@ -3435,6 +3537,7 @@ __all__ = [
     "FINAL_CONTEXT_SCHEMA",
     "APC_CHILD_OPERATION_SCHEMA",
     "CURRENT_PLAN_STATES",
+    "HANDOFF_PLAN_STATES",
     "CANDIDATE_KINDS",
     "CANDIDATE_DISPOSITIONS",
     "ATTEMPT_STATUSES",
@@ -3443,6 +3546,8 @@ __all__ = [
     "SEARCH_OUTCOMES",
     "PlanStateError",
     "classify_current_plan",
+    "current_plan_state_for",
+    "handoff_plan",
     "make_preparation",
     "validate_preparation",
     "make_candidate",

@@ -41,6 +41,14 @@ def representation(limits: config.PreparationLimits, tokens: list[str]) -> dict:
     }
 
 
+# Only ROOT may replace or extend a current plan, so template selection is
+# exercised behind one explicit ROOT replan request.
+ROOT_REPLAN = {
+    "requested_by": "ROOT",
+    "reason": "the tests exercise the explicit ROOT replan path",
+}
+
+
 class BoundedPreparationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -212,6 +220,9 @@ class BoundedPreparationTests(unittest.TestCase):
             plan=self.plan,
             objective_id="objective-1",
             route="ordinary",
+            # Template selection only runs behind an explicit ROOT replan
+            # request, so this capacity test models one.
+            root_replan=ROOT_REPLAN,
             stores=[
                 self._store("everos", "historical_evidence", evidence),
                 self._store("templates", "template", template_items),

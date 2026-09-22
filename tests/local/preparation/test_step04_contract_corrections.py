@@ -1,4 +1,4 @@
-﻿"""STEP-04 contract corrections: plan precedence, budget durability, bounds.
+"""STEP-04 contract corrections: plan precedence, budget durability, bounds.
 
 These tests pin the validated STEP-04 defects discovered after the rejected
 implementation: absent versus candidate plan precedence, accepted-plan-only
@@ -184,7 +184,13 @@ class Step04ContractCorrectionTests(unittest.TestCase):
         self.assertEqual(
             self.candidate["content_hash"], outcome.preparation["plan_digest"]
         )
-        # The pending candidate never becomes authority by itself.
+        self.assertEqual("candidate_review", outcome.disposition["branch"])
+        # The pending candidate never becomes authority by itself, and review
+        # never silently runs template selection over the preserved plan.
+        self.assertEqual([], scored, "candidate review must not score templates")
+        attempts = {entry["store_id"]: entry for entry in outcome.trace["attempts"]}
+        self.assertEqual("disabled", attempts["templates"]["status"])
+        self.assertEqual([], outcome.disposition["reuse_attempts"])
         self.assertIsNone(outcome.disposition.get("root_acceptance"))
         self.assertNotEqual("accepted", outcome.plan["state"])
         self.assertIsNone(outcome.envelope)
@@ -255,6 +261,127 @@ class Step04ContractCorrectionTests(unittest.TestCase):
                 route="ordinary",
                 finalize=True,
             )
+
+    # -- absent and candidate plans cannot become execution authority -------
+
+    def test_absent_plan_gets_a_fresh_planning_disposition_and_cannot_launch(self) -> None:
+        """A truly absent plan is fresh ROOT planning/review, never authority."""
+
+        template_queries: list[object] = []
+
+        def recording(query):
+            template_queries.append(query)
+            return []
+
+        outcome = self.service.prepare(
+            task_card=self.card,
+            plan=None,
+            objective_id="objective-1",
+            route="ordinary",
+            stores=[
+                search.SearchStore(
+                    store_id="templates", kind="template", query=recording
+                )
+            ],
+        )
+        self.assertEqual("absent", outcome.preparation["current_plan_state"])
+        self.assertEqual("fresh", outcome.disposition["branch"])
+        self.assertEqual("fresh", outcome.plan["state"])
+        self.assertEqual([], template_queries, "absent planning must not select templates")
+        self.assertIsNone(outcome.envelope)
+        self.assertFalse(outcome.dispatchable)
+        with self.assertRaisesRegex(preparation.PlanAcceptanceError, "accepted"):
+            self.service.prepare(
+                task_card=self.card,
+                plan=None,
+                objective_id="objective-1",
+                route="ordinary",
+                lane_id="lane-1",
+                run_id="run-1",
+                worktree_path=str(self.root),
+                base_commit="base-1",
+                finalize=True,
+            )
+
+    def test_candidate_plan_is_preserved_without_any_reuse_attempt(self) -> None:
+        """Candidate/review keeps the exact plan and runs no template work."""
+
+        template_queries: list[object] = []
+        apc_calls: list[object] = []
+
+        def recording(query):
+            template_queries.append(query)
+            return []
+
+        outcome = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            route="ordinary",
+            stores=[
+                search.SearchStore(
+                    store_id="templates", kind="template", query=recording
+                )
+            ],
+            bindings={"failure": "parser", "component": "parser"},
+            apc_binding={
+                "provider": "synthetic",
+                "model": "synthetic/drafter",
+                "cli": "synthetic-cli",
+                "effort": "low",
+                "source": "explicit",
+            },
+            apc_launcher=lambda request: apc_calls.append(request),
+        )
+        self.assertEqual("candidate_review", outcome.disposition["branch"])
+        self.assertEqual(self.candidate["content_hash"], outcome.plan["content_hash"])
+        self.assertEqual(self.candidate["plan_id"], outcome.plan["plan_id"])
+        self.assertEqual([], template_queries, "candidate review must not select templates")
+        self.assertEqual([], apc_calls, "candidate review must not launch an APC child")
+        self.assertIsNone(outcome.proposal)
+        self.assertIsNone(outcome.disposition.get("root_acceptance"))
+        self.assertIsNone(outcome.disposition.get("fresh"))
+        self.assertIsNone(outcome.envelope)
+        self.assertFalse(outcome.dispatchable)
+        attempts = {entry["store_id"]: entry for entry in outcome.trace["attempts"]}
+        self.assertEqual("disabled", attempts["templates"]["status"])
+
+    def test_candidate_plan_requires_an_explicit_root_replan_request(self) -> None:
+        """Only an explicit ROOT replan request may replace or extend a candidate."""
+
+        requests: list[object] = []
+
+        def recording(query):
+            requests.append(query)
+            return []
+
+        with self.assertRaisesRegex(preparation.MandatoryStateFailure, "ROOT replan"):
+            self.service.prepare(
+                task_card=self.card,
+                plan=self.candidate,
+                objective_id="objective-1",
+                route="ordinary",
+                root_replan={"requested_by": "lane-worker", "reason": "not ROOT"},
+            )
+        replanned = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            route="ordinary",
+            stores=[
+                search.SearchStore(
+                    store_id="templates", kind="template", query=recording
+                )
+            ],
+            root_replan={
+                "requested_by": "ROOT",
+                "reason": "the draft omits the regression check",
+            },
+        )
+        self.assertEqual("candidate_review", replanned.preparation["current_plan_state"])
+        self.assertTrue(requests, "an explicit ROOT replan request may select templates")
+        self.assertEqual("ROOT", replanned.disposition["root_replan"]["requested_by"])
+        self.assertIsNone(replanned.envelope)
 
     # -- bounded independent store calls -----------------------------------
 
@@ -444,6 +571,10 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             "route": "ordinary",
             "apc_binding": BINDING,
             "apc_launcher": launcher,
+            "root_replan": {
+                "requested_by": "ROOT",
+                "reason": "the test exercises the explicit ROOT replan path",
+            },
         }
         arguments.update(overrides)
         return self.service.prepare(**arguments)
@@ -470,6 +601,10 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             route="ordinary",
             apc_binding=BINDING,
             apc_launcher=slow_launcher,
+            root_replan={
+                "requested_by": "ROOT",
+                "reason": "the test exercises the explicit ROOT replan path",
+            },
         )
         self.assertEqual("fresh", first.disposition["branch"])
         operations = self.memory_store.list_apc_child_operations(
@@ -486,6 +621,10 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             route="ordinary",
             apc_binding=BINDING,
             apc_launcher=slow_launcher,
+            root_replan={
+                "requested_by": "ROOT",
+                "reason": "the test exercises the explicit ROOT replan path",
+            },
         )
         self.assertEqual(1, len(calls), "an unresolved child must not relaunch")
         self.assertIn("reconcile", second.disposition["reuse_attempts"][0]["reason"])

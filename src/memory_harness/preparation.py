@@ -192,6 +192,7 @@ class PreparationService:
         failure_context: str | None = None,
         stores: Sequence[SearchStore] = (),
         bindings: Mapping[str, Any] | None = None,
+        root_replan: Mapping[str, Any] | None = None,
         apc_binding: Mapping[str, Any] | None = None,
         apc_launcher: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
         apc_cleanup: Mapping[str, Any] | None = None,
@@ -329,11 +330,11 @@ class PreparationService:
             self.store.record_preparation(preparation)
 
         accepted_precedence = current_plan_state == "execution_accepted"
-        # Only an execution-accepted same-objective plan has precedence over
-        # template selection.  A candidate plan keeps its exact identity and
-        # state, so the ordinary reuse path still produces a non-authoritative
-        # proposal that ROOT must accept before anything can dispatch.
-        template_precedence = accepted_precedence
+        replan = self._validate_root_replan(root_replan)
+        # Template selection and adaptation run only for an explicit ROOT
+        # replan request.  An accepted plan is preserved, and a pending
+        # candidate keeps its exact identity and state until ROOT decides.
+        template_selection = replan is not None and not accepted_precedence
         search = self._run_search(
             preparation=preparation,
             route=route,
@@ -341,7 +342,7 @@ class PreparationService:
             stores=stores,
             stage_allowance=stage_allowance,
             failure_context=failure_context,
-            accepted_precedence=template_precedence,
+            accepted_precedence=not template_selection,
             config=resolved_config,
             budget_reason=admission_reason,
         )
@@ -371,6 +372,55 @@ class PreparationService:
                 proposal=None,
                 reason="accepted plan preserved without template scoring",
             )
+        elif current_plan_state == "candidate_review" and not template_selection:
+            disposition = contracts.make_plan_disposition(
+                decision_id=decision["decision_id"],
+                objective_id=objective_id,
+                route=route,
+                branch="candidate_review",
+                reason=(
+                    "a pending candidate plan continues its existing ROOT review "
+                    "without template selection, adaptation, or replacement"
+                ),
+                preserved_plan=plan,
+            )
+            if self.store is not None:
+                self.store.record_plan_disposition(disposition)
+            outcome = self._finish_planning(
+                mode=self._planning_mode(search["trace"]),
+                decision=decision,
+                preparation=preparation,
+                trace=search["trace"],
+                disposition=disposition,
+                plan=plan,
+                proposal=None,
+                reason=disposition["reason"],
+            )
+        elif current_plan_state == "absent":
+            fresh = templates.fresh_plan(objective_id=objective_id, route=route)
+            disposition = contracts.make_plan_disposition(
+                decision_id=decision["decision_id"],
+                objective_id=objective_id,
+                route=route,
+                branch="fresh",
+                reason=(
+                    "a truly absent current plan starts fresh ROOT planning and "
+                    "review; no template selection or adaptation runs"
+                ),
+                fresh=fresh,
+            )
+            if self.store is not None:
+                self.store.record_plan_disposition(disposition)
+            outcome = self._finish_planning(
+                mode=self._planning_mode(search["trace"]),
+                decision=decision,
+                preparation=preparation,
+                trace=search["trace"],
+                disposition=disposition,
+                plan=fresh,
+                proposal=None,
+                reason=disposition["reason"],
+            )
         else:
             disposition, produced_plan, proposal = self._produce_plan(
                 ownership_decision_id=ownership_decision["decision_id"],
@@ -386,6 +436,7 @@ class PreparationService:
                 deadline=absolute_deadline,
                 unknown_time=unknown_time,
                 failure_context=failure_context,
+                root_replan=replan,
             )
             if self.store is not None:
                 self.store.record_plan_disposition(disposition)
@@ -638,6 +689,31 @@ class PreparationService:
 
     # -- internals ---------------------------------------------------------
 
+    def _validate_root_replan(
+        self, request: Mapping[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Return one explicit ROOT replan request, or `None`.
+
+        Only ROOT may replace or extend a current plan.  Any other replan
+        request is a mandatory-state failure rather than a quiet replan.
+        """
+
+        if request is None:
+            return None
+        if not isinstance(request, Mapping):
+            raise MandatoryStateFailure("a ROOT replan request must be an object")
+        if request.get("requested_by") != "ROOT":
+            raise MandatoryStateFailure(
+                "only an explicit ROOT replan request may replace a current plan"
+            )
+        return dict(request)
+
+    @staticmethod
+    def _planning_mode(trace: Mapping[str, Any] | None) -> str:
+        if trace is None or trace.get("outcome") == "no_optional_memory":
+            return "no_optional_memory"
+        return "planning"
+
     def _recipe_fits(self, strategy: str, remaining: float) -> bool:
         """A recipe is admitted only when its full configured maximum and the
         positive execution reserve both fit the trusted remaining time."""
@@ -849,6 +925,7 @@ class PreparationService:
         deadline: float,
         unknown_time: bool,
         failure_context: str | None,
+        root_replan: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
         task_text = str(task_card.get("task", objective_id))
         objective = templates.objective_representation(
@@ -902,6 +979,7 @@ class PreparationService:
                 },
                 proposal=proposal,
                 reuse_attempts=reuse_attempts,
+                root_replan=root_replan,
             )
             # A direct fill is the proposal itself; it launches no APC child.
             return disposition, proposal, None
@@ -995,6 +1073,7 @@ class PreparationService:
                             "status": attempt.child_operation["status"],
                         },
                         reuse_attempts=reuse_attempts,
+                        root_replan=root_replan,
                     )
                     return disposition, proposal, proposal
 
@@ -1007,6 +1086,7 @@ class PreparationService:
             reason="no comparable direct-fill or permitted adaptation applied; normal fresh planning",
             fresh=fresh,
             reuse_attempts=reuse_attempts,
+            root_replan=root_replan,
         )
         return disposition, fresh, None
 
