@@ -994,7 +994,7 @@ class PreparationService:
         route: str,
         trace: Mapping[str, Any] | None,
         attempts: list[dict[str, Any]],
-    ) -> list[tuple[templates.Template, float]]:
+    ) -> tuple[list[tuple[templates.Template, float]], bool]:
         """Rejoin every selected template to the explicit immutable registry.
 
         Only template candidates this preparation trace actually *selected*
@@ -1004,7 +1004,11 @@ class PreparationService:
         canonical representation the bounded search used, and the configured
         calibrated thresholds decide the band.  A mismatched, forged, or
         inapplicable record is rejected with its reason and is never replaced
-        by a looser registry sweep.
+        by a looser registry sweep.  The returned flag is true only when every
+        selected candidate rejoined with a trusted comparable score, so the
+        fresh-planning reason never blames the registry for a later direct-fill
+        or adaptation failure.  The rejoined shortlist is ordered by that
+        recomputed trusted score, never by the raw score the store supplied.
         """
 
         selected = [
@@ -1079,7 +1083,9 @@ class PreparationService:
                     }
                 )
                 continue
-            score = templates.score_representations(objective, representation)
+            score = templates.score_representations(
+                templates.projected_objective(objective), representation
+            )
             if score < self.limits.near_match_threshold:
                 attempts.append(
                     {
@@ -1094,7 +1100,14 @@ class PreparationService:
                 )
                 continue
             shortlist.append((template, score))
-        return shortlist
+        rejoined = len(shortlist) == len(selected) and bool(selected)
+        # Only the rejoined selected candidates are ordered here, by the
+        # recomputed trusted score.  The delivered trace order can be set by
+        # store-supplied raw scores, so it must not decide which selected
+        # template is proposed; the rejoin order of equally scored candidates
+        # is the deterministic tie.  No unselected registry entry is added.
+        shortlist.sort(key=lambda item: -item[1])
+        return shortlist, rejoined
 
     @staticmethod
     def _no_selected_template_reason(trace: Mapping[str, Any] | None) -> str:
@@ -1133,21 +1146,29 @@ class PreparationService:
         trace: Mapping[str, Any] | None,
         shortlist: Sequence[tuple[templates.Template, float]],
         attempts: Sequence[Mapping[str, Any]],
+        rejoined: bool,
     ) -> str:
+        """Explain honestly why fresh ROOT planning applies.
+
+        A nonempty shortlist is reported first: a selected template did rejoin
+        the registry with a trusted comparable score, so a later direct-fill or
+        adaptation failure is never misreported as a registry mismatch.
+        """
+
         if not resolved_config.template_memory:
             return (
                 "template memory is disabled; no template reuse or adaptation runs "
                 "and normal fresh ROOT planning applies"
             )
-        if attempts:
-            return (
-                "no selected template rejoined the explicit immutable registry with "
-                "a trusted comparable score; normal fresh ROOT planning applies"
-            )
         if shortlist:
             return (
                 "no selected template produced a usable direct fill or permitted "
                 "adaptation; normal fresh ROOT planning applies"
+            )
+        if attempts and not rejoined:
+            return (
+                "no selected template rejoined the explicit immutable registry with "
+                "a trusted comparable score; normal fresh ROOT planning applies"
             )
         return self._no_selected_template_reason(trace)
 
@@ -1185,16 +1206,16 @@ class PreparationService:
         """
 
         reuse_attempts: list[dict[str, Any]] = []
-        shortlist = (
-            self._rejoin_selected_templates(
+        rejoined = False
+        if resolved_config.template_memory:
+            shortlist, rejoined = self._rejoin_selected_templates(
                 objective=objective,
                 route=route,
                 trace=trace,
                 attempts=reuse_attempts,
             )
-            if resolved_config.template_memory
-            else []
-        )
+        else:
+            shortlist = []
 
         for template, score in shortlist:
             if score < self.limits.direct_fill_threshold:
@@ -1358,6 +1379,7 @@ class PreparationService:
                 trace=trace,
                 shortlist=shortlist,
                 attempts=reuse_attempts,
+                rejoined=rejoined,
             ),
             fresh=fresh,
             reuse_attempts=reuse_attempts,

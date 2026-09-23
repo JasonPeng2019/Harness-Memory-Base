@@ -197,12 +197,12 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
             registry=registry if registry is not None else self.service_registry,
         )
 
-    def _local_stores(self, *, registry=None):
+    def _local_stores(self, *, registry=None, limits=None):
         return local_adapters.make_local_search_stores(
             experience_service=self.evidence,
             scope=self.scope,
             registry=registry,
-            limits=self.limits,
+            limits=limits or self.limits,
         )
 
     def _plan_for(self, route: str):
@@ -333,6 +333,91 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
         self.assertNotIn("standard", tokens)
         self.assertNotIn("strategy", tokens)
 
+    def test_long_task_keeps_the_shared_bounded_token_projection_eligible(self) -> None:
+        """A task past the bounded projection is judged on what was queried.
+
+        The bounded store query carries only the one shared 32-token
+        projection, so the trusted reuse recomputation must score exactly that
+        projection; scoring the whole canonical token set instead would reject
+        the candidate the bounded search just selected at the same threshold.
+        """
+
+        limits = config.resolve_limits(
+            {
+                "default_deadline_seconds": 300.0,
+                "execution_reserve_seconds": 60.0,
+                "store_seconds": 8.0,
+                "minimum_optional_slice_seconds": 1.0,
+                "minimum_comparable_score": 0.05,
+                "near_match_threshold": 0.1,
+                "direct_fill_threshold": 0.5,
+            }
+        )
+        # One long, sanitized task whose token set is far wider than the shared
+        # projection while every declared template keyword stays inside it.
+        task = (
+            "regression failure test repair "
+            + " ".join(f"aaa{index}" for index in range(1, 13))
+            + " "
+            + " ".join(f"zeta{index}" for index in range(1, 41))
+        )
+        service = self._service(limits=limits)
+        stores = self._local_stores(limits=limits)
+        calls: list[object] = []
+        outcome = service.prepare(
+            task_card=self._card(task),
+            plan=self.plan,
+            objective_id="objective-1",
+            route="ordinary",
+            root_replan=ROOT_REPLAN,
+            stores=list(stores),
+            apc_binding=BINDING,
+            apc_launcher=self._launcher(calls),
+        )
+        canonical = templates.objective_representation(
+            f"{task} objective-1", route="ordinary", limits=limits
+        )
+        self.assertGreater(
+            len(canonical["tokens"]), templates.MAX_REPRESENTATION_TOKENS
+        )
+        projection = templates.bounded_token_projection(canonical["tokens"])
+        self.assertEqual(templates.MAX_REPRESENTATION_TOKENS, len(projection))
+        template = templates.load_default_templates()[0]
+        declaration = templates.template_representation(template, limits=limits)
+        for keyword in template.keywords:
+            self.assertIn(keyword, projection)
+        projected = templates.score_representations(
+            templates.projected_objective(canonical), declaration
+        )
+        # The dropped long tail only exists outside the shared projection: the
+        # whole-record score is strictly lower, and judging the selected
+        # template on it would cross the same near-match threshold.
+        self.assertLess(
+            templates.score_representations(canonical, declaration),
+            limits.near_match_threshold,
+        )
+        self.assertGreaterEqual(projected, limits.near_match_threshold)
+        selected = self._selected_templates(outcome)
+        self.assertEqual(1, len(selected))
+        self.assertEqual(template.template_id, selected[0]["logical_id"])
+        self.assertEqual(projected, selected[0]["score"])
+        attempts = outcome.disposition["reuse_attempts"]
+        self.assertFalse(
+            [
+                entry
+                for entry in attempts
+                if "below the configured near-match threshold"
+                in str(entry.get("reason", ""))
+            ],
+            attempts,
+        )
+        # The selected long-task template stayed eligible through the rejoin:
+        # its near-match band hands off to one bounded adaptation child.
+        self.assertEqual("apc_proposal", outcome.disposition["branch"])
+        self.assertEqual(1, len(calls))
+        self.assertEqual(template.template_id, calls[0]["template_id"])
+        self.assertEqual(projected, outcome.disposition["template"]["score"])
+
     def test_direct_fill_resolves_only_from_the_selected_trace_candidate(self) -> None:
         stores = self._local_stores()
         outcome = self._prepare(
@@ -405,6 +490,83 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
             ),
             attempts,
         )
+
+    def test_rejoin_orders_selected_candidates_by_recomputed_trusted_score(self) -> None:
+        """Store-declared raw scores cannot choose the proposed template.
+
+        Two exact registry-matching selected templates are delivered with their
+        raw discovery scores inverted against the trusted comparable score the
+        rejoin recomputes, so the delivered rank order proposes the weaker
+        template.  Only the recomputed trusted score may order the selected
+        shortlist, and no unselected registry entry is ever added.
+        """
+
+        strong = templates.Template(
+            template_id="invert-strong/v1",
+            version=1,
+            family="Invert strong",
+            fixed_steps=("establish the failure",),
+            required_fields=("failure",),
+            allowed_edits=("bindings",),
+            verification_intent="intent",
+            keywords=("regression", "failure", "test", "repair"),
+            representation=templates.representation_identity(limits=self.limits),
+        )
+        weak = templates.Template(
+            template_id="invert-weak/v1",
+            version=2,
+            family="Invert weak",
+            fixed_steps=("establish the failure",),
+            required_fields=("failure",),
+            allowed_edits=("bindings",),
+            verification_intent="intent",
+            keywords=("regression", "failure", "test"),
+            representation=templates.representation_identity(limits=self.limits),
+        )
+        # Only these two exact registry records are declared on both sides of
+        # the seam, and the delivered raw scores are inverted against the
+        # trusted recomputation: the weaker record arrives first.
+        registry = (strong, weak)
+        service = self._service(registry=registry)
+        weak_item = raw_template_candidate(weak)
+        weak_item["score"] = 0.99
+        strong_item = raw_template_candidate(strong)
+        strong_item["score"] = 0.01
+        outcome = service.prepare(
+            task_card=self._card("regression failure test repair"),
+            plan=self.plan,
+            objective_id="objective-1",
+            route="ordinary",
+            root_replan=ROOT_REPLAN,
+            stores=[ShortlistStore("inverted-templates", [weak_item, strong_item])],
+            bindings={"failure": "parser test fails"},
+        )
+        selected = self._selected_templates(outcome)
+        self.assertEqual(
+            ["invert-weak/v1", "invert-strong/v1"],
+            [item["logical_id"] for item in selected],
+        )
+        canonical = templates.objective_representation(
+            "regression failure test repair objective-1",
+            route="ordinary",
+            limits=self.limits,
+        )
+        strong_score = templates.score_representations(
+            canonical, templates.template_representation(strong, limits=self.limits)
+        )
+        weak_score = templates.score_representations(
+            canonical, templates.template_representation(weak, limits=self.limits)
+        )
+        self.assertGreater(strong_score, weak_score)
+        self.assertGreaterEqual(weak_score, self.limits.direct_fill_threshold)
+        # Both selected records are direct-fill eligible, so only the trusted
+        # recomputed score may decide which one is proposed.
+        self.assertEqual("direct_fill", outcome.disposition["branch"])
+        self.assertEqual(
+            "invert-strong/v1", outcome.disposition["template"]["template_id"]
+        )
+        self.assertEqual(strong_score, outcome.disposition["template"]["score"])
+        self.assertEqual([], outcome.disposition["reuse_attempts"])
 
     def test_known_secret_never_reaches_the_query_or_the_reuse_score(self) -> None:
         """A configured secret is sanitized before tokenization in both phases.
@@ -792,6 +954,12 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
         self.assertEqual("unavailable", attempts[0]["status"])
         self.assertEqual("direct_fill", attempts[0]["branch"])
         self.assertEqual("ordinary-regression-repair/v1", attempts[0]["template_id"])
+        # A selected template did rejoin the registry with a trusted score, so
+        # the fresh reason reports the failed fill, never a registry mismatch.
+        self.assertIn(
+            "no selected template produced a usable direct fill",
+            outcome.disposition["reason"],
+        )
 
 
 if __name__ == "__main__":

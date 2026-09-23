@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from . import contracts
+from . import contracts, templates
 from .config import PreparationLimits
 from .privacy import PrivacyPolicy, safe_query_payload
 
@@ -354,7 +354,9 @@ class BoundedSearch:
         query = safe_query_payload(
             {
                 "representation": {key: objective[key] for key in ("model", "dimensions", "metric", "sanitizer_version")},
-                "tokens": list(objective.get("tokens", []))[:32],
+                "tokens": templates.bounded_token_projection(
+                    objective.get("tokens", [])
+                ),
                 "route": route,
             },
             self.privacy_policy,

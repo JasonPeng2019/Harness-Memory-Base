@@ -109,12 +109,11 @@ def _tokens(value: str) -> tuple[str, ...]:
 
 
 def _payload_tokens(payload: Any) -> list[str]:
+    """Read the one bounded sanitized token projection out of a query."""
+
     if not isinstance(payload, Mapping):
         return []
-    raw = payload.get("tokens")
-    if not isinstance(raw, (list, tuple)):
-        return []
-    return [token for token in list(raw)[:32] if isinstance(token, str) and token]
+    return templates.bounded_token_projection(payload.get("tokens", []))
 
 
 def _objective_representation(payload: Any) -> dict[str, Any] | None:

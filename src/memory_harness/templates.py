@@ -240,6 +240,35 @@ def representation_identity(
     return resolved.representation_identity
 
 
+MAX_REPRESENTATION_TOKENS = 32
+
+
+def bounded_token_projection(tokens: Any) -> list[str]:
+    """Return the one bounded sanitized token projection both phases compare.
+
+    The bounded store query carries at most this many canonical tokens in their
+    canonical order, and the trusted reuse recomputation scores exactly that
+    projection, so a long task can never be selected against one token set and
+    then judged against another.
+    """
+
+    if not isinstance(tokens, (list, tuple)):
+        return []
+    return [
+        token
+        for token in list(tokens)[:MAX_REPRESENTATION_TOKENS]
+        if isinstance(token, str) and token
+    ]
+
+
+def projected_objective(objective: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the canonical objective reduced to that one projection."""
+
+    record = dict(objective)
+    record["tokens"] = bounded_token_projection(objective.get("tokens", []))
+    return record
+
+
 def objective_representation(
     objective_text: str,
     *,
@@ -449,6 +478,9 @@ __all__ = [
     "fresh_plan",
     "TemplateMatch",
     "representation_identity",
+    "MAX_REPRESENTATION_TOKENS",
+    "bounded_token_projection",
+    "projected_objective",
     "objective_representation",
     "template_representation",
     "representations_comparable",
