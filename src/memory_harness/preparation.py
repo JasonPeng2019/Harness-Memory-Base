@@ -835,6 +835,27 @@ class PreparationService:
                     "generated_skill_use is disabled: a generated-origin local "
                     "procedure source performs no query"
                 )
+            elif store.source_kind == "everos_generated_skill":
+                # The future EverOS generated-skill procedure store performs a
+                # real remote call, so it is admitted only while generated-skill
+                # use is on: ``atlas_shared_retrieval`` is the shared-retrieval
+                # authority for Atlas procedures and never enables this source
+                # by itself.
+                flag = config.generated_skill_use
+                disabled_reason = (
+                    "generated_skill_use is disabled: the EverOS generated-skill "
+                    "source performs no query"
+                )
+                if flag and network_mode == "restricted_local":
+                    # Restricted-local mode must not begin the shared/remote
+                    # task-path call at all; the suppression happens here,
+                    # before the call, instead of filtering its output after
+                    # work already occurred.
+                    flag = False
+                    disabled_reason = (
+                        "restricted-local mode never begins a shared/remote "
+                        "retrieval call"
+                    )
             elif flag and store.requires_network:
                 # A remote procedure store carries shared-retrieval authority:
                 # only atlas_shared_retrieval enables it, never the local

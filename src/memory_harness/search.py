@@ -44,11 +44,16 @@ STORE_SOURCE_KINDS = frozenset(
         "caller",
         "curated_local_procedure",
         "generated_local_procedure",
+        "everos_generated_skill",
     }
 )
 _LOCAL_PROCEDURE_SOURCE_KINDS = frozenset(
     {"curated_local_procedure", "generated_local_procedure"}
 )
+# The one future shared/remote procedure source: an EverOS generated-skill
+# store performs a real remote SearchStore call, so the marker is only honest
+# together with ``requires_network=True``.
+_REMOTE_PROCEDURE_SOURCE_KINDS = frozenset({"everos_generated_skill"})
 
 
 @dataclass(frozen=True)
@@ -72,8 +77,14 @@ class SearchStore:
     shared/remote call, so it stays eligible when shared retrieval and
     generated-skill use are off), and ``generated_local_procedure`` (a local
     generated-origin store that makes no query at all while
-    ``generated_skill_use`` is off).  A local procedure source never declares
+    ``generated_skill_use`` is off), and ``everos_generated_skill`` (the future
+    EverOS generated-skill procedure store whose query performs a real remote
+    call, admitted only while ``generated_skill_use`` is true outside
+    ``restricted_local``).  A local procedure source never declares
     ``requires_network``: ``restricted_local`` suppresses only the remote call.
+    ``everos_generated_skill`` is the opposite case: the remote call is
+    intrinsic to the source, so the marker is rejected unless it also declares
+    ``requires_network=True``.
     """
 
     store_id: str
@@ -99,6 +110,11 @@ class SearchStore:
         if self.source_kind in _LOCAL_PROCEDURE_SOURCE_KINDS and self.requires_network:
             raise SearchError(
                 "a local procedure source never performs a shared/remote call"
+            )
+        if self.source_kind in _REMOTE_PROCEDURE_SOURCE_KINDS and not self.requires_network:
+            raise SearchError(
+                "an EverOS generated-skill source always performs a shared/remote "
+                "call and never declares a local/non-network call"
             )
 
 
