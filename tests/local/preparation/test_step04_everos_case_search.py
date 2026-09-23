@@ -267,6 +267,10 @@ class Step04EverOSCaseEvidenceTests(Step04EverOSCaseSearchTests):
             "task_intent": "repair the parser regression",
             "approach": "run one discriminating parser check before editing",
             "key_insight": "the local parser lock was held by the previous worker",
+            # The accepted public surface returns SearchAgentCaseItem.score
+            # on every hit; it is the ranking result of the query that
+            # produced the hit, not part of the case's stable identity.
+            "score": 0.5,
         }
         case.update(overrides)
         return case
@@ -431,12 +435,14 @@ class Step04EverOSCaseEvidenceTests(Step04EverOSCaseSearchTests):
         ]
         self.assertEqual([], local_evidence)
 
-    def test_case_query_ignores_the_reconciliation_session_filter(self) -> None:
-        # A confirmed ingestion that the reconciliation search cannot see --
-        # because the durable sanitized case carries another session -- still
-        # resolves through the read-only case query: the case seam filters by
-        # the exact durable case id, never by the ingestion session token.
-        trajectory = self._capture("foreign-session")
+    def test_case_query_appends_no_session_token_and_omits_a_cross_session_receipt(self) -> None:
+        # Discovery itself carries no session token: the accepted reconcile
+        # search appends the ingestion session to its own query text, while
+        # this read-only case query keeps the sanitized bounded tokens only.
+        # A confirmed case whose durable source-case session equals its
+        # confirmed ingestion session therefore stays discoverable here, and a
+        # receipt whose source session differs is omitted instead of promoted.
+        trajectory = self._capture("session-token")
         ingestion = contracts.make_experience_ingestion(
             trajectory=trajectory,
             destination=self.adapter.destination,
@@ -444,7 +450,7 @@ class Step04EverOSCaseEvidenceTests(Step04EverOSCaseSearchTests):
             payload_digest=contracts.sha256_hex({"trajectory": trajectory["trajectory_id"]}),
         )
         self.memory_store.create_experience_ingestion(ingestion)
-        case = self._case(trajectory, case_id="case-foreign-session", session_id="another-session")
+        case = self._case(trajectory, case_id="case-session-valid")
         receipt = contracts.make_case_receipt(
             trajectory=trajectory,
             ingestion=ingestion,
@@ -453,19 +459,93 @@ class Step04EverOSCaseEvidenceTests(Step04EverOSCaseSearchTests):
         self.memory_store.confirm_experience_ingestion(
             ingestion["ingestion_id"], [receipt], expected_version=0
         )
+        self.assertEqual(ingestion["session_id"], case["session_id"])
 
         self.fake.case_results = [case]
-        reconciliation = asyncio.run(
-            self.adapter.search_representation(
-                session_id=ingestion["session_id"], query="parser regression"
-            )
+        searches_before = len(self.fake.search_calls)
+        payload = self._payload("parser regression repair")
+        candidates = list(self._remote_store().query(payload))
+        self.assertEqual(
+            ["case-session-valid"], [item["payload"]["case_id"] for item in candidates]
         )
-        self.assertEqual([], reconciliation["agent_cases"])
-
-        candidates = list(self._remote_store().query(self._payload("parser regression repair")))
-        self.assertEqual(["case-foreign-session"], [item["payload"]["case_id"] for item in candidates])
         self.assertEqual(
             [trajectory["trajectory_id"]], [item["logical_id"] for item in candidates]
+        )
+
+        # The one discovery request used the sanitized bounded tokens and never
+        # appended the ingestion-reconciliation session token.
+        self.assertEqual(searches_before + 1, len(self.fake.search_calls))
+        request = self.fake.search_calls[-1]
+        self.assertEqual(" ".join(payload["tokens"]), request["query"])
+        self.assertNotIn("session_id", request)
+        self.assertNotIn(ingestion["session_id"], str(request["query"]))
+
+        # A direct public store confirmation can still write a receipt whose
+        # durable source-case session differs from its confirmed ingestion
+        # session.  The final durable join re-establishes the exact session
+        # provenance the accepted reconcile path required before confirmation,
+        # so that hit is omitted instead of promoted, and the unrelated
+        # eligible case above is untouched.
+        cross = self._capture("cross-session")
+        cross_ingestion = contracts.make_experience_ingestion(
+            trajectory=cross,
+            destination=self.adapter.destination,
+            session_id=self.adapter.session_id_for(cross["trajectory_id"]),
+            payload_digest=contracts.sha256_hex({"trajectory": cross["trajectory_id"]}),
+        )
+        self.memory_store.create_experience_ingestion(cross_ingestion)
+        cross_case = self._case(
+            cross, case_id="case-cross-session", session_id="another-session"
+        )
+        cross_receipt = contracts.make_case_receipt(
+            trajectory=cross,
+            ingestion=cross_ingestion,
+            source_case=cross_case,
+        )
+        self.memory_store.confirm_experience_ingestion(
+            cross_ingestion["ingestion_id"], [cross_receipt], expected_version=0
+        )
+        self.assertNotEqual(cross_ingestion["session_id"], cross_case["session_id"])
+
+        with self.assertRaises(store.StoreError):
+            self.memory_store.read_confirmed_case_join(
+                self.scope.to_record(), cross_case["id"]
+            )
+
+        self.fake.case_results = [cross_case, case]
+        candidates = list(self._remote_store().query(self._payload("parser regression repair")))
+        self.assertEqual(
+            ["case-session-valid"], [item["payload"]["case_id"] for item in candidates]
+        )
+        self.assertEqual(
+            [trajectory["trajectory_id"]], [item["logical_id"] for item in candidates]
+        )
+
+    def test_query_dependent_score_change_keeps_the_unchanged_confirmed_case(self) -> None:
+        # EverOS returns SearchAgentCaseItem.score on every hit, and that value
+        # is the ranking result of the query that produced it.  STEP-02
+        # confirmation and this preparation search use different queries, so
+        # the same unchanged confirmed case comes back with another score: only
+        # that query-dependent ranking metadata may be ignored, and the stable
+        # sanitized case identity/content must still match exactly.
+        trajectory, case = self._confirmed("score-change", case_id="case-score-change")
+        rescored = dict(case, score=float(case["score"]) + 0.25)
+        self.assertNotEqual(case["score"], rescored["score"])
+        self.fake.case_results = [rescored]
+
+        candidates = list(self._remote_store().query(self._payload("parser regression repair")))
+        self.assertEqual(
+            ["case-score-change"], [item["payload"]["case_id"] for item in candidates]
+        )
+        self.assertEqual(
+            [trajectory["trajectory_id"]], [item["logical_id"] for item in candidates]
+        )
+
+        # A changed stable field is still rejected even while the score also
+        # moves: ignoring ranking metadata never widens case authority.
+        self.fake.case_results = [dict(rescored, approach="a different stored approach")]
+        self.assertEqual(
+            [], list(self._remote_store().query(self._payload("parser regression repair")))
         )
 
     # -- the durable receipt join fails closed -----------------------------

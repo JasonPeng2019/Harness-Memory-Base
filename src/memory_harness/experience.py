@@ -995,12 +995,15 @@ class ReviewedExperienceService:
         - the reviewed, reviewed-state trajectory behind that ingestion, and
         - the durable review receipt the trajectory still binds.
 
-        The stored sanitized source content must still match this exact remote
-        case byte for byte, so an altered, unresolved, unreviewed, unconfirmed,
-        cross-scope, or stale remote hit returns ``None`` instead of being
-        promoted.  The returned projection is historical evidence only: it
-        carries no raw evidence, no protected references, no procedural steps,
-        and no plan authority.
+        The stored sanitized source case must still match this remote hit on
+        every stable identity/content field, so an altered, unresolved,
+        unreviewed, unconfirmed, cross-scope, or stale remote hit returns
+        ``None`` instead of being promoted.  Only the query-dependent ranking
+        metadata the accepted public surface returns on every hit (the exact
+        ``SearchAgentCaseItem.score`` of the ranking query) may differ between
+        confirmation and this later search.  The returned projection is
+        historical evidence only: it carries no raw evidence, no protected
+        references, no procedural steps, and no plan authority.
         """
 
         expected_scope = scope.to_record()
@@ -1037,13 +1040,18 @@ class ReviewedExperienceService:
         ):
             return None
         stored_source_case = receipt["source_case"]
-        if (
-            not isinstance(stored_source_case, Mapping)
-            or dict(stored_source_case) != dict(sanitized_case)
-            or receipt["source_case_digest"] != contracts.sha256_hex(sanitized_case)
+        if not isinstance(stored_source_case, Mapping):
+            return None
+        if receipt["source_case_digest"] != contracts.sha256_hex(stored_source_case):
+            # The durable receipt no longer matches its own retained digest.
+            return None
+        if _stable_case_content(stored_source_case) != _stable_case_content(
+            sanitized_case
         ):
-            # The remote case changed after confirmation: the durable receipt
-            # is authoritative and this hit is omitted as altered.
+            # A stable identity or content field changed after confirmation and
+            # the remote case is omitted as altered; only the query-dependent
+            # ranking metadata may differ between the confirming query and this
+            # later discovery query.
             return None
         projection = _trajectory_evidence_projection(trajectory, self.privacy_policy)
         projection["case_id"] = case_id
@@ -1075,6 +1083,25 @@ class ReviewedExperienceService:
                 continue
             results.append(projection)
         return results
+
+
+# The accepted public EverOS case surface returns ``SearchAgentCaseItem.score``
+# on every hit, and that value is the ranking result of the exact query that
+# produced the hit.  STEP-02 confirmation and a later preparation search use
+# different queries, so the same unchanged case legitimately comes back with
+# another score; every other returned field is stable case identity or content
+# and must still match the durable receipt exactly.
+_QUERY_DEPENDENT_CASE_FIELDS = frozenset({"score"})
+
+
+def _stable_case_content(case: Mapping[str, Any]) -> dict[str, Any]:
+    """Return one sanitized case without its query-dependent ranking metadata."""
+
+    return {
+        key: value
+        for key, value in case.items()
+        if key not in _QUERY_DEPENDENT_CASE_FIELDS
+    }
 
 
 def _trajectory_evidence_projection(

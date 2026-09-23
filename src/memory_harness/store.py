@@ -1388,8 +1388,11 @@ class MemoryStore:
         an exact scoped search, so a later read that wants to reuse that case
         re-establishes the whole chain instead of trusting a remote hit: the
         case receipt, its confirmed ingestion, the reviewed trajectory, and the
-        durable review receipt all have to agree on the same case id,
-        ingestion, trajectory, review receipt, and exact four-part scope.
+        durable review receipt all have to agree on the same case id, ingestion,
+        trajectory, review receipt, and exact four-part scope, and the retained
+        source case's session must equal its confirmed ingestion session exactly
+        -- the same equality the accepted reconcile path required before any
+        receipt could be confirmed.
 
         The lookup runs on one read-only connection created and closed by the
         calling thread, because the accepted bounded search queries every store
@@ -1442,6 +1445,16 @@ class MemoryStore:
             if case_id not in ingestion["case_ids"]:
                 raise StoreError(
                     f"confirmed ingestion does not claim the case receipt: {case_id}"
+                )
+            if (
+                case_receipt["source_case"].get("session_id")
+                != ingestion["session_id"]
+            ):
+                # A direct public store confirmation can disagree with the
+                # accepted reconcile path, which required this exact equality
+                # (``validate_case``) before any receipt could be confirmed.
+                raise StoreError(
+                    f"case receipt source session does not match its ingestion: {case_id}"
                 )
             trajectory_row = connection.execute(
                 "SELECT * FROM reviewed_trajectories WHERE trajectory_id = ?",
