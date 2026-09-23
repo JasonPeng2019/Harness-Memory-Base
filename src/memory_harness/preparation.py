@@ -344,6 +344,7 @@ class PreparationService:
             failure_context=failure_context,
             accepted_precedence=not template_selection,
             config=resolved_config,
+            network_mode=network_mode,
             budget_reason=admission_reason,
         )
 
@@ -656,6 +657,7 @@ class PreparationService:
             failure_context=failure_context,
             accepted_precedence=False,
             config=replacement_config,
+            network_mode=replacement["network_mode"],
             budget_reason=admission_reason,
         )
         disposition = contracts.make_plan_disposition(
@@ -796,6 +798,7 @@ class PreparationService:
         failure_context: str | None,
         accepted_precedence: bool,
         config: MemoryConfig,
+        network_mode: str,
         budget_reason: str = "",
     ) -> dict[str, Any]:
         enabled: list[SearchStore] = []
@@ -806,6 +809,24 @@ class PreparationService:
                 "procedure": config.atlas_shared_retrieval or config.generated_skill_use,
                 "template": config.template_memory,
             }.get(store.kind, False)
+            disabled_reason = "the resolved configuration disables this store"
+            if flag and store.requires_network:
+                # A remote procedure store carries shared-retrieval authority:
+                # only atlas_shared_retrieval enables it, never the local
+                # generated-skill analogue, so an Atlas store is never queried
+                # just because generated_skill_use is true.
+                if store.kind == "procedure":
+                    flag = config.atlas_shared_retrieval
+                if flag and network_mode == "restricted_local":
+                    # Restricted-local mode must not begin the shared/remote
+                    # task-path call at all; the suppression happens here,
+                    # before the call, instead of filtering its output after
+                    # work already occurred.
+                    flag = False
+                    disabled_reason = (
+                        "restricted-local mode never begins a shared/remote "
+                        "retrieval call"
+                    )
             if accepted_precedence and store.kind == "template":
                 # Template selection never runs when an accepted or candidate
                 # plan has precedence.
@@ -817,7 +838,7 @@ class PreparationService:
                         "kind": store.kind,
                         "status": "disabled",
                         "candidates": 0,
-                        "reason": "the resolved configuration disables this store",
+                        "reason": disabled_reason,
                     }
                 )
                 continue

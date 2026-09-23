@@ -37,7 +37,16 @@ class UnknownKindError(SearchError):
 
 @dataclass(frozen=True)
 class SearchStore:
-    """One bounded, enabled optional store adapter."""
+    """One bounded, enabled optional store adapter.
+
+    ``requires_network`` is the smallest explicit source marker the
+    preparation gate needs: it declares that the store's query performs a
+    shared/remote task-path call (the Atlas procedure service), so disabling
+    its shared-retrieval feature or selecting ``restricted_local`` must
+    suppress the actual call before it begins instead of filtering its output
+    afterwards.  Existing caller-supplied stores keep their exact behavior:
+    the field defaults to a local store.
+    """
 
     store_id: str
     kind: str
@@ -45,6 +54,7 @@ class SearchStore:
     scope: Mapping[str, Any] | None = None
     freshness: str = "live"
     specificity: str = "project"
+    requires_network: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.store_id, str) or not self.store_id.strip():
@@ -53,6 +63,8 @@ class SearchStore:
             raise UnknownKindError(f"unknown candidate kind: {self.kind!r}")
         if not callable(self.query):
             raise SearchError("store query must be callable")
+        if not isinstance(self.requires_network, bool):
+            raise SearchError("store requires_network must be boolean")
 
 
 @dataclass(frozen=True)

@@ -3,6 +3,7 @@
 from . import (
     apc,
     atlas,
+    atlas_adapters,
     config,
     context,
     contracts,
@@ -21,6 +22,7 @@ from . import (
 __all__ = [
     "apc",
     "atlas",
+    "atlas_adapters",
     "config",
     "context",
     "contracts",
