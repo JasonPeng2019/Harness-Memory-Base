@@ -944,19 +944,25 @@ class PreparationService:
         literally the same representation instead of two separately
         constructed ones.
 
-        The task and failure text are sanitized with the active privacy policy
-        *before* tokenization, so a configured secret contributes no token to
-        the bounded store query and no weight to the trusted reuse score: the
-        one sanitized record is what both phases consume.
+        The task, objective, and failure text are sanitized with the active
+        privacy policy *before* tokenization, so a configured secret contributes
+        no token to the bounded store query and no weight to the trusted reuse
+        score: the one sanitized record is what both phases consume.  Only this
+        query/scoring text is sanitized; durable records keep the exact
+        objective identity.
         """
 
         task_text = sanitize_text(
             str(task_card.get("task") or "").strip(), self.privacy_policy
         )
+        # The objective identity is caller-supplied too, so it is sanitized for
+        # this query/scoring text exactly like the task and failure context.
+        # The durable record keeps the exact objective id untouched.
+        objective_text = sanitize_text(str(objective_id), self.privacy_policy)
         context_text = sanitize_text(failure_context or "", self.privacy_policy)
-        parts = [part for part in (task_text, str(objective_id)) if part]
+        parts = [part for part in (task_text, objective_text) if part]
         return templates.objective_representation(
-            " ".join(parts) or str(objective_id),
+            " ".join(parts) or objective_text or str(objective_id),
             route=route,
             limits=self.limits,
             failure_context=context_text or None,

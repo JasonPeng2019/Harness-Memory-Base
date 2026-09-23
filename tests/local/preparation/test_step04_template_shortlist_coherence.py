@@ -425,7 +425,18 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
             privacy_policy=policy,
         )
 
-        def prepare(task: str, failure: str):
+        def prepare(task: str, failure: str, objective_id: str = "objective-1"):
+            plan = (
+                self.plan
+                if objective_id == "objective-1"
+                else contracts.make_plan(
+                    plan_id="candidate-plan",
+                    objective_id=objective_id,
+                    route="ordinary",
+                    state="candidate",
+                    content={"steps": ["draft"]},
+                )
+            )
             stores = self._local_stores()
             recording = RecordingTemplateQuery(
                 next(item for item in stores if item.kind == "template")
@@ -444,8 +455,8 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
             )
             outcome = service.prepare(
                 task_card=self._card(task),
-                plan=self.plan,
-                objective_id="objective-1",
+                plan=plan,
+                objective_id=objective_id,
                 route="ordinary",
                 root_replan=ROOT_REPLAN,
                 failure_context=failure,
@@ -502,6 +513,52 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
         self.assertEqual(
             redacted_selected[0]["score"], protected_selected[0]["score"]
         )
+
+        # The caller-supplied objective identity is sanitized for the same one
+        # representation, so a secret there is inert too; the durable record
+        # still carries the exact objective id unchanged.
+        secret_objective = f"objective-1-{secret}"
+        plain_objective = f"objective-1-{marker}"
+        protected_objective, protected_objective_query = prepare(
+            "regression failure test repair",
+            "indexerror",
+            objective_id=secret_objective,
+        )
+        redacted_objective, redacted_objective_query = prepare(
+            "regression failure test repair",
+            "indexerror",
+            objective_id=plain_objective,
+        )
+        self.assertNotIn(secret, repr(protected_objective_query))
+        objective_tokens = set(protected_objective_query["tokens"])
+        self.assertNotIn("canary", objective_tokens)
+        self.assertNotIn("s3cr3t", objective_tokens)
+        self.assertNotIn("value", objective_tokens)
+        self.assertIn("redacted", objective_tokens)
+        self.assertEqual(redacted_objective_query, protected_objective_query)
+        self.assertEqual(
+            redacted_objective_query["tokens"], protected_objective_query["tokens"]
+        )
+        self.assertEqual(
+            redacted_objective.disposition["template"]["score"],
+            protected_objective.disposition["template"]["score"],
+        )
+        # The objective-id leg is judged on that same sanitized record: its
+        # tokens are the canonical ones plus the declared failure context, and
+        # it direct-fills from the trace candidate the bounded search selected.
+        self.assertEqual(set(canonical["tokens"]) | {"indexerror"}, objective_tokens)
+        self.assertEqual("direct_fill", protected_objective.disposition["branch"])
+        self.assertEqual(
+            templates.load_default_templates()[0].template_id,
+            protected_objective.disposition["template"]["template_id"],
+        )
+        self.assertEqual(
+            protected_objective.disposition["template"]["template_id"],
+            redacted_objective.disposition["template"]["template_id"],
+        )
+        # Exact objective identity stays untouched in the durable record.
+        self.assertEqual(secret_objective, protected_objective.preparation["objective_id"])
+        self.assertEqual(secret_objective, protected_objective.decision["objective_id"])
 
     # -- fail-closed paths --------------------------------------------------
 
