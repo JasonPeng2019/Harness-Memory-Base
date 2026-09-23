@@ -18,6 +18,7 @@ real ``search.SearchStore`` inputs for ``preparation.PreparationService``:
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 import tempfile
@@ -134,7 +135,22 @@ class Step04LocalSearchAdapterTests(unittest.TestCase):
 
     # -- helpers -----------------------------------------------------------
 
-    def _reviewed_trajectory(self, scope, *, suffix: str, task: str, raw_evidence: str) -> dict:
+    def _reviewed_trajectory(
+        self,
+        scope,
+        *,
+        suffix: str,
+        task: str,
+        raw_evidence: str,
+        memory_store=None,
+        experience_service=None,
+    ) -> dict:
+        memory_store = self.memory_store if memory_store is None else memory_store
+        experience_service = (
+            self.experience_service
+            if experience_service is None
+            else experience_service
+        )
         plan = contracts.make_plan(
             plan_id=f"accepted-plan-{suffix}",
             objective_id=f"objective-{suffix}",
@@ -151,7 +167,7 @@ class Step04LocalSearchAdapterTests(unittest.TestCase):
             ),
         )
         decision = contracts.make_decision(card, plan)
-        self.memory_store.record_decision(decision)
+        memory_store.record_decision(decision)
         outcome = contracts.make_outcome(
             decision_id=decision["decision_id"],
             plan_id=plan["plan_id"],
@@ -162,7 +178,7 @@ class Step04LocalSearchAdapterTests(unittest.TestCase):
             task_card_digest=card["content_hash"],
             objective_id=plan["objective_id"],
         )
-        self.memory_store.record_outcome(outcome)
+        memory_store.record_outcome(outcome)
         review = contracts.make_review_receipt(
             review_id=f"review-{suffix}",
             outcome=outcome,
@@ -175,7 +191,7 @@ class Step04LocalSearchAdapterTests(unittest.TestCase):
             raw_evidence=raw_evidence,
             failed_hypotheses=("the network adapter caused the regression",),
         )
-        return self.experience_service.capture(
+        return experience_service.capture(
             task_card=card,
             plan=plan,
             decision=decision,
@@ -659,6 +675,65 @@ class Step04LocalSearchAdapterTests(unittest.TestCase):
         strict.start()
         strict.join()
         self.assertIsInstance(failed.get("error"), store.TrajectoryConflictError)
+
+    def test_relative_store_path_read_survives_a_changed_process_cwd(self) -> None:
+        # initialize() always accepted relative database paths, so the
+        # read-only seam must open the database initialize() opened, not
+        # re-resolve the relative path against whatever cwd the bounded
+        # worker thread happens to run in.
+        original_cwd = Path.cwd()
+        workdir = self.root / "relative-workdir"
+        workdir.mkdir()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        relative_store = store.MemoryStore("relative-state.sqlite3")
+        try:
+            os.chdir(workdir)
+            relative_store.initialize()
+            # The public path attribute keeps the caller's relative form.
+            self.assertEqual(Path("relative-state.sqlite3"), relative_store.path)
+            opened_database = workdir / "relative-state.sqlite3"
+            self.assertTrue(opened_database.exists())
+            trajectory = self._reviewed_trajectory(
+                self.scope,
+                suffix="relative-path",
+                task="Repair the parser regression",
+                raw_evidence=(
+                    "The parser repair passed inside the relative database."
+                ),
+                memory_store=relative_store,
+                experience_service=experience.ReviewedExperienceService(
+                    relative_store, privacy_policy=self.policy
+                ),
+            )
+            os.chdir(elsewhere)
+            self.assertFalse((elsewhere / "relative-state.sqlite3").exists())
+
+            result: dict = {}
+
+            def read_off_thread() -> None:
+                try:
+                    result["rows"] = relative_store.list_recent_reviewed_trajectories(
+                        self.scope.to_record()
+                    )
+                except BaseException as exc:  # the regression must surface
+                    result["error"] = exc
+
+            reader = threading.Thread(target=read_off_thread, name="step04-relative-read")
+            reader.start()
+            reader.join()
+            self.assertNotIn(
+                "error", result, f"off-thread read failed: {result.get('error')!r}"
+            )
+            rows = result["rows"]
+            self.assertEqual(
+                [trajectory["trajectory_id"]],
+                [row["trajectory_id"] for row in rows],
+            )
+            self.assertEqual(self.scope.to_record(), dict(rows[0]["scope"]))
+        finally:
+            os.chdir(original_cwd)
+            relative_store.close()
 
     def _schema_snapshot(self) -> list[tuple]:
         connection = sqlite3.connect(str(self.memory_store.path))

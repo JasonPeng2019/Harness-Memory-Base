@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Mapping
@@ -411,6 +412,7 @@ class MemoryStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.connection: sqlite3.Connection | None = None
+        self._opened_path: Path | None = None
 
     def __enter__(self) -> "MemoryStore":
         self.initialize()
@@ -425,6 +427,10 @@ class MemoryStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self.connection = sqlite3.connect(str(self.path), timeout=30.0)
+            # Remember the database this connection actually opened so a
+            # relative path keeps working for later reads after the process
+            # cwd moves; ``self.path`` keeps the caller's form.
+            self._opened_path = Path(os.path.abspath(self.path))
             self.connection.row_factory = sqlite3.Row
             self.connection.execute("PRAGMA foreign_keys=ON")
             self.connection.execute("PRAGMA journal_mode=WAL")
@@ -459,6 +465,7 @@ class MemoryStore:
             if self.connection is not None:
                 self.connection.close()
                 self.connection = None
+            self._opened_path = None
             raise StoreError(f"cannot initialize memory store {self.path}: {exc}") from exc
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
@@ -474,6 +481,7 @@ class MemoryStore:
         if self.connection is not None:
             self.connection.close()
             self.connection = None
+        self._opened_path = None
 
     def _require_connection(self) -> sqlite3.Connection:
         if self.connection is None:
@@ -488,17 +496,21 @@ class MemoryStore:
         own bounded worker thread, so this seam lets the local reviewed-evidence
         read run there: the connection is created by the caller and closed by
         the caller, and it never writes, migrates, or changes shared state.
+        Its URI is built from the absolute database identity captured by
+        ``initialize``, so relative store paths keep working after the
+        process cwd moves.
         """
 
-        if self.connection is None:
+        opened_path = self._opened_path
+        if self.connection is None or opened_path is None:
             raise StoreError("memory store is not initialized")
         try:
             connection = sqlite3.connect(
-                f"{self.path.as_uri()}?mode=ro", uri=True, timeout=30.0
+                f"{opened_path.as_uri()}?mode=ro", uri=True, timeout=30.0
             )
         except (sqlite3.Error, ValueError) as exc:
             raise StoreError(
-                f"cannot open read-only memory store {self.path}: {exc}"
+                f"cannot open read-only memory store {opened_path}: {exc}"
             ) from exc
         connection.row_factory = sqlite3.Row
         return connection
