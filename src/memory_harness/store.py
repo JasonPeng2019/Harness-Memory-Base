@@ -1379,6 +1379,109 @@ class MemoryStore:
                 )
         return self.get_experience_ingestion(ingestion_id)
 
+    def read_confirmed_case_join(
+        self, scope: Mapping[str, Any], case_id: str
+    ) -> dict[str, Any]:
+        """Return the exact durable confirmed-receipt join for one case.
+
+        The accepted reconcile path confirms one EverOS case receipt only from
+        an exact scoped search, so a later read that wants to reuse that case
+        re-establishes the whole chain instead of trusting a remote hit: the
+        case receipt, its confirmed ingestion, the reviewed trajectory, and the
+        durable review receipt all have to agree on the same case id,
+        ingestion, trajectory, review receipt, and exact four-part scope.
+
+        The lookup runs on one read-only connection created and closed by the
+        calling thread, because the accepted bounded search queries every store
+        on its own bounded worker thread and the shared store connection is
+        thread-affine.  It never writes, migrates, or changes shared state, and
+        every check fails closed: a missing, unconfirmed, altered, unreviewed,
+        or out-of-scope chain raises instead of returning a partial record.
+        """
+
+        if not isinstance(case_id, str) or not case_id.strip():
+            raise StoreError("case id must be a nonempty string")
+        connection = self._open_read_only_connection()
+        try:
+            expected_scope = contracts.normalize_experience_scope(scope)
+            scope_digest = contracts.sha256_hex(expected_scope)
+            row = connection.execute(
+                """
+                SELECT * FROM experience_case_receipts
+                WHERE case_id = ? AND scope_digest = ?
+                """,
+                (case_id, scope_digest),
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"case receipt not found for {case_id}")
+            case_receipt = self._case_receipt_from_row(row)
+            if case_receipt["scope"] != expected_scope:
+                raise StoreError(
+                    f"case receipt is outside the requested scope: {case_id}"
+                )
+            ingestion_row = connection.execute(
+                "SELECT * FROM experience_ingestions WHERE ingestion_id = ?",
+                (case_receipt["ingestion_id"],),
+            ).fetchone()
+            if ingestion_row is None:
+                raise StoreError(f"case receipt has no durable ingestion: {case_id}")
+            ingestion = self._ingestion_from_row(ingestion_row)
+            if ingestion["status"] != "confirmed":
+                raise StoreError(
+                    "case receipt ingestion is not confirmed: "
+                    f"{ingestion['status']}"
+                )
+            if (
+                ingestion["scope"] != expected_scope
+                or ingestion["scope_digest"] != scope_digest
+                or ingestion["trajectory_id"] != case_receipt["trajectory_id"]
+            ):
+                raise StoreError(
+                    f"confirmed ingestion is outside the case receipt scope: {case_id}"
+                )
+            if case_id not in ingestion["case_ids"]:
+                raise StoreError(
+                    f"confirmed ingestion does not claim the case receipt: {case_id}"
+                )
+            trajectory_row = connection.execute(
+                "SELECT * FROM reviewed_trajectories WHERE trajectory_id = ?",
+                (case_receipt["trajectory_id"],),
+            ).fetchone()
+            if trajectory_row is None:
+                raise StoreError(
+                    f"case receipt has no durable reviewed trajectory: {case_id}"
+                )
+            trajectory = self._trajectory_from_row(trajectory_row)
+            if trajectory["scope"] != expected_scope:
+                raise StoreError(
+                    f"reviewed trajectory is outside the requested scope: {case_id}"
+                )
+            if trajectory["status"] not in contracts.REVIEWED_TRAJECTORY_STATUSES:
+                raise StoreError(
+                    f"reviewed trajectory is not a reviewed status: {case_id}"
+                )
+            if trajectory["review_state"] not in contracts.REVIEW_STATES:
+                raise StoreError(
+                    f"reviewed trajectory is not in a review state: {case_id}"
+                )
+            if (
+                case_receipt["review_receipt_id"] != trajectory["review_receipt_id"]
+                or case_receipt["review_receipt_digest"]
+                != trajectory["review_receipt_digest"]
+            ):
+                raise StoreError(f"case receipt review binding changed: {case_id}")
+            review_receipt = self._durable_review_receipt_for_trajectory(
+                trajectory, connection=connection
+            )
+            return {
+                "case_receipt": case_receipt,
+                "ingestion": ingestion,
+                "trajectory": trajectory,
+                "review_receipt": review_receipt,
+            }
+        finally:
+            connection.close()
+
     def get_case_receipt(
         self, scope: Mapping[str, Any], case_id: str
     ) -> dict[str, Any]:

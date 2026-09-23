@@ -464,6 +464,73 @@ class EverOSAdapter:
             self.validate_skill(source_skill)
         return result
 
+    def validate_case_scope(self, source_case: Mapping[str, Any]) -> None:
+        """Fail closed unless one returned case is exactly inside this scope.
+
+        The case query below returns remote records that no ingestion session
+        has reconciled yet, so this is the smallest read-only public check the
+        scoped query and its callers can apply before any durable rejoin: the
+        exact case id plus the bound owner, application, and project.
+        """
+
+        self._validate_case_scope(source_case)
+
+    async def search_case_candidates(
+        self, *, query: str, top_k: int = 100
+    ) -> list[dict[str, Any]]:
+        """Search this scope's EverOS case candidates without a session filter.
+
+        This is the smallest read-only scoped query on top of the accepted
+        public search surface: the exact bound root is re-checked, the accepted
+        ``SearchRequest`` carries the exact application, project, and owner
+        filters, and no ingestion-reconciliation receipt token is appended.
+        The ingestion session is deliberately not part of this query, because a
+        case is discoverable before any local ingestion exists; every hit is
+        only a candidate and stays untrusted until its exact case receipt,
+        confirmed ingestion, reviewed trajectory, and review receipt resolve in
+        this same scope.
+
+        Per-hit scope failures are omitted here so one foreign or malformed
+        remote record can never discard an unrelated in-scope hit; a whole
+        response or bound-root failure still raises, and the caller isolates
+        it.
+        """
+
+        self._assert_bound_memory_root()
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ExperienceError("EverOS case query top_k must be a positive integer")
+        safe_query = privacy_module.sanitize_text(query, self.privacy_policy).strip()
+        if not safe_query:
+            raise ExperienceError("EverOS case query became empty after sanitization")
+        request = self.surface.make_search_request(
+            agent_id=self.everos_owner_id,
+            app_id=self.everos_application_id,
+            project_id=self.everos_project_id,
+            query=safe_query,
+            method="keyword",
+            top_k=int(top_k),
+        )
+        response = _model_mapping(
+            await self.surface.search(request), "EverOS case search response"
+        )
+        data = response.get("data")
+        if not isinstance(data, Mapping):
+            raise ExperienceError("EverOS case search response has no data object")
+        items = data.get("agent_cases", [])
+        if not isinstance(items, list):
+            raise ExperienceError("EverOS case search agent_cases must be a list")
+        cases: list[dict[str, Any]] = []
+        for item in items:
+            try:
+                source_case = _model_mapping(item, "EverOS agent case")
+                self.validate_case_scope(source_case)
+            except (ScopeBoundaryError, ExperienceError):
+                # A foreign or malformed hit is omitted, never promoted and
+                # never allowed to suppress an unrelated in-scope hit.
+                continue
+            cases.append(source_case)
+        return cases
+
     def validate_case(self, source_case: Mapping[str, Any], *, session_id: str) -> None:
         self._validate_case_scope(source_case)
         value = source_case.get("session_id")
@@ -912,6 +979,76 @@ class ReviewedExperienceService:
 
     def get_trajectory(self, trajectory_id: str) -> dict[str, Any]:
         return self.store.get_reviewed_trajectory(trajectory_id)
+
+    def confirmed_case_evidence(
+        self, scope: ExperienceScope, source_case: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return sanitized evidence for one durable confirmed reviewed case.
+
+        A remote case is discovery, never authority.  This method accepts one
+        already scope-validated EverOS case and returns a sanitized
+        historical-evidence projection only after the exact durable chain
+        resolves in the same scope:
+
+        - the case receipt recorded for this exact case id and scope,
+        - its confirmed experience ingestion (same trajectory, same scope),
+        - the reviewed, reviewed-state trajectory behind that ingestion, and
+        - the durable review receipt the trajectory still binds.
+
+        The stored sanitized source content must still match this exact remote
+        case byte for byte, so an altered, unresolved, unreviewed, unconfirmed,
+        cross-scope, or stale remote hit returns ``None`` instead of being
+        promoted.  The returned projection is historical evidence only: it
+        carries no raw evidence, no protected references, no procedural steps,
+        and no plan authority.
+        """
+
+        expected_scope = scope.to_record()
+        case_id = source_case.get("id") if isinstance(source_case, Mapping) else None
+        if not isinstance(case_id, str) or not case_id.strip():
+            return None
+        sanitized_case = privacy_module.sanitize_payload(source_case, self.privacy_policy)
+        if not isinstance(sanitized_case, Mapping):
+            return None
+        try:
+            join = self.store.read_confirmed_case_join(expected_scope, case_id)
+        except Exception:
+            # Missing, unconfirmed, altered, unreviewed, or out-of-scope
+            # durable state omits this hit instead of trusting the remote case.
+            return None
+        receipt = join["case_receipt"]
+        ingestion = join["ingestion"]
+        trajectory = join["trajectory"]
+        if (
+            receipt["scope"] != expected_scope
+            or ingestion["scope"] != expected_scope
+            or trajectory["scope"] != expected_scope
+        ):
+            return None
+        if ingestion["status"] != "confirmed" or case_id not in ingestion["case_ids"]:
+            return None
+        if ingestion["trajectory_id"] != receipt["trajectory_id"]:
+            return None
+        if not is_reviewed(trajectory) or trajectory["review_state"] not in contracts.REVIEW_STATES:
+            return None
+        if (
+            receipt["review_receipt_id"] != trajectory["review_receipt_id"]
+            or receipt["review_receipt_digest"] != trajectory["review_receipt_digest"]
+        ):
+            return None
+        stored_source_case = receipt["source_case"]
+        if (
+            not isinstance(stored_source_case, Mapping)
+            or dict(stored_source_case) != dict(sanitized_case)
+            or receipt["source_case_digest"] != contracts.sha256_hex(sanitized_case)
+        ):
+            # The remote case changed after confirmation: the durable receipt
+            # is authoritative and this hit is omitted as altered.
+            return None
+        projection = _trajectory_evidence_projection(trajectory, self.privacy_policy)
+        projection["case_id"] = case_id
+        projection["case_receipt_id"] = receipt["case_receipt_id"]
+        return projection
 
     def search_recent_evidence(
         self, scope: ExperienceScope, query: str
