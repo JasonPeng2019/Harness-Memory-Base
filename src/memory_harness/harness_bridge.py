@@ -25,6 +25,15 @@ class ApcUnavailableError(HarnessBridgeError):
     """Light adaptation is unavailable for this exact run."""
 
 
+class ApcChildUnavailableError(HarnessBridgeError):
+    """The product harness proved no child was launched for this attempt.
+
+    The refusal is terminal: the queue or launch failed before any child
+    existed, so a later attempt is not blocked by a live owner and the
+    recorded operation never claims an unresolved live child.
+    """
+
+
 class ApcChildAmbiguityError(HarnessBridgeError):
     """The child acknowledgement is ambiguous and must be reconciled exactly."""
 
@@ -160,7 +169,25 @@ def run_apc_child(
             )
         raise ApcChildTimeoutError("the child stage allowance expired before launch")
 
-    observed = launcher(request)
+    try:
+        observed = launcher(request)
+    except ApcChildUnavailableError as exc:
+        # The product harness proved that no child was launched, so the
+        # recorded attempt becomes terminal instead of an unresolved claim
+        # that would block every later attempt.
+        if store is not None:
+            store.record_apc_child_operation(
+                contracts.make_apc_child_operation(
+                    request=request,
+                    status="refused",
+                    cleanup={
+                        "state": "no child was launched; the product harness refused the attempt",
+                        "reason": str(exc),
+                    },
+                    attempt=attempt_number,
+                )
+            )
+        raise
     if observed is None:
         ambiguous = contracts.make_apc_child_operation(
             request=request,
@@ -189,32 +216,66 @@ def run_apc_child(
         )
 
     result = observed.get("result")
+    observed_cleanup = observed.get("cleanup")
+    effective_cleanup = (
+        dict(observed_cleanup)
+        if isinstance(observed_cleanup, Mapping)
+        else (dict(cleanup) if cleanup else None)
+    )
+    # Only an explicit proof retires the exact child.  Without it the child may
+    # still be live, so a timeout or rejection must stay unresolved.
+    cleanup_proven = bool(
+        isinstance(effective_cleanup, Mapping)
+        and effective_cleanup.get("cleanup_proven") is True
+    )
     launched = contracts.make_apc_child_operation(
         request=request,
         status="launched",
         launch_intent={"binding": dict(request["binding"])},
-        observed_invocation={key: observed[key] for key in observed if key != "result"},
+        observed_invocation={
+            key: observed[key] for key in observed if key not in ("result", "cleanup")
+        },
         result=result if isinstance(result, Mapping) else None,
-        cleanup=dict(cleanup) if cleanup else None,
+        cleanup=effective_cleanup,
         attempt=attempt_number,
     )
     if store is not None:
         store.record_apc_child_operation(launched)
 
     if deadline is not None and now() > deadline:
-        # The child was already launched, so its exact identity is live and its
-        # cleanup is not yet proven.  Persist that unresolved ownership instead
-        # of a terminal failure; a retry must reconcile this exact child.
+        # The child exceeded the one shared stage bound.  Only a proven
+        # retirement makes the attempt terminal; otherwise the exact live
+        # ownership stays unresolved and a retry must reconcile it first.
+        if cleanup_proven:
+            retired = contracts.make_apc_child_operation(
+                request=request,
+                status="failed",
+                launch_intent={"binding": dict(request["binding"])},
+                observed_invocation=launched["observed_invocation"],
+                result=result if isinstance(result, Mapping) else None,
+                cleanup=effective_cleanup,
+                attempt=attempt_number,
+            )
+            if store is not None:
+                store.record_apc_child_operation(retired)
+            raise ApcChildTimeoutError(
+                "the child exceeded the enclosing absolute deadline; its exact "
+                "owned lane was retired by the product harness"
+            )
         cleanup_pending = contracts.make_apc_child_operation(
             request=request,
             status="cleanup_pending",
             launch_intent={"binding": dict(request["binding"])},
             observed_invocation=launched["observed_invocation"],
             result=result if isinstance(result, Mapping) else None,
-            cleanup={
-                "state": "cleanup pending on the product harness",
-                "reason": "the child exceeded the enclosing absolute deadline after launch",
-            },
+            cleanup=(
+                effective_cleanup
+                if isinstance(effective_cleanup, Mapping)
+                else {
+                    "state": "cleanup pending on the product harness",
+                    "reason": "the child exceeded the enclosing absolute deadline after launch",
+                }
+            ),
             attempt=attempt_number,
         )
         if store is not None:
@@ -227,18 +288,35 @@ def run_apc_child(
     def _reject(reason: str) -> ApcChildRejectedError:
         failure = ApcChildRejectedError(reason)
         if store is not None:
-            store.record_apc_child_operation(
-                contracts.make_apc_child_operation(
-                    request=request,
-                    status="failed",
-                    observed_invocation=launched["observed_invocation"],
-                    cleanup={
-                        "state": "retired by the product harness",
-                        "reason": reason,
-                    },
-                    attempt=attempt_number,
+            if effective_cleanup is not None and not cleanup_proven:
+                # The rejected child may still be live; retain the exact
+                # unresolved ownership instead of a terminal claim.
+                store.record_apc_child_operation(
+                    contracts.make_apc_child_operation(
+                        request=request,
+                        status="cleanup_pending",
+                        observed_invocation=launched["observed_invocation"],
+                        cleanup={**dict(effective_cleanup), "reason": reason},
+                        attempt=attempt_number,
+                    )
                 )
-            )
+            else:
+                store.record_apc_child_operation(
+                    contracts.make_apc_child_operation(
+                        request=request,
+                        status="failed",
+                        observed_invocation=launched["observed_invocation"],
+                        cleanup=(
+                            dict(effective_cleanup)
+                            if isinstance(effective_cleanup, Mapping)
+                            else {
+                                "state": "retired by the product harness",
+                                "reason": reason,
+                            }
+                        ),
+                        attempt=attempt_number,
+                    )
+                )
         return failure
 
     if not isinstance(result, Mapping):
@@ -260,13 +338,25 @@ def run_apc_child(
         )
     except ApcChildRejectedError as exc:
         raise _reject(str(exc)) from exc
+    if isinstance(effective_cleanup, Mapping) and not cleanup_proven:
+        # BEHAVIOR-02 only shows ROOT a proposal once the exact child is proven
+        # retired by the product harness.  Reported cleanup without that proof
+        # stays unresolved, so the attempt falls back instead of reconciling.
+        raise _reject(
+            "the child's cleanup is not proven by the product harness; "
+            "its exact ownership stays unresolved"
+        )
     reconciled = contracts.make_apc_child_operation(
         request=request,
         status="reconciled",
         launch_intent={"binding": dict(request["binding"])},
         observed_invocation=launched["observed_invocation"],
         result=result,
-        cleanup=dict(cleanup) if cleanup else {"state": "owned by the product harness"},
+        cleanup=(
+            effective_cleanup
+            if isinstance(effective_cleanup, Mapping)
+            else {"state": "owned by the product harness"}
+        ),
         attempt=attempt_number,
     )
     if store is not None:
@@ -302,6 +392,7 @@ def reconcile_apc_child(
 __all__ = [
     "ApcAttempt",
     "ApcChildAmbiguityError",
+    "ApcChildUnavailableError",
     "ApcChildRejectedError",
     "ApcChildTimeoutError",
     "ApcUnavailableError",
