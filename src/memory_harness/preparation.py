@@ -820,7 +820,22 @@ class PreparationService:
                 "template": config.template_memory,
             }.get(store.kind, False)
             disabled_reason = "the resolved configuration disables this store"
-            if flag and store.requires_network:
+            if store.source_kind == "curated_local_procedure":
+                # A local curated/builtin procedure store performs no
+                # shared/remote call, so the accepted local trust path stays
+                # eligible even when Atlas shared retrieval and generated-skill
+                # use are both off, and restricted_local never suppresses it.
+                flag = True
+            elif store.source_kind == "generated_local_procedure":
+                # Generated-origin local guidance is separately gated: with
+                # generated_skill_use off the source makes no query at all, so
+                # no delivery can be filtered out of work already performed.
+                flag = config.generated_skill_use
+                disabled_reason = (
+                    "generated_skill_use is disabled: a generated-origin local "
+                    "procedure source performs no query"
+                )
+            elif flag and store.requires_network:
                 # A remote procedure store carries shared-retrieval authority:
                 # only atlas_shared_retrieval enables it, never the local
                 # generated-skill analogue, so an Atlas store is never queried

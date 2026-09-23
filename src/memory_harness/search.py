@@ -35,6 +35,22 @@ class UnknownKindError(SearchError):
     """A store declared a candidate kind the coordinator does not own."""
 
 
+# The finite set of optional-store source markers the preparation gate
+# understands.  Only the two local procedure sources change the accepted
+# generic gate; every other value keeps the accepted behavior, and ``caller``
+# is the default so existing caller-supplied stores are unaffected.
+STORE_SOURCE_KINDS = frozenset(
+    {
+        "caller",
+        "curated_local_procedure",
+        "generated_local_procedure",
+    }
+)
+_LOCAL_PROCEDURE_SOURCE_KINDS = frozenset(
+    {"curated_local_procedure", "generated_local_procedure"}
+)
+
+
 @dataclass(frozen=True)
 class SearchStore:
     """One bounded, enabled optional store adapter.
@@ -46,6 +62,18 @@ class SearchStore:
     suppress the actual call before it begins instead of filtering its output
     afterwards.  Existing caller-supplied stores keep their exact behavior:
     the field defaults to a local store.
+
+    ``source_kind`` is the one additive, finite source marker a purely local
+    procedure store needs: the accepted generic ``procedure`` gate cannot tell
+    a local curated/builtin store, a local generated-origin store, and a
+    shared/remote store apart.  Its documented values are exactly ``caller``
+    (the default: every existing caller keeps the accepted generic behavior),
+    ``curated_local_procedure`` (a local curated/builtin store that performs no
+    shared/remote call, so it stays eligible when shared retrieval and
+    generated-skill use are off), and ``generated_local_procedure`` (a local
+    generated-origin store that makes no query at all while
+    ``generated_skill_use`` is off).  A local procedure source never declares
+    ``requires_network``: ``restricted_local`` suppresses only the remote call.
     """
 
     store_id: str
@@ -55,6 +83,7 @@ class SearchStore:
     freshness: str = "live"
     specificity: str = "project"
     requires_network: bool = False
+    source_kind: str = "caller"
 
     def __post_init__(self) -> None:
         if not isinstance(self.store_id, str) or not self.store_id.strip():
@@ -65,6 +94,12 @@ class SearchStore:
             raise SearchError("store query must be callable")
         if not isinstance(self.requires_network, bool):
             raise SearchError("store requires_network must be boolean")
+        if self.source_kind not in STORE_SOURCE_KINDS:
+            raise SearchError(f"unknown store source_kind: {self.source_kind!r}")
+        if self.source_kind in _LOCAL_PROCEDURE_SOURCE_KINDS and self.requires_network:
+            raise SearchError(
+                "a local procedure source never performs a shared/remote call"
+            )
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,4 @@
-﻿"""Small standard-library SQLite store for Stage-A decisions and operations."""
+"""Small standard-library SQLite store for Stage-A decisions and operations."""
 
 from __future__ import annotations
 
@@ -1912,6 +1912,442 @@ class MemoryStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    def read_local_current_procedures(
+        self,
+        partition: Mapping[str, Any],
+        *,
+        receiver: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read the durable local current procedures of one exact partition.
+
+        The exact partition is the smallest read-only lookup the bounded local
+        procedure store needs; the optional explicit ``receiver`` additionally
+        discovers durable current rows whose stored project/shared partition
+        names that exact recipient even when other recipients make the stored
+        partition identity differ from the constructed lookup key.  A
+        discovered row keeps its exact stored partition, and the caller still
+        re-checks authorization against that durable partition.  The lookup
+        runs on a read-only connection created and closed by the calling
+        thread, because the accepted bounded search queries every store on its
+        own worker thread while the shared store connection is thread-affine;
+        it never writes, migrates, or changes shared state.
+
+        Every returned entry is one durable current row joined to its exact
+        designation, procedure revision, approval, search representations, and
+        revocation tombstone -- plus, for a generated-origin revision, its
+        rechecked Step-02 candidate, skill approval, source case, and review
+        receipts.  One missing, altered, or unreadable link keeps that row's
+        exact identity and an explicit defect instead of raising, so a single
+        bad local record can never suppress an unrelated eligible procedure.
+        """
+
+        normalized = contracts.normalize_procedure_partition(partition)
+        partition_id = contracts.procedure_partition_id(normalized)
+        receiver_scope = (
+            contracts.normalize_experience_scope(receiver)
+            if receiver is not None
+            else None
+        )
+        connection = self._open_read_only_connection()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM procedure_current_designations ORDER BY logical_id"
+            ).fetchall()
+            entries: list[dict[str, Any]] = []
+            seen: set[tuple[str, str]] = set()
+            for row in rows:
+                entry = self._local_procedure_entry(
+                    row,
+                    normalized,
+                    connection=connection,
+                    receiver=receiver_scope,
+                )
+                if entry is None:
+                    continue
+                key = (entry["logical_id"], entry["partition_id"])
+                if key in seen:
+                    continue
+                if (
+                    entry["partition_id"] != partition_id
+                    and entry.get("receiver_authorized") is not True
+                ):
+                    continue
+                seen.add(key)
+                entries.append(entry)
+            return entries
+        finally:
+            connection.close()
+
+    def _local_procedure_entry(
+        self,
+        row: sqlite3.Row,
+        expected_partition: Mapping[str, Any],
+        *,
+        connection: sqlite3.Connection,
+        receiver: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Join one durable current-designation row to its exact evidence.
+
+        A row of the requested exact partition is always returned (even with an
+        explicit defect).  With an explicit receiver, a durable project/shared
+        designation of the receiver's application and namespace is returned
+        only when its recipients name that exact receiver; the returned entry
+        keeps the exact stored partition, so the caller's authorization check
+        still evaluates the durable partition rather than the lookup key.
+        """
+
+        entry: dict[str, Any] = {
+            "logical_id": str(row["logical_id"]),
+            "partition": None,
+            "partition_id": str(row["partition_id"]),
+            "designation_id": str(row["current_id"]),
+            "revision_id": str(row["revision_id"]),
+            "generation": int(row["generation"]),
+            "state": str(row["state"]),
+            "designation": None,
+            "procedure": None,
+            "approval": None,
+            "representations": (),
+            "revocation": None,
+            "revoked": False,
+            "source_cases": (),
+            "defects": (),
+            "receiver_authorized": False,
+        }
+        exact = entry["partition_id"] == contracts.procedure_partition_id(
+            dict(expected_partition)
+        )
+        if entry["state"] != "active":
+            if not exact:
+                return None
+            # A withdrawn partition keeps its exact durable state; the caller
+            # decides that it is not a deliverable current designation.
+            entry["partition"] = dict(expected_partition)
+            entry["defects"] = (
+                f"the local current designation is {entry['state']!r}, not active",
+            )
+            return entry
+        try:
+            designation = self._read_only_record(
+                connection,
+                "procedure_designations",
+                "designation_id",
+                entry["designation_id"],
+                contracts.validate_procedure_designation,
+            )
+        except Exception as exc:
+            if not exact:
+                return None
+            entry["partition"] = dict(expected_partition)
+            entry["defects"] = (
+                f"the local current designation is not durable: {exc}",
+            )
+            return entry
+        try:
+            stored_partition = contracts.normalize_procedure_partition(
+                designation["partition"]
+            )
+        except contracts.ContractError as exc:
+            if not exact:
+                return None
+            entry["partition"] = dict(expected_partition)
+            entry["defects"] = (
+                f"the local current designation partition is not exact: {exc}",
+            )
+            return entry
+        if exact:
+            if (
+                designation["logical_id"] != entry["logical_id"]
+                or designation["revision_id"] != entry["revision_id"]
+                or designation["generation"] != entry["generation"]
+                or stored_partition != dict(expected_partition)
+            ):
+                entry["partition"] = dict(expected_partition)
+                entry["defects"] = (
+                    "the durable designation does not match its current row",
+                )
+                return entry
+        elif not self._receiver_names_the_designation(receiver, stored_partition):
+            return None
+        else:
+            entry["receiver_authorized"] = True
+        entry["partition"] = stored_partition
+        entry["designation"] = designation
+        try:
+            procedure = self._read_only_record(
+                connection,
+                "procedure_revisions",
+                "revision_id",
+                entry["revision_id"],
+                contracts.validate_procedure_revision,
+            )
+            approval = self._read_only_record(
+                connection,
+                "procedure_approvals",
+                "approval_id",
+                str(designation["approval_id"]),
+                contracts.validate_procedure_approval,
+            )
+            contracts.validate_procedure_approval(approval, procedure=procedure)
+            contracts.validate_procedure_designation(
+                designation, procedure=procedure, approval=approval
+            )
+        except Exception as exc:
+            entry["defects"] = (
+                f"the local designation lacks durable procedure evidence: {exc}",
+            )
+            return entry
+        entry["procedure"] = procedure
+        entry["approval"] = approval
+        defects: list[str] = []
+        representations: list[dict[str, Any]] = []
+        representation_rows = connection.execute(
+            """
+            SELECT * FROM procedure_representations
+            WHERE revision_id = ?
+            ORDER BY representation_id
+            """,
+            (entry["revision_id"],),
+        ).fetchall()
+        for representation_row in representation_rows:
+            try:
+                representation = self._stored_record(
+                    representation_row, contracts.validate_procedure_representation
+                )
+                if representation.get("content_hash") != representation_row["content_hash"]:
+                    raise ProcedureConflictError(
+                        "the stored representation content hash changed"
+                    )
+                contracts.validate_procedure_representation(
+                    representation, procedure=procedure
+                )
+            except Exception as exc:
+                defects.append(f"one local representation is unusable: {exc}")
+                continue
+            representations.append(representation)
+        # One deterministic order keeps an equally valid set of projections
+        # stable no matter how they were recorded.
+        representations.sort(
+            key=lambda item: (
+                str(item.get("model")),
+                int(item.get("dimensions") or 0),
+                str(item.get("metric")),
+                str(item.get("sanitizer_version")),
+                str(item.get("representation_id")),
+            )
+        )
+        entry["representations"] = tuple(representations)
+        revocation_row = connection.execute(
+            "SELECT * FROM procedure_revocations WHERE revision_id = ?",
+            (entry["revision_id"],),
+        ).fetchone()
+        if revocation_row is not None:
+            # A visible tombstone is authoritative even when its own record is
+            # unreadable, so the revision stays revoked either way.
+            entry["revoked"] = True
+            try:
+                revocation = self._stored_record(
+                    revocation_row, contracts.validate_procedure_revocation
+                )
+                contracts.validate_procedure_revocation(revocation, procedure=procedure)
+            except Exception as exc:
+                defects.append(f"the local revocation tombstone is unusable: {exc}")
+            else:
+                entry["revocation"] = revocation
+        source = procedure.get("source")
+        if isinstance(source, Mapping) and source.get("kind") == "generated_skill":
+            source_cases, source_defects = self._local_procedure_source(
+                source, procedure, connection=connection
+            )
+            defects.extend(source_defects)
+            entry["source_cases"] = source_cases
+        entry["defects"] = tuple(defects)
+        return entry
+
+    @staticmethod
+    def _receiver_names_the_designation(
+        receiver: Mapping[str, Any] | None, partition: Mapping[str, Any]
+    ) -> bool:
+        """Return whether a durable partition names this exact receiver.
+
+        Only a project/shared partition of the receiver's own application and
+        namespace can authorize it; a private partition is never discovered
+        this way, and a project partition stays inside the receiver's project
+        while a shared partition may name cross-project recipients.
+        """
+
+        if receiver is None:
+            return False
+        if partition.get("scope") not in ("project", "shared"):
+            return False
+        if (
+            partition.get("application") != receiver.get("application")
+            or partition.get("namespace") != receiver.get("namespace")
+        ):
+            return False
+        if partition.get("scope") == "project" and partition.get("project") != receiver.get("project"):
+            return False
+        key = contracts.canonical_json(dict(receiver)).decode("utf-8")
+        return any(
+            contracts.canonical_json(dict(item)).decode("utf-8") == key
+            for item in partition.get("recipients", ())
+        )
+
+    def _local_procedure_source(
+        self,
+        source: Mapping[str, Any],
+        procedure: Mapping[str, Any],
+        *,
+        connection: sqlite3.Connection,
+    ) -> tuple[tuple[dict[str, Any], ...], list[str]]:
+        """Recheck one generated-origin revision's durable Step-02 provenance."""
+
+        try:
+            # The two Step-02 tables keep their records as explicit columns,
+            # so they use the accepted column-shaped readers instead of the
+            # JSON-record reader the procedure tables use.
+            candidate = self._read_only_skill_candidate(
+                connection, str(source.get("candidate_id") or "")
+            )
+            skill_approval = self._read_only_skill_approval(
+                connection, str(source.get("skill_approval_id") or "")
+            )
+        except Exception as exc:
+            return (), [f"the generated procedure source is not durable: {exc}"]
+        source_cases = [dict(item) for item in candidate["source_cases"]]
+        if (
+            source.get("candidate_digest") != candidate["content_hash"]
+            or source.get("skill_approval_digest") != skill_approval["content_hash"]
+            or source.get("source_cases") != source_cases
+            or candidate["content"] != procedure["behavior"]["body"]
+        ):
+            return (), ["the generated procedure source provenance changed or is ambiguous"]
+        if any(
+            skill_approval[field] != candidate[field]
+            for field in (
+                "candidate_id",
+                "skill_id",
+                "origin",
+                "scope_digest",
+                "scope",
+                "content_digest",
+                "source_cases",
+            )
+        ):
+            # The accepted store rejoins an approval to its exact candidate
+            # before accepting it; this read repeats that exact rejoin.
+            return (), ["the generated procedure source approval does not rejoin its candidate"]
+        try:
+            for source_case in source_cases:
+                self._rejoin_local_source_case(source_case, candidate["scope"])
+        except Exception as exc:
+            return (), [f"the generated procedure source case is not durable: {exc}"]
+        return tuple(source_cases), []
+
+    def _rejoin_local_source_case(
+        self, source_case: Mapping[str, Any], scope: Mapping[str, Any]
+    ) -> None:
+        """Re-establish one retained Step-02 source case from its receipts.
+
+        The accepted ``read_confirmed_case_join`` already revalidates the
+        durable case receipt, its confirmed ingestion, the reviewed
+        trajectory, and the durable review receipt inside the exact scope; this
+        read additionally requires the retained provenance to name exactly
+        those receipts, so a missing or changed source receipt omits that
+        guidance instead of delivering it on partial trust.
+        """
+
+        required = (
+            "case_id",
+            "case_receipt_id",
+            "trajectory_id",
+            "review_receipt_id",
+            "review_receipt_digest",
+        )
+        if any(not source_case.get(field) for field in required):
+            raise ProcedureConflictError("a generated source case lacks exact receipts")
+        join = self.read_confirmed_case_join(scope, str(source_case["case_id"]))
+        case_receipt = join["case_receipt"]
+        trajectory = join["trajectory"]
+        if (
+            case_receipt["case_receipt_id"] != source_case["case_receipt_id"]
+            or case_receipt["trajectory_id"] != source_case["trajectory_id"]
+            or case_receipt["review_receipt_id"] != source_case["review_receipt_id"]
+            or case_receipt["review_receipt_digest"] != source_case["review_receipt_digest"]
+            or trajectory["review_receipt_id"] != source_case["review_receipt_id"]
+            or trajectory["review_receipt_digest"] != source_case["review_receipt_digest"]
+        ):
+            raise ProcedureConflictError("the generated source case receipt changed")
+
+    def _read_only_skill_candidate(
+        self, connection: sqlite3.Connection, candidate_id: str
+    ) -> dict[str, Any]:
+        """Read one durable Step-02 candidate on the calling thread's read.
+
+        The candidate table keeps its record as explicit columns, so the
+        accepted column-shaped reader applies; a row whose stored content hash
+        no longer matches its own retained record is never accepted.
+        """
+
+        row = connection.execute(
+            "SELECT * FROM generated_skill_candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"generated skill candidate not found: {candidate_id}")
+        candidate = MemoryStore._generated_skill_from_row(row)
+        if candidate.get("content_hash") != row["content_hash"]:
+            raise ExperienceConflictError(
+                "generated skill candidate content hash no longer matches its row"
+            )
+        return candidate
+
+    def _read_only_skill_approval(
+        self, connection: sqlite3.Connection, approval_id: str
+    ) -> dict[str, Any]:
+        """Read one durable Step-02 skill approval on the calling thread's read."""
+
+        row = connection.execute(
+            "SELECT * FROM generated_skill_approvals WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"skill approval not found: {approval_id}")
+        approval = MemoryStore._skill_approval_from_row(row)
+        if approval.get("content_hash") != row["content_hash"]:
+            raise ExperienceConflictError(
+                "skill approval content hash no longer matches its row"
+            )
+        return approval
+
+    @staticmethod
+    def _read_only_record(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        value: Any,
+        validator: Any,
+    ) -> dict[str, Any]:
+        """Return one validated durable record of the calling thread's read.
+
+        ``table``, ``column``, and ``validator`` are literals owned by this
+        module, and every check fails closed: a missing row, unreadable JSON, an
+        invalid contract record, or a content hash that no longer matches its
+        row raises instead of returning a partial record.
+        """
+
+        row = connection.execute(
+            f"SELECT * FROM {table} WHERE {column} = ?", (value,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"{table} record not found for {column}={value!r}")
+        record = MemoryStore._stored_record(row, validator)
+        if record.get("content_hash") != row["content_hash"]:
+            raise ProcedureConflictError(
+                f"{table} record content hash no longer matches its row"
+            )
+        return record
 
     def get_current_procedure_designation(
         self, logical_id: str, partition: Mapping[str, Any]
