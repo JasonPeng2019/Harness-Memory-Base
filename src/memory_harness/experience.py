@@ -531,6 +531,62 @@ class EverOSAdapter:
             cases.append(source_case)
         return cases
 
+    async def search_skill_candidates(
+        self, *, query: str, top_k: int = 100
+    ) -> list[dict[str, Any]]:
+        """Search this scope's EverOS skill candidates without a session filter.
+
+        This is the smallest read-only scoped query on top of the accepted
+        public search surface: the exact bound root is re-checked, the accepted
+        ``SearchRequest`` carries the exact application, project, and owner
+        filters, and no session token is appended.  Every returned mapping is
+        raw discovery only: EverOS presence, similarity (``score``), and any
+        Step-02 generated-skill approval are never procedural guidance here,
+        nothing local is written, and no hit is promoted into guidance or a
+        plan.  Whether one hit may later rejoin an exact durable trust chain is
+        deliberately a separate decision outside this query.
+
+        Per-hit scope failures are omitted here so one foreign or malformed
+        remote record can never discard an unrelated in-scope hit; a whole
+        response or bound-root failure still raises, and the caller isolates
+        it.
+        """
+
+        self._assert_bound_memory_root()
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ExperienceError("EverOS skill query top_k must be a positive integer")
+        safe_query = privacy_module.sanitize_text(query, self.privacy_policy).strip()
+        if not safe_query:
+            raise ExperienceError("EverOS skill query became empty after sanitization")
+        request = self.surface.make_search_request(
+            agent_id=self.everos_owner_id,
+            app_id=self.everos_application_id,
+            project_id=self.everos_project_id,
+            query=safe_query,
+            method="keyword",
+            top_k=int(top_k),
+        )
+        response = _model_mapping(
+            await self.surface.search(request), "EverOS skill search response"
+        )
+        data = response.get("data")
+        if not isinstance(data, Mapping):
+            raise ExperienceError("EverOS skill search response has no data object")
+        items = data.get("agent_skills", [])
+        if not isinstance(items, list):
+            raise ExperienceError("EverOS skill search agent_skills must be a list")
+        skills: list[dict[str, Any]] = []
+        for item in items:
+            try:
+                source_skill = _model_mapping(item, "EverOS agent skill")
+                self.validate_skill(source_skill)
+            except (ScopeBoundaryError, ExperienceError):
+                # A foreign or malformed hit is omitted, never promoted and
+                # never allowed to suppress an unrelated in-scope hit.
+                continue
+            skills.append(source_skill)
+        return skills
+
     def validate_case(self, source_case: Mapping[str, Any], *, session_id: str) -> None:
         self._validate_case_scope(source_case)
         value = source_case.get("session_id")
