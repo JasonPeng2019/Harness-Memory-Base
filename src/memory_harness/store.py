@@ -2003,7 +2003,7 @@ class MemoryStore:
             "partition_id": str(row["partition_id"]),
             "designation_id": str(row["current_id"]),
             "revision_id": str(row["revision_id"]),
-            "generation": int(row["generation"]),
+            "generation": None,
             "state": str(row["state"]),
             "designation": None,
             "procedure": None,
@@ -2018,6 +2018,23 @@ class MemoryStore:
         exact = entry["partition_id"] == contracts.procedure_partition_id(
             dict(expected_partition)
         )
+        row_generation = row["generation"]
+        if isinstance(row_generation, bool) or not isinstance(row_generation, int):
+            # Only an exact durable integer is a current generation: text such
+            # as "malformed" is unreadable, and a float such as 1.5 or the
+            # boolean True would be truncated to an integer the row never
+            # wrote.  Both are one unreadable link of this row only: the row
+            # keeps its exact identity with an explicit defect instead of
+            # raising, so a single bad row can never suppress an unrelated
+            # eligible current row of the same read.
+            if not exact:
+                return None
+            entry["partition"] = dict(expected_partition)
+            entry["defects"] = (
+                "the local current designation generation is not an exact integer",
+            )
+            return entry
+        entry["generation"] = row_generation
         if entry["state"] != "active":
             if not exact:
                 return None
@@ -2056,13 +2073,22 @@ class MemoryStore:
                 f"the local current designation partition is not exact: {exc}",
             )
             return entry
+        # Every active current row -- exact-partition or receiver-discovered --
+        # must describe its exact joined designation: the row's logical,
+        # revision, generation, and current designation identities, its stored
+        # designation record, and its content hash.  A row that disagrees with
+        # the durable designation is never deliverable, so a receiver-discovered
+        # multi-recipient row cannot promote an altered generation or hash.
+        if not self._current_row_matches_designation(row, designation):
+            if not exact:
+                return None
+            entry["partition"] = dict(expected_partition)
+            entry["defects"] = (
+                "the durable designation does not match its current row",
+            )
+            return entry
         if exact:
-            if (
-                designation["logical_id"] != entry["logical_id"]
-                or designation["revision_id"] != entry["revision_id"]
-                or designation["generation"] != entry["generation"]
-                or stored_partition != dict(expected_partition)
-            ):
+            if stored_partition != dict(expected_partition):
                 entry["partition"] = dict(expected_partition)
                 entry["defects"] = (
                     "the durable designation does not match its current row",
@@ -2156,7 +2182,15 @@ class MemoryStore:
             else:
                 entry["revocation"] = revocation
         source = procedure.get("source")
-        if isinstance(source, Mapping) and source.get("kind") == "generated_skill":
+        if procedure.get("origin") == "generated" or (
+            isinstance(source, Mapping) and source.get("kind") == "generated_skill"
+        ):
+            # A generated-origin revision is never delivered on the strength
+            # of its own approval alone: its retained Step-02 provenance has
+            # to be present, exact, and re-established from the durable
+            # candidate, skill approval, and source-case receipts -- and its
+            # retained source kind has to be exactly the accepted generated
+            # Step-02 kind, so no other source can claim this trust path.
             source_cases, source_defects = self._local_procedure_source(
                 source, procedure, connection=connection
             )
@@ -2164,6 +2198,50 @@ class MemoryStore:
             entry["source_cases"] = source_cases
         entry["defects"] = tuple(defects)
         return entry
+
+    @staticmethod
+    def _current_row_matches_designation(
+        row: sqlite3.Row, designation: Mapping[str, Any]
+    ) -> bool:
+        """Return whether one current row still describes its joined designation.
+
+        The current-designation row is the durable pointer a local delivery
+        resolves, so it must keep the exact identity, stored record, and
+        content hash of the designation it names.  A row whose identity,
+        record, or hash was altered is not the current designation of any
+        deliverable revision and fails closed before candidate emission.
+        """
+
+        row_generation = row["generation"]
+        designation_generation = designation.get("generation")
+        if (
+            isinstance(row_generation, bool)
+            or not isinstance(row_generation, int)
+            or isinstance(designation_generation, bool)
+            or not isinstance(designation_generation, int)
+        ):
+            # Only an exact durable integer generation can describe the
+            # current designation: 1.5, "1", and True all denote an integer
+            # neither durable record wrote, so they fail closed for this row
+            # only instead of being truncated into a match.
+            return False
+        if (
+            str(row["logical_id"]) != str(designation.get("logical_id"))
+            or str(row["partition_id"]) != str(designation.get("partition_id"))
+            or str(row["current_id"]) != str(designation.get("designation_id"))
+            or str(row["revision_id"]) != str(designation.get("revision_id"))
+            or row_generation != designation_generation
+        ):
+            return False
+        if str(row["content_hash"]) != str(designation.get("content_hash")):
+            return False
+        try:
+            stored_record = json.loads(str(row["record"]))
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(stored_record, dict):
+            return False
+        return stored_record == dict(designation)
 
     @staticmethod
     def _receiver_names_the_designation(
@@ -2196,13 +2274,21 @@ class MemoryStore:
 
     def _local_procedure_source(
         self,
-        source: Mapping[str, Any],
+        source: Any,
         procedure: Mapping[str, Any],
         *,
         connection: sqlite3.Connection,
     ) -> tuple[tuple[dict[str, Any], ...], list[str]]:
-        """Recheck one generated-origin revision's durable Step-02 provenance."""
+        """Recheck one generated-origin revision's durable Step-02 provenance.
 
+        A generated-origin revision earns this trust path only with the exact
+        accepted Step-02 source kind: any other retained source keeps the
+        revision outside the generated provenance rejoin, so it is omitted
+        instead of being delivered on a trusted approval alone.
+        """
+
+        if not isinstance(source, Mapping) or source.get("kind") != "generated_skill":
+            return (), ["the generated procedure source is not the accepted Step-02 kind"]
         try:
             # The two Step-02 tables keep their records as explicit columns,
             # so they use the accepted column-shaped readers instead of the
@@ -2221,7 +2307,12 @@ class MemoryStore:
             or source.get("skill_approval_digest") != skill_approval["content_hash"]
             or source.get("source_cases") != source_cases
             or candidate["content"] != procedure["behavior"]["body"]
+            or candidate["scope"] != procedure["origin_scope"]
         ):
+            # The retained Step-02 candidate also has to name exactly the
+            # revision's own origin scope: a candidate from another scope was
+            # never the reviewed source of this origin, so it is ambiguous
+            # provenance instead of delivery approval.
             return (), ["the generated procedure source provenance changed or is ambiguous"]
         if any(
             skill_approval[field] != candidate[field]

@@ -1025,5 +1025,359 @@ class Step04LocalProcedureTrustTests(unittest.TestCase):
         )
 
 
+    # -- corrected trust-boundary regressions ------------------------------
+
+    def test_generated_origin_requires_generated_skill_source_kind_and_exact_scope(self) -> None:
+        # An origin=generated revision whose retained source is not the
+        # accepted Step-02 generated-skill provenance must never deliver on
+        # partial trust, even with a trusted procedure approval and current
+        # designation, because nothing rejoined it to Step-02 evidence.
+        unprovenanced = self._curated(
+            "generated-without-skill-source",
+            origin="generated",
+            body="Inspect the unaudited generated lock advice.",
+        )
+        unprovenanced_approval = self._approve(
+            unprovenanced, approval_id="approval-unprovenanced-generated"
+        )
+        self.procedure_service.record_representation(
+            self._representation(
+                unprovenanced,
+                search_text="parser lock regression focused inspection recovery",
+            )
+        )
+        self._designate(unprovenanced, unprovenanced_approval)
+
+        # A generated-origin revision whose retained Step-02 candidate belongs
+        # to another scope than its own origin_scope is equally omitted.
+        foreign_candidate = contracts.make_generated_skill_candidate(
+            scope=dict(self.receiver, owner="other-agent"),
+            skill_id="generated-parser-lock-foreign-scope",
+            content="Inspect the foreign generated parser lock evidence.",
+            source_cases=[self._durable_source_case("foreign-scope")],
+            metadata={"source": "synthetic"},
+            created_at="2026-09-21T00:00:08Z",
+        )
+        self.memory_store.record_generated_skill_candidate(foreign_candidate)
+        foreign_skill_approval = contracts.make_skill_approval(
+            approval_id="generated-source-approval-foreign-scope",
+            candidate=foreign_candidate,
+            issuer="ROOT",
+            recipients=(self.receiver["owner"],),
+            approved_at="2026-09-21T00:00:09Z",
+            authority_evidence={"policy_id": "step02-test/v1", "subject": "root"},
+        )
+        self.memory_store.record_skill_approval(foreign_skill_approval)
+        foreign_source = {
+            "kind": "generated_skill",
+            "candidate_id": foreign_candidate["candidate_id"],
+            "candidate_digest": foreign_candidate["content_hash"],
+            "skill_approval_id": foreign_skill_approval["approval_id"],
+            "skill_approval_digest": foreign_skill_approval["content_hash"],
+            "source_cases": [dict(item) for item in foreign_candidate["source_cases"]],
+        }
+        foreign_scope = contracts.make_procedure_revision(
+            logical_name="generated-foreign-scope",
+            origin="generated",
+            origin_scope=self.receiver,
+            body=foreign_candidate["content"],
+            references=[{"id": "guide://generated", "content": "historical"}],
+            predicates={
+                "applicability": {},
+                "conflicts": {},
+                "capabilities": {},
+                "routes": {
+                    "all": [{"field": "route", "operator": "equals", "value": "ordinary"}]
+                },
+            },
+            source=foreign_source,
+            created_at="2026-09-21T00:00:00Z",
+        )
+        foreign_approval = self._approve(
+            foreign_scope, approval_id="approval-generated-foreign-scope"
+        )
+        self.procedure_service.record_representation(
+            self._representation(
+                foreign_scope,
+                search_text="parser lock regression focused inspection recovery",
+            )
+        )
+        self._designate(foreign_scope, foreign_approval)
+
+        valid_candidate, _valid_source_approval, valid = self._deliverable_generated("kept")
+        generated = self._by_id(self._stores(), GENERATED_STORE_ID)
+        self.assertEqual(
+            [valid["logical_id"]],
+            [item["logical_id"] for item in generated.query(self._payload())],
+        )
+        outcome = self._prepare([generated])
+        self.assertEqual(
+            [valid["logical_id"]],
+            [item["logical_id"] for item in self._selected(outcome)],
+        )
+        traced = {item["logical_id"] for item in self._procedures(outcome)}
+        self.assertNotIn(unprovenanced["logical_id"], traced)
+        self.assertNotIn(foreign_scope["logical_id"], traced)
+
+    def test_receiver_discovered_current_row_must_match_its_joined_designation(self) -> None:
+        # A receiver-discovered multi-recipient row must describe its exact
+        # joined designation.  An altered generation still delivered the
+        # procedure before the correction; it must now be omitted while the
+        # untouched multi-recipient neighbor and an exact-partition procedure
+        # keep delivering.
+        teammate = dict(self.receiver, owner="teammate-agent")
+        altered = self._curated("multi-recipient-altered")
+        altered_approval = self._approve(
+            altered,
+            approval_id="approval-multi-altered",
+            recipients=[dict(self.receiver), teammate],
+        )
+        self.procedure_service.record_representation(
+            self._representation(
+                altered, search_text="parser lock regression focused inspection recovery"
+            )
+        )
+        multi_partition = {
+            "scope": "project",
+            "application": self.receiver["application"],
+            "project": self.receiver["project"],
+            "namespace": self.receiver["namespace"],
+            "recipients": [dict(self.receiver), teammate],
+        }
+        self._designate(altered, altered_approval, partition=multi_partition)
+
+        healthy_multi = self._curated("multi-recipient-healthy")
+        healthy_multi_approval = self._approve(
+            healthy_multi,
+            approval_id="approval-multi-healthy",
+            recipients=[dict(self.receiver), teammate],
+        )
+        self.procedure_service.record_representation(
+            self._representation(
+                healthy_multi,
+                search_text="parser lock regression focused inspection recovery",
+            )
+        )
+        self._designate(healthy_multi, healthy_multi_approval, partition=multi_partition)
+
+        exact, _approval, _representation, _designation = self._deliverable_curated(
+            "exact-partition-healthy"
+        )
+
+        self._mutate(
+            "UPDATE procedure_current_designations SET generation = generation + 7 "
+            "WHERE logical_id = ?",
+            (altered["logical_id"],),
+        )
+
+        curated = self._by_id(self._stores(), CURATED_STORE_ID)
+        delivered = {item["logical_id"] for item in curated.query(self._payload())}
+        self.assertIn(healthy_multi["logical_id"], delivered)
+        self.assertIn(exact["logical_id"], delivered)
+        self.assertNotIn(altered["logical_id"], delivered)
+
+        outcome = self._prepare([curated])
+        selected = {item["logical_id"] for item in self._selected(outcome)}
+        self.assertEqual({healthy_multi["logical_id"], exact["logical_id"]}, selected)
+
+    def test_altered_current_row_record_or_content_hash_fails_closed(self) -> None:
+        # The durable current row keeps the exact designation record and its
+        # content hash.  A row whose stored hash was replaced must not deliver
+        # even on the exact-partition path, while an unrelated eligible
+        # procedure keeps working.
+        tampered = self._curated("current-row-hash-tampered")
+        tampered_approval = self._approve(
+            tampered, approval_id="approval-current-row-tampered"
+        )
+        self.procedure_service.record_representation(
+            self._representation(
+                tampered, search_text="parser lock regression focused inspection recovery"
+            )
+        )
+        self._designate(tampered, tampered_approval)
+        healthy, _approval, _representation, _designation = self._deliverable_curated(
+            "current-row-healthy"
+        )
+        self._mutate(
+            "UPDATE procedure_current_designations SET content_hash = ? "
+            "WHERE logical_id = ?",
+            ("tampered-current-row-digest", tampered["logical_id"]),
+        )
+
+        curated = self._by_id(self._stores(), CURATED_STORE_ID)
+        self.assertEqual(
+            [healthy["logical_id"]],
+            [item["logical_id"] for item in curated.query(self._payload())],
+        )
+        outcome = self._prepare([curated])
+        self.assertEqual(
+            [healthy["logical_id"]],
+            [item["logical_id"] for item in self._selected(outcome)],
+        )
+        self.assertNotIn(
+            tampered["logical_id"],
+            {item["logical_id"] for item in self._procedures(outcome)},
+        )
+
+    def test_untrusted_designation_issuer_cannot_authorize_delivery(self) -> None:
+        # A durable designation recorded directly by an issuer outside the
+        # accepted trusted-issuer set must not authorize delivery even though
+        # its revision approval is trusted and its own record validates.
+        trusted, trusted_approval, _representation, trusted_designation = (
+            self._deliverable_curated("trusted-designation-issuer")
+        )
+        foreign = self._curated("untrusted-designation-issuer")
+        foreign_approval = self._approve(
+            foreign, approval_id="approval-untrusted-designation"
+        )
+        self.procedure_service.record_representation(
+            self._representation(
+                foreign, search_text="parser lock regression focused inspection recovery"
+            )
+        )
+        untrusted_designation = contracts.make_procedure_designation(
+            procedure=foreign,
+            approval=foreign_approval,
+            partition=self.partition,
+            generation=1,
+            predecessor_generation=None,
+            issuer="INTRUDER",
+            created_at="2026-09-21T00:00:03Z",
+        )
+        # A direct durable write is the honest reproduction: the accepted
+        # service would refuse this issuer, so only a raw durable row can show
+        # that the read-side join must also require a trusted designation issuer.
+        self._mutate(
+            "INSERT INTO procedure_designations (designation_id, logical_id, "
+            "revision_id, partition_id, generation, record, content_hash, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                untrusted_designation["designation_id"],
+                untrusted_designation["logical_id"],
+                untrusted_designation["revision_id"],
+                untrusted_designation["partition_id"],
+                untrusted_designation["generation"],
+                store.MemoryStore._serialize_record(untrusted_designation),
+                untrusted_designation["content_hash"],
+                untrusted_designation["created_at"],
+            ),
+        )
+        self._mutate(
+            "INSERT INTO procedure_current_designations (logical_id, partition_id, "
+            "current_id, revision_id, generation, state, record, content_hash, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+            (
+                untrusted_designation["logical_id"],
+                untrusted_designation["partition_id"],
+                untrusted_designation["designation_id"],
+                untrusted_designation["revision_id"],
+                untrusted_designation["generation"],
+                store.MemoryStore._serialize_record(untrusted_designation),
+                untrusted_designation["content_hash"],
+                untrusted_designation["created_at"],
+                untrusted_designation["created_at"],
+            ),
+        )
+
+        curated = self._by_id(self._stores(), CURATED_STORE_ID)
+        self.assertEqual(
+            [trusted["logical_id"]],
+            [item["logical_id"] for item in curated.query(self._payload())],
+        )
+        outcome = self._prepare([curated])
+        self.assertEqual(
+            [trusted["logical_id"]],
+            [item["logical_id"] for item in self._selected(outcome)],
+        )
+        traced = {item["logical_id"] for item in self._procedures(outcome)}
+        self.assertIn(trusted["logical_id"], traced)
+        self.assertNotIn(foreign["logical_id"], traced)
+
+
+    def test_non_integer_current_row_generation_omits_only_that_row(self) -> None:
+        # A durable generation is an exact integer.  A text generation used to
+        # raise out of the whole partition read, and a fractional generation
+        # such as 1.5 truncated to 1 and delivered.  Both must now fail closed
+        # for that row alone: the untouched neighbor in the same partition
+        # keeps delivering, and the exact row predicate never raises.
+        healthy, _approval, _representation, designation = self._deliverable_curated(
+            "generation-healthy-neighbor"
+        )
+        malformed = self._curated("generation-malformed-row")
+        malformed_approval = self._approve(
+            malformed, approval_id="approval-generation-malformed"
+        )
+        self.procedure_service.record_representation(
+            self._representation(
+                malformed,
+                search_text="parser lock regression focused inspection recovery",
+            )
+        )
+        self._designate(malformed, malformed_approval)
+        fractional = self._curated("generation-fractional-row")
+        fractional_approval = self._approve(
+            fractional, approval_id="approval-generation-fractional"
+        )
+        self.procedure_service.record_representation(
+            self._representation(
+                fractional,
+                search_text="parser lock regression focused inspection recovery",
+            )
+        )
+        self._designate(fractional, fractional_approval)
+
+        self._mutate(
+            "UPDATE procedure_current_designations SET generation = ? "
+            "WHERE logical_id = ?",
+            ("malformed", malformed["logical_id"]),
+        )
+        self._mutate(
+            "UPDATE procedure_current_designations SET generation = ? "
+            "WHERE logical_id = ?",
+            (1.5, fractional["logical_id"]),
+        )
+
+        # The partition read neither raises nor drops the healthy neighbor.
+        entries = self.memory_store.read_local_current_procedures(self.partition)
+        by_logical = {entry["logical_id"]: entry for entry in entries}
+        self.assertIn(healthy["logical_id"], by_logical)
+        self.assertNotEqual((), by_logical[malformed["logical_id"]]["defects"])
+        self.assertNotEqual((), by_logical[fractional["logical_id"]]["defects"])
+
+        # The exact row predicate itself is total: an unreadable, fractional,
+        # or boolean generation is never truncated into a matching row.
+        predicate = store.MemoryStore._current_row_matches_designation
+        matching = {
+            "logical_id": designation["logical_id"],
+            "partition_id": designation["partition_id"],
+            "current_id": designation["designation_id"],
+            "revision_id": designation["revision_id"],
+            "generation": designation["generation"],
+            "content_hash": designation["content_hash"],
+            "record": store.MemoryStore._serialize_record(designation),
+        }
+        self.assertTrue(predicate(matching, designation))
+        for value in ("malformed", 1.5, True, None, designation["generation"] + 1):
+            self.assertFalse(
+                predicate({**matching, "generation": value}, designation),
+                f"generation {value!r} must not match the durable designation",
+            )
+
+        curated = self._by_id(self._stores(), CURATED_STORE_ID)
+        self.assertEqual(
+            [healthy["logical_id"]],
+            [item["logical_id"] for item in curated.query(self._payload())],
+        )
+        outcome = self._prepare([curated])
+        self.assertEqual(
+            [healthy["logical_id"]],
+            [item["logical_id"] for item in self._selected(outcome)],
+        )
+        traced = {item["logical_id"] for item in self._procedures(outcome)}
+        self.assertNotIn(malformed["logical_id"], traced)
+        self.assertNotIn(fractional["logical_id"], traced)
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -341,6 +341,11 @@ def _local_candidate(
     if approval.get("issuer") not in trusted_issuers:
         # A raw durable approval is never delivery approval by itself.
         return None
+    if designation.get("issuer") not in trusted_issuers:
+        # The designation is the second authorization an exact current
+        # delivery stands on: an issuer outside the accepted trusted set can
+        # never make one durable record current for a recipient.
+        return None
     if not contracts.partition_is_authorized(approval, normalized_partition):
         return None
     recipient_keys = {
