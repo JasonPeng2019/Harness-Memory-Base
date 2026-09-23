@@ -480,6 +480,29 @@ class MemoryStore:
             raise StoreError("memory store is not initialized")
         return self.connection
 
+    def _open_read_only_connection(self) -> sqlite3.Connection:
+        """Open one read-only connection owned by the calling thread.
+
+        The shared store connection is thread-affine, so it cannot be used from
+        another thread.  The accepted bounded search queries every store on its
+        own bounded worker thread, so this seam lets the local reviewed-evidence
+        read run there: the connection is created by the caller and closed by
+        the caller, and it never writes, migrates, or changes shared state.
+        """
+
+        if self.connection is None:
+            raise StoreError("memory store is not initialized")
+        try:
+            connection = sqlite3.connect(
+                f"{self.path.as_uri()}?mode=ro", uri=True, timeout=30.0
+            )
+        except (sqlite3.Error, ValueError) as exc:
+            raise StoreError(
+                f"cannot open read-only memory store {self.path}: {exc}"
+            ) from exc
+        connection.row_factory = sqlite3.Row
+        return connection
+
     def record_decision(self, decision: Mapping[str, Any]) -> dict[str, Any]:
         contracts.validate_decision(decision)
         connection = self._require_connection()
@@ -818,11 +841,18 @@ class MemoryStore:
         return result
 
     def _durable_review_receipt_for_trajectory(
-        self, trajectory: Mapping[str, Any]
+        self, trajectory: Mapping[str, Any], *, connection: sqlite3.Connection | None = None
     ) -> dict[str, Any]:
-        """Return the full receipt and reject flattened narrative substitution."""
+        """Return the full receipt and reject flattened narrative substitution.
 
-        connection = self._require_connection()
+        ``connection`` lets a caller-owned read connection (for example the
+        read-only one used by the recent-evidence search) perform the identical
+        validation.  Every check stays exactly the same; other callers keep
+        using the shared store connection.
+        """
+
+        if connection is None:
+            connection = self._require_connection()
         row = connection.execute(
             "SELECT * FROM review_receipts WHERE review_receipt_id = ?",
             (trajectory["review_receipt_id"],),
@@ -1020,31 +1050,42 @@ class MemoryStore:
     def list_recent_reviewed_trajectories(
         self, scope: Mapping[str, Any]
     ) -> list[dict[str, Any]]:
-        """Return only local evidence whose EverOS representation is unconfirmed."""
+        """Return only local evidence whose EverOS representation is unconfirmed.
 
-        connection = self._require_connection()
-        expected_scope = contracts.normalize_experience_scope(scope)
-        scope_digest = contracts.sha256_hex(expected_scope)
-        rows = connection.execute(
-            """
-            SELECT trajectory.* FROM reviewed_trajectories AS trajectory
-            WHERE trajectory.scope_digest = ?
-              AND NOT EXISTS (
-                  SELECT 1 FROM experience_ingestions AS ingestion
-                  WHERE ingestion.trajectory_id = trajectory.trajectory_id
-                    AND ingestion.status = 'confirmed'
-              )
-            ORDER BY trajectory.recorded_at, trajectory.trajectory_id
-            """,
-            (scope_digest,),
-        ).fetchall()
-        result: list[dict[str, Any]] = []
-        for row in rows:
-            trajectory = self._trajectory_from_row(row)
-            self._durable_review_receipt_for_trajectory(trajectory)
-            if trajectory["scope"] == expected_scope:
-                result.append(trajectory)
-        return result
+        The lookup and its durable receipt validation run on a read-only
+        connection created and closed in the calling thread, so the accepted
+        bounded search can query this local store from its own worker thread.
+        The query, the scope proof, and the receipt checks are unchanged.
+        """
+
+        connection = self._open_read_only_connection()
+        try:
+            expected_scope = contracts.normalize_experience_scope(scope)
+            scope_digest = contracts.sha256_hex(expected_scope)
+            rows = connection.execute(
+                """
+                SELECT trajectory.* FROM reviewed_trajectories AS trajectory
+                WHERE trajectory.scope_digest = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM experience_ingestions AS ingestion
+                      WHERE ingestion.trajectory_id = trajectory.trajectory_id
+                        AND ingestion.status = 'confirmed'
+                  )
+                ORDER BY trajectory.recorded_at, trajectory.trajectory_id
+                """,
+                (scope_digest,),
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                trajectory = self._trajectory_from_row(row)
+                self._durable_review_receipt_for_trajectory(
+                    trajectory, connection=connection
+                )
+                if trajectory["scope"] == expected_scope:
+                    result.append(trajectory)
+            return result
+        finally:
+            connection.close()
 
     def create_experience_ingestion(
         self, ingestion: Mapping[str, Any]
