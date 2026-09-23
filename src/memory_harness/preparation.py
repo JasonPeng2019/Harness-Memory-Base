@@ -23,7 +23,7 @@ from .config import (
     resolve_config,
     resolve_limits,
 )
-from .privacy import PrivacyPolicy
+from .privacy import PrivacyPolicy, sanitize_text
 from .search import BoundedSearch, SearchStore
 
 
@@ -335,13 +335,21 @@ class PreparationService:
         # replan request.  An accepted plan is preserved, and a pending
         # candidate keeps its exact identity and state until ROOT decides.
         template_selection = replan is not None and not accepted_precedence
+        # One canonical sanitized representation of the exact task, objective,
+        # route, and real failure context is constructed once and shared: the
+        # bounded search compares candidates against it, and plan production
+        # recomputes every selected template's trusted comparable score against
+        # the same record instead of sweeping the registry a second time.
+        objective = self._canonical_objective(
+            task_card, objective_id, route, failure_context
+        )
         search = self._run_search(
             preparation=preparation,
+            objective=objective,
             route=route,
             strategy=resolved_config.strategy,
             stores=stores,
             stage_allowance=stage_allowance,
-            failure_context=failure_context,
             accepted_precedence=not template_selection,
             config=resolved_config,
             network_mode=network_mode,
@@ -428,7 +436,8 @@ class PreparationService:
                 decision=decision,
                 objective_id=objective_id,
                 route=route,
-                task_card=task_card,
+                objective=objective,
+                trace=search["trace"],
                 resolved_config=resolved_config,
                 bindings=bindings,
                 apc_binding=apc_binding,
@@ -436,7 +445,6 @@ class PreparationService:
                 apc_cleanup=apc_cleanup,
                 deadline=absolute_deadline,
                 unknown_time=unknown_time,
-                failure_context=failure_context,
                 root_replan=replan,
             )
             if self.store is not None:
@@ -650,11 +658,13 @@ class PreparationService:
         # never replenishes the time already spent on the abandoned packet.
         search = self._run_search(
             preparation=replacement,
+            objective=self._canonical_objective(
+                task_card, objective_id, route, failure_context
+            ),
             route=route,
             strategy=replacement_config.strategy,
             stores=stores,
             stage_allowance=stage_allowance,
-            failure_context=failure_context,
             accepted_precedence=False,
             config=replacement_config,
             network_mode=replacement["network_mode"],
@@ -791,11 +801,11 @@ class PreparationService:
         self,
         *,
         preparation: Mapping[str, Any],
+        objective: Mapping[str, Any],
         route: str,
         strategy: str,
         stores: Sequence[SearchStore],
         stage_allowance: float,
-        failure_context: str | None,
         accepted_precedence: bool,
         config: MemoryConfig,
         network_mode: str,
@@ -843,12 +853,6 @@ class PreparationService:
                 )
                 continue
             enabled.append(store)
-        objective = templates.objective_representation(
-            self._objective_text(preparation, preparation["objective_id"]),
-            route=route,
-            limits=self.limits,
-            failure_context=failure_context,
-        )
         unknown_time = preparation["budget_source"] == "unknown_time"
         rounds = 1 if unknown_time else self.limits.rounds_for(strategy)
         if unknown_time:
@@ -925,9 +929,221 @@ class PreparationService:
                 return dict(operation)
         return None
 
-    def _objective_text(self, preparation: Mapping[str, Any], objective_id: str) -> str:
-        requested = preparation.get("requested_strategy")
-        return f"{objective_id} {requested}" if isinstance(requested, str) else objective_id
+    def _canonical_objective(
+        self,
+        task_card: Mapping[str, Any],
+        objective_id: str,
+        route: str,
+        failure_context: str | None,
+    ) -> dict[str, Any]:
+        """Build the one canonical sanitized representation both phases share.
+
+        The exact declared task text, the exact objective identity, the
+        resolved route, and the real failure context are the only inputs, so
+        the bounded search and plan production compare candidates against
+        literally the same representation instead of two separately
+        constructed ones.
+
+        The task and failure text are sanitized with the active privacy policy
+        *before* tokenization, so a configured secret contributes no token to
+        the bounded store query and no weight to the trusted reuse score: the
+        one sanitized record is what both phases consume.
+        """
+
+        task_text = sanitize_text(
+            str(task_card.get("task") or "").strip(), self.privacy_policy
+        )
+        context_text = sanitize_text(failure_context or "", self.privacy_policy)
+        parts = [part for part in (task_text, str(objective_id)) if part]
+        return templates.objective_representation(
+            " ".join(parts) or str(objective_id),
+            route=route,
+            limits=self.limits,
+            failure_context=context_text or None,
+        )
+
+    def _registry_template(
+        self, template_id: str, revision_id: str
+    ) -> templates.Template | None:
+        """Return the exact explicit registry record for one selected identity.
+
+        Rejoining compares the selected candidate's exact logical id with the
+        immutable registry template id and its delivered revision with the
+        registry version, so a version bump cannot silently satisfy an older
+        selection.
+        """
+
+        version_text = revision_id[1:] if revision_id[:1] in {"v", "V"} else revision_id
+        for template in self.registry:
+            if template.template_id != template_id:
+                continue
+            if str(template.version) == version_text:
+                return template
+        return None
+
+    def _rejoin_selected_templates(
+        self,
+        *,
+        objective: Mapping[str, Any],
+        route: str,
+        trace: Mapping[str, Any] | None,
+        attempts: list[dict[str, Any]],
+    ) -> list[tuple[templates.Template, float]]:
+        """Rejoin every selected template to the explicit immutable registry.
+
+        Only template candidates this preparation trace actually *selected*
+        are considered, in their delivered rank order.  Each one must match
+        one explicit registry record by exact logical id, version, and content
+        digest; its trusted comparable score is then recomputed from the same
+        canonical representation the bounded search used, and the configured
+        calibrated thresholds decide the band.  A mismatched, forged, or
+        inapplicable record is rejected with its reason and is never replaced
+        by a looser registry sweep.
+        """
+
+        selected = [
+            candidate
+            for candidate in (trace or {}).get("candidates", [])
+            if isinstance(candidate, Mapping)
+            and candidate.get("kind") == "template"
+            and candidate.get("disposition") == "selected"
+        ]
+        shortlist: list[tuple[templates.Template, float]] = []
+        for candidate in selected:
+            logical_id = candidate.get("logical_id")
+            revision_id = candidate.get("revision_id")
+            if not isinstance(logical_id, str) or not isinstance(revision_id, str):
+                continue
+            template = self._registry_template(logical_id, revision_id)
+            if template is None:
+                attempts.append(
+                    {
+                        "template_id": logical_id,
+                        "branch": "shortlist",
+                        "status": "rejected",
+                        "reason": (
+                            "the selected template does not rejoin the explicit "
+                            "immutable registry by exact id/version"
+                        ),
+                    }
+                )
+                continue
+            if candidate.get("payload_digest") != contracts.sha256_hex(
+                template.to_record()
+            ):
+                attempts.append(
+                    {
+                        "template_id": template.template_id,
+                        "branch": "shortlist",
+                        "status": "rejected",
+                        "reason": (
+                            "the selected template content digest does not match "
+                            "the immutable registry record"
+                        ),
+                    }
+                )
+                continue
+            representation = templates.template_representation(
+                template, limits=self.limits
+            )
+            if not template.representation_declared or not templates.representations_comparable(
+                objective, representation
+            ):
+                attempts.append(
+                    {
+                        "template_id": template.template_id,
+                        "branch": "shortlist",
+                        "status": "rejected",
+                        "reason": (
+                            "the selected template representation is not comparable "
+                            "with the canonical objective representation"
+                        ),
+                    }
+                )
+                continue
+            if route not in template.routes:
+                attempts.append(
+                    {
+                        "template_id": template.template_id,
+                        "branch": "shortlist",
+                        "status": "rejected",
+                        "reason": (
+                            f"the selected template is not applicable to route {route!r}"
+                        ),
+                    }
+                )
+                continue
+            score = templates.score_representations(objective, representation)
+            if score < self.limits.near_match_threshold:
+                attempts.append(
+                    {
+                        "template_id": template.template_id,
+                        "branch": "shortlist",
+                        "status": "rejected",
+                        "reason": (
+                            "the selected template scores below the configured "
+                            "near-match threshold in the canonical representation"
+                        ),
+                    }
+                )
+                continue
+            shortlist.append((template, score))
+        return shortlist
+
+    @staticmethod
+    def _no_selected_template_reason(trace: Mapping[str, Any] | None) -> str:
+        """Explain honestly why no template candidate could be selected."""
+
+        attempts = [
+            entry
+            for entry in (trace or {}).get("attempts", [])
+            if isinstance(entry, Mapping) and entry.get("kind") == "template"
+        ]
+        if not attempts:
+            return (
+                "no bounded template store ran in this preparation trace; fresh "
+                "ROOT planning applies without template reuse or adaptation"
+            )
+        statuses = {str(entry.get("status")) for entry in attempts}
+        if "unattempted-by-budget" in statuses:
+            return (
+                "the optional stage admitted no template search budget; fresh ROOT "
+                "planning applies without template reuse or adaptation"
+            )
+        if "disabled" in statuses:
+            return (
+                "template selection was disabled for this preparation; fresh ROOT "
+                "planning applies without template reuse or adaptation"
+            )
+        return (
+            "the bounded eligible shortlist selected no template candidate; fresh "
+            "ROOT planning applies without template reuse or adaptation"
+        )
+
+    def _fresh_plan_reason(
+        self,
+        *,
+        resolved_config: MemoryConfig,
+        trace: Mapping[str, Any] | None,
+        shortlist: Sequence[tuple[templates.Template, float]],
+        attempts: Sequence[Mapping[str, Any]],
+    ) -> str:
+        if not resolved_config.template_memory:
+            return (
+                "template memory is disabled; no template reuse or adaptation runs "
+                "and normal fresh ROOT planning applies"
+            )
+        if attempts:
+            return (
+                "no selected template rejoined the explicit immutable registry with "
+                "a trusted comparable score; normal fresh ROOT planning applies"
+            )
+        if shortlist:
+            return (
+                "no selected template produced a usable direct fill or permitted "
+                "adaptation; normal fresh ROOT planning applies"
+            )
+        return self._no_selected_template_reason(trace)
 
 
     def _produce_plan(
@@ -937,7 +1153,8 @@ class PreparationService:
         decision: Mapping[str, Any],
         objective_id: str,
         route: str,
-        task_card: Mapping[str, Any],
+        objective: Mapping[str, Any],
+        trace: Mapping[str, Any] | None,
         resolved_config: MemoryConfig,
         bindings: Mapping[str, Any] | None,
         apc_binding: Mapping[str, Any] | None,
@@ -945,26 +1162,41 @@ class PreparationService:
         apc_cleanup: Mapping[str, Any] | None,
         deadline: float,
         unknown_time: bool,
-        failure_context: str | None,
         root_replan: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
-        task_text = str(task_card.get("task", objective_id))
-        objective = templates.objective_representation(
-            f"{task_text} {objective_id}",
-            route=route,
-            limits=self.limits,
-            failure_context=failure_context,
-        )
-        matches = templates.rank_templates(objective, self.registry, limits=self.limits)
-        reuse_attempts: list[dict[str, Any]] = []
-        if not resolved_config.template_memory:
-            matches = []
+        """Produce a bounded reuse proposal from the selected shortlist only.
 
-        for match in templates.direct_fill_band(matches, limits=self.limits):
+        BEHAVIOR-01's bounded preparation trace is the only source of template
+        candidates: a template the eligible shortlist did not actually select
+        is never considered, so a disabled feature, a denied optional stage, a
+        missing store, or a filtered candidate cannot be routed around by a
+        second registry sweep.  Each selected candidate must rejoin the
+        explicit immutable registry by exact id, version, and content digest,
+        and its trusted comparable score is recomputed from the same canonical
+        representation the search used; the configured calibrated thresholds
+        decide the band.  A mismatch is rejected, never downgraded to a looser
+        registry fallback.
+        """
+
+        reuse_attempts: list[dict[str, Any]] = []
+        shortlist = (
+            self._rejoin_selected_templates(
+                objective=objective,
+                route=route,
+                trace=trace,
+                attempts=reuse_attempts,
+            )
+            if resolved_config.template_memory
+            else []
+        )
+
+        for template, score in shortlist:
+            if score < self.limits.direct_fill_threshold:
+                continue
             if not bindings:
                 reuse_attempts.append(
                     {
-                        "template_id": match.template.template_id,
+                        "template_id": template.template_id,
                         "branch": "direct_fill",
                         "status": "unavailable",
                         "reason": "no trusted typed bindings were supplied",
@@ -973,12 +1205,14 @@ class PreparationService:
                 continue
             try:
                 proposal = templates.direct_fill_typed(
-                    match.template, bindings, objective_id=objective_id, route=route
+                    template, bindings, objective_id=objective_id, route=route
                 )
             except templates.TemplateError as exc:
+                # A typed validation failure keeps every lower-ranked selected
+                # eligible candidate available; field trust is never weakened.
                 reuse_attempts.append(
                     {
-                        "template_id": match.template.template_id,
+                        "template_id": template.template_id,
                         "branch": "direct_fill",
                         "status": "rejected",
                         "reason": str(exc),
@@ -990,13 +1224,16 @@ class PreparationService:
                 objective_id=objective_id,
                 route=route,
                 branch="direct_fill",
-                reason="a comparable template with complete typed fields was directly filled",
+                reason=(
+                    "a selected comparable template with complete typed fields "
+                    "was directly filled"
+                ),
                 template={
-                    "template_id": match.template.template_id,
-                    "version": match.template.version,
-                    "family": match.template.family,
-                    "digest": contracts.sha256_hex(match.template.to_record()),
-                    "score": match.score,
+                    "template_id": template.template_id,
+                    "version": template.version,
+                    "family": template.family,
+                    "digest": contracts.sha256_hex(template.to_record()),
+                    "score": score,
                 },
                 proposal=proposal,
                 reuse_attempts=reuse_attempts,
@@ -1005,7 +1242,13 @@ class PreparationService:
             # A direct fill is the proposal itself; it launches no APC child.
             return disposition, proposal, None
 
-        near = templates.near_match_band(matches, limits=self.limits)
+        near = [
+            (template, score)
+            for template, score in shortlist
+            if self.limits.near_match_threshold
+            <= score
+            < self.limits.direct_fill_threshold
+        ]
         adaptation_available = bool(
             resolved_config.apc
             and resolved_config.light_adaptation
@@ -1014,8 +1257,8 @@ class PreparationService:
             and apc_launcher is not None
         )
         if near and adaptation_available:
-            match = near[0]
-            record = match.template.to_record()
+            template, score = near[0]
+            record = template.to_record()
             pending = self._unresolved_child_operation(ownership_decision_id)
             remaining = deadline - self.clock()
             if pending is not None:
@@ -1025,7 +1268,7 @@ class PreparationService:
                 # behind a budget excuse.
                 reuse_attempts.append(
                     {
-                        "template_id": match.template.template_id,
+                        "template_id": template.template_id,
                         "branch": "apc_proposal",
                         "status": "rejected",
                         "reason": (
@@ -1037,7 +1280,7 @@ class PreparationService:
             elif remaining <= self.limits.execution_reserve_seconds:
                 reuse_attempts.append(
                     {
-                        "template_id": match.template.template_id,
+                        "template_id": template.template_id,
                         "branch": "apc_proposal",
                         "status": "unattempted-by-budget",
                         "reason": "no usable adaptation time remains inside the deadline",
@@ -1049,7 +1292,7 @@ class PreparationService:
                         template=record,
                         parent_decision_id=decision["decision_id"],
                         parent_objective_id=objective_id,
-                        permitted_edits=list(match.template.allowed_edits),
+                        permitted_edits=list(template.allowed_edits),
                         binding=apc_binding,
                     )
                     attempt = harness_bridge.run_apc_child(
@@ -1065,7 +1308,7 @@ class PreparationService:
                 except (apc.APCError, harness_bridge.HarnessBridgeError) as exc:
                     reuse_attempts.append(
                         {
-                            "template_id": match.template.template_id,
+                            "template_id": template.template_id,
                             "branch": "apc_proposal",
                             "status": "rejected",
                             "reason": f"{type(exc).__name__}: {exc}",
@@ -1080,11 +1323,11 @@ class PreparationService:
                         branch="apc_proposal",
                         reason="one bounded drafting child produced a proposed artifact",
                         template={
-                            "template_id": match.template.template_id,
-                            "version": match.template.version,
-                            "family": match.template.family,
+                            "template_id": template.template_id,
+                            "version": template.version,
+                            "family": template.family,
                             "digest": contracts.sha256_hex(record),
-                            "score": match.score,
+                            "score": score,
                         },
                         proposal=proposal,
                         apc={
@@ -1104,7 +1347,12 @@ class PreparationService:
             objective_id=objective_id,
             route=route,
             branch="fresh",
-            reason="no comparable direct-fill or permitted adaptation applied; normal fresh planning",
+            reason=self._fresh_plan_reason(
+                resolved_config=resolved_config,
+                trace=trace,
+                shortlist=shortlist,
+                attempts=reuse_attempts,
+            ),
             fresh=fresh,
             reuse_attempts=reuse_attempts,
             root_replan=root_replan,

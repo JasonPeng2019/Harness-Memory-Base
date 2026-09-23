@@ -22,12 +22,21 @@ from memory_harness import (
     apc,
     config,
     contracts,
+    experience,
     harness_bridge,
+    local_adapters,
     preparation,
     search,
     store,
     templates,
 )
+
+
+class QuietEvidenceService:
+    """An inert local evidence seam; the template store is the subject."""
+
+    def search_recent_evidence(self, scope, query):
+        return []
 
 
 BINDING = {
@@ -569,6 +578,7 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             "plan": self.candidate,
             "objective_id": "objective-1",
             "route": "ordinary",
+            "stores": [self._template_store()],
             "apc_binding": BINDING,
             "apc_launcher": launcher,
             "root_replan": {
@@ -578,6 +588,21 @@ class Step04ContractCorrectionTests(unittest.TestCase):
         }
         arguments.update(overrides)
         return self.service.prepare(**arguments)
+
+    def _template_store(self, items=None):
+        """One bounded local template store over the explicit registry."""
+
+        return local_adapters.make_local_search_stores(
+            experience_service=QuietEvidenceService(),
+            scope=experience.ExperienceScope(
+                application="harness",
+                project="product",
+                namespace="contract-corrections",
+                owner="root-agent",
+            ),
+            registry=templates.load_default_templates(),
+            limits=self.limits,
+        )[1]
 
     def test_apc_timeout_is_cleanup_pending_and_retry_is_refused(self) -> None:
         calls: list[object] = []
@@ -599,6 +624,7 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             plan=self.candidate,
             objective_id="objective-1",
             route="ordinary",
+            stores=[self._template_store()],
             apc_binding=BINDING,
             apc_launcher=slow_launcher,
             root_replan={
@@ -606,6 +632,9 @@ class Step04ContractCorrectionTests(unittest.TestCase):
                 "reason": "the test exercises the explicit ROOT replan path",
             },
         )
+        # A timed-out bounded child leaves the exact child cleanup_pending and
+        # the decision falls back to fresh ROOT planning; the unresolved child
+        # is recorded, never hidden.
         self.assertEqual("fresh", first.disposition["branch"])
         operations = self.memory_store.list_apc_child_operations(
             first.decision["decision_id"]
@@ -614,11 +643,16 @@ class Step04ContractCorrectionTests(unittest.TestCase):
         self.assertIn(
             "cleanup_pending", contracts.APC_CHILD_UNRESOLVED_STATUSES
         )
+        # The retry receives trusted time so the optional stage is admitted and
+        # the near-match handoff is genuinely reachable: the unresolved child,
+        # not the budget, must be what refuses a second launch.
         second = service.prepare(
             task_card=self.card,
             plan=self.candidate,
             objective_id="objective-1",
             route="ordinary",
+            deadline=clock() + 300.0,
+            stores=[self._template_store()],
             apc_binding=BINDING,
             apc_launcher=slow_launcher,
             root_replan={
@@ -627,6 +661,7 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             },
         )
         self.assertEqual(1, len(calls), "an unresolved child must not relaunch")
+        self.assertEqual("fresh", second.disposition["branch"])
         self.assertIn("reconcile", second.disposition["reuse_attempts"][0]["reason"])
 
     def test_apc_reconciliation_clears_cleanup_pending_before_retry(self) -> None:

@@ -14,7 +14,9 @@ from memory_harness import (
     apc,
     config,
     contracts,
+    experience,
     harness_bridge,
+    local_adapters,
     preparation,
     store,
     templates,
@@ -55,6 +57,19 @@ def representation(tokens: list[str], *, limits: config.PreparationLimits) -> di
     }
 
 
+class QuietEvidenceService:
+    """An explicit local evidence seam with no reviewed trajectories yet.
+
+    Template reuse consumes BEHAVIOR-01's bounded eligible shortlist, so the
+    reuse tests exercise the actual local template ``SearchStore`` from the
+    accepted local adapter factory; this evidence stub only keeps the sibling
+    reviewed-evidence store inert without weakening it.
+    """
+
+    def search_recent_evidence(self, scope, query):
+        return []
+
+
 class ReusePlanningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -72,6 +87,21 @@ class ReusePlanningTests(unittest.TestCase):
         self.memory_store.initialize()
         self.service = preparation.PreparationService(
             store=self.memory_store, limits=self.limits, clock=self.clock
+        )
+        # Reuse and adaptation consume only templates the bounded preparation
+        # trace actually selected, so the fixture supplies the real local
+        # template SearchStore through the accepted local adapter factory and
+        # passes it to every preparation below.
+        self.stores = local_adapters.make_local_search_stores(
+            experience_service=QuietEvidenceService(),
+            scope=experience.ExperienceScope(
+                application="harness",
+                project="product",
+                namespace="reuse-planning",
+                owner="root-agent",
+            ),
+            registry=templates.load_default_templates(),
+            limits=self.limits,
         )
         self.plan = contracts.make_plan(
             plan_id="candidate-plan",
@@ -103,6 +133,7 @@ class ReusePlanningTests(unittest.TestCase):
             "plan": self.plan,
             "objective_id": "objective-1",
             "route": "ordinary",
+            "stores": list(self.stores),
             "root_replan": ROOT_REPLAN,
         }
         arguments.update(overrides)
@@ -355,6 +386,7 @@ class ReusePlanningTests(unittest.TestCase):
             plan=self.plan,
             objective_id="objective-1",
             route="ordinary",
+            stores=list(self.stores),
             apc_binding=BINDING,
             apc_launcher=slow_launcher,
             root_replan=ROOT_REPLAN,
