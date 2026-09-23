@@ -1595,6 +1595,63 @@ class MemoryStore:
         contracts.validate_generated_skill_candidate(result)
         return result
 
+    def read_generated_skill_candidates_for_scope(
+        self, skill_id: str, scope: Mapping[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Read the durable Step-02 generated candidates of one exact skill.
+
+        The exact four-part scope and the exact stable skill id are the
+        smallest read-only lookup a later remote-skill rejoin needs: a
+        discovered EverOS hit is compared only against the durable generated
+        candidates this store already holds for that same skill and scope, so
+        EverOS presence and its query-dependent ranking score never stand in
+        for a stable identity.  The lookup runs on one read-only connection
+        created and closed by the calling thread, because the accepted bounded
+        search queries every store on its own bounded worker thread while the
+        shared store connection is thread-affine.  It never writes, migrates,
+        or promotes anything: every returned record remains the
+        non-authoritative, proposed Step-02 candidate it was stored as, and no
+        approval, designation, or guidance is derived from this read.
+
+        Each row is validated on its own: the stored scope has to equal the
+        requested scope exactly, and the accepted column reader revalidates
+        the contract identity and the row content hash of that candidate.  A
+        foreign, altered, or unreadable row is omitted by itself, so one
+        corrupt row can never suppress an unrelated intact candidate of the
+        same skill and scope.
+        """
+
+        if not isinstance(skill_id, str) or not skill_id.strip():
+            raise StoreError("skill id must be a nonempty string")
+        connection = self._open_read_only_connection()
+        try:
+            expected_scope = contracts.normalize_experience_scope(scope)
+            rows = connection.execute(
+                """
+                SELECT * FROM generated_skill_candidates
+                WHERE skill_id = ? AND scope_digest = ?
+                ORDER BY candidate_id
+                """,
+                (skill_id, contracts.sha256_hex(expected_scope)),
+            ).fetchall()
+            candidates: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    candidate = self._read_only_skill_candidate(
+                        connection, str(row["candidate_id"])
+                    )
+                except Exception:
+                    # One altered or unreadable row is isolated: it is never
+                    # returned, and it never suppresses an intact candidate
+                    # of the same skill and scope.
+                    continue
+                if candidate["scope"] != expected_scope:
+                    continue
+                candidates.append(candidate)
+            return candidates
+        finally:
+            connection.close()
+
     def record_skill_approval(self, approval: Mapping[str, Any]) -> dict[str, Any]:
         contracts.validate_skill_approval(approval)
         connection = self._require_connection()
