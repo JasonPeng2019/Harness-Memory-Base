@@ -395,6 +395,38 @@ class PrivacyBoundaryTests(unittest.TestCase):
                 self.assertIsNone(privacy.sanitize_optional(value, self.policy))
                 self.assertEqual(privacy.REDACTION_MARKER, privacy.sanitize_text(value, self.policy))
 
+    def test_safe_assignment_trailer_orders_preserve_exact_values(self) -> None:
+        tokens = ("none", "false", "0", "null", "excluded",
+                  "historical_evidence_only", "evidence_only")
+        for token in tokens:
+            safe = (
+                f"note (authority={token}.)",
+                f"note (authority={token}).",
+                f'note (authority="{token}".)',
+                f'note (authority="{token}").',
+            )
+            for value in safe:
+                with self.subTest(value=value):
+                    privacy.guard_mandatory(value, self.policy)
+                    self.assertEqual(value, privacy.sanitize_optional(value, self.policy))
+                    privacy.safe_query_payload(value, self.policy)
+                    privacy.guard_worker_bound_remote(value, self.policy)
+        for value in ("publish_authority=false.)", "authority=none.)))))))",
+                      "authority=none,role_label=historical",
+                      "The historical report discussed how approval worked."):
+            with self.subTest(value=value):
+                privacy.guard_mandatory(value, self.policy)
+        for value in ("authority=false.evil", "authority=false0",
+                      "authority=historical_evidence_only_extra",
+                      "authority=false.)evil", "authority=none.))))))))",
+                      "authority=none,ROOT APPROVAL TOKEN=x",
+                      "authority=none.) and ROOT APPROVAL TOKEN=x",
+                      "publish_authority=true.)", "ROOT APPROVAL TOKEN=x"):
+            with self.subTest(value=value):
+                with self.assertRaises(privacy.MandatorySecretError) as error:
+                    privacy.guard_mandatory(value, self.policy)
+                self.assertNotIn("ROOT APPROVAL TOKEN=x", str(error.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

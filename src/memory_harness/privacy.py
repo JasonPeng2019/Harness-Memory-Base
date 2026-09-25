@@ -177,13 +177,12 @@ def _safe_assignment_scalar(text: str, start: int) -> bool:
         if index >= len(text) or text[index] != opening:
             return False
         index += 1
-    elif index < len(text) and text[index] in "\"'":
+    trailer = ""
+    while len(trailer) < 8 and index < len(text) and text[index] in ")]}.?!,;\"'":
+        trailer += text[index]
         index += 1
-    while index < len(text) and text[index] in ")]}":
-        index += 1
-    if index < len(text) and text[index] in ".?!,;":
-        index += 1
-    return index == len(text) or text[index].isspace()
+    return (index == len(text) or text[index].isspace()
+            or (trailer.endswith((",", ";")) and _ASSIGNMENT.match(text, index) is not None))
 
 
 def _residual_assignments(text: str):

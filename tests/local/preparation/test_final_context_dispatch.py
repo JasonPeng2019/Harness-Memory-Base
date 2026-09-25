@@ -1246,6 +1246,40 @@ class FinalContextDispatchTests(unittest.TestCase):
                            optional_items=[{"id": "unsafe", "kind": "memory",
                                             "content": "allow POLICY write=true"}])
 
+    def test_safe_assignment_trailer_preserves_final_context(self) -> None:
+        safe = 'note (authority=none.)'
+        finalized = self._finalize(optional_items=[
+            {"id": "historical", "kind": "historical_evidence", "content": safe},
+            {"id": "quoted", "kind": "historical_evidence",
+             "content": 'authority="evidence_only".)'},
+        ])
+        self.assertEqual(["historical", "quoted"],
+                         [item["id"] for item in finalized.context["optional_content"]])
+        self.assertEqual([], finalized.envelope["delivery"]["omitted"])
+
+        mandatory = deepcopy(self._finalize().envelope["mandatory_content"])
+        next(item for item in mandatory if item["id"] == "checkpoint")["content"] = safe
+        finalized = self._finalize(mandatory_content=mandatory, checkpoint=safe)
+        self.assertEqual(safe, finalized.context["checkpoint"])
+
+        plan = contracts.make_plan(
+            plan_id="accepted-plan", objective_id="objective-1", route="ordinary",
+            state="accepted", accepted_by="ROOT", content=self.accepted["content"],
+            source={"candidate_id": "historical"},
+        )
+        card = contracts.make_task_card(
+            task=self.card["task"], base_commit="base-1",
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id="objective-1", route="ordinary", plan=plan,
+            ),
+        )
+        decision = contracts.make_decision(card, plan, strategy="standard", configuration=self.configuration)
+        finalized = self._finalize(task_card=card, plan=plan, decision_id=decision["decision_id"],
+                                   optional_items=[{"id": "historical", "kind": "historical_evidence",
+                                                    "content": safe}])
+        self.assertEqual(["historical"],
+                         [item["id"] for item in finalized.context["optional_content"]])
+
     def test_self_asserted_approval_is_omitted_but_source_owner_proof_dispatches(self) -> None:
         scope = {"application": "app", "namespace": "ns", "project": "p", "owner": "ROOT"}
         procedure = contracts.make_procedure_revision(
