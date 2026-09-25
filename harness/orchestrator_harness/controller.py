@@ -24,7 +24,7 @@ from .core import content_hash, iso_utc, read_json, require_schema
 from .epochs import lane_record_dir
 from .lanes import find_active_lane, update_lane
 from .leases import acquire_leases, release_leases
-from .provider_adapters import usage_observation
+from .provider_adapters import has_native_counter, usage_observation
 from .records import (
     RecordLock,
     append_jsonl,
@@ -312,10 +312,11 @@ def _append_attempt(
     range [transcript_start_byte, transcript_end_byte). Its ordered
     native_usage_observations keep native counter names, event identities and
     byte offsets. Observations may be replayed, intermediate, cumulative, or
-    terminal; native_usage_state=observed only means at least one numeric
-    counter was seen. Missing counters remain absent and state=incomplete when
-    none were seen. Lane 1's future usage store must reconcile these source
-    facts; this row does not assert attributed totals or outcome authority.
+    terminal; native_usage_state=observed only means at least one recognized
+    native token or cost counter was seen. Missing counters remain absent;
+    state=incomplete when none were seen. Lane 1's future usage store must
+    reconcile these source facts; this row does not assert attributed totals
+    or outcome authority.
     """
     observations: list[dict[str, Any]] = []
     native_session_id = session_id
@@ -337,17 +338,35 @@ def _append_attempt(
                         parsed = parser(line)
                     except Exception as exc:
                         parsed = None
-                        capture_error = f"provider parser failed at line {line_number}: {exc}"
-                    if isinstance(parsed, dict) and parsed.get("session_id"):
-                        native_session_id = str(parsed["session_id"])
+                        capture_error = (
+                            f"provider parser failed at line {line_number}: "
+                            f"{type(exc).__name__}"
+                        )
+                    if (
+                        isinstance(parsed, dict)
+                        and isinstance(parsed.get("session_id"), str)
+                        and 0 < len(parsed["session_id"]) <= 256
+                    ):
+                        native_session_id = parsed["session_id"]
                     try:
                         native_event = json.loads(raw_line)
-                    except (UnicodeDecodeError, json.JSONDecodeError):
+                    except (ValueError, RecursionError) as exc:
                         native_event = None
-                    receipt = (
-                        usage_observation(native_event, lane.get("provider", {}).get("id", ""))
-                        if isinstance(native_event, dict) else None
-                    )
+                        capture_error = (
+                            f"malformed native JSON at line {line_number}: "
+                            f"{type(exc).__name__}"
+                        )
+                    try:
+                        receipt = (
+                            usage_observation(native_event, lane.get("provider", {}).get("id", ""))
+                            if isinstance(native_event, dict) else None
+                        )
+                    except Exception as exc:
+                        receipt = None
+                        capture_error = (
+                            f"malformed native receipt at line {line_number}: "
+                            f"{type(exc).__name__}"
+                        )
                     if receipt is not None:
                         observations.append({
                             "line_number": line_number,
@@ -380,10 +399,8 @@ def _append_attempt(
             "validation_error": validation_error,
             "native_usage_state": (
                 "observed"
-                if any(
-                    isinstance(value, (int, float)) and not isinstance(value, bool)
-                    for item in observations for value in item["usage"].values()
-                ) else "incomplete"
+                if any(has_native_counter(item) for item in observations)
+                else "incomplete"
             ),
             "native_usage_observations": observations,
             "native_usage_capture_error": capture_error,
@@ -573,7 +590,10 @@ def _run_provider(
                 next_observation = time.monotonic() + 0.5
             line = handle.readline()
             if line:
-                parsed = binding.parse_line(line.rstrip("\n"))
+                try:
+                    parsed = binding.parse_line(line.rstrip("\n"))
+                except Exception:
+                    parsed = None  # The post-exit receipt read records this malformed line.
                 if isinstance(parsed, dict):
                     if parsed.get("message"):
                         last_message = str(parsed["message"])
@@ -601,7 +621,10 @@ def _run_provider(
                     break
                 time.sleep(0.2)
         for line in handle:
-            parsed = binding.parse_line(line.rstrip("\n"))
+            try:
+                parsed = binding.parse_line(line.rstrip("\n"))
+            except Exception:
+                parsed = None  # Keep draining the final tail and append the attempt.
             if isinstance(parsed, dict):
                 if parsed.get("message"):
                     last_message = str(parsed["message"])

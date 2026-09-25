@@ -62,6 +62,101 @@ def append_observed_attempt(
 
 
 class NativeAttemptReceipts(unittest.TestCase):
+    def test_untrusted_usage_fields_are_dropped_and_do_not_mark_observed(self):
+        cases = (
+            ({"latency_ms": 5, "access_token": "TOPSECRET"}, "incomplete", {}),
+            ({
+                "input_tokens": 4,
+                "latency_ms": 5,
+                "access_token": "TOPSECRET",
+                "cached_input_tokens": float("inf"),
+                "reasoning_output_tokens": True,
+            }, "observed", {"input_tokens": 4}),
+        )
+        for usage, state, expected in cases:
+            with self.subTest(usage=usage), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                transcript = root / "transcript.jsonl"
+                transcript.write_text(json.dumps({
+                    "type": "turn.completed",
+                    "model": {"access_token": "TOPSECRET"},
+                    "turn_id": {"access_token": "TOPSECRET"},
+                    "uuid": "x" * 300,
+                    "usage": usage,
+                }) + "\n", encoding="utf-8")
+                row = append_observed_attempt(root, "codex", transcript)
+                self.assertEqual(state, row["native_usage_state"])
+                self.assertEqual(expected, row["native_usage_observations"][0]["usage"])
+                self.assertNotIn("TOPSECRET", (root / "attempts.jsonl").read_text())
+                self.assertNotIn("latency_ms", (root / "attempts.jsonl").read_text())
+                self.assertNotIn("uuid", row["native_usage_observations"][0])
+                self.assertNotIn("turn_id", row["native_usage_observations"][0])
+
+    def test_claude_result_retains_independent_model_usage_and_cost(self):
+        for generic_usage, keep_models, keep_cost in (
+            (None, True, True),
+            ({}, True, True),
+            (None, True, False),
+            (None, False, True),
+        ):
+            with self.subTest(generic_usage=generic_usage, keep_models=keep_models,
+                              keep_cost=keep_cost), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                transcript = root / "transcript.jsonl"
+                event = {
+                    "type": "result",
+                    "uuid": "terminal",
+                }
+                if keep_models:
+                    event["modelUsage"] = {
+                        "claude-native": {
+                            "inputTokens": 6,
+                            "cacheReadInputTokens": 3,
+                            "costUSD": 0.006,
+                            "latency_ms": 9,
+                            "access_token": "TOPSECRET",
+                        }
+                    }
+                if keep_cost:
+                    event["total_cost_usd"] = 0.01
+                if generic_usage is not None:
+                    event["usage"] = generic_usage
+                transcript.write_text(json.dumps(event) + "\n", encoding="utf-8")
+                row = append_observed_attempt(root, "claude-code", transcript)
+                self.assertEqual("observed", row["native_usage_state"])
+                self.assertEqual(1, len(row["native_usage_observations"]))
+                receipt = row["native_usage_observations"][0]
+                self.assertEqual({}, receipt["usage"])
+                if keep_models:
+                    self.assertEqual(
+                        {"claude-native": {
+                            "inputTokens": 6,
+                            "cacheReadInputTokens": 3,
+                            "costUSD": 0.006,
+                        }},
+                        receipt["modelUsage"],
+                    )
+                else:
+                    self.assertNotIn("modelUsage", receipt)
+                if keep_cost:
+                    self.assertEqual(0.01, receipt["total_cost_usd"])
+                else:
+                    self.assertNotIn("total_cost_usd", receipt)
+                self.assertNotIn("TOPSECRET", (root / "attempts.jsonl").read_text())
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            transcript = root / "transcript.jsonl"
+            transcript.write_text(json.dumps({
+                "type": "result",
+                "usage": {"latency_ms": 5},
+                "total_cost_usd": float("inf"),
+            }) + "\n", encoding="utf-8")
+            row = append_observed_attempt(root, "claude-code", transcript)
+            self.assertEqual("incomplete", row["native_usage_state"])
+            self.assertEqual({}, row["native_usage_observations"][0]["usage"])
+            self.assertNotIn("total_cost_usd", row["native_usage_observations"][0])
+
     def test_source_events_keep_native_fields_and_distinct_observations(self):
         codex_usage = {
             "input_tokens": 11,
@@ -197,6 +292,22 @@ class NativeAttemptReceipts(unittest.TestCase):
             self.assertEqual(4, row["native_usage_observations"][0]["usage"]["input_tokens"])
             self.assertIn("provider parser failed", row["native_usage_capture_error"])
 
+    def test_json_value_and_recursion_errors_still_append_incomplete_attempt(self):
+        malformed_lines = (
+            b'{"type":"turn.completed","usage":{"input_tokens":' + b"9" * 5000 + b'}}\n',
+            b'{"type":"turn.completed","usage":{"input_tokens":'
+            + b"[" * 5000 + b"0" + b"]" * 5000 + b'}}\n',
+        )
+        for line in malformed_lines:
+            with self.subTest(length=len(line)), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                transcript = root / "transcript.jsonl"
+                transcript.write_bytes(line)
+                row = append_observed_attempt(root, "codex", transcript, exit_code=1)
+                self.assertEqual("incomplete", row["native_usage_state"])
+                self.assertEqual([], row["native_usage_observations"])
+                self.assertIn("malformed native JSON", row["native_usage_capture_error"])
+
     def test_late_tail_after_exit_is_captured_for_started_attempt(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -224,6 +335,7 @@ class NativeAttemptReceipts(unittest.TestCase):
             boundary.record.return_value = {"root": {"pid": 123}}
 
             def spawn(argv, *, cwd, stdin, stdout, stderr):
+                stdout.write('{"type":["turn.completed"],"usage":{"input_tokens":5}}\n')
                 stdout.write('{"type":"thread.started","thread_id":"native-session"}\n')
                 stdout.flush()
                 return child
@@ -269,7 +381,8 @@ class NativeAttemptReceipts(unittest.TestCase):
             )
             row = read_jsonl(root / "attempts.jsonl")[-1]
             self.assertEqual(9, row["native_usage_observations"][0]["usage"]["input_tokens"])
-            self.assertEqual(2, row["native_usage_observations"][0]["line_number"])
+            self.assertEqual(3, row["native_usage_observations"][0]["line_number"])
+            self.assertIn("malformed", row["native_usage_capture_error"])
             self.assertEqual(len(b"stale earlier invocation\n"), execution.transcript_start_byte)
             self.assertEqual(execution.transcript_start_byte, row["transcript_start_byte"])
             self.assertEqual(transcript.stat().st_size, row["transcript_end_byte"])

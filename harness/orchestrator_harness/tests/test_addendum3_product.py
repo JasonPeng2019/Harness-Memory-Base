@@ -424,6 +424,7 @@ class Addendum3ProductTests(unittest.TestCase):
             "provider-start-failed": "provider-start-failed",
             "receipts": "native-receipts",
             "receipt-failure": "native-receipt-failure",
+            "malformed-receipt": "malformed-native-receipt",
         }[scenario]
         worktree = self.runtime / f"controller-{suffix}-worktree"
         workspace = worktree / ".agent-workspace"
@@ -556,7 +557,12 @@ class Addendum3ProductTests(unittest.TestCase):
 
             paths = controller._attempt_paths(lane, attempt_number)
             paths["transcript"].parent.mkdir(parents=True, exist_ok=True)
-            if scenario in {"receipts", "receipt-failure"}:
+            if scenario == "malformed-receipt":
+                paths["transcript"].write_text(
+                    '{"type":["turn.completed"],"usage":{"input_tokens":5}}\n',
+                    encoding="utf-8",
+                )
+            elif scenario in {"receipts", "receipt-failure"}:
                 paths["transcript"].write_text(
                     f'{{"type":"turn.completed","turn_id":"turn-{attempt_number}","usage":{{"input_tokens":{attempt_number},"cached_input_tokens":1,"output_tokens":2}}}}\n',
                     encoding="utf-8",
@@ -610,7 +616,7 @@ class Addendum3ProductTests(unittest.TestCase):
                 }
             )
             session_id = None if scenario == "no-session" else "native-session-1"
-            if scenario == "receipt-failure":
+            if scenario in {"receipt-failure", "malformed-receipt"}:
                 return ProviderExecution(9, boundary, session_id, argv, True)
             return ProviderExecution(0, boundary, session_id, argv)
 
@@ -626,7 +632,8 @@ class Addendum3ProductTests(unittest.TestCase):
                 controller, "_load_binding",
                 return_value=(
                     SimpleNamespace(parse_line=lambda _line: None)
-                    if scenario in {"receipts", "receipt-failure"} else object()
+                    if scenario in {"receipts", "receipt-failure", "malformed-receipt"}
+                    else object()
                 ),
             ),
             patch.object(controller, "update_lane", side_effect=track_update_lane),
@@ -963,6 +970,21 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual("invalid", rows[0]["result_state"])
         self.assertEqual("observed", rows[0]["native_usage_state"])
         self.assertEqual("turn-1", rows[0]["native_usage_observations"][0]["turn_id"])
+
+    def test_malformed_receipt_still_appends_failed_attempt_and_releases_lease(self) -> None:
+        observed = self._run_candidate_correction_boundary(
+            valid_on_sixth=False, scenario="malformed-receipt"
+        )
+        self.assertEqual(0, observed["exit_code"])
+        row = observed["attempts"][1]
+        self.assertEqual(("lane-1", "run-1", 1),
+                         (row["lane_id"], row["run_id"], row["attempt"]))
+        self.assertEqual("incomplete", row["native_usage_state"])
+        self.assertEqual([], row["native_usage_observations"])
+        self.assertIn("malformed", row["native_usage_capture_error"])
+        self.assertEqual("provider_exited_no_result", observed["status"]["recorded_status"])
+        self.assertTrue(row["cleanup_proven"])
+        self.assertIsNone(observed["lease_after"])
 
     def test_sixth_invalid_attempt_escalates_once_with_full_durable_evidence(self) -> None:
         observed = self._run_candidate_correction_boundary(valid_on_sixth=False)
