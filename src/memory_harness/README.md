@@ -31,6 +31,15 @@ fresh-plan fallback.  A late Level 0 admission permanently supersedes the old
 packet and permits at most one bounded ordinary re-prepare without replenishing
 spent time.
 
+For a persisted preparation, `prepare` identifies continuation by the exact
+task-card digest (including repository base), objective, route, and plan
+ID/state/digest. A retry with no `request` or `network_mode` uses the captured
+fixed strategy, feature gates, and network mode, even if service defaults have
+changed. An explicit conflicting per-call policy raises `MandatoryStateFailure`
+before optional work; recover the mandatory state or supply a genuinely new
+task/plan identity for a new decision. The first decision and preparation are
+claimed together in one SQLite transaction.
+
 `context.finalize_context` renders mandatory task/accepted-plan state first,
 packs whole eligible optional items inside the configured allowance, rechecks
 plan-affecting freshness, and binds one integrity over the actual task,

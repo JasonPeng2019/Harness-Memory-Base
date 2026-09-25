@@ -620,6 +620,9 @@ class Step04EverOSGeneratedSkillStoreTests(unittest.TestCase):
             [store_instance],
             network_mode="restricted_local",
             request={"generated_skill_use": True},
+            task_card=contracts.make_task_card(
+                task=self.card["task"], base_commit="base-restricted"
+            ),
         )
         attempt = self._attempts(outcome)[SKILL_STORE_ID]
         self.assertEqual("disabled", attempt["status"])
@@ -629,7 +632,11 @@ class Step04EverOSGeneratedSkillStoreTests(unittest.TestCase):
 
         # The admitted configuration begins exactly one real query and the
         # revision is delivered through the accepted local trust path.
-        outcome = self._prepare([store_instance])
+        outcome = self._prepare(
+            [store_instance], task_card=contracts.make_task_card(
+                task=self.card["task"], base_commit="base-enabled"
+            ),
+        )
         attempt = self._attempts(outcome)[SKILL_STORE_ID]
         self.assertEqual("completed", attempt["status"])
         self.assertEqual(calls_before + 1, len(self.fake.search_calls))

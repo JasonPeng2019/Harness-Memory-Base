@@ -517,8 +517,13 @@ class Step04AtlasSearchAdapterTests(unittest.TestCase):
         self.assertEqual([], self._selected_procedures(outcome))
         self.assertEqual("no_optional_memory", outcome.trace["outcome"])
 
-        # The same store does run when its own feature is enabled.
-        enabled = self._prepare([self._store()])
+        # A different repository base owns an independent decision, so its
+        # enabled policy can exercise the Atlas gate.
+        enabled = self._prepare(
+            [self._store()], task_card=contracts.make_task_card(
+                task=self.card["task"], base_commit="base-enabled"
+            ),
+        )
         self.assertEqual(
             "completed", self._attempts(enabled)["atlas-shared-procedures"]["status"]
         )

@@ -585,6 +585,73 @@ class MemoryStore:
             )
         return result
 
+    def find_logical_decision(
+        self, identity: Mapping[str, str]
+    ) -> dict[str, Any] | None:
+        """Read one exact preparation owner; only an empty result means absence."""
+
+        keys = (
+            "task_card_digest", "objective_id", "route", "plan_id",
+            "plan_state", "plan_digest",
+        )
+        if any(not isinstance(identity.get(key), str) or not identity[key] for key in keys):
+            raise StoreError("logical decision identity is incomplete")
+        try:
+            # Validate related rows before filtering to the exact identity.
+            # A damaged identity column cannot make an existing owner look
+            # absent and permit a second decision under drifted defaults.
+            rows = self._require_connection().execute(
+                """SELECT * FROM decisions WHERE task_card_digest=?
+                   OR (objective_id=? AND route=? AND plan_id=?)
+                   ORDER BY decision_id""",
+                (
+                    identity["task_card_digest"], identity["objective_id"],
+                    identity["route"], identity["plan_id"],
+                ),
+            ).fetchall()
+            matches = []
+            for stored in rows:
+                row = dict(stored)
+                if sum(row[key] == identity[key] for key in keys) < len(keys) - 1:
+                    continue
+                record = {
+                    "schema": contracts.DECISION_SCHEMA,
+                    **{key: row[key] for key in (
+                        "decision_id", *keys, "strategy", "configuration_digest",
+                        "state", "created_at",
+                    )},
+                    "configuration": json.loads(row["configuration"]),
+                }
+                # The accepted nullable column has no bearing on the captured
+                # identity. Reconstruct only that accepted hash representation.
+                record["content_hash"] = row["content_hash"] or contracts.content_hash(record)
+                contracts.validate_decision(record)
+                expected_state = (
+                    "prepared" if record["plan_state"] == "accepted"
+                    else record["plan_state"]
+                )
+                if record["state"] != expected_state:
+                    raise StoreError("logical decision state conflicts with its plan state")
+                if all(record[key] == identity[key] for key in keys):
+                    matches.append(record)
+            if len(matches) > 1:
+                raise StoreError("ambiguous logical decision: multiple durable owners")
+            return matches[0] if matches else None
+        except StoreError:
+            raise
+        except (sqlite3.Error, ValueError, TypeError, KeyError, contracts.ContractError) as exc:
+            raise StoreError(f"logical decision is unreadable: {exc}") from exc
+
+    def decision_id_exists(self, decision_id: str) -> bool:
+        """Test an accepted identifier before allocating a distinct plan owner."""
+
+        try:
+            return self._require_connection().execute(
+                "SELECT 1 FROM decisions WHERE decision_id=?", (decision_id,)
+            ).fetchone() is not None
+        except sqlite3.Error as exc:
+            raise StoreError(f"cannot check decision identifier: {exc}") from exc
+
     def record_operation(self, operation: Mapping[str, Any]) -> dict[str, Any]:
         contracts.validate_operation(operation)
         connection = self._require_connection()
@@ -3148,8 +3215,21 @@ class MemoryStore:
 
     # -- STEP-04 preparation, search, disposition, child, and context state --
 
-    def record_preparation(self, preparation: Mapping[str, Any]) -> dict[str, Any]:
+    def record_preparation(
+        self, preparation: Mapping[str, Any],
+        *, first_decision: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         contracts.validate_preparation(preparation)
+        if first_decision is not None:
+            contracts.validate_decision(first_decision)
+            if first_decision["decision_id"] != preparation["decision_id"]:
+                raise StoreError("first preparation and decision identity differ")
+            for key in (
+                "task_card_digest", "objective_id", "route", "plan_id",
+                "plan_state", "plan_digest", "strategy", "configuration_digest",
+            ):
+                if first_decision[key] != preparation[key]:
+                    raise StoreError(f"first preparation and decision {key} differ")
         connection = self._require_connection()
         payload = self._serialize_record(preparation)
         # BEGIN IMMEDIATE makes the decision-wide read and the attempt write
@@ -3157,7 +3237,40 @@ class MemoryStore:
         # caller can retry with the new minimum rather than overwrite it.
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if first_decision is not None:
+                identity = {key: first_decision[key] for key in (
+                    "task_card_digest", "objective_id", "route", "plan_id",
+                    "plan_state", "plan_digest",
+                )}
+                if self.find_logical_decision(identity) is not None:
+                    raise PreparationConflictError("another caller captured this logical decision")
+                try:
+                    connection.execute(
+                        """INSERT INTO decisions (
+                        decision_id, task_card_digest, objective_id, route, plan_id,
+                        plan_state, plan_digest, strategy, configuration,
+                        configuration_digest, state, content_hash, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            first_decision["decision_id"], first_decision["task_card_digest"],
+                            first_decision["objective_id"], first_decision["route"],
+                            first_decision["plan_id"], first_decision["plan_state"],
+                            first_decision["plan_digest"], first_decision["strategy"],
+                            json.dumps(first_decision["configuration"], sort_keys=True),
+                            first_decision["configuration_digest"], first_decision["state"],
+                            first_decision["content_hash"], first_decision["created_at"],
+                            first_decision["created_at"],
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    if "decisions.decision_id" in str(exc):
+                        raise PreparationConflictError(
+                            "another exact plan claimed the accepted decision identifier"
+                        ) from exc
+                    raise
             prior = self.list_preparations(str(preparation["decision_id"]))
+            if prior and any(row["network_mode"] != preparation["network_mode"] for row in prior):
+                raise PreparationConflictError("captured preparation network mode changed")
             existing = next(
                 (row for row in prior if row["preparation_id"] == preparation["preparation_id"]),
                 None,
@@ -3260,6 +3373,15 @@ class MemoryStore:
     def list_preparations(self, decision_id: str) -> list[dict[str, Any]]:
         connection = self._require_connection()
         rows = connection.execute(
+            "SELECT record FROM preparations WHERE decision_id = ? ORDER BY created_at, preparation_id",
+            (decision_id,),
+        ).fetchall()
+        return [self._stored_record(row, contracts.validate_preparation) for row in rows]
+
+    def list_captured_preparations(self, decision_id: str) -> list[dict[str, Any]]:
+        """Read captured policy separately from the optional budget gate."""
+
+        rows = self._require_connection().execute(
             "SELECT record FROM preparations WHERE decision_id = ? ORDER BY created_at, preparation_id",
             (decision_id,),
         ).fetchall()

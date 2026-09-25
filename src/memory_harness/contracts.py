@@ -446,6 +446,22 @@ def make_decision(
     return record
 
 
+def logical_decision_identity(
+    task_card: Mapping[str, Any], plan: Mapping[str, Any]
+) -> dict[str, str]:
+    """The exact mandatory state that owns one captured preparation decision."""
+
+    validate_task_plan_binding(task_card, plan)
+    return {
+        "task_card_digest": task_card["content_hash"],
+        "objective_id": plan["objective_id"],
+        "route": plan["route"],
+        "plan_id": plan["plan_id"],
+        "plan_state": plan["state"],
+        "plan_digest": plan["content_hash"],
+    }
+
+
 def validate_decision(record: Mapping[str, Any]) -> None:
     validate_record(record, DECISION_SCHEMA)
     for field in (

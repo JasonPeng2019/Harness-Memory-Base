@@ -958,6 +958,9 @@ class Step04LocalProcedureTrustTests(unittest.TestCase):
         second = self._prepare(
             [self._by_id(self._stores(), CURATED_STORE_ID), self._atlas_store()],
             network_mode="restricted_local",
+            task_card=contracts.make_task_card(
+                task=self.card["task"], base_commit="base-atlas-enabled"
+            ),
         )
         second_attempts = self._attempts(second)
         self.assertEqual("disabled", second_attempts["atlas-shared-procedures"]["status"])

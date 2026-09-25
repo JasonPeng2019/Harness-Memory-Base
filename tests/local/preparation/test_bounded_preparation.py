@@ -397,9 +397,12 @@ class BoundedPreparationTests(unittest.TestCase):
             request={"strategy": "problem_focused"},
             failure_context="the parser raises IndexError on an empty token stream",
         )
-        self.assertEqual("problem_focused", with_context.preparation["strategy"])
+        # The same exact mandatory identity keeps the first captured effective
+        # recipe even when a later caller supplies failure context.
+        self.assertEqual(without.decision["decision_id"], with_context.decision["decision_id"])
+        self.assertEqual("standard", with_context.preparation["strategy"])
         self.assertEqual(
-            min(self.limits.problem_focused_stage_seconds, 300.0 - 60.0),
+            min(self.limits.standard_stage_seconds, 300.0 - 60.0),
             with_context.preparation["stage_allowance_seconds"],
         )
 
@@ -492,7 +495,8 @@ class BoundedPreparationTests(unittest.TestCase):
         )
         self.assertEqual("deeper", demoted.preparation["requested_strategy"])
         self.assertEqual("standard", demoted.preparation["strategy"])
-        self.assertEqual("standard", demoted.decision["strategy"])
+        self.assertEqual(admitted.decision["decision_id"], demoted.decision["decision_id"])
+        self.assertEqual("deeper", demoted.decision["strategy"])
         self.assertEqual("standard", demoted.trace["strategy"])
         self.assertEqual(
             limits.standard_stage_seconds, demoted.preparation["stage_allowance_seconds"]

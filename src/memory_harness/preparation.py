@@ -123,6 +123,68 @@ class PreparationService:
             }
         )
 
+    @staticmethod
+    def _decision_config(decision: Mapping[str, Any]) -> MemoryConfig:
+        """Require a complete fixed policy before using durable state as authority."""
+
+        recorded = decision.get("configuration")
+        names = {field.name for field in fields(MemoryConfig)}
+        if not isinstance(recorded, Mapping) or set(recorded) != names:
+            raise MandatoryStateFailure(
+                "durable logical decision configuration is unreadable; recover mandatory state"
+            )
+        if any(
+            not isinstance(recorded[name], bool)
+            for name in names - {"strategy", "requested_strategy", "reason"}
+        ) or any(
+            not isinstance(recorded[name], str) or not recorded[name]
+            for name in ("strategy", "requested_strategy", "reason")
+        ) or recorded["strategy"] not in (STANDARD, PROBLEM_FOCUSED, DEEPER):
+            raise MandatoryStateFailure(
+                "durable logical decision configuration is invalid; recover mandatory state"
+            )
+        if recorded["strategy"] != decision["strategy"]:
+            raise MandatoryStateFailure(
+                "durable logical decision strategy conflicts with its configuration"
+            )
+        return MemoryConfig(**recorded)
+
+    @staticmethod
+    def _check_explicit_policy(
+        request: Mapping[str, Any] | None, resolved: MemoryConfig, captured: MemoryConfig,
+    ) -> None:
+        if not request:
+            return
+        if request.get("all_features") is False and not captured.all_off:
+            raise MandatoryStateFailure(
+                "explicit feature policy conflicts with the captured logical decision; "
+                "recover mandatory state or start a new decision"
+            )
+        if request.get("all_features") is True and any(
+            getattr(resolved, field.name) != getattr(captured, field.name)
+            for field in fields(MemoryConfig)
+            if isinstance(getattr(captured, field.name), bool)
+        ):
+            raise MandatoryStateFailure(
+                "explicit all_features policy conflicts with the captured logical decision; "
+                "recover mandatory state or start a new decision"
+            )
+        requested = asdict(captured)
+        for key in requested:
+            if key not in request:
+                continue
+            value = (
+                resolved.requested_strategy if key == "strategy" else request[key]
+            )
+            captured_value = (
+                captured.requested_strategy if key == "strategy" else requested[key]
+            )
+            if value != captured_value:
+                raise MandatoryStateFailure(
+                    f"explicit {key} policy conflicts with the captured logical decision; "
+                    "recover mandatory state or start a new decision"
+                )
+
     def _durable_preparation(self, preparation_id: str) -> dict[str, Any] | None:
         """Read one exact durable preparation record.
 
@@ -229,6 +291,94 @@ class PreparationService:
         )
         return (tightest_deadline, granted_budget), max(attempts) + 1
 
+    def _logical_owner(
+        self, identity: Mapping[str, str], request: Mapping[str, Any] | None,
+        requested: MemoryConfig, explicit_network_mode: str | None,
+    ) -> tuple[dict[str, Any] | None, MemoryConfig | None, str | None, str | None]:
+        if self.store is None:
+            return None, None, None, None
+        try:
+            decision = self.store.find_logical_decision(identity)
+        except Exception as exc:
+            raise MandatoryStateFailure(
+                f"durable logical decision lookup failed; recover mandatory state: {exc}"
+            ) from exc
+        if decision is None:
+            return None, None, None, None
+        if any(decision.get(key) != value for key, value in identity.items()):
+            raise MandatoryStateFailure(
+                "durable logical decision identity conflicts with mandatory state; "
+                "recover mandatory state"
+            )
+        try:
+            prior = self.store.list_captured_preparations(decision["decision_id"])
+        except Exception as exc:
+            raise MandatoryStateFailure(
+                f"captured logical decision lookup failed; recover mandatory state: {exc}"
+            ) from exc
+        if not isinstance(prior, list):
+            raise MandatoryStateFailure(
+                "captured logical decision preparations are unreadable; recover mandatory state"
+            )
+        # A standalone accepted decision has not captured preparation policy.
+        # An all-off service with no per-call override still takes the inherited
+        # path, including when that older decision has a minimal configuration.
+        if not prior and requested.all_off and request is None:
+            return None, None, None, None
+        captured = self._decision_config(decision)
+        self._check_explicit_policy(request, requested, captured)
+        network_modes = set()
+        for packet in prior:
+            if not isinstance(packet, Mapping) or any(
+                packet.get(key) != value for key, value in identity.items()
+            ) or packet.get("decision_id") != decision["decision_id"]:
+                raise MandatoryStateFailure(
+                    "captured logical decision preparation identity is inconsistent; "
+                    "recover mandatory state"
+                )
+            packet_config = self._decision_config({
+                "configuration": packet.get("configuration"),
+                "strategy": packet.get("strategy"),
+            })
+            if packet.get("requested_strategy") != captured.requested_strategy or any(
+                getattr(packet_config, field.name) != getattr(captured, field.name)
+                for field in fields(MemoryConfig)
+                if isinstance(getattr(captured, field.name), bool)
+            ):
+                raise MandatoryStateFailure(
+                    "captured logical decision feature policy is inconsistent; "
+                    "recover mandatory state"
+                )
+            if (packet_config.strategy != captured.strategy
+                    and packet_config.strategy != STANDARD):
+                raise MandatoryStateFailure(
+                    "captured logical decision strategy is inconsistent; recover mandatory state"
+                )
+            if packet.get("attempt") == 1 and packet_config != captured:
+                raise MandatoryStateFailure(
+                    "first preparation conflicts with its captured decision configuration; "
+                    "recover mandatory state"
+                )
+            mode = packet.get("network_mode")
+            if not isinstance(mode, str) or not mode:
+                raise MandatoryStateFailure(
+                    "captured logical decision network mode is unreadable; recover mandatory state"
+                )
+            network_modes.add(mode)
+        if len(network_modes) > 1:
+            raise MandatoryStateFailure(
+                "captured logical decision network mode is inconsistent; recover mandatory state"
+            )
+        network_mode = next(iter(network_modes)) if network_modes else None
+        if (explicit_network_mode is not None and network_mode is not None
+                and explicit_network_mode != network_mode):
+            raise MandatoryStateFailure(
+                "explicit network policy conflicts with the captured logical decision; "
+                "recover mandatory state or start a new decision"
+            )
+        source = prior[0].get("budget_source") if prior else None
+        return decision, captured, network_mode, source
+
     # -- preparation -------------------------------------------------------
 
     def _effective_config(
@@ -270,7 +420,7 @@ class PreparationService:
         objective_id: str,
         route: str = "ordinary",
         request: Mapping[str, Any] | None = None,
-        network_mode: str = "normal",
+        network_mode: str | None = None,
         deadline: float | None = None,
         unknown_time: bool = False,
         failure_context: str | None = None,
@@ -290,26 +440,7 @@ class PreparationService:
         finalize: bool = False,
     ) -> PreparationOutcome:
         contracts.validate_task_card(task_card)
-        resolved_config = self._resolve(request)
-        if resolved_config.all_off:
-            if plan is None:
-                raise MandatoryStateFailure(
-                    "all-off preparation still needs its exact plan state"
-                )
-            return PreparationOutcome(
-                mode="inherited",
-                decision=None,
-                preparation=None,
-                trace=None,
-                disposition=None,
-                plan=dict(plan),
-                reason="all enhancements are off; the inherited harness path applies",
-            )
-        resolved_config = self._effective_config(
-            resolved_config,
-            failure_context=failure_context,
-            unknown_time=unknown_time,
-        )
+        supplied_config = self._resolve(request)
         try:
             current_plan_state = contracts.classify_current_plan(
                 plan, expected_objective_id=objective_id, expected_route=route
@@ -323,6 +454,9 @@ class PreparationService:
             if plan is not None
             else templates.fresh_plan(objective_id=objective_id, route=route)
         )
+        if plan is None and finalize:
+            raise PlanAcceptanceError("finalization needs an accepted exact plan")
+        identity = contracts.logical_decision_identity(task_card, plan_of_record)
 
         now = self.clock()
         if deadline is not None:
@@ -335,33 +469,16 @@ class PreparationService:
             absolute_deadline = now + self.limits.default_deadline_seconds
             budget_source = "trusted_deadline"
 
-        # The provisional identity only exists to recover the durable deadline
-        # captured configuration for this objective's logical decision; it is
-        # never persisted as-is.
         explicit_deadline = deadline is not None
-        provisional = contracts.make_decision(
-            task_card,
-            plan_of_record,
-            strategy=resolved_config.strategy,
-            configuration=asdict(resolved_config),
-        )
-        # One logical decision owns one captured configuration.  Stage
-        # admission only demotes the *packet*; it must not mint a fresh
-        # decision identity, because a later call with less remaining time
-        # would otherwise silently become a new decision with new ownership.
-        ownership_decision = contracts.make_decision(
-            task_card,
-            plan_of_record,
-            strategy=resolved_config.strategy,
-            configuration=asdict(resolved_config),
-        )
+        ownership_decision: dict[str, Any] | None = None
 
         def blocked_budget(
-            reason: str, *, decision: Mapping[str, Any] = provisional,
+            reason: str, *, decision: Mapping[str, Any] | None = None,
             preparation: Mapping[str, Any] | None = None,
         ) -> PreparationOutcome:
+            assert decision is not None or ownership_decision is not None
             outcome = self._blocked_budget_outcome(
-                decision=decision, plan=plan_of_record,
+                decision=decision or ownership_decision, plan=plan_of_record,
                 preparation=preparation, reason=reason,
             )
             if not finalize or current_plan_state != "execution_accepted":
@@ -391,21 +508,74 @@ class PreparationService:
                 freshness_check=freshness_check,
             )
 
-        requested_config = resolved_config
         proposed_deadline = absolute_deadline
         proposed_budget_source = budget_source
         proposed_unknown_time = unknown_time
         for _ in range(2):
+            durable, captured, captured_network, captured_source = self._logical_owner(
+                identity, request, supplied_config, network_mode
+            )
+            if durable is None and supplied_config.all_off:
+                if plan is None:
+                    raise MandatoryStateFailure(
+                        "all-off preparation still needs its exact plan state"
+                    )
+                return PreparationOutcome(
+                    mode="inherited", decision=None, preparation=None, trace=None,
+                    disposition=None, plan=dict(plan),
+                    reason="all enhancements are off; the inherited harness path applies",
+                )
+            if durable is None:
+                requested_config = self._effective_config(
+                    supplied_config, failure_context=failure_context,
+                    unknown_time=unknown_time,
+                )
+                ownership_decision = contracts.make_decision(
+                    task_card, plan_of_record, strategy=requested_config.strategy,
+                    configuration=asdict(requested_config),
+                )
+                if self.store is not None:
+                    try:
+                        id_taken = self.store.decision_id_exists(
+                            ownership_decision["decision_id"]
+                        )
+                    except Exception as exc:
+                        raise MandatoryStateFailure(
+                            f"decision identifier lookup failed; recover mandatory state: {exc}"
+                        ) from exc
+                    if id_taken:
+                        # The accepted identifier omits plan state/digest. Only
+                        # a genuinely distinct exact plan needs a new suffix.
+                        ownership_decision = contracts.make_decision(
+                            task_card, plan_of_record, strategy=requested_config.strategy,
+                            configuration=asdict(requested_config),
+                            decision_id=contracts.sha256_hex({
+                                "domain": "memory-decision-exact/v1",
+                                "accepted_id": ownership_decision["decision_id"],
+                                "identity": identity,
+                            }),
+                        )
+            else:
+                ownership_decision = durable
+                assert captured is not None
+                requested_config = captured
+            effective_network_mode = (
+                captured_network if captured_network is not None
+                else network_mode if network_mode is not None else "normal"
+            )
             try:
                 # One decision owns one deadline. A later trusted cutoff may
                 # tighten it, while a conflict retries against the new minimum.
-                recovered, next_attempt = self._recover_budget(provisional["decision_id"])
+                recovered, next_attempt = self._recover_budget(ownership_decision["decision_id"])
             except PreparationError as exc:
                 return blocked_budget(str(exc))
             now = self.clock()  # The durable read itself spends trusted time.
             absolute_deadline = proposed_deadline
-            budget_source = proposed_budget_source
-            unknown_time = proposed_unknown_time
+            budget_source = (
+                "unknown_time" if captured_source == "unknown_time"
+                else proposed_budget_source
+            )
+            unknown_time = captured_source == "unknown_time" or proposed_unknown_time
             resolved_config = requested_config
             if recovered is not None:
                 durable_deadline, granted_budget = recovered
@@ -426,15 +596,13 @@ class PreparationService:
             stage_allowance = self._stage_allowance(
                 resolved_config.strategy, remaining, unknown_time, admitted=admitted
             )
-            decision = contracts.make_decision(
-                task_card,
-                plan_of_record,
-                strategy=resolved_config.strategy,
-                configuration=asdict(resolved_config),
-                decision_id=ownership_decision["decision_id"],
+            decision = (
+                durable if durable is not None else contracts.make_decision(
+                    task_card, plan_of_record, strategy=resolved_config.strategy,
+                    configuration=asdict(resolved_config),
+                    decision_id=ownership_decision["decision_id"],
+                )
             )
-            if self.store is not None:
-                self.store.record_decision(decision)
             preparation = contracts.make_preparation(
                 task_card=task_card,
                 decision_id=decision["decision_id"],
@@ -446,8 +614,8 @@ class PreparationService:
                 current_plan_state=current_plan_state,
                 strategy=resolved_config.strategy,
                 requested_strategy=resolved_config.requested_strategy,
-                configuration=decision["configuration"],
-                network_mode=network_mode,
+                configuration=asdict(resolved_config),
+                network_mode=effective_network_mode,
                 budget_source=budget_source,
                 remaining_seconds=None if unknown_time else remaining,
                 deadline_monotonic=None if unknown_time else absolute_deadline,
@@ -459,17 +627,23 @@ class PreparationService:
             if self.store is None:
                 break
             try:
-                preparation = self.store.record_preparation(preparation)
+                preparation = self.store.record_preparation(
+                    preparation, first_decision=decision if durable is None else None
+                )
             except PreparationConflictError:
                 continue
             except StoreError as exc:
+                if durable is None:
+                    raise MandatoryStateFailure(
+                        f"logical decision first-writer recovery failed: {exc}"
+                    ) from exc
                 return self._blocked_budget_outcome(
-                    decision=provisional, plan=plan_of_record, reason=str(exc)
+                    decision=decision, plan=plan_of_record, reason=str(exc)
                 )
             break
         else:
             return self._blocked_budget_outcome(
-                decision=provisional, plan=plan_of_record,
+                decision=ownership_decision, plan=plan_of_record,
                 reason="another caller changed the decision budget during the bounded retry",
             )
 
@@ -496,7 +670,7 @@ class PreparationService:
             stage_allowance=stage_allowance,
             accepted_precedence=not template_selection,
             config=resolved_config,
-            network_mode=network_mode,
+            network_mode=effective_network_mode,
             budget_reason=admission_reason,
         )
         if "budget_error" in search:
