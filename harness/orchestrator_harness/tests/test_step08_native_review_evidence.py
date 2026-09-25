@@ -10,9 +10,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from memory_harness import contracts
-from orchestrator_harness import controller, launch, memory_handoff, monitor, operator_launch, resume, review, terminal_evidence
+from orchestrator_harness import controller, launch, manager_queue, memory_handoff, monitor, operator_launch, resume, review, terminal_evidence
 from orchestrator_harness.core import content_hash
-from orchestrator_harness.epochs import lane_record_dir
+from orchestrator_harness.epochs import current_epoch_path, lane_record_dir, manager_queue_path
 from orchestrator_harness.lanes import LaneError
 from orchestrator_harness.manager_queue import ManagerQueueError
 from orchestrator_harness.records import atomic_write_json
@@ -107,6 +107,97 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         )
         assert value is not None
         return value
+
+    def _native_unknown_review_queue(self) -> dict:
+        self.result_path.unlink()
+        self.lane["lifecycle"] = "result_invalid"
+        atomic_write_json(Path(self.lane["controller_status_path"]), {
+            "schema": "controller-status/v1", "lane_id": self.lane_id, "run_id": self.run_id,
+            "controller_state": "exited", "provider_state": {"state": "exited", "exit_code": 1},
+            "result_state": "invalid", "recorded_status": "provider_exited_no_result",
+            "cleanup_proven": True, "updated_at": "2026-09-25T00:00:00Z",
+        })
+        atomic_write_json(current_epoch_path(self.rt), {
+            "schema": "current-epoch/v1", "epoch_id": self.epoch_id, "queue_id": "queue-1",
+        })
+        atomic_write_json(manager_queue_path(self.rt), {
+            "schema": "manager-queue/v1", "epoch_id": self.epoch_id,
+            "queue_id": "queue-1", "events": [],
+        })
+        monitor._promote_status(self.rt, self.epoch_id, self.lane, "provider_exited_no_result")
+        event = manager_queue.read_manager_queue(self.rt)["events"][0]
+        return manager_queue.acknowledge_event(self.rt, event["event_id"])
+
+    def _crash_after_unknown_preparation(self) -> None:
+        original_write = review.atomic_write_json
+
+        def crash_before_acceptance(path: Path, value: dict) -> None:
+            if path.name == "ORCHESTRATOR_ACCEPTANCE.json":
+                raise OSError("crash before acceptance publication")
+            original_write(path, value)
+
+        with patch.object(review, "atomic_write_json", side_effect=crash_before_acceptance):
+            self.assertFalse(self._review(
+                outcome="UNKNOWN", force_reason="ROOT accepts terminal uncertainty", managed=True,
+            )["ok"])
+        self.assertFalse((self.folder / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+        self.assertIsNone(review.read_json(
+            self.folder / terminal_evidence.TERMINAL_EVIDENCE_NAME,
+        )["result"])
+
+    def test_native_result_invalid_closed_status_recovers_once_in_real_queue(self) -> None:
+        status_event = self._native_unknown_review_queue()
+        self._crash_after_unknown_preparation()
+        manager_queue.close_event(
+            self.rt, status_event["event_id"], "COMPLETE", summary="review prepared",
+        )
+        with patch.object(monitor, "update_lane"):
+            recovered = monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane)
+            repeated = monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane)
+        self.assertEqual(1, len(recovered))
+        self.assertEqual([], repeated)
+        queue = manager_queue.read_manager_queue(self.rt)
+        self.assertEqual("COMPLETE", queue["events"][0]["state"])
+        self.assertEqual("COMPLETION_REVIEW_REQUIRED", recovered[0]["type"])
+        self.assertEqual("PENDING", recovered[0]["state"])
+        self.assertEqual(self.run_id, recovered[0]["run_id"])
+        self.assertEqual([recovered[0]["event_id"]], [
+            event["event_id"] for event in queue["events"]
+            if event["type"] == "COMPLETION_REVIEW_REQUIRED"
+        ])
+
+    def test_native_result_invalid_open_status_suppresses_recovery(self) -> None:
+        status_event = self._native_unknown_review_queue()
+        self._crash_after_unknown_preparation()
+        with patch.object(monitor, "update_lane"):
+            self.assertEqual([], monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane))
+        queue = manager_queue.read_manager_queue(self.rt)
+        self.assertEqual([status_event["event_id"]], [event["event_id"] for event in queue["events"]])
+        self.assertEqual("ACKNOWLEDGED", queue["events"][0]["state"])
+
+    def test_result_invalid_without_retained_unknown_stays_non_reviewable(self) -> None:
+        status_event = self._native_unknown_review_queue()
+        manager_queue.close_event(
+            self.rt, status_event["event_id"], "COMPLETE", summary="no review prepared",
+        )
+        with patch.object(monitor, "update_lane"):
+            self.assertEqual([], monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane))
+        self.assertEqual(1, len(manager_queue.read_manager_queue(self.rt)["events"]))
+
+    def test_result_invalid_rejects_wrong_run_retained_unknown(self) -> None:
+        status_event = self._native_unknown_review_queue()
+        self._crash_after_unknown_preparation()
+        terminal_path = self.folder / terminal_evidence.TERMINAL_EVIDENCE_NAME
+        terminal = review.read_json(terminal_path)
+        terminal["run_id"] = "another-run"
+        terminal["content_hash"] = content_hash(terminal)
+        atomic_write_json(terminal_path, terminal)
+        manager_queue.close_event(
+            self.rt, status_event["event_id"], "COMPLETE", summary="review prepared",
+        )
+        with patch.object(monitor, "update_lane"):
+            self.assertEqual([], monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane))
+        self.assertEqual(1, len(manager_queue.read_manager_queue(self.rt)["events"]))
 
     def test_pass_binds_exact_parent_dispatch_result_review_and_acceptance(self) -> None:
         response = self._review()

@@ -307,7 +307,13 @@ def _has_open_review_event(rt: Path, lane: dict[str, Any]) -> bool:
         return False
     for event in queue.get("events", []):
         if (
-            event.get("type") == "COMPLETION_REVIEW_REQUIRED"
+            (
+                event.get("type") == "COMPLETION_REVIEW_REQUIRED"
+                or (
+                    event.get("type") == "LANE_STATUS_CHANGED"
+                    and event.get("actionable_status") == "provider_exited_no_result"
+                )
+            )
             and event.get("lane_id") == lane.get("lane_id")
             and event.get("run_id") == lane.get("run_id")
             and event.get("state") in {"PENDING", "ACKNOWLEDGED"}
@@ -320,12 +326,15 @@ def _recover_lost_review_event(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> list[dict[str, Any]]:
     """Restore one review request when valid work has no open request."""
-    if lane.get("lifecycle") != "review_pending":
+    lifecycle = lane.get("lifecycle")
+    if lifecycle not in {"review_pending", "result_invalid"}:
         return []
     folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+    result_path = Path(lane.get("result_path") or Path(lane["worktree_path"]) / "RESULT.json")
     retained_unknown = False
     if (
         lane.get("memory_plan_state") == "execution_accepted"
+        and not result_path.exists()
         and not (folder / "ORCHESTRATOR_ACCEPTANCE.json").exists()
         and (folder / "COMPLETION_REVIEW.json").is_file()
         and (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file()
@@ -336,6 +345,10 @@ def _recover_lost_review_event(
             terminal_evidence.validate_terminal_evidence(
                 terminal, lane_id=lane["lane_id"], run_id=lane["run_id"],
             )
+            if folder != lane_record_dir(rt, epoch_id, lane["lane_id"]):
+                terminal_evidence.validate_root_siblings(
+                    rt, epoch_id, lane["lane_id"], lane["run_id"], terminal,
+                )
             retained_unknown = (
                 terminal["epoch_id"] == epoch_id
                 and terminal["review"] == review
@@ -348,6 +361,8 @@ def _recover_lost_review_event(
             )
         except (OSError, ValueError, KeyError, TypeError):
             pass
+    if lifecycle == "result_invalid" and not retained_unknown:
+        return []
     if not (_valid_current_result(lane) or retained_unknown):
         return []
     if _review_pair_is_valid(rt, epoch_id, lane):
