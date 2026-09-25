@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import memory_handoff, processes
+from . import memory_handoff, processes, terminal_evidence
 from .config import find_harness_root, load_config
 from .core import content_hash, iso_utc, read_json, require_schema
 from .epochs import lane_record_dir
@@ -325,7 +325,7 @@ def _append_attempt(
 def _read_acceptance_chain(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> dict[str, Any] | None:
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     if not review_path.is_file() or not acceptance_path.is_file():
@@ -342,6 +342,15 @@ def _read_acceptance_chain(
         run_id=lane["run_id"],
     ):
         return None
+    if lane.get("memory_plan_state") == "execution_accepted":
+        try:
+            terminal = terminal_evidence.read_terminal_evidence(
+                rt, epoch_id, lane["lane_id"], run_id=lane["run_id"],
+            )
+        except terminal_evidence.TerminalEvidenceError:
+            return None
+        if terminal is None or terminal["review"] != review or terminal["acceptance"] != acceptance:
+            return None
     return {"review": review, "acceptance": acceptance}
 
 

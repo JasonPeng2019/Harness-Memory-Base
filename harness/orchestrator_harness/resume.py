@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from . import memory_handoff, processes
+from . import memory_handoff, processes, terminal_evidence
 from .bootstrap import (
     _write_invocation,
     _write_result_template,
@@ -136,7 +136,7 @@ def _has_valid_acceptance_chain(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> bool:
     """Return whether a complete, linked ACCEPTED chain exists for this run."""
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     if not review_path.is_file() or not acceptance_path.is_file():
@@ -154,7 +154,17 @@ def _has_valid_acceptance_chain(
         return False
     if acceptance.get("review_ref") != review.get("content_hash"):
         return False
-    return acceptance.get("approval") == "ACCEPTED"
+    if acceptance.get("approval") != "ACCEPTED":
+        return False
+    if lane.get("memory_plan_state") == "execution_accepted":
+        try:
+            terminal = terminal_evidence.read_terminal_evidence(
+                rt, epoch_id, lane["lane_id"], run_id=lane["run_id"],
+            )
+        except terminal_evidence.TerminalEvidenceError:
+            return False
+        return terminal is not None and terminal["review"] == review and terminal["acceptance"] == acceptance
+    return True
 
 
 def _clear_prior_run(rt: Path, epoch_id: str, lane: dict[str, Any]) -> None:
@@ -162,8 +172,9 @@ def _clear_prior_run(rt: Path, epoch_id: str, lane: dict[str, Any]) -> None:
     worktree = Path(lane["worktree_path"])
     remove_record(worktree / "RESULT.json")
     folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
-    remove_record(folder / "COMPLETION_REVIEW.json")
-    remove_record(folder / "ORCHESTRATOR_ACCEPTANCE.json")
+    if lane.get("memory_plan_state") != "execution_accepted":
+        remove_record(folder / "COMPLETION_REVIEW.json")
+        remove_record(folder / "ORCHESTRATOR_ACCEPTANCE.json")
     remove_record(worktree / ".agent-workspace" / "controller.status.json")
 
 
@@ -232,7 +243,7 @@ def run_resume(
                 "code": ALREADY_ACCEPTED,
                 "summary": f"lane {lane_id} already has a valid ACCEPTED chain; it is not re-resumed",
                 "evidence_paths": [
-                    str(lane_record_dir(rt, epoch_id, lane_id) / "ORCHESTRATOR_ACCEPTANCE.json")
+                    str(terminal_evidence.publication_dir(rt, epoch_id, lane) / "ORCHESTRATOR_ACCEPTANCE.json")
                 ],
                 "next_action": "retire the lane with `lane retire --acceptance-ref <file>`",
             }

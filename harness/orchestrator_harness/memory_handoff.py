@@ -1171,6 +1171,38 @@ def get_dispatch_operation(
         memory_store.close()
 
 
+def get_dispatch_decision(
+    *, worktree_path: str | Path, envelope: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Read the exact durable decision in the existing optional store.
+
+    The store exposes a SQL row without its contract schema. On same-decision
+    preparation replay it updates the hash and update time while keeping the
+    first insertion time. The latest canonical decision uses that update time.
+    """
+    from memory_harness import contracts
+
+    memory_store, _ = _open_runtime(worktree_path)
+    try:
+        row = memory_store.get_decision(str(envelope["decision_id"]))
+        decision = {
+            "schema": "memory-decision/v1",
+            **{field: row[field] for field in (
+                "decision_id", "task_card_digest", "objective_id", "route",
+                "plan_id", "plan_state", "plan_digest", "strategy",
+                "configuration", "configuration_digest", "state",
+                "content_hash",
+            )},
+            "created_at": row["updated_at"],
+        }
+        contracts.validate_decision(decision)
+        return decision
+    except Exception as exc:
+        raise MemoryHandoffError(f"cannot read exact dispatch decision: {exc}") from exc
+    finally:
+        memory_store.close()
+
+
 def native_observation(
     *, envelope: Mapping[str, Any], context: Mapping[str, Any],
     controller_identity: Mapping[str, Any],

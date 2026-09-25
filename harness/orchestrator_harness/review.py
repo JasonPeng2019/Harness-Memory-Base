@@ -16,7 +16,7 @@ from typing import Any
 from .config import find_harness_root, load_config
 from .core import content_hash, iso_utc, read_json, require_schema, sha256_hex
 from .epochs import lane_record_dir
-from .lanes import find_active_lane, read_lane
+from .lanes import LaneError, find_active_lane, read_lane
 from . import memory_handoff, terminal_evidence
 from .manager_queue import (
     MANAGER_ACK_EVENT_NOT_FOUND,
@@ -201,7 +201,14 @@ def _resolve_lane_managed(
             f"event {event_id} is not ACKNOWLEDGED (state={event.get('state')})",
         )
     lane_id = str(event.get("lane_id") or "")
-    epoch_id, lane = find_active_lane(rt, lane_id)
+    try:
+        epoch_id, lane = find_active_lane(rt, lane_id)
+    except LaneError:
+        # An older publication may already have advanced and retired its lane
+        # before manager close was acknowledged. The queue still names its
+        # exact epoch/run; replay can finish from retained publication.
+        epoch_id = str(queue["epoch_id"])
+        lane = read_lane(rt, epoch_id, lane_id)
     if lane.get("run_id") != event.get("run_id"):
         raise ReviewError(
             COMPLETION_REVIEW_EVENT_INVALID,
@@ -242,6 +249,9 @@ def _native_source(
         operation = memory_handoff.get_dispatch_operation(
             worktree_path=worktree, envelope=envelope,
         )
+        decision = memory_handoff.get_dispatch_decision(
+            worktree_path=worktree, envelope=envelope,
+        )
         if not isinstance(operation, dict) or operation.get("status") != "delivered":
             raise memory_handoff.MemoryHandoffError(
                 "enhanced parent has no delivered native dispatch observation"
@@ -264,8 +274,8 @@ def _native_source(
                 "delivered native observation conflicts with this lane and run"
             )
         return {
-            "plan": plan, "envelope": envelope, "operation": operation,
-            "observed": observed,
+            "plan": plan, "decision": decision, "envelope": envelope,
+            "context": context, "operation": operation, "observed": observed,
         }
     except (OSError, ValueError, memory_handoff.MemoryHandoffError) as exc:
         raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, str(exc)) from exc
@@ -336,8 +346,22 @@ def _write_pair(
     evidence: list[str],
     approval: str,
     force_accept_reason: str | None,
+    managed_event: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+    root_folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    if folder != root_folder:
+        for name, schema in (
+            ("COMPLETION_REVIEW.json", COMPLETION_REVIEW_SCHEMA),
+            ("ORCHESTRATOR_ACCEPTANCE.json", ACCEPTANCE_SCHEMA),
+            (terminal_evidence.TERMINAL_EVIDENCE_NAME, terminal_evidence.TERMINAL_EVIDENCE_SCHEMA),
+        ):
+            historical = _existing_record(root_folder / name, schema)
+            if historical is not None and historical.get("run_id") == lane["run_id"]:
+                raise ReviewError(
+                    COMPLETION_REVIEW_OUTPUT_CONFLICT,
+                    "the root publication already owns this exact run",
+                )
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     terminal_path = folder / terminal_evidence.TERMINAL_EVIDENCE_NAME
@@ -424,6 +448,8 @@ def _write_pair(
                 epoch_id=epoch_id, lane_id=lane["lane_id"], run_id=lane["run_id"],
                 task_card=task_card, accepted_plan=native["plan"],
                 objective_id=envelope["objective_id"], decision_id=envelope["decision_id"],
+                decision=native["decision"], envelope=envelope,
+                final_context=native["context"],
                 dispatch_operation=native["operation"],
                 envelope_digest=envelope["content_hash"],
                 observed_invocation=native["observed"],
@@ -448,11 +474,54 @@ def _write_pair(
             atomic_write_json(review_path, review)
         if terminal is not None and existing_terminal is None:
             atomic_write_json(terminal_path, terminal)
+        if terminal is not None and managed_event is not None and managed_event.get("state") != "COMPLETE":
+            try:
+                close_event(
+                    rt, managed_event["event_id"], "COMPLETE",
+                    summary=f"completion review recorded: {review_outcome} / {approval}",
+                )
+            except ManagerQueueError as exc:
+                raise ReviewError(
+                    COMPLETION_REVIEW_WRITE_FAILED,
+                    f"review prepared but the event could not be closed: {exc}",
+                ) from exc
         # Acceptance is the existing harness advancement signal. Publish it
-        # only after the enhanced evidence is durable, so a crash cannot let
-        # the controller retire the worktree before the native record exists.
+        # only after the enhanced evidence and managed close are durable.
         if existing_acceptance is None:
             atomic_write_json(acceptance_path, acceptance)
+    return review, acceptance
+
+
+def _replay_retained_pair(
+    rt: Path, epoch_id: str, lane: dict[str, Any], *, review_outcome: str,
+    review_summary: str, evidence: list[str], approval: str,
+    force_accept_reason: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Retry manager close from an exact publication, even after retirement."""
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+    review = _existing_record(folder / "COMPLETION_REVIEW.json", COMPLETION_REVIEW_SCHEMA)
+    acceptance = _existing_record(folder / "ORCHESTRATOR_ACCEPTANCE.json", ACCEPTANCE_SCHEMA)
+    if review is None or acceptance is None or not validate_acceptance_chain(
+        review, acceptance, lane_id=lane["lane_id"], run_id=lane["run_id"],
+    ):
+        raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained review pair is absent or invalid")
+    if (
+        review.get("review_outcome") != review_outcome
+        or review.get("review_summary") != review_summary
+        or review.get("evidence") != evidence
+        or acceptance.get("approval") != approval
+        or acceptance.get("force_accept_reason") != force_accept_reason
+    ):
+        raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained review conflicts with this retry")
+    if lane.get("memory_plan_state") == "execution_accepted":
+        try:
+            terminal = terminal_evidence.read_terminal_evidence(
+                rt, epoch_id, lane["lane_id"], run_id=lane["run_id"],
+            )
+        except terminal_evidence.TerminalEvidenceError as exc:
+            raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
+        if terminal is None or terminal["review"] != review or terminal["acceptance"] != acceptance:
+            raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained native evidence is absent or conflicts")
     return review, acceptance
 
 
@@ -516,10 +585,12 @@ def run_completion_review(
                 COMPLETION_REVIEW_EVENT_INVALID,
                 "select the lane with --event-id (managed) or --lane-id (plain)",
             )
-        folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+        folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
         if lane.get("lifecycle") not in ("review_pending", "result_invalid"):
             if not (
-                lane.get("lifecycle") == "accepted"
+                (lane.get("lifecycle") == "accepted" or (
+                    lane.get("lifecycle") == "retired" and event is not None
+                ))
                 and (folder / "COMPLETION_REVIEW.json").is_file()
                 and (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file()
             ):
@@ -528,36 +599,53 @@ def run_completion_review(
                     f"lane {lane['lane_id']} is not terminal (lifecycle={lane.get('lifecycle')})",
                 )
         if event is not None and event.get("state") == "COMPLETE":
-            if not (folder / "COMPLETION_REVIEW.json").is_file() or not (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file():
+            if not (folder / "COMPLETION_REVIEW.json").is_file() or (
+                lane.get("memory_plan_state") == "execution_accepted"
+                and not (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file()
+            ) or (
+                lane.get("memory_plan_state") != "execution_accepted"
+                and not (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file()
+            ):
                 raise ReviewError(
                     COMPLETION_REVIEW_OUTPUT_CONFLICT,
-                    "completed review event has no durable review pair",
+                    "completed review event has no durable review preparation",
                 )
-        review, acceptance = _write_pair(
-            rt,
-            epoch_id,
-            lane,
-            review_outcome=review_outcome,
-            review_summary=review_summary,
-            evidence=evidence,
-            approval=approval,
-            force_accept_reason=force_reason if (force_accept and approval == "ACCEPTED" and review_outcome != "PASS") else None,
-        )
-        if event is not None and event.get("state") != "COMPLETE":
-            try:
-                close_event(
-                    rt,
-                    event["event_id"],
-                    "COMPLETE",
-                    summary=(
-                        f"completion review recorded: {review_outcome} / {approval}"
-                    ),
-                )
-            except ManagerQueueError as exc:
-                raise ReviewError(
-                    COMPLETION_REVIEW_WRITE_FAILED,
-                    f"review pair written but the event could not be closed: {exc}",
-                ) from exc
+        exact_reason = force_reason if (force_accept and approval == "ACCEPTED" and review_outcome != "PASS") else None
+        if event is not None and (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file():
+            review, acceptance = _replay_retained_pair(
+                rt, epoch_id, lane, review_outcome=review_outcome,
+                review_summary=review_summary, evidence=evidence,
+                approval=approval, force_accept_reason=exact_reason,
+            )
+            if event.get("state") != "COMPLETE":
+                try:
+                    close_event(
+                        rt, event["event_id"], "COMPLETE",
+                        summary=f"completion review recorded: {review_outcome} / {approval}",
+                    )
+                except ManagerQueueError as exc:
+                    raise ReviewError(
+                        COMPLETION_REVIEW_WRITE_FAILED,
+                        f"retained review is valid but the event could not be closed: {exc}",
+                    ) from exc
+        else:
+            review, acceptance = _write_pair(
+                rt, epoch_id, lane, review_outcome=review_outcome,
+                review_summary=review_summary, evidence=evidence,
+                approval=approval, force_accept_reason=exact_reason,
+                managed_event=event,
+            )
+            if event is not None and event.get("state") != "COMPLETE" and lane.get("memory_plan_state") != "execution_accepted":
+                try:
+                    close_event(
+                        rt, event["event_id"], "COMPLETE",
+                        summary=f"completion review recorded: {review_outcome} / {approval}",
+                    )
+                except ManagerQueueError as exc:
+                    raise ReviewError(
+                        COMPLETION_REVIEW_WRITE_FAILED,
+                        f"review pair written but the event could not be closed: {exc}",
+                    ) from exc
     except ReviewError as exc:
         return {
             "ok": False,
@@ -575,7 +663,7 @@ def run_completion_review(
             "next_action": "resolve the error and retry the review",
         }
 
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     next_action = (
         "retire the lane with `lane retire --acceptance-ref <file>` when done"
         if approval == "ACCEPTED"

@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
-from . import memory_handoff, processes
+from . import memory_handoff, processes, terminal_evidence
 from .bootstrap import BootstrapError, _validate_provider_launch_config
 from .config import find_harness_root, load_config
 from .core import content_hash, read_json, require_schema
@@ -1192,6 +1192,29 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
         acceptance = _validate_acceptance_ref(Path(acceptance_ref))
         lane_id = str(acceptance["lane_id"])
         epoch_id, lane = find_active_lane(rt, lane_id)
+        if lane.get("memory_plan_state") == "execution_accepted":
+            from .review import validate_acceptance_chain
+
+            folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+            expected_ref = folder / "ORCHESTRATOR_ACCEPTANCE.json"
+            if Path(acceptance_ref).resolve() != expected_ref.resolve():
+                raise LaunchError(RETIRE_ACCEPTANCE_INVALID, "acceptance is not the current run's publication")
+            try:
+                review = read_record(folder / "COMPLETION_REVIEW.json", COMPLETION_REVIEW_SCHEMA)
+                terminal = terminal_evidence.read_terminal_evidence(
+                    rt, epoch_id, lane_id, run_id=lane["run_id"],
+                )
+            except (OSError, ValueError) as exc:
+                raise LaunchError(RETIRE_ACCEPTANCE_INVALID, str(exc)) from exc
+            if (
+                terminal is None
+                or not validate_acceptance_chain(
+                    review, acceptance, lane_id=lane_id, run_id=lane["run_id"],
+                )
+                or terminal["review"] != review
+                or terminal["acceptance"] != acceptance
+            ):
+                raise LaunchError(RETIRE_ACCEPTANCE_INVALID, "current run lacks exact valid native evidence")
         status = _read_controller_status(lane)
         process = lane.get("process") or {}
         pid = process.get("pid")

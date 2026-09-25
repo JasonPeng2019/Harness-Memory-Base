@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import processes
+from . import processes, terminal_evidence
 from .config import (
     compute_config_identity,
     find_harness_root,
@@ -81,7 +81,7 @@ def _read_acceptance_chain(
     lane: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Return the acceptance decision when a complete linked pair exists."""
-    folder = lane_record_dir(rt, epoch_id, lane_id)
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane) if lane is not None else lane_record_dir(rt, epoch_id, lane_id)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     if not review_path.is_file() or not acceptance_path.is_file():
@@ -100,6 +100,15 @@ def _read_acceptance_chain(
         run_id=lane.get("run_id") if lane is not None else None,
     ):
         return None
+    if lane is not None and lane.get("memory_plan_state") == "execution_accepted":
+        try:
+            terminal = terminal_evidence.read_terminal_evidence(
+                rt, epoch_id, lane_id, run_id=lane["run_id"],
+            )
+        except terminal_evidence.TerminalEvidenceError:
+            return None
+        if terminal is None or terminal["review"] != review or terminal["acceptance"] != acceptance:
+            return None
     return acceptance
 
 
@@ -218,7 +227,7 @@ def _valid_current_result(lane: dict[str, Any]) -> bool:
 def _review_pair_is_valid(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> bool:
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     if not review_path.is_file() or not acceptance_path.is_file():
@@ -230,19 +239,28 @@ def _review_pair_is_valid(
         require_schema(acceptance, "orchestrator-acceptance/v1", acceptance_path)
     except (OSError, ValueError):
         return False
-    return validate_acceptance_chain(
+    valid = validate_acceptance_chain(
         review,
         acceptance,
         lane_id=lane["lane_id"],
         run_id=lane.get("run_id"),
     )
+    if not valid or lane.get("memory_plan_state") != "execution_accepted":
+        return valid
+    try:
+        terminal = terminal_evidence.read_terminal_evidence(
+            rt, epoch_id, lane["lane_id"], run_id=lane["run_id"],
+        )
+    except terminal_evidence.TerminalEvidenceError:
+        return False
+    return terminal is not None and terminal["review"] == review and terminal["acceptance"] == acceptance
 
 
 def _recover_broken_review_pair(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> bool:
     """Remove a broken pair and leave the lane awaiting a fresh review."""
-    folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
     with RecordLock(review_path):
@@ -306,6 +324,33 @@ def _recover_lost_review_event(
         return []
     if _review_pair_is_valid(rt, epoch_id, lane):
         return []
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+    if (
+        lane.get("memory_plan_state") == "execution_accepted"
+        and (folder / "COMPLETION_REVIEW.json").is_file()
+        and (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file()
+        and not (folder / "ORCHESTRATOR_ACCEPTANCE.json").exists()
+    ):
+        # Managed close may have committed immediately before acceptance
+        # publication. Keep the original event as the retry handle only for
+        # an exact, valid preparation.
+        try:
+            prepared = read_json(folder / terminal_evidence.TERMINAL_EVIDENCE_NAME)
+            terminal_evidence.validate_terminal_evidence(
+                prepared, lane_id=lane["lane_id"], run_id=lane["run_id"],
+            )
+            if prepared["review"] == read_json(folder / "COMPLETION_REVIEW.json"):
+                queue = read_manager_queue(rt)
+                if any(
+                    event.get("type") == "COMPLETION_REVIEW_REQUIRED"
+                    and event.get("lane_id") == lane["lane_id"]
+                    and event.get("run_id") == lane["run_id"]
+                    and event.get("state") == "COMPLETE"
+                    for event in queue.get("events", [])
+                ):
+                    return []
+        except (OSError, ValueError):
+            pass
     if _has_open_review_event(rt, lane):
         update_lane(
             rt,

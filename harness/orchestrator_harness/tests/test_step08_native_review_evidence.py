@@ -10,9 +10,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from memory_harness import contracts
-from orchestrator_harness import memory_handoff, monitor, operator_launch, review, terminal_evidence
+from orchestrator_harness import controller, launch, memory_handoff, monitor, operator_launch, resume, review, terminal_evidence
 from orchestrator_harness.core import content_hash
 from orchestrator_harness.epochs import lane_record_dir
+from orchestrator_harness.lanes import LaneError
 from orchestrator_harness.manager_queue import ManagerQueueError
 from orchestrator_harness.records import atomic_write_json
 
@@ -199,17 +200,94 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         self.assertEqual(before, (self.folder / "NATIVE_TERMINAL_EVIDENCE.json").read_bytes())
         self.assertEqual("ACCEPTED", self._evidence()["acceptance"]["approval"])
 
-    def test_post_publication_manager_close_failure_retries_same_record(self) -> None:
+    def test_manager_close_failure_and_ack_ambiguity_precede_acceptance(self) -> None:
         first = self._review(managed=True, close_side_effect=ManagerQueueError("QUEUE_UNAVAILABLE", "queue unavailable"))
         self.assertFalse(first["ok"])
-        before = self._evidence()
-        self.lane["lifecycle"] = "accepted"
-        second = self._review(managed=True)
+        self.assertFalse((self.folder / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+        before = (self.folder / "NATIVE_TERMINAL_EVIDENCE.json").read_bytes()
+        second = self._review(managed=True, event_state="COMPLETE")
         self.assertTrue(second["ok"], second)
-        self.assertEqual(before, self._evidence())
+        self.assertEqual(before, (self.folder / "NATIVE_TERMINAL_EVIDENCE.json").read_bytes())
         completed = self._review(managed=True, event_state="COMPLETE")
         self.assertTrue(completed["ok"], completed)
+        self.assertEqual(before, (self.folder / "NATIVE_TERMINAL_EVIDENCE.json").read_bytes())
+
+    def test_managed_close_and_acceptance_crashes_replay_exact_identity(self) -> None:
+        def close_after_preparation(*args, **kwargs):
+            self.assertEqual((self.rt, "event-1", "COMPLETE"), args)
+            self.assertIn("PASS / ACCEPTED", kwargs["summary"])
+            self.assertTrue((self.folder / "COMPLETION_REVIEW.json").is_file())
+            self.assertTrue((self.folder / "NATIVE_TERMINAL_EVIDENCE.json").is_file())
+            self.assertFalse((self.folder / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+
+        real_write = review.atomic_write_json
+
+        def crash_after_acceptance(path: Path, value: dict) -> None:
+            real_write(path, value)
+            if path.name == "ORCHESTRATOR_ACCEPTANCE.json":
+                raise OSError("crash after acceptance publication")
+
+        with patch.object(review, "atomic_write_json", side_effect=crash_after_acceptance):
+            first = self._review(managed=True, close_side_effect=close_after_preparation)
+        self.assertFalse(first["ok"])
+        before = self._evidence()
+        self.lane["lifecycle"] = "retired"
+        import shutil
+
+        shutil.rmtree(self.worktree)
+        replay = self._review(managed=True, event_state="COMPLETE")
+        self.assertTrue(replay["ok"], replay)
         self.assertEqual(before, self._evidence())
+
+    def test_crash_after_managed_close_before_acceptance_replays_preparation(self) -> None:
+        original_write = review.atomic_write_json
+
+        def before_acceptance(path: Path, value: dict) -> None:
+            if path.name == "ORCHESTRATOR_ACCEPTANCE.json":
+                raise OSError("crash before acceptance publication")
+            original_write(path, value)
+
+        with patch.object(review, "atomic_write_json", side_effect=before_acceptance):
+            first = self._review(managed=True)
+        self.assertFalse(first["ok"])
+        self.assertFalse((self.folder / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+        before = (self.folder / "NATIVE_TERMINAL_EVIDENCE.json").read_bytes()
+        closed_event = {
+            "type": "COMPLETION_REVIEW_REQUIRED", "lane_id": self.lane_id,
+            "run_id": self.run_id, "state": "COMPLETE",
+        }
+        with (
+            patch.object(monitor, "read_manager_queue", return_value={"events": [closed_event]}),
+            patch.object(monitor, "promote_event") as promote,
+        ):
+            self.assertEqual([], monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane))
+        promote.assert_not_called()
+        with (
+            patch.object(monitor, "read_manager_queue", return_value={"events": []}),
+            patch.object(monitor, "promote_event", return_value={"event_id": "replacement"}) as promote,
+            patch.object(monitor, "update_lane"),
+        ):
+            self.assertEqual([{"event_id": "replacement"}], monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane))
+        promote.assert_called_once()
+        replay = self._review(managed=True, event_state="COMPLETE")
+        self.assertTrue(replay["ok"], replay)
+        self.assertEqual(before, (self.folder / "NATIVE_TERMINAL_EVIDENCE.json").read_bytes())
+
+    def test_retired_managed_close_retry_uses_retained_exact_publication(self) -> None:
+        fresh_response = self._review()
+        self.assertTrue(fresh_response["ok"], fresh_response)
+        before = self._evidence()
+        self.lane["lifecycle"] = "retired"
+        import shutil
+
+        shutil.rmtree(self.worktree)
+        failed = self._review(managed=True, close_side_effect=ManagerQueueError("QUEUE_UNAVAILABLE", "queue unavailable"))
+        self.assertFalse(failed["ok"])
+        replay = self._review(managed=True)
+        self.assertTrue(replay["ok"], replay)
+        self.assertEqual(before, self._evidence())
+        conflicting = self._review(managed=True, outcome="FAIL", force_reason="override")
+        self.assertFalse(conflicting["ok"])
 
     def test_conflicting_acceptance_and_evidence_stay_visible(self) -> None:
         self.assertTrue(self._review()["ok"])
@@ -249,6 +327,224 @@ class NativeReviewEvidenceTests(unittest.TestCase):
 
         shutil.rmtree(self.worktree)
         self.assertEqual(expected, self._evidence())
+
+    def test_retained_sources_reject_rehashed_identity_mutations_after_retirement(self) -> None:
+        self.assertTrue(self._review()["ok"])
+        original = self._evidence()
+        self.assertEqual(self.envelope, original["dispatch"]["envelope"])
+        self.assertEqual(self.envelope["decision_id"], original["decision"]["decision_id"])
+        self.assertEqual(self.observed["context_digest"], original["final_context"]["content_hash"])
+        import shutil
+
+        shutil.rmtree(self.worktree)
+        cases = (
+            ("task", lambda e: e["task_card"].update(task="unrelated task")),
+            ("plan", lambda e: e["accepted_plan"].update(plan_id="unrelated plan")),
+            ("objective", lambda e: e.update(objective_id="unrelated objective")),
+            ("decision", lambda e: e["decision"].update(plan_id="unrelated plan")),
+            ("decision-id", lambda e: e["decision"].update(decision_id="unrelated decision")),
+            ("decision-configuration", lambda e: e["decision"]["configuration"].update(strategy="unrelated")),
+            ("configuration", lambda e: e["configuration"].update(strategy="unrelated")),
+            ("configuration-digest", lambda e: e.update(configuration_digest="unrelated digest")),
+            ("envelope", lambda e: e["dispatch"]["envelope"].update(run_id="unrelated run")),
+            ("envelope-task", lambda e: e["dispatch"]["envelope"].update(task_card_digest="unrelated task")),
+            ("envelope-configuration", lambda e: e["dispatch"]["envelope"].update(configuration_digest="unrelated digest")),
+            ("context", lambda e: e["final_context"].update(plan_id="unrelated plan")),
+            ("context-id", lambda e: e["final_context"].update(context_id="unrelated context")),
+            ("context-configuration", lambda e: e["final_context"]["configuration"].update(strategy="unrelated")),
+            ("context-omissions", lambda e: e["final_context"].update(omitted=["unrelated item"])),
+            ("operation", lambda e: e["dispatch"]["operation"].update(status="not-a-status")),
+            ("operation-created", lambda e: e["dispatch"]["operation"].update(created_at=None)),
+            ("operation-fields", lambda e: e["dispatch"]["operation"].update(schema="unrelated-operation/v1")),
+            ("observed", lambda e: e["dispatch"]["observed_invocation"].update(context_id="unrelated context")),
+            ("observed-pid", lambda e: e["dispatch"]["observed_invocation"].update(pid=999)),
+            ("run", lambda e: e.update(run_id="unrelated run")),
+        )
+        for name, change in cases:
+            with self.subTest(name=name):
+                evidence = copy.deepcopy(original)
+                change(evidence)
+                for source in (evidence["task_card"], evidence["accepted_plan"], evidence["decision"],
+                               evidence["dispatch"]["envelope"], evidence["final_context"]):
+                    if "content_hash" in source:
+                        source["content_hash"] = content_hash(source)
+                evidence["dispatch"]["operation_digest"] = terminal_evidence.sha256_hex(evidence["dispatch"]["operation"])
+                evidence["content_hash"] = content_hash(evidence)
+                with self.assertRaises(terminal_evidence.TerminalEvidenceError):
+                    terminal_evidence.validate_terminal_evidence(evidence)
+
+    def test_enhanced_acceptance_requires_terminal_record_at_all_gates(self) -> None:
+        self.assertTrue(self._review()["ok"])
+        self.assertIsNotNone(controller._read_acceptance_chain(self.rt, self.epoch_id, self.lane))
+        self.assertIsNotNone(monitor._read_acceptance_chain(self.rt, self.epoch_id, self.lane_id, self.lane))
+        terminal_path = self.folder / "NATIVE_TERMINAL_EVIDENCE.json"
+        original = terminal_path.read_bytes()
+        for damage in (None, b'{"schema":"native-terminal-evidence/v1","wrong":true}'):
+            with self.subTest(damage=damage):
+                if damage is None:
+                    terminal_path.unlink(missing_ok=True)
+                else:
+                    terminal_path.write_bytes(damage)
+                self.assertIsNone(controller._read_acceptance_chain(self.rt, self.epoch_id, self.lane))
+                self.assertIsNone(monitor._read_acceptance_chain(self.rt, self.epoch_id, self.lane_id, self.lane))
+                self.assertEqual("review_pending", monitor.derive_lane_status(
+                    self.rt, self.epoch_id, self.lane,
+                    {"recorded_status": "review_pending", "cleanup_proven": True},
+                ))
+                with (
+                    patch.object(launch, "find_harness_root", return_value=self.root),
+                    patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.rt, root_workspace=self.root)),
+                    patch.object(launch, "find_active_lane", return_value=(self.epoch_id, self.lane)),
+                    patch.object(launch, "release_leases") as release,
+                ):
+                    retired = launch.run_retire(str(self.folder / "ORCHESTRATOR_ACCEPTANCE.json"))
+                self.assertFalse(retired["ok"])
+                release.assert_not_called()
+        terminal_path.write_bytes(original)
+        self.assertIsNotNone(controller._read_acceptance_chain(self.rt, self.epoch_id, self.lane))
+
+    def test_enhanced_retire_requires_current_acceptance_slot_and_valid_evidence(self) -> None:
+        self.assertTrue(self._review()["ok"])
+        acceptance_path = self.folder / "ORCHESTRATOR_ACCEPTANCE.json"
+        copied_path = self.root / "copied-acceptance.json"
+        copied_path.write_bytes(acceptance_path.read_bytes())
+        status = {
+            "cleanup_proven": True, "controller_state": "exited",
+            "process_boundary": {"root": {"pid": 1, "creation_time": "old"}},
+            "provider_state": {"state": "exited"},
+        }
+        with (
+            patch.object(launch, "find_harness_root", return_value=self.root),
+            patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.rt, root_workspace=self.root)),
+            patch.object(launch, "find_active_lane", return_value=(self.epoch_id, self.lane)),
+            patch.object(launch, "_read_controller_status", return_value=status),
+            patch.object(launch.processes, "identity_matches", return_value=False),
+            patch.object(launch.processes, "process_boundary_is_gone", return_value=True),
+            patch.object(launch, "release_leases") as release,
+            patch.object(launch, "update_lane"),
+            patch.object(launch, "read_active_lanes", return_value=[]),
+            patch.object(launch, "write_active_lanes"),
+            patch.object(launch, "_prune_worktrees"),
+            patch.object(launch, "_maybe_close_epoch"),
+        ):
+            self.assertFalse(launch.run_retire(str(copied_path))["ok"])
+            release.assert_not_called()
+            self.assertTrue(launch.run_retire(str(acceptance_path))["ok"])
+            release.assert_called_once()
+
+    def test_legacy_pair_still_advances_without_native_evidence(self) -> None:
+        legacy_card = contracts.make_task_card(task="legacy work", base_commit="base-1")
+        atomic_write_json(self.worktree / ".agent-workspace" / "task-card.json", legacy_card)
+        self.lane.pop("memory_plan_state")
+        self.assertTrue(self._review()["ok"])
+        self.assertIsNone(terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id))
+        self.assertIsNotNone(controller._read_acceptance_chain(self.rt, self.epoch_id, self.lane))
+        self.assertIsNotNone(monitor._read_acceptance_chain(self.rt, self.epoch_id, self.lane_id, self.lane))
+
+    def test_legacy_managed_close_failure_replays_after_retirement(self) -> None:
+        legacy_card = contracts.make_task_card(task="legacy work", base_commit="base-1")
+        atomic_write_json(self.worktree / ".agent-workspace" / "task-card.json", legacy_card)
+        self.lane.pop("memory_plan_state")
+        first = self._review(managed=True, close_side_effect=ManagerQueueError("QUEUE_UNAVAILABLE", "queue unavailable"))
+        self.assertFalse(first["ok"])
+        before = (self.folder / "ORCHESTRATOR_ACCEPTANCE.json").read_bytes()
+        self.lane["lifecycle"] = "retired"
+        import shutil
+
+        shutil.rmtree(self.worktree)
+        replay = self._review(managed=True)
+        self.assertTrue(replay["ok"], replay)
+        self.assertEqual(before, (self.folder / "ORCHESTRATOR_ACCEPTANCE.json").read_bytes())
+
+    def test_rejected_resume_retains_history_and_publishes_fresh_run(self) -> None:
+        self.assertTrue(self._review(outcome="PASS", approval="REJECTED")["ok"])
+        prior = self._evidence()
+        self.lane["session"] = {"session_id": "saved-session"}
+        self.lane["provider"] = {"id": "codex", "model": "test", "launch_config": {}}
+        resume_card = self.root / "resume-card.json"
+        atomic_write_json(resume_card, self.card)
+
+        def update_lane(_rt, _epoch, _lane, mutate):
+            self.lane.update(mutate(self.lane))
+            return self.lane
+
+        def write_invocation(worktree, *, lane_id, run_id, **_kwargs):
+            value = {"schema": "controller-invocation/v1", "lane_id": lane_id, "run_id": run_id,
+                     "provider": {"id": "codex"}}
+            value["content_hash"] = content_hash(value)
+            atomic_write_json(Path(worktree) / ".agent-workspace" / "invocation.json", value)
+            return value
+
+        with (
+            patch.object(resume, "find_harness_root", return_value=self.root),
+            patch.object(resume, "load_config", return_value=SimpleNamespace(runtime_root=self.rt, profile="plain")),
+            patch.object(resume, "find_active_lane", return_value=(self.epoch_id, self.lane)),
+            patch.object(resume, "read_lane", side_effect=lambda *_: self.lane),
+            patch.object(resume, "update_lane", side_effect=update_lane),
+            patch.object(resume, "_live_controller", return_value=False),
+            patch.object(resume, "new_id", return_value="run-2"),
+            patch.object(resume, "_write_worker_prompt"),
+            patch.object(resume, "_write_invocation", side_effect=write_invocation),
+        ):
+            resumed = resume.run_resume(lane_id=self.lane_id, resume_task_card=str(resume_card))
+        self.assertTrue(resumed["ok"], resumed)
+        self.assertEqual("run-2", self.lane["run_id"])
+        self.assertEqual(prior, terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-1"))
+        self.assertIsNone(terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-2"))
+        self.run_id = "run-2"
+        self.lane["lifecycle"] = "review_pending"
+        self.lane["process"] = {"pid": 124, "creation_time": "incarnation-2"}
+        self._result("PASS")
+        fresh_envelope = memory_handoff.load_envelope(self.worktree)
+        assert fresh_envelope is not None
+        fresh_context = memory_handoff.load_final_context(worktree_path=self.worktree, envelope=fresh_envelope)
+        memory_handoff.record_dispatch_intent(worktree_path=self.worktree, envelope=fresh_envelope)
+        memory_handoff.record_observed_invocation(
+            worktree_path=self.worktree, envelope=fresh_envelope,
+            observed_invocation=memory_handoff.native_observation(
+                envelope=fresh_envelope, context=fresh_context, controller_identity=self.lane["process"],
+            ),
+        )
+        fresh_response = self._review()
+        self.assertTrue(fresh_response["ok"], fresh_response)
+        fresh = terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-2")
+        self.assertIsNotNone(fresh)
+        self.assertNotEqual(prior["content_hash"], fresh["content_hash"])
+        self.assertEqual(prior, terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-1"))
+        self.assertFalse(self._review(outcome="FAIL", force_reason="contradiction")["ok"])
+        self.assertEqual(fresh, terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-2"))
+        self.lane["run_id"] = "run-1"
+        collision = self._review()
+        self.assertEqual(review.COMPLETION_REVIEW_OUTPUT_CONFLICT, collision["code"])
+        self.lane["run_id"] = "run-2"
+        current_path = terminal_evidence.run_publication_dir(
+            self.rt, self.epoch_id, self.lane_id, "run-2",
+        ) / "ORCHESTRATOR_ACCEPTANCE.json"
+        current_bytes = current_path.read_bytes()
+        changed_current = copy.deepcopy(fresh["acceptance"])
+        changed_current["approval"] = "REJECTED"
+        changed_current["content_hash"] = content_hash(changed_current)
+        atomic_write_json(current_path, changed_current)
+        with self.assertRaises(terminal_evidence.TerminalEvidenceError):
+            terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-2")
+        current_path.write_bytes(current_bytes)
+        historical_review_path = self.folder / "COMPLETION_REVIEW.json"
+        review_bytes = historical_review_path.read_bytes()
+        changed_review = copy.deepcopy(prior["review"])
+        changed_review["run_id"] = "other-run"
+        changed_review["content_hash"] = content_hash(changed_review)
+        atomic_write_json(historical_review_path, changed_review)
+        with self.assertRaises(terminal_evidence.TerminalEvidenceError):
+            terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-1")
+        historical_review_path.write_bytes(review_bytes)
+        historical_path = self.folder / "ORCHESTRATOR_ACCEPTANCE.json"
+        historical = copy.deepcopy(prior["acceptance"])
+        historical["approval"] = "ACCEPTED"
+        historical["content_hash"] = content_hash(historical)
+        atomic_write_json(historical_path, historical)
+        with self.assertRaises(terminal_evidence.TerminalEvidenceError):
+            terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-1")
+        self.assertEqual(fresh, terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-2"))
 
     def test_true_unknown_requires_same_run_cleanup_and_root_exception(self) -> None:
         self.result_path.unlink()
@@ -299,6 +595,20 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             with self.assertRaises(review.ReviewError):
                 review._resolve_lane_managed(self.rt, "event-1")
 
+    def test_managed_event_resolves_retired_same_run_from_queue_epoch(self) -> None:
+        self.lane["lifecycle"] = "retired"
+        event = {
+            "event_id": "event-1", "type": "COMPLETION_REVIEW_REQUIRED",
+            "state": "ACKNOWLEDGED", "lane_id": self.lane_id, "run_id": self.run_id,
+        }
+        with (
+            patch.object(review, "read_manager_queue", return_value={"epoch_id": self.epoch_id, "events": [event]}),
+            patch.object(review, "find_active_lane", side_effect=LaneError("LANE_NOT_FOUND", "retired")),
+            patch.object(review, "read_lane", return_value=self.lane) as read_lane,
+        ):
+            self.assertEqual((self.epoch_id, self.lane, event), review._resolve_lane_managed(self.rt, "event-1"))
+        read_lane.assert_called_once_with(self.rt, self.epoch_id, self.lane_id)
+
     def test_cli_exposes_explicit_unknown_finding(self) -> None:
         args = operator_launch._build_parser().parse_args([
             "lane", "completion-review", "--lane-id", self.lane_id,
@@ -327,6 +637,8 @@ class NativeReviewEvidenceTests(unittest.TestCase):
                 self.assertIsNone(terminal_evidence.read_terminal_evidence(
                     self.rt, self.epoch_id, self.lane_id,
                 ))
+                self.assertIsNotNone(controller._read_acceptance_chain(self.rt, self.epoch_id, self.lane))
+                self.assertIsNotNone(monitor._read_acceptance_chain(self.rt, self.epoch_id, self.lane_id, self.lane))
                 (self.folder / "ORCHESTRATOR_ACCEPTANCE.json").unlink()
                 (self.folder / "COMPLETION_REVIEW.json").unlink()
 
