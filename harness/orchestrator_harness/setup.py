@@ -55,7 +55,20 @@ CODEX_ROOT_CONFIG = Path(".codex") / "config.toml"
 SHARED_ROOT_HOOK_CONFIGS = {
     Path(".codex") / "hooks.json",
     Path(".claude") / "settings.json",
+    Path(".qwen") / "settings.json",
 }
+COMPOSED_PAYLOADS = Path("composed-payloads")
+SHARED_WORKER_FILES = (
+    Path(".agent-workspace") / "hook-dispatch.py",
+    Path(".agent-workspace") / "lane-queue.py",
+    Path(".agent-workspace") / "manager-notify.py",
+    Path(".agent-workspace") / "result-stop-check.py",
+)
+PROVIDER_WORKER_FILES = (
+    Path("orchestrator-harness-binding.json"),
+    Path("skills") / "lane-assignment" / "SKILL.md",
+    Path("skills") / "manager-notify" / "SKILL.md",
+)
 
 SETUP_CONFIG_INVALID = "SETUP_CONFIG_INVALID"
 SETUP_CACHE_INVALID = "SETUP_CACHE_INVALID"
@@ -125,17 +138,161 @@ def _plan_tree(source: Path) -> list[tuple[Path, Path]]:
     if not source.is_dir():
         raise ConfigError(f"source tree missing: {source}")
     planned: list[tuple[Path, Path]] = []
-    for item in source.rglob("*"):
+    for item in sorted(source.rglob("*")):
         if not item.is_file() or "__pycache__" in item.parts:
             continue
         planned.append((item, item.relative_to(source)))
     return planned
 
 
-def _plan_active_cache(harness_root: Path) -> list[tuple[Path, Path]]:
-    """Plan the active cache: ``super-cache/workspace`` plus every
-    ``adapters/<provider-id>/super-cache`` payload, each relative to
-    ``<rt>/super-cache``."""
+def _claim_destination(claims: dict[str, str], relative: Path, owner: str) -> None:
+    """Claim one installed path, including its parent directories."""
+    parts = [part.casefold() for part in relative.parts]
+    key = "/".join(parts)
+    if key in claims:
+        raise SetupError(
+            SETUP_ADAPTER_COLLISION,
+            f"worker destination {relative} is claimed by {claims[key]} and {owner}",
+        )
+    for index in range(1, len(parts)):
+        parent = "/".join(parts[:index])
+        if parent in claims:
+            raise SetupError(
+                SETUP_ADAPTER_COLLISION,
+                f"worker destination {relative} is below a file owned by {claims[parent]}",
+            )
+    if any(existing.startswith(key + "/") for existing in claims):
+        raise SetupError(
+            SETUP_ADAPTER_COLLISION,
+            f"worker destination {relative} replaces a planned directory",
+        )
+    claims[key] = owner
+
+
+def _validate_worker_commands(
+    provider_id: str, dotdir: str, files: dict[Path, Path]
+) -> None:
+    """Shipped hook commands must name files owned by the same worker payload."""
+    for config_name in ("hooks.json", "settings.json"):
+        config = files.get(Path(dotdir) / config_name)
+        if config is None:
+            continue
+        try:
+            record = json.loads(config.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SetupError(SETUP_CONFIG_INVALID, f"invalid {provider_id} worker hooks: {config}: {exc}") from exc
+        hooks = record.get("hooks") if isinstance(record, dict) else None
+        if not isinstance(hooks, dict):
+            raise SetupError(SETUP_CONFIG_INVALID, f"worker hook commands missing for {provider_id}: {config}")
+        seen: set[str] = set()
+        for groups in hooks.values():
+            if not isinstance(groups, list):
+                raise SetupError(SETUP_CONFIG_INVALID, f"malformed worker hook groups for {provider_id}: {config}")
+            for group in groups:
+                entries = group.get("hooks") if isinstance(group, dict) else None
+                if not isinstance(entries, list) or not entries:
+                    raise SetupError(SETUP_CONFIG_INVALID, f"malformed worker hook command for {provider_id}: {config}")
+                for entry in entries:
+                    command = entry.get("command") if isinstance(entry, dict) else None
+                    if not isinstance(command, str):
+                        raise SetupError(SETUP_CONFIG_INVALID, f"malformed worker hook command for {provider_id}: {config}")
+                    parts = command.split()
+                    relative = Path(parts[-1].replace("\\", "/")) if len(parts) == 2 and parts[0] == "python" else None
+                    if (
+                        command in seen
+                        or relative is None
+                        or not relative.parts
+                        or relative.parts[0] != dotdir
+                        or relative not in files
+                    ):
+                        raise SetupError(
+                            SETUP_ADAPTER_COLLISION,
+                            f"duplicate or unknown {provider_id} worker command: {command}",
+                        )
+                    seen.add(command)
+
+
+def _plan_worker_compositions(
+    harness_root: Path,
+    *,
+    root_plan: list[tuple[Path, Path]] | None = None,
+) -> dict[str, list[tuple[Path, Path]]]:
+    """Resolve every provider's shared and provider-owned worker destination."""
+    workspace = harness_root / "super-cache" / "workspace"
+    if not workspace.is_dir():
+        raise SetupError(SETUP_CACHE_INVALID, f"shipped super-cache workspace missing: {workspace}")
+    base = _plan_tree(workspace)
+    base_paths = {relative for _, relative in base}
+    missing = next((path for path in SHARED_WORKER_FILES if path not in base_paths), None)
+    if missing is not None:
+        raise SetupError(SETUP_CACHE_INVALID, f"shared worker lifecycle file missing: {missing}")
+    if any(not (workspace / path).read_bytes() for path in SHARED_WORKER_FILES):
+        raise SetupError(SETUP_CACHE_INVALID, "shared worker lifecycle file is empty")
+    root_owners: dict[str, str] = {}
+    root_dotdirs: dict[str, set[str]] = {}
+    adapters_dir = harness_root / "adapters"
+    for source, relative in root_plan if root_plan is not None else _plan_root_payloads(harness_root):
+        owner = source.relative_to(adapters_dir).parts[0]
+        root_dotdirs.setdefault(owner, set()).add(relative.parts[0].casefold())
+        key = relative.as_posix().casefold()
+        if key in root_owners and root_owners[key] != owner:
+            raise SetupError(SETUP_ADAPTER_COLLISION, f"ROOT destination {relative} has multiple provider owners")
+        root_owners[key] = owner
+    compositions: dict[str, list[tuple[Path, Path]]] = {}
+    dotdir_owners: dict[str, str] = {}
+    for adapter in sorted(adapters_dir.iterdir()):
+        if not adapter.is_dir():
+            continue
+        provider_id = adapter.name
+        payload = adapter / "super-cache"
+        if payload.is_dir() and not (adapter / "harness" / "launcher_binding.py").is_file():
+            raise SetupError(SETUP_ADAPTER_COLLISION, f"unknown worker provider owns {payload}")
+        if not (adapter / "harness" / "launcher_binding.py").is_file():
+            continue
+        if not payload.is_dir():
+            raise SetupError(SETUP_CACHE_INVALID, f"worker payload missing for {provider_id}: {payload}")
+        worker = _plan_tree(payload)
+        dotdirs = {relative.parts[0] for _, relative in worker}
+        if len(dotdirs) != 1 or not next(iter(dotdirs)).startswith(".") or ".agent-workspace" in dotdirs:
+            raise SetupError(SETUP_ADAPTER_COLLISION, f"unknown provider-owned destination in {payload}")
+        dotdir = next(iter(dotdirs))
+        if dotdir.casefold() not in root_dotdirs.get(provider_id, set()):
+            raise SetupError(SETUP_ADAPTER_COLLISION, f"unknown {provider_id} worker destination: {dotdir}")
+        prior_owner = dotdir_owners.setdefault(dotdir.casefold(), provider_id)
+        if prior_owner != provider_id:
+            raise SetupError(SETUP_ADAPTER_COLLISION, f"provider destination {dotdir} is owned by {prior_owner} and {provider_id}")
+        worker_files = {relative: source for source, relative in worker}
+        missing = next((Path(dotdir) / path for path in PROVIDER_WORKER_FILES if Path(dotdir) / path not in worker_files), None)
+        if missing is not None:
+            raise SetupError(SETUP_CACHE_INVALID, f"{provider_id} worker tool missing: {missing}")
+        for skill, helper in (("lane-assignment", "lane-queue.py"), ("manager-notify", "manager-notify.py")):
+            skill_path = worker_files[Path(dotdir) / "skills" / skill / "SKILL.md"]
+            if f".agent-workspace/{helper}" not in skill_path.read_text(encoding="utf-8"):
+                raise SetupError(SETUP_CACHE_INVALID, f"{provider_id} worker skill does not call {helper}: {skill_path}")
+        binding = _read_json_object(worker_files[Path(dotdir) / PROVIDER_WORKER_FILES[0]], description="worker binding")
+        if binding.get("schema") != ROOT_HOOK_BINDING_SCHEMA or binding.get("role") != "worker" or binding.get("provider_id") != provider_id:
+            raise SetupError(SETUP_CONFIG_INVALID, f"worker binding identity invalid for {provider_id}")
+        _validate_worker_commands(provider_id, dotdir, worker_files)
+        claims: dict[str, str] = {}
+        for source, relative in [*base, *worker]:
+            if relative.name.casefold() in {"agents.md", "claude.md"}:
+                raise SetupError(SETUP_ADAPTER_COLLISION, f"repository instruction destination is checkout-owned: {relative}")
+            owner = "shared lifecycle" if source.is_relative_to(workspace) else provider_id
+            _claim_destination(claims, relative, owner)
+            if owner == provider_id:
+                root_owner = root_owners.get(relative.as_posix().casefold())
+                if root_owner is not None and root_owner != provider_id:
+                    raise SetupError(SETUP_ADAPTER_COLLISION, f"worker destination {relative} belongs to ROOT provider {root_owner}")
+        compositions[provider_id] = [*base, *worker]
+    if not compositions:
+        raise SetupError(SETUP_CACHE_INVALID, f"no managed worker payloads in {adapters_dir}")
+    return compositions
+
+
+def _plan_active_cache(
+    harness_root: Path, *, root_plan: list[tuple[Path, Path]] | None = None
+) -> list[tuple[Path, Path]]:
+    """Plan the shipped cache and each provider's exact composed worker tree."""
     source_cache = harness_root / "super-cache"
     if not source_cache.is_dir():
         raise SetupError(SETUP_CACHE_INVALID, f"shipped super-cache missing: {source_cache}")
@@ -163,6 +320,9 @@ def _plan_active_cache(harness_root: Path) -> list[tuple[Path, Path]]:
                 planned.append(
                     (source_file, Path("adapter-payloads") / adapter.name / relative)
                 )
+    for provider_id, files in _plan_worker_compositions(harness_root, root_plan=root_plan).items():
+        for source_file, relative in files:
+            planned.append((source_file, COMPOSED_PAYLOADS / provider_id / relative))
     return planned
 
 
@@ -182,6 +342,41 @@ def _validate_active_cache(
                 SETUP_CACHE_INVALID,
                 f"active cache malformed: {relative} differs from the shipped source",
             )
+    composed = destination / COMPOSED_PAYLOADS
+    expected = {
+        relative.relative_to(COMPOSED_PAYLOADS).as_posix()
+        for _, relative in plan
+        if relative.parts[0] == COMPOSED_PAYLOADS.name
+    }
+    if expected:
+        actual = {
+            path.relative_to(composed).as_posix()
+            for path in composed.rglob("*")
+            if path.is_file()
+        }
+        if actual != expected:
+            extra = sorted(actual - expected)
+            raise SetupError(SETUP_CACHE_INVALID, f"active worker composition has unknown file: {extra[0] if extra else 'none'}")
+
+
+def _validated_worker_payload(harness_root: Path, rt: Path, provider_id: str) -> Path:
+    """Return only the installed composed tree whose bytes match its planned owners."""
+    compositions = _plan_worker_compositions(harness_root)
+    files = compositions.get(provider_id)
+    if files is None:
+        raise SetupError(SETUP_CACHE_INVALID, f"unsupported worker provider: {provider_id}")
+    payload = rt / "super-cache" / COMPOSED_PAYLOADS / provider_id
+    for source, relative in files:
+        installed = payload / relative
+        if not installed.is_file():
+            raise SetupError(SETUP_CACHE_INVALID, f"installed worker composition missing: {installed}")
+        if installed.read_bytes() != source.read_bytes():
+            raise SetupError(SETUP_CACHE_INVALID, f"installed worker composition changed: {installed}")
+    expected = {relative.as_posix() for _, relative in files}
+    actual = {path.relative_to(payload).as_posix() for path in payload.rglob("*") if path.is_file()}
+    if actual != expected:
+        raise SetupError(SETUP_CACHE_INVALID, f"installed worker composition has unknown files: {payload}")
+    return payload
 
 
 def _replace_tree(staging: Path, destination: Path) -> None:
@@ -231,7 +426,9 @@ def _install_active_cache(
                 raise SetupError(
                     SETUP_CACHE_INVALID, f"byte verification failed for {relative}"
                 )
+        _validate_active_cache(plan, staging)
         _replace_tree(staging, destination)
+        _validate_active_cache(plan, destination)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -1009,7 +1206,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
             runtime_root=rt,
             binding_templates=binding_templates,
         )
-        cache_plan = _plan_active_cache(harness_root)
+        cache_plan = _plan_active_cache(harness_root, root_plan=root_plan)
         destination = rt / "super-cache"
         if destination.is_dir():
             try:

@@ -155,6 +155,7 @@ class LaunchBoundaryFixture:
         workspace = self.harness / "super-cache" / "workspace" / ".agent-workspace"
         for name, contents in {
             "README.md": "base workspace\n",
+            "hook-dispatch.py": "# hook dispatch\n",
             "lane-queue.py": "# lane queue\n",
             "manager-notify.py": "# manager notify\n",
             "result-stop-check.py": "# result stop check\n",
@@ -164,6 +165,19 @@ class LaunchBoundaryFixture:
             self.harness / "adapters" / "codex" / "super-cache" / ".codex" / "worker.txt",
             "codex worker payload\n",
         )
+        worker_root = self.harness / "adapters" / "codex" / "super-cache" / ".codex"
+        self.write_json(
+            worker_root / "orchestrator-harness-binding.json",
+            {"schema": "harness-hook-binding/v1", "role": "worker", "provider_id": "codex"},
+        )
+        self.write_text(
+            worker_root / "skills" / "lane-assignment" / "SKILL.md",
+            ".agent-workspace/lane-queue.py\n",
+        )
+        self.write_text(
+            worker_root / "skills" / "manager-notify" / "SKILL.md",
+            ".agent-workspace/manager-notify.py\n",
+        )
         self.write_text(
             self.harness
             / "orchestrator_harness"
@@ -171,6 +185,14 @@ class LaunchBoundaryFixture:
             / "codex"
             / "launcher_binding.py",
             BINDING_SOURCE,
+        )
+        self.write_text(
+            self.harness / "adapters" / "codex" / "harness" / "launcher_binding.py",
+            BINDING_SOURCE,
+        )
+        self.write_text(
+            self.harness / "adapters" / "codex" / "root" / ".codex" / "root.txt",
+            "root payload\n",
         )
         self.runtime = self.root_workspace / ".harness-runtime"
         for source, relative in setup._plan_active_cache(self.harness):
