@@ -23,7 +23,7 @@ import tempfile
 import tomllib
 from copy import deepcopy
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import processes
@@ -185,6 +185,7 @@ def _validate_worker_commands(
         if not isinstance(hooks, dict):
             raise SetupError(SETUP_CONFIG_INVALID, f"worker hook commands missing for {provider_id}: {config}")
         seen: set[str] = set()
+        owned = {path.as_posix().casefold() for path in files}
         for groups in hooks.values():
             if not isinstance(groups, list):
                 raise SetupError(SETUP_CONFIG_INVALID, f"malformed worker hook groups for {provider_id}: {config}")
@@ -197,19 +198,22 @@ def _validate_worker_commands(
                     if not isinstance(command, str):
                         raise SetupError(SETUP_CONFIG_INVALID, f"malformed worker hook command for {provider_id}: {config}")
                     parts = command.split()
-                    relative = Path(parts[-1].replace("\\", "/")) if len(parts) == 2 and parts[0] == "python" else None
+                    relative = PurePosixPath(parts[-1].replace("\\", "/")) if len(parts) == 2 and parts[0] == "python" else None
+                    destination = relative.as_posix().casefold() if relative is not None else None
                     if (
-                        command in seen
-                        or relative is None
+                        relative is None
                         or not relative.parts
-                        or relative.parts[0] != dotdir
-                        or relative not in files
+                        or relative.is_absolute()
+                        or ".." in relative.parts
+                        or relative.parts[0].casefold() != dotdir.casefold()
+                        or destination not in owned
+                        or destination in seen
                     ):
                         raise SetupError(
                             SETUP_ADAPTER_COLLISION,
                             f"duplicate or unknown {provider_id} worker command: {command}",
                         )
-                    seen.add(command)
+                    seen.add(destination)
 
 
 def _plan_worker_compositions(

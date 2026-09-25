@@ -610,6 +610,8 @@ class V2MaterializationTests(unittest.TestCase):
         for commands in (
             ["python .codex/hooks/missing.py"],
             ["python .codex/hooks/known.py", "python .codex/hooks/known.py"],
+            ["python .codex/hooks/known.py extra"],
+            ["python .codex/hooks/../known.py"],
         ):
             with self.subTest(commands=commands):
                 self.fixture._write_json(
@@ -626,6 +628,52 @@ class V2MaterializationTests(unittest.TestCase):
                 self.assertFalse((self.fixture.root_workspace / ".harness-runtime").exists())
                 self.assertFalse((self.fixture.root_workspace / ".codex").exists())
                 start_monitor.assert_not_called()
+
+    def test_equivalent_worker_hook_script_spellings_are_rejected_before_setup_writes(self) -> None:
+        for variant in (r"python .codex\hooks\known.py", "python .CODEX/Hooks/KNOWN.py"):
+            with self.subTest(variant=variant):
+                fixture = MaterializationFixture()
+                self.addCleanup(fixture.close)
+                payload = fixture.harness / "adapters" / "codex" / "super-cache" / ".codex"
+                fixture._write_text(payload / "hooks" / "known.py", "# known\n")
+                fixture._write_json(
+                    payload / "hooks.json",
+                    {"hooks": {"Stop": [{"hooks": [
+                        {"command": "python .codex/hooks/known.py"},
+                        {"command": variant},
+                    ]}]}},
+                )
+                with (
+                    patch.object(setup, "find_harness_root", return_value=fixture.harness),
+                    patch.object(setup, "_start_monitor") as start_monitor,
+                ):
+                    result = setup.run_setup()
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(setup.SETUP_ADAPTER_COLLISION, result["code"])
+                self.assertFalse((fixture.root_workspace / ".harness-runtime").exists())
+                self.assertFalse((fixture.root_workspace / ".codex").exists())
+                start_monitor.assert_not_called()
+
+    def test_distinct_owned_worker_hook_commands_remain_valid(self) -> None:
+        payload = self.fixture.harness / "adapters" / "codex" / "super-cache" / ".codex"
+        for name in ("first.py", "second.py"):
+            self.fixture._write_text(payload / "hooks" / name, "# known\n")
+        self.fixture._write_json(
+            payload / "hooks.json",
+            {"hooks": {"Stop": [{"hooks": [
+                {"command": "python .codex/hooks/first.py"},
+                {"command": r"python .CODEX\HOOKS\second.py"},
+            ]}]}},
+        )
+        plan = setup._plan_active_cache(self.fixture.harness)
+        self.assertIn(
+            Path("composed-payloads/codex/.codex/hooks/first.py"),
+            [relative for _, relative in plan],
+        )
+        self.assertIn(
+            Path("composed-payloads/codex/.codex/hooks/second.py"),
+            [relative for _, relative in plan],
+        )
 
     def test_setup_installs_shared_and_provider_files_in_one_worker_tree(self) -> None:
         child = MagicMock(pid=1701)

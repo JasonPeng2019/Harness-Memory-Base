@@ -1809,6 +1809,28 @@ class Step04ResumeBoundaryTests(unittest.TestCase):
         self.assertFalse(envelope_path.exists())
         self.assertTrue((worktree / ".agent-workspace" / "invocation.json").is_file())
 
+    def test_managed_resume_receipt_names_composed_payload_and_fresh_run(self) -> None:
+        lane_id = "resume-composed-receipt"
+        card = legacy_card()
+        prepared, worktree = self.fixture.run_bootstrap(lane_id=lane_id, card=card)
+        self.assertTrue(prepared["ok"], prepared)
+        receipt_path = worktree / ".agent-workspace" / "overlay-receipt.json"
+        original = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual("composed-payloads/codex", original["provider_payload"])
+        self.fixture.make_resumable(lane_id)
+
+        resumed = self.fixture.run_resume(lane_id=lane_id, card=card)
+        self.assertTrue(resumed["ok"], resumed)
+        self.assertEqual("RESUME_OK", resumed["code"])
+        lane = self.fixture.lane_record(lane_id)
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertNotEqual(original["run_id"], lane["run_id"])
+        self.assertEqual(lane_id, receipt["lane_id"])
+        self.assertEqual(lane["run_id"], receipt["run_id"])
+        self.assertEqual("managed", receipt["profile"])
+        self.assertEqual("composed-payloads/codex", receipt["provider_payload"])
+        self.assertNotIn("adapter-payloads", json.dumps(receipt))
+
     def test_resume_of_legacy_lane_durably_strengthens_scrubbed_boundary(self) -> None:
         card = legacy_card()
         prepared, worktree = self.fixture.run_bootstrap(

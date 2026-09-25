@@ -25,6 +25,7 @@ from .epochs import lane_record_dir
 from .lanes import find_active_lane, read_lane, update_lane
 from .records import RecordLock, atomic_write_json, remove_record
 from .manager_queue import acknowledge_event, close_event, read_manager_queue
+from .setup import COMPOSED_PAYLOADS
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
 INVOCATION_SCHEMA = "controller-invocation/v1"
@@ -201,7 +202,7 @@ def _rewrite_overlay_receipt(
         "applied_at": iso_utc(),
     }
     if managed:
-        receipt["provider_payload"] = f"adapter-payloads/{lane['provider']['id']}"
+        receipt["provider_payload"] = f"{COMPOSED_PAYLOADS.as_posix()}/{lane['provider']['id']}"
     atomic_write_json(worktree / ".agent-workspace" / "overlay-receipt.json", receipt)
 
 
