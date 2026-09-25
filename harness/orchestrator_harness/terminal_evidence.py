@@ -328,25 +328,36 @@ def read_terminal_evidence(
             sibling = read_json(folder / name)
             _require(sibling == record[field], f"{name} conflicts with terminal evidence")
         if scoped is not None and folder == scoped:
-            root = lane_record_dir(rt, epoch_id, lane_id)
-            for name, field, schema in (
-                ("COMPLETION_REVIEW.json", "review", "completion-review/v1"),
-                ("ORCHESTRATOR_ACCEPTANCE.json", "acceptance", "orchestrator-acceptance/v1"),
-                (TERMINAL_EVIDENCE_NAME, None, TERMINAL_EVIDENCE_SCHEMA),
-            ):
-                root_path = root / name
-                if not root_path.exists():
-                    continue
-                historical = read_json(root_path)
-                if historical.get("run_id") != run_id:
-                    continue
-                _hashed(historical, schema, f"root {name}")
-                if field is None:
-                    validate_terminal_evidence(historical, lane_id=lane_id, run_id=run_id)
-                _require(historical == (record if field is None else record[field]),
-                         f"root {name} conflicts with scoped terminal evidence")
+            validate_root_siblings(rt, epoch_id, lane_id, run_id, record)
     except (OSError, ValueError) as exc:
         if isinstance(exc, TerminalEvidenceError):
             raise
         raise TerminalEvidenceError(f"cannot validate terminal evidence at {path}: {exc}") from exc
     return record
+
+
+def validate_root_siblings(
+    rt: Path, epoch_id: str, lane_id: str, run_id: str, record: dict[str, Any],
+) -> None:
+    """Reject contradictory root publications for the same scoped run."""
+    root = lane_record_dir(rt, epoch_id, lane_id)
+    for name, field, schema in (
+        ("COMPLETION_REVIEW.json", "review", "completion-review/v1"),
+        ("ORCHESTRATOR_ACCEPTANCE.json", "acceptance", "orchestrator-acceptance/v1"),
+        (TERMINAL_EVIDENCE_NAME, None, TERMINAL_EVIDENCE_SCHEMA),
+    ):
+        root_path = root / name
+        if not root_path.exists():
+            continue
+        try:
+            historical = read_json(root_path)
+        except (OSError, ValueError) as exc:
+            raise TerminalEvidenceError(f"cannot inspect root {name}: {exc}") from exc
+        _require(isinstance(historical, dict), f"root {name} is not an object")
+        if historical.get("run_id") != run_id:
+            continue
+        _hashed(historical, schema, f"root {name}")
+        if field is None:
+            validate_terminal_evidence(historical, lane_id=lane_id, run_id=run_id)
+        _require(historical == (record if field is None else record[field]),
+                 f"root {name} conflicts with scoped terminal evidence")

@@ -321,6 +321,121 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         self.assertEqual(retained["acceptance"], review.read_json(self.folder / "ORCHESTRATOR_ACCEPTANCE.json"))
         self.assertEqual(retained, self._evidence())
 
+    def test_closed_true_unknown_preparation_without_result_recovers_one_open_event(self) -> None:
+        self.result_path.unlink()
+        atomic_write_json(Path(self.lane["controller_status_path"]), {
+            "schema": "controller-status/v1", "lane_id": self.lane_id, "run_id": self.run_id,
+            "controller_state": "exited", "provider_state": {"state": "exited", "exit_code": 1},
+            "result_state": "invalid", "recorded_status": "provider_exited_no_result",
+            "cleanup_proven": True, "updated_at": "2026-09-25T00:00:00Z",
+        })
+        original_write = review.atomic_write_json
+
+        def crash_before_acceptance(path: Path, value: dict) -> None:
+            if path.name == "ORCHESTRATOR_ACCEPTANCE.json":
+                raise OSError("crash before acceptance publication")
+            original_write(path, value)
+
+        with patch.object(review, "atomic_write_json", side_effect=crash_before_acceptance):
+            self.assertFalse(self._review(outcome="UNKNOWN", force_reason="ROOT accepts terminal uncertainty", managed=True)["ok"])
+        self.assertFalse((self.folder / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+        terminal = review.read_json(self.folder / terminal_evidence.TERMINAL_EVIDENCE_NAME)
+        self.assertIsNone(terminal["result"])
+        closed = {
+            "type": "COMPLETION_REVIEW_REQUIRED", "lane_id": self.lane_id,
+            "run_id": self.run_id, "state": "COMPLETE",
+            "dedup_key": f"review:{self.lane_id}:{self.run_id}:{self.epoch_id}",
+        }
+        opened = {**closed, "event_id": "recovery", "state": "PENDING"}
+        with (
+            patch.object(monitor, "read_manager_queue", return_value={"events": [closed]}),
+            patch.object(monitor, "promote_event", return_value=opened) as promote,
+            patch.object(monitor, "update_lane"),
+        ):
+            self.assertEqual([opened], monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane))
+        promote.assert_called_once()
+        self.assertIsNone(promote.call_args.kwargs["dedup_key"])
+        with (
+            patch.object(monitor, "read_manager_queue", return_value={"events": [closed, opened]}),
+            patch.object(monitor, "promote_event") as promote,
+            patch.object(monitor, "update_lane"),
+        ):
+            self.assertEqual([], monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane))
+        promote.assert_not_called()
+
+    def test_scoped_retained_preparation_rejects_conflicting_root_before_acceptance(self) -> None:
+        self.lane["resume_from_run_id"] = "prior-run"
+        scoped = terminal_evidence.publication_dir(self.rt, self.epoch_id, self.lane)
+        original_write = review.atomic_write_json
+
+        def crash_before_acceptance(path: Path, value: dict) -> None:
+            if path.name == "ORCHESTRATOR_ACCEPTANCE.json":
+                raise OSError("crash before acceptance publication")
+            original_write(path, value)
+
+        with patch.object(review, "atomic_write_json", side_effect=crash_before_acceptance):
+            self.assertFalse(self._review(managed=True)["ok"])
+        prepared = review.read_json(scoped / terminal_evidence.TERMINAL_EVIDENCE_NAME)
+        changed_review = copy.deepcopy(prepared["review"])
+        changed_review["review_summary"] = "conflicting root review"
+        changed_review["content_hash"] = content_hash(changed_review)
+        changed_acceptance = copy.deepcopy(prepared["acceptance"])
+        changed_acceptance["approval"] = "REJECTED"
+        changed_acceptance["content_hash"] = content_hash(changed_acceptance)
+        changed_terminal = copy.deepcopy(prepared)
+        changed_terminal["review"] = changed_review
+        changed_terminal["acceptance"]["review_ref"] = changed_review["content_hash"]
+        changed_terminal["acceptance"]["content_hash"] = content_hash(changed_terminal["acceptance"])
+        changed_terminal["content_hash"] = content_hash(changed_terminal)
+        terminal_evidence.validate_terminal_evidence(changed_terminal, lane_id=self.lane_id, run_id=self.run_id)
+        for name, conflicting in (
+            ("COMPLETION_REVIEW.json", changed_review),
+            ("ORCHESTRATOR_ACCEPTANCE.json", changed_acceptance),
+            (terminal_evidence.TERMINAL_EVIDENCE_NAME, changed_terminal),
+        ):
+            with self.subTest(root_slot=name):
+                root_path = self.folder / name
+                atomic_write_json(root_path, conflicting)
+                replay = self._review(managed=True, event_state="COMPLETE")
+                self.assertEqual(review.COMPLETION_REVIEW_OUTPUT_CONFLICT, replay["code"])
+                self.assertFalse((scoped / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+                self.assertIsNone(monitor._read_acceptance_chain(self.rt, self.epoch_id, self.lane_id, self.lane))
+                root_path.unlink()
+        for name, identical in (
+            ("COMPLETION_REVIEW.json", prepared["review"]),
+            ("ORCHESTRATOR_ACCEPTANCE.json", prepared["acceptance"]),
+            (terminal_evidence.TERMINAL_EVIDENCE_NAME, prepared),
+        ):
+            atomic_write_json(self.folder / name, identical)
+        self.assertTrue(self._review(managed=True, event_state="COMPLETE")["ok"])
+        self.assertEqual(prepared, self._evidence())
+
+    def test_scoped_retained_preparation_allows_different_run_root_history(self) -> None:
+        self.lane["resume_from_run_id"] = "prior-run"
+        scoped = terminal_evidence.publication_dir(self.rt, self.epoch_id, self.lane)
+        original_write = review.atomic_write_json
+
+        def crash_before_acceptance(path: Path, value: dict) -> None:
+            if path.name == "ORCHESTRATOR_ACCEPTANCE.json":
+                raise OSError("crash before acceptance publication")
+            original_write(path, value)
+
+        with patch.object(review, "atomic_write_json", side_effect=crash_before_acceptance):
+            self.assertFalse(self._review(managed=True)["ok"])
+        prepared = review.read_json(scoped / terminal_evidence.TERMINAL_EVIDENCE_NAME)
+        for name, field in (
+            ("COMPLETION_REVIEW.json", "review"),
+            ("ORCHESTRATOR_ACCEPTANCE.json", "acceptance"),
+            (terminal_evidence.TERMINAL_EVIDENCE_NAME, None),
+        ):
+            historical = copy.deepcopy(prepared if field is None else prepared[field])
+            historical["run_id"] = "prior-run"
+            historical["content_hash"] = content_hash(historical)
+            atomic_write_json(self.folder / name, historical)
+        replay = self._review(managed=True, event_state="COMPLETE")
+        self.assertTrue(replay["ok"], replay)
+        self.assertEqual(prepared, self._evidence())
+
     def test_scoped_reader_and_consumers_reject_same_run_root_siblings(self) -> None:
         self.assertTrue(self._review()["ok"])
         original = self._evidence()

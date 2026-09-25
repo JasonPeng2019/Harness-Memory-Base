@@ -562,6 +562,13 @@ def _replay_retained_preparation(
             or acceptance.get("force_accept_reason") != force_accept_reason
         ):
             raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained preparation conflicts with this retry")
+        if folder != lane_record_dir(rt, epoch_id, lane["lane_id"]):
+            try:
+                terminal_evidence.validate_root_siblings(
+                    rt, epoch_id, lane["lane_id"], lane["run_id"], terminal,
+                )
+            except terminal_evidence.TerminalEvidenceError as exc:
+                raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
         if managed_event.get("state") != "COMPLETE":
             try:
                 close_event(
