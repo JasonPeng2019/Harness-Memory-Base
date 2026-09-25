@@ -784,10 +784,10 @@ class ReviewedExperienceService:
         """
 
         trajectory = self.get_trajectory(trajectory_id)
+        adapter.assert_scope(trajectory["scope"])
         existing = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
         if not experience_write:
             return existing
-        adapter.assert_scope(trajectory["scope"])
         if existing is not None:
             if existing["status"] in {"pending", "uncertain"}:
                 return await self.reconcile_extraction(
@@ -836,10 +836,10 @@ class ReviewedExperienceService:
         """Confirm exact case receipts, or pause reconciliation while writing is off."""
 
         trajectory = self.get_trajectory(trajectory_id)
+        adapter.assert_scope(trajectory["scope"])
         ingestion = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
         if not experience_write:
             return ingestion
-        adapter.assert_scope(trajectory["scope"])
         if ingestion is None:
             raise ExperienceError("no reviewed-experience ingestion exists to reconcile")
         if ingestion["status"] == "confirmed":
