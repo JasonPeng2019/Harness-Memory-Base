@@ -8,6 +8,7 @@ own process cleanup, and copies a valid ACCEPTED advancement into its status.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import processes
+from . import memory_handoff, processes
 from .config import find_harness_root, load_config
 from .core import content_hash, iso_utc, read_json, require_schema
 from .epochs import lane_record_dir
@@ -119,6 +120,70 @@ def _write_status(lane: dict[str, Any], fields: dict[str, Any]) -> None:
         record.update(fields)
         record["updated_at"] = iso_utc()
         atomic_write_json(path, record)
+
+
+def _validate_enhanced_dispatch(
+    lane: dict[str, Any], invocation: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Attest the accepted dispatch before this controller can own a PID."""
+
+    state = lane.get("memory_plan_state")
+    if state is None:
+        if invocation.get("dispatch_binding") is not None:
+            raise ControllerError(LAUNCH_INVOCATION_INVALID, "unexpected enhanced dispatch binding")
+        return None
+    if state != "execution_accepted":
+        raise ControllerError(LAUNCH_INVOCATION_INVALID, "enhanced lane has no accepted plan")
+    worktree = Path(lane["worktree_path"])
+    workspace = worktree / ".agent-workspace"
+    try:
+        card = read_json(workspace / "task-card.json")
+        envelope = memory_handoff.load_envelope(worktree)
+        if envelope is None:
+            raise ValueError("missing envelope")
+        memory_handoff.validate_envelope_for_launch(
+            envelope=envelope,
+            task_card=card,
+            lane_id=lane["lane_id"],
+            run_id=lane["run_id"],
+            worktree_path=worktree,
+            base_commit=card["base_commit"],
+        )
+        context = memory_handoff.load_final_context(
+            worktree_path=worktree, envelope=envelope
+        )
+        memory_handoff.validate_final_context_for_launch(
+            context=context,
+            envelope=envelope,
+            task_card=card,
+            lane_id=lane["lane_id"],
+            run_id=lane["run_id"],
+            worktree_path=worktree,
+            base_commit=card["base_commit"],
+        )
+        prompt = workspace / "worker-prompt.md"
+        binding = memory_handoff.dispatch_binding(envelope=envelope, context=context)
+        if (
+            invocation.get("content_hash") != content_hash(invocation)
+            or invocation.get("dispatch_binding") != binding
+            or invocation.get("prompt_digest") != hashlib.sha256(prompt.read_bytes()).hexdigest()
+            or invocation.get("provider") != lane.get("provider")
+            or invocation.get("cwd") != str(worktree)
+            or invocation.get("paths", {}).get("prompt") != str(prompt)
+        ):
+            raise ValueError("invocation binding mismatch")
+        memory_handoff.validate_worker_material(
+            worktree_path=worktree,
+            invocation=invocation,
+            environment=os.environ,
+            task_card=card,
+        )
+        return binding
+    except Exception as exc:
+        raise ControllerError(
+            LAUNCH_INVOCATION_INVALID,
+            "enhanced controller dispatch identity or worker material is invalid",
+        ) from exc
 
 
 def _append_event(lane: dict[str, Any], event_type: str, detail: str) -> None:
@@ -475,6 +540,8 @@ def run_controller(lane_id: str) -> int:
         raise ControllerError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
     provider_id = invocation["provider"]["id"]
 
+    dispatch_binding = _validate_enhanced_dispatch(lane, invocation)
+
     _write_status(lane, {"controller_state": "starting"})
     _append_event(lane, "controller_started", lane_id)
 
@@ -493,6 +560,10 @@ def run_controller(lane_id: str) -> int:
             "process": {"pid": identity["pid"], "creation_time": identity["creation_time"]},
         },
     )
+    _write_status(lane, {
+        "controller_identity": identity,
+        **({"dispatch_binding": dispatch_binding} if dispatch_binding is not None else {}),
+    })
     try:
         binding = _load_binding(harness_root, provider_id)
     except Exception as exc:

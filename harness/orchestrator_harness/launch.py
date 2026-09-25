@@ -7,6 +7,8 @@ lane hard stop.  Retire is the graceful end of an accepted lane.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -15,7 +17,7 @@ from typing import Any, Mapping
 from . import memory_handoff, processes
 from .bootstrap import BootstrapError, _validate_provider_launch_config
 from .config import find_harness_root, load_config
-from .core import read_json, require_schema
+from .core import content_hash, read_json, require_schema
 from .epochs import (
     close_epoch,
     epoch_dir,
@@ -28,7 +30,7 @@ from .epochs import (
 from .lanes import find_active_lane, read_lane, update_lane
 from .leases import force_release_leases, release_leases
 from .manager_queue import read_manager_queue
-from .records import read_record
+from .records import RecordLock, read_record
 from .setup import read_runtime_state
 
 INVOCATION_SCHEMA = "controller-invocation/v1"
@@ -43,6 +45,7 @@ LAUNCH_BINDING_FAILED = "LAUNCH_BINDING_FAILED"
 LAUNCH_LEASE_BUSY = "LAUNCH_LEASE_BUSY"
 LAUNCH_CONTROLLER_START_FAILED = "LAUNCH_CONTROLLER_START_FAILED"
 LAUNCH_PROVIDER_START_FAILED = "LAUNCH_PROVIDER_START_FAILED"
+LAUNCH_DISPATCH_AMBIGUOUS = "LAUNCH_DISPATCH_AMBIGUOUS"
 FORCE_STOP_LANE_NOT_FOUND = "FORCE_STOP_LANE_NOT_FOUND"
 FORCE_STOP_PROCESS_SURVIVED = "FORCE_STOP_PROCESS_SURVIVED"
 FORCE_STOP_ALLOWANCE_EXPIRED = "FORCE_STOP_ALLOWANCE_EXPIRED"
@@ -197,6 +200,114 @@ def _declared_worker_environment(task_card: Mapping[str, Any] | None) -> str | N
     return mode
 
 
+def _lookup_native_invocation(
+    rt: Path, epoch_id: str, lane: Mapping[str, Any], *,
+    expected_binding: Mapping[str, Any], expected_pid: int | None = None,
+) -> dict[str, Any] | None:
+    """Look up the controller's exact lane/run and PID/creation incarnation.
+
+    The controller writes its process identity to the lane and attests the
+    binding in its status. Both are needed before a lost acknowledgement can
+    be reconciled to this dispatch.
+    """
+
+    current = read_lane(rt, epoch_id, str(lane["lane_id"]))
+    if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path")):
+        raise LaunchError(
+            LAUNCH_DISPATCH_AMBIGUOUS,
+            "native lane ownership changed during dispatch reconciliation",
+        )
+    process = current.get("process") or {}
+    pid = process.get("pid")
+    creation = process.get("creation_time")
+    if not isinstance(pid, int) or pid <= 0 or not isinstance(creation, str) or not creation:
+        return None
+    if expected_pid is not None and pid != expected_pid:
+        raise LaunchError(
+            LAUNCH_DISPATCH_AMBIGUOUS,
+            "a different native controller owns this lane and run",
+        )
+    status = _read_controller_status(current)
+    if status is not None and status.get("dispatch_binding") is not None and status["dispatch_binding"] != expected_binding:
+        raise LaunchError(
+            LAUNCH_DISPATCH_AMBIGUOUS,
+            "native controller attests a conflicting dispatch binding",
+        )
+    if status is None or status.get("dispatch_binding") != expected_binding:
+        return None
+    if status.get("controller_identity") != {"pid": pid, "creation_time": creation}:
+        raise LaunchError(
+            LAUNCH_DISPATCH_AMBIGUOUS,
+            "native controller attests a conflicting process identity",
+        )
+    if status.get("lane_id") != lane["lane_id"] or status.get("run_id") != lane["run_id"]:
+        raise LaunchError(
+            LAUNCH_DISPATCH_AMBIGUOUS,
+            "native controller attests a conflicting lane or run",
+        )
+    live = processes.identity_matches(pid, creation)
+    terminal = bool(
+        status is not None
+        and status.get("run_id") == lane["run_id"]
+        and status.get("controller_state") == "exited"
+        and status.get("cleanup_proven") is True
+    )
+    if not live and not terminal:
+        return None
+    return {"pid": pid, "creation_time": creation}
+
+
+def _wait_for_spawn_attestation(
+    rt: Path, epoch_id: str, lane: Mapping[str, Any], child: subprocess.Popen[Any],
+    *, expected_binding: Mapping[str, Any], identity: dict[str, Any] | None,
+    deadline: float,
+) -> dict[str, Any] | None:
+    """Wait within the handshake allowance for the exact native controller."""
+    while True:
+        if identity is None:
+            identity = _lookup_native_invocation(
+                rt, epoch_id, lane,
+                expected_binding=expected_binding, expected_pid=child.pid,
+            )
+            if identity is not None:
+                return identity
+        else:
+            current = read_lane(rt, epoch_id, str(lane["lane_id"]))
+            if any(current.get(field) != lane.get(field) for field in ("lane_id", "run_id", "worktree_path")):
+                raise LaunchError(
+                    LAUNCH_DISPATCH_AMBIGUOUS,
+                    "native lane ownership changed before controller attestation",
+                )
+            recorded_process = current.get("process") or {}
+            if recorded_process and recorded_process != identity:
+                raise LaunchError(
+                    LAUNCH_DISPATCH_AMBIGUOUS,
+                    "a different native process occupied this lane and run",
+                )
+            status = _read_controller_status(current)
+            if status is not None:
+                if status.get("dispatch_binding") not in (None, expected_binding):
+                    raise LaunchError(
+                        LAUNCH_DISPATCH_AMBIGUOUS,
+                        "native controller attests a conflicting dispatch binding",
+                    )
+                if status.get("controller_identity") not in (None, identity):
+                    raise LaunchError(
+                        LAUNCH_DISPATCH_AMBIGUOUS,
+                        "native controller attests a conflicting process identity",
+                    )
+                if (
+                    status.get("lane_id") == lane["lane_id"]
+                    and status.get("run_id") == lane["run_id"]
+                    and status.get("dispatch_binding") == expected_binding
+                    and status.get("controller_identity") == identity
+                ):
+                    return identity
+        if child.poll() is not None or time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
+
+
 def run_launch(
     lane_id: str, *, allowance_seconds: float | None = None
 ) -> dict[str, Any]:
@@ -234,7 +345,7 @@ def run_launch(
         return {
             "ok": False,
             "code": LAUNCH_CONTROLLER_START_FAILED,
-            "summary": str(exc),
+            "summary": memory_handoff.redact_control_diagnostic(str(exc)),
             "evidence_paths": [],
             "next_action": "fix the configuration and re-run setup",
         }
@@ -321,6 +432,7 @@ def run_launch(
         except memory_handoff.MemoryHandoffError as exc:
             raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
         memory_envelope: dict[str, Any] | None = None
+        final_context: dict[str, Any] | None = None
         if memory_state is not None:
             memory_envelope = memory_handoff.load_envelope(lane["worktree_path"])
             if memory_envelope is None:
@@ -353,14 +465,32 @@ def run_launch(
                     worktree_path=lane["worktree_path"],
                     base_commit=base_commit,
                 )
+                if invocation.get("content_hash") != content_hash(invocation):
+                    raise memory_handoff.MemoryHandoffError("controller invocation integrity changed")
+                if invocation.get("dispatch_binding") != memory_handoff.dispatch_binding(
+                    envelope=memory_envelope, context=final_context
+                ):
+                    raise memory_handoff.MemoryHandoffError(
+                        "controller invocation dispatch identity changed"
+                    )
+                prompt_path = Path(lane["worktree_path"]) / ".agent-workspace" / "worker-prompt.md"
+                if invocation.get("prompt_digest") != hashlib.sha256(prompt_path.read_bytes()).hexdigest():
+                    raise memory_handoff.MemoryHandoffError(
+                        "controller invocation worker prompt changed"
+                    )
+                if (
+                    invocation.get("provider") != lane.get("provider")
+                    or invocation.get("cwd") != lane["worktree_path"]
+                    or invocation.get("paths", {}).get("prompt")
+                    != str(Path(lane["worktree_path"]) / ".agent-workspace" / "worker-prompt.md")
+                ):
+                    raise memory_handoff.MemoryHandoffError(
+                        "controller invocation differs from the prepared lane"
+                    )
             except memory_handoff.PendingPlanError as exc:
                 raise LaunchError(LAUNCH_PLAN_PENDING, str(exc)) from exc
             except memory_handoff.MemoryHandoffError as exc:
                 raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
-            memory_handoff.record_dispatch_intent(
-                worktree_path=lane["worktree_path"],
-                envelope=memory_envelope,
-            )
         binding_path = (
             harness_root / "orchestrator_harness" / "provider_adapters" / provider_id / "launcher_binding.py"
         )
@@ -374,53 +504,253 @@ def run_launch(
             )
 
         spawn_options: dict[str, Any] = {"cwd": str(harness_root)}
-        if memory_envelope is not None or worker_environment == WORKER_ENVIRONMENT_SCRUBBED:
-            spawn_options["env"] = memory_handoff.worker_environment()
-        child = processes.spawn_detached(
-            processes.python_argv("orchestrator_harness.controller", lane_id),
-            **spawn_options,
-        )
-        controller_identity = processes.process_identity(child.pid)
-        if controller_identity is None:
-            if memory_envelope is not None:
-                memory_handoff.record_ambiguous_dispatch(
-                    worktree_path=lane["worktree_path"],
-                    envelope=memory_envelope,
+        if memory_envelope is not None:
+            try:
+                spawn_options["env"] = memory_handoff.worker_environment(
+                    task_card, provider_id=provider_id
                 )
-            child.terminate()
-            child.wait(timeout=10.0)
-            raise LaunchError(
-                LAUNCH_CONTROLLER_START_FAILED,
-                "cannot record the launched controller process identity",
-            )
-        if memory_envelope is not None and controller_identity is not None:
-            memory_handoff.record_observed_invocation(
-                worktree_path=lane["worktree_path"],
-                envelope=memory_envelope,
-                observed_invocation={
-                    "invocation_id": (
-                        f"controller:{controller_identity['pid']}:"
-                        f"{controller_identity['creation_time']}"
-                    ),
+                memory_handoff.validate_worker_material(
+                    worktree_path=lane["worktree_path"],
+                    invocation=invocation,
+                    environment=spawn_options["env"],
+                    task_card=task_card,
+                )
+            except memory_handoff.MemoryHandoffError as exc:
+                raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
+        elif worker_environment == WORKER_ENVIRONMENT_SCRUBBED:
+            from memory_harness import privacy
+
+            spawn_options["env"] = privacy.worker_environment(os.environ)
+        argv = processes.python_argv("orchestrator_harness.controller", lane_id)
+        if memory_envelope is not None:
+            assert final_context is not None
+            # Serialize only the final intent/native-ownership transition.
+            # The operation row is the durable intent; this lock adds no
+            # second receipt or launcher and closes concurrent launch races.
+            with RecordLock(memory_handoff.memory_paths(lane["worktree_path"])[1]):
+                try:
+                    locked_lane = read_lane(rt, epoch_id, lane_id)
+                    if any(
+                        locked_lane.get(field) != lane.get(field)
+                        for field in (
+                            "lane_id", "run_id", "worktree_path", "provider",
+                            "memory_plan_state", "worker_environment", "dispatchable",
+                            "launch_pending", "lifecycle",
+                        )
+                    ):
+                        raise memory_handoff.MemoryHandoffError(
+                            "lane dispatch identity changed before native launch"
+                        )
+                    current_card = read_json(task_card_path)
+                    current_envelope = memory_handoff.load_envelope(lane["worktree_path"])
+                    if current_card != task_card or current_envelope != memory_envelope:
+                        raise memory_handoff.MemoryHandoffError(
+                            "accepted task or dispatch envelope changed before native launch"
+                        )
+                    if read_json(invocation_path) != invocation:
+                        raise memory_handoff.MemoryHandoffError(
+                            "controller invocation changed before native launch"
+                        )
+                    if invocation["prompt_digest"] != hashlib.sha256(
+                        (Path(lane["worktree_path"]) / ".agent-workspace" / "worker-prompt.md").read_bytes()
+                    ).hexdigest():
+                        raise memory_handoff.MemoryHandoffError(
+                            "worker prompt changed before native launch"
+                        )
+                    memory_handoff.validate_envelope_for_launch(
+                        envelope=current_envelope,
+                        task_card=current_card,
+                        lane_id=lane_id,
+                        run_id=str(lane["run_id"]),
+                        worktree_path=lane["worktree_path"],
+                        base_commit=base_commit,
+                    )
+                    current_context = memory_handoff.load_final_context(
+                        worktree_path=lane["worktree_path"], envelope=memory_envelope
+                    )
+                    memory_handoff.validate_final_context_for_launch(
+                        context=current_context,
+                        envelope=memory_envelope,
+                        task_card=task_card,
+                        lane_id=lane_id,
+                        run_id=str(lane["run_id"]),
+                        worktree_path=lane["worktree_path"],
+                        base_commit=base_commit,
+                    )
+                    if current_context != final_context:
+                        raise memory_handoff.MemoryHandoffError(
+                            "durable final context changed before native launch"
+                        )
+                    memory_handoff.validate_worker_material(
+                        worktree_path=lane["worktree_path"],
+                        invocation=invocation,
+                        environment=spawn_options["env"],
+                        task_card=current_card,
+                    )
+                    existing = memory_handoff.get_dispatch_operation(
+                        worktree_path=lane["worktree_path"], envelope=memory_envelope
+                    )
+                except (OSError, ValueError, memory_handoff.MemoryHandoffError) as exc:
+                    raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
+                if existing is not None:
+                    observed = existing.get("observed_invocation")
+                    if existing["status"] == "delivered" and isinstance(observed, Mapping):
+                        expected = memory_handoff.native_observation(
+                            envelope=memory_envelope,
+                            context=final_context,
+                            controller_identity=observed,
+                        )
+                        if observed != expected:
+                            raise LaunchError(
+                                LAUNCH_DISPATCH_AMBIGUOUS,
+                                "stored native owner conflicts with this exact dispatch",
+                            )
+                        recorded_process = read_lane(rt, epoch_id, lane_id).get("process") or {}
+                        if recorded_process and any(
+                            recorded_process.get(field) != observed.get(field)
+                            for field in ("pid", "creation_time")
+                        ):
+                            raise LaunchError(
+                                LAUNCH_DISPATCH_AMBIGUOUS,
+                                "a conflicting native controller occupies this lane and run",
+                            )
+                    else:
+                        controller_identity = _lookup_native_invocation(
+                            rt, epoch_id, lane,
+                            expected_binding=invocation["dispatch_binding"],
+                        )
+                        if controller_identity is None:
+                            raise LaunchError(
+                                LAUNCH_DISPATCH_AMBIGUOUS,
+                                "dispatch intent has unresolved native ownership; reconcile the exact lane and run before retry",
+                            )
+                        observed = memory_handoff.native_observation(
+                            envelope=memory_envelope,
+                            context=final_context,
+                            controller_identity=controller_identity,
+                        )
+                        memory_handoff.record_observed_invocation(
+                            worktree_path=lane["worktree_path"],
+                            envelope=memory_envelope,
+                            observed_invocation=observed,
+                        )
+                    update_lane(
+                        rt, epoch_id, lane_id,
+                        lambda current: {**current, "launch_pending": False},
+                    )
+                    return {
+                        "ok": True,
+                        "code": "LAUNCH_OK",
+                        "summary": f"lane {lane_id} has one reconciled native invocation",
+                        "evidence_paths": [str(memory_handoff.memory_paths(lane["worktree_path"])[0])],
+                        "next_action": "continue the existing harness review and cleanup lifecycle",
+                    }
+                if launch_deadline is not None and time.monotonic() >= launch_deadline:
+                    raise LaunchError(
+                        LAUNCH_ALLOWANCE_EXPIRED,
+                        "the enclosing allowance expired before dispatch intent; no native controller started",
+                    )
+                try:
+                    memory_handoff.record_dispatch_intent(
+                        worktree_path=lane["worktree_path"], envelope=memory_envelope
+                    )
+                except memory_handoff.MemoryHandoffError as exc:
+                    raise LaunchError(LAUNCH_DISPATCH_AMBIGUOUS, str(exc)) from exc
+                if launch_deadline is not None and time.monotonic() >= launch_deadline:
+                    raise LaunchError(
+                        LAUNCH_ALLOWANCE_EXPIRED,
+                        "the enclosing allowance expired after intent; native ownership remains unresolved",
+                    )
+                try:
+                    child = processes.spawn_detached(argv, **spawn_options)
+                except Exception as exc:
+                    memory_handoff.record_ambiguous_dispatch(
+                        worktree_path=lane["worktree_path"], envelope=memory_envelope
+                    )
+                    raise LaunchError(
+                        LAUNCH_DISPATCH_AMBIGUOUS,
+                        "native launch acknowledgement was lost; reconcile exact ownership before retry",
+                    ) from exc
+                attestation_deadline = time.monotonic() + HANDSHAKE_TIMEOUT_SECONDS
+                if launch_deadline is not None:
+                    attestation_deadline = min(attestation_deadline, launch_deadline)
+                try:
+                    controller_identity = _wait_for_spawn_attestation(
+                        rt, epoch_id, lane, child,
+                        expected_binding=invocation["dispatch_binding"],
+                        identity=processes.process_identity(child.pid),
+                        deadline=attestation_deadline,
+                    )
+                except LaunchError:
+                    memory_handoff.record_ambiguous_dispatch(
+                        worktree_path=lane["worktree_path"], envelope=memory_envelope
+                    )
+                    raise
+                if controller_identity is None:
+                    memory_handoff.record_ambiguous_dispatch(
+                        worktree_path=lane["worktree_path"], envelope=memory_envelope
+                    )
+                    raise LaunchError(
+                        LAUNCH_DISPATCH_AMBIGUOUS,
+                        "native controller identity is unresolved; reconcile exact ownership before retry",
+                    )
+                try:
+                    memory_handoff.record_observed_invocation(
+                        worktree_path=lane["worktree_path"],
+                        envelope=memory_envelope,
+                        observed_invocation=memory_handoff.native_observation(
+                            envelope=memory_envelope,
+                            context=final_context,
+                            controller_identity=controller_identity,
+                        ),
+                    )
+                except Exception as exc:
+                    raise LaunchError(
+                        LAUNCH_DISPATCH_AMBIGUOUS,
+                        "native observation is unresolved; reconcile exact ownership before retry",
+                    ) from exc
+        else:
+            child = processes.spawn_detached(argv, **spawn_options)
+            controller_identity = processes.process_identity(child.pid)
+            if controller_identity is None:
+                child.terminate()
+                child.wait(timeout=10.0)
+                raise LaunchError(
+                    LAUNCH_CONTROLLER_START_FAILED,
+                    "cannot record the launched controller process identity",
+                )
+        def mark_launched(current: dict[str, Any]) -> dict[str, Any]:
+            if memory_envelope is not None:
+                if current.get("run_id") != lane.get("run_id"):
+                    raise LaunchError(
+                        LAUNCH_DISPATCH_AMBIGUOUS,
+                        "lane run changed after native observation",
+                    )
+                current_process = current.get("process") or {}
+                if current_process and current_process != controller_identity:
+                    raise LaunchError(
+                        LAUNCH_DISPATCH_AMBIGUOUS,
+                        "a conflicting native process owns the observed run",
+                    )
+            return {
+                **current,
+                "lifecycle": "running",
+                "process": {
                     "pid": controller_identity["pid"],
                     "creation_time": controller_identity["creation_time"],
                 },
-            )
+                "launch_pending": False,
+            }
+
         try:
             lane = update_lane(
                 rt,
                 epoch_id,
                 lane_id,
-                lambda current: {
-                    **current,
-                    "lifecycle": "running",
-                    "process": {
-                        "pid": controller_identity["pid"],
-                        "creation_time": controller_identity["creation_time"],
-                    },
-                    "launch_pending": False,
-                },
+                mark_launched,
             )
+        except LaunchError:
+            raise
         except Exception as exc:
             child.terminate()
             child.wait(timeout=10.0)
@@ -449,6 +779,11 @@ def run_launch(
             )
             if running or terminal:
                 lane = read_lane(rt, epoch_id, lane_id)
+                if memory_envelope is not None and lane.get("run_id") != invocation["run_id"]:
+                    raise LaunchError(
+                        LAUNCH_DISPATCH_AMBIGUOUS,
+                        "lane run changed during native launch handshake",
+                    )
                 state = status.get("recorded_status") if terminal else "running"
                 return {
                     "ok": True,
@@ -501,7 +836,7 @@ def run_launch(
         return {
             "ok": False,
             "code": exc.code,
-            "summary": str(exc),
+            "summary": memory_handoff.redact_control_diagnostic(str(exc)),
             "evidence_paths": exc.evidence_paths,
             "next_action": "on LAUNCH_LEASE_BUSY, wait for the holder to finish and re-launch",
         }
@@ -509,7 +844,7 @@ def run_launch(
         return {
             "ok": False,
             "code": LAUNCH_CONTROLLER_START_FAILED,
-            "summary": str(exc),
+            "summary": memory_handoff.redact_control_diagnostic(str(exc)),
             "evidence_paths": [],
             "next_action": "resolve the error and re-launch",
         }

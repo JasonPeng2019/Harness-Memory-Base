@@ -13,6 +13,7 @@ worktree, and base before recording any dispatch intent.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -26,7 +27,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from orchestrator_harness import bootstrap, launch, lanes, memory_handoff, resume, setup
+from orchestrator_harness import bootstrap, controller, launch, lanes, memory_handoff, resume, setup
 from memory_harness import config, contracts, store
 
 
@@ -236,17 +237,36 @@ class LaunchBoundaryFixture:
                 lane_id=lane_id, resume_task_card=str(task_card_path)
             )
 
-    def run_launch(self, *, lane_id: str) -> tuple[dict, MagicMock]:
+    def run_launch(
+        self, *, lane_id: str, status: dict | None = None,
+        allowance_seconds: float | None = None,
+    ) -> tuple[dict, MagicMock]:
         child = MagicMock(pid=41)
         child.poll.return_value = 0
-        terminal = {
+        terminal = status or {
             "schema": "controller-status/v1",
             "lane_id": lane_id,
+            "run_id": self.lane_record(lane_id)["run_id"],
             "controller_state": "exited",
             "provider_state": {"state": "exited", "exit_code": 0},
             "cleanup_proven": True,
             "recorded_status": "review_pending",
         }
+        if status is None:
+            envelope = memory_handoff.load_envelope(self.lane_record(lane_id)["worktree_path"])
+            if envelope is not None:
+                try:
+                    context = memory_handoff.load_final_context(
+                        worktree_path=self.lane_record(lane_id)["worktree_path"],
+                        envelope=envelope,
+                    )
+                except memory_handoff.MemoryHandoffError:
+                    context = None
+                if context is not None:
+                    terminal["controller_identity"] = {"pid": 41, "creation_time": "ct-1"}
+                    terminal["dispatch_binding"] = memory_handoff.dispatch_binding(
+                        envelope=envelope, context=context
+                    )
         with (
             patch.object(launch, "find_harness_root", return_value=self.harness),
             patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
@@ -259,7 +279,7 @@ class LaunchBoundaryFixture:
             ),
             patch.object(launch, "_read_controller_status", return_value=terminal),
         ):
-            result = launch.run_launch(lane_id)
+            result = launch.run_launch(lane_id, allowance_seconds=allowance_seconds)
         return result, spawn
 
     def _read_active_lane(self, rt: Path, lane_id: str) -> tuple[str, dict]:
@@ -555,10 +575,18 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
                 return_value={
                     "schema": "controller-status/v1",
                     "lane_id": "launch-lane",
+                    "run_id": self.envelope["run_id"],
                     "controller_state": "exited",
                     "provider_state": {"state": "exited", "exit_code": 0},
                     "cleanup_proven": True,
                     "recorded_status": "review_pending",
+                    "controller_identity": {"pid": 41, "creation_time": "ct-1"},
+                    "dispatch_binding": memory_handoff.dispatch_binding(
+                        envelope=self.envelope,
+                        context=memory_handoff.load_final_context(
+                            worktree_path=self.worktree, envelope=self.envelope
+                        ),
+                    ),
                 },
             ),
         ):
@@ -582,11 +610,474 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
             self.assertEqual(1, len(operations))
             self.assertEqual("delivered", operations[0]["status"])
             self.assertEqual(41, operations[0]["observed_invocation"]["pid"])
+            observed_invocation = operations[0]["observed_invocation"]
+            for field, expected in {
+                "task_card_digest": self.card["content_hash"],
+                "decision_id": self.envelope["decision_id"],
+                "plan_id": self.plan["plan_id"],
+                "plan_digest": self.plan["content_hash"],
+                "lane_id": "launch-lane",
+                "run_id": self.envelope["run_id"],
+                "envelope_digest": self.envelope["content_hash"],
+                "context_id": memory_handoff.load_final_context(
+                    worktree_path=self.worktree, envelope=self.envelope
+                )["context_id"],
+            }.items():
+                self.assertEqual(expected, observed_invocation[field], field)
         finally:
             memory_store.close()
         lane = self.fixture.lane_record("launch-lane")
         self.assertEqual("running", lane["lifecycle"])
         self.assertFalse(lane["launch_pending"])
+
+    def test_lost_acknowledgement_reconciles_exact_native_lane_without_spawning(self) -> None:
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        memory_handoff.record_ambiguous_dispatch(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        self.fixture.write_lane_fields(
+            "launch-lane",
+            process={"pid": 57, "creation_time": "native-57"},
+            lifecycle="running",
+        )
+        with patch.object(launch.processes, "identity_matches", return_value=True) as lookup:
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane", status={
+                "lane_id": "launch-lane", "run_id": self.envelope["run_id"],
+                "controller_state": "running", "cleanup_proven": False,
+                "controller_identity": {"pid": 57, "creation_time": "native-57"},
+                "dispatch_binding": memory_handoff.dispatch_binding(
+                    envelope=self.envelope,
+                    context=memory_handoff.load_final_context(
+                        worktree_path=self.worktree, envelope=self.envelope
+                    ),
+                ),
+            })
+        self.assertTrue(result["ok"], result)
+        lookup.assert_called_with(57, "native-57")
+        spawn.assert_not_called()
+        memory_store = self.fixture.open_store(self.worktree)
+        try:
+            operation = memory_store.list_operations(self.envelope["decision_id"])[0]
+            self.assertEqual("delivered", operation["status"])
+            self.assertEqual(57, operation["observed_invocation"]["pid"])
+            self.assertEqual(self.envelope["content_hash"], operation["envelope_digest"])
+        finally:
+            memory_store.close()
+
+    def test_terminal_lookup_refuses_a_status_for_another_process(self) -> None:
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        self.fixture.write_lane_fields(
+            "launch-lane", process={"pid": 57, "creation_time": "native-57"}
+        )
+        with (
+            patch.object(launch.processes, "identity_matches", return_value=False),
+        ):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane", status={
+                "lane_id": "launch-lane", "run_id": self.envelope["run_id"],
+                "controller_state": "exited", "cleanup_proven": True,
+                "controller_identity": {"pid": 58, "creation_time": "native-58"},
+            })
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, result["code"])
+        spawn.assert_not_called()
+
+    def test_terminal_lookup_reconciles_matching_attested_controller(self) -> None:
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        self.fixture.write_lane_fields(
+            "launch-lane", process={"pid": 57, "creation_time": "native-57"}
+        )
+        with patch.object(launch.processes, "identity_matches", return_value=False):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane", status={
+                "lane_id": "launch-lane", "run_id": self.envelope["run_id"],
+                "controller_state": "exited", "cleanup_proven": True,
+                "controller_identity": {"pid": 57, "creation_time": "native-57"},
+                "dispatch_binding": memory_handoff.dispatch_binding(
+                    envelope=self.envelope,
+                    context=memory_handoff.load_final_context(
+                        worktree_path=self.worktree, envelope=self.envelope
+                    ),
+                ),
+            })
+        self.assertTrue(result["ok"], result)
+        spawn.assert_not_called()
+
+    def test_live_lookup_rejects_conflicting_controller_attestation(self) -> None:
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        self.fixture.write_lane_fields(
+            "launch-lane", process={"pid": 57, "creation_time": "native-57"}
+        )
+        with patch.object(launch.processes, "identity_matches", return_value=True):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane", status={
+                "lane_id": "launch-lane", "run_id": self.envelope["run_id"],
+                "controller_state": "running", "cleanup_proven": False,
+                "controller_identity": {"pid": 57, "creation_time": "native-57"},
+                "dispatch_binding": {"plan_digest": "different-plan"},
+            })
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, result["code"])
+        spawn.assert_not_called()
+
+    def test_live_lookup_does_not_accept_an_unattested_process(self) -> None:
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        self.fixture.write_lane_fields(
+            "launch-lane", process={"pid": 57, "creation_time": "native-57"}
+        )
+        with patch.object(launch.processes, "identity_matches", return_value=True):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane", status={
+                "lane_id": "launch-lane", "run_id": self.envelope["run_id"],
+                "controller_state": "running", "cleanup_proven": False,
+                "controller_identity": {"pid": 57, "creation_time": "native-57"},
+            })
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, result["code"])
+        spawn.assert_not_called()
+
+    def test_spawn_without_controller_attestation_keeps_intent_unresolved(self) -> None:
+        result, spawn = self.fixture.run_launch(lane_id="launch-lane", status={
+            "lane_id": "launch-lane", "run_id": self.envelope["run_id"],
+            "controller_state": "running", "cleanup_proven": False,
+        })
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, result["code"])
+        spawn.assert_called_once()
+        memory_store = self.fixture.open_store(self.worktree)
+        try:
+            operation = memory_store.list_operations(self.envelope["decision_id"])[0]
+            self.assertIn(operation["status"], ("pending", "ambiguous"))
+        finally:
+            memory_store.close()
+
+    def test_changed_lane_run_at_dispatch_lock_refuses_intent(self) -> None:
+        real_lock = launch.RecordLock
+
+        class ChangedLaneLock:
+            def __init__(inner, path: Path) -> None:
+                inner.lock = real_lock(path)
+
+            def __enter__(inner):
+                self.fixture.write_lane_fields("launch-lane", run_id="another-run")
+                return inner.lock.__enter__()
+
+            def __exit__(inner, exc_type, exc, traceback):
+                return inner.lock.__exit__(exc_type, exc, traceback)
+
+        with patch.object(launch, "RecordLock", side_effect=ChangedLaneLock):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        spawn.assert_not_called()
+        memory_store = self.fixture.open_store(self.worktree)
+        try:
+            self.assertEqual([], memory_store.list_operations(self.envelope["decision_id"]))
+        finally:
+            memory_store.close()
+
+    def test_control_tool_added_at_dispatch_lock_refuses_intent(self) -> None:
+        real_lock = launch.RecordLock
+
+        class ChangedToolLock:
+            def __init__(inner, path: Path) -> None:
+                inner.lock = real_lock(path)
+
+            def __enter__(inner):
+                self.fixture.write_text(
+                    self.worktree / ".codex" / "config.toml",
+                    '[mcp_servers.policy_mutation]\ncommand = "control-tool"\n',
+                )
+                return inner.lock.__enter__()
+
+            def __exit__(inner, exc_type, exc, traceback):
+                return inner.lock.__exit__(exc_type, exc, traceback)
+
+        with patch.object(launch, "RecordLock", side_effect=ChangedToolLock):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        spawn.assert_not_called()
+        memory_store = self.fixture.open_store(self.worktree)
+        try:
+            self.assertEqual([], memory_store.list_operations(self.envelope["decision_id"]))
+        finally:
+            memory_store.close()
+
+    def test_new_run_after_observation_is_not_overwritten_by_launcher(self) -> None:
+        real_update = launch.update_lane
+
+        def resume_before_parent_update(rt, epoch_id, lane_id, updater):
+            real_update(
+                rt, epoch_id, lane_id,
+                lambda current: {**current, "run_id": "newer-run", "process": {}},
+            )
+            return real_update(rt, epoch_id, lane_id, updater)
+
+        with patch.object(launch, "update_lane", side_effect=resume_before_parent_update):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, result["code"])
+        spawn.assert_called_once()
+        self.assertEqual("newer-run", self.fixture.lane_record("launch-lane")["run_id"])
+        self.assertEqual({}, self.fixture.lane_record("launch-lane")["process"])
+
+    def test_delivered_dispatch_rejects_a_conflicting_native_owner(self) -> None:
+        context = memory_handoff.load_final_context(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        memory_handoff.record_observed_invocation(
+            worktree_path=self.worktree,
+            envelope=self.envelope,
+            observed_invocation=memory_handoff.native_observation(
+                envelope=self.envelope,
+                context=context,
+                controller_identity={"pid": 57, "creation_time": "native-57"},
+            ),
+        )
+        self.fixture.write_lane_fields(
+            "launch-lane", process={"pid": 58, "creation_time": "native-58"}
+        )
+        result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, result["code"])
+        spawn.assert_not_called()
+
+    def test_unresolved_intent_blocks_a_second_native_spawn(self) -> None:
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, result["code"])
+        spawn.assert_not_called()
+
+    def test_prepared_invocation_names_the_exact_dispatch_and_prompt(self) -> None:
+        invocation = json.loads(
+            (self.worktree / ".agent-workspace" / "invocation.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        context = memory_handoff.load_final_context(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        self.assertEqual(self.card["content_hash"], invocation["dispatch_binding"]["task_card_digest"])
+        self.assertEqual(self.plan["content_hash"], invocation["dispatch_binding"]["plan_digest"])
+        self.assertEqual(context["context_id"], invocation["dispatch_binding"]["context_id"])
+        self.assertEqual(self.envelope["run_id"], invocation["dispatch_binding"]["run_id"])
+        self.assertTrue(invocation["prompt_digest"])
+
+    def test_controller_refuses_a_different_dispatch_binding_before_provider(self) -> None:
+        invocation = json.loads(
+            (self.worktree / ".agent-workspace" / "invocation.json").read_text(encoding="utf-8")
+        )
+        invocation["dispatch_binding"]["plan_digest"] = "wrong-plan"
+        invocation["content_hash"] = contracts.content_hash(invocation)
+        with self.assertRaises(controller.ControllerError):
+            controller._validate_enhanced_dispatch(
+                self.fixture.lane_record("launch-lane"), invocation
+            )
+
+    def test_controller_attests_the_exact_prepared_dispatch(self) -> None:
+        invocation = json.loads(
+            (self.worktree / ".agent-workspace" / "invocation.json").read_text(encoding="utf-8")
+        )
+        with patch.dict(os.environ, memory_handoff.worker_environment(
+            self.card, provider_id="codex"
+        ), clear=True):
+            binding = controller._validate_enhanced_dispatch(
+                self.fixture.lane_record("launch-lane"), invocation
+            )
+        self.assertEqual(invocation["dispatch_binding"], binding)
+
+    def test_changed_prompt_refuses_dispatch_before_intent(self) -> None:
+        prompt = self.worktree / ".agent-workspace" / "worker-prompt.md"
+        prompt.write_text(prompt.read_text(encoding="utf-8") + "\nNew instructions\n", encoding="utf-8")
+        result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        spawn.assert_not_called()
+        memory_store = self.fixture.open_store(self.worktree)
+        try:
+            self.assertEqual([], memory_store.list_operations(self.envelope["decision_id"]))
+        finally:
+            memory_store.close()
+
+    def test_lost_spawn_identity_uses_exact_native_lookup_before_killing_child(self) -> None:
+        child = MagicMock(pid=57)
+
+        def spawn_and_publish(*args: object, **kwargs: object) -> MagicMock:
+            self.fixture.write_lane_fields(
+                "launch-lane", process={"pid": 57, "creation_time": "native-57"}
+            )
+            return child
+
+        with (
+            patch.object(launch, "find_harness_root", return_value=self.fixture.harness),
+            patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "find_active_lane", side_effect=self.fixture._read_active_lane),
+            patch.object(launch.processes, "spawn_detached", side_effect=spawn_and_publish) as spawn,
+            patch.object(launch.processes, "process_identity", return_value=None),
+            patch.object(launch.processes, "identity_matches", return_value=True),
+            patch.object(launch, "_read_controller_status", return_value={
+                "lane_id": "launch-lane", "run_id": self.envelope["run_id"],
+                "controller_state": "running", "provider_state": {"state": "running"},
+                "controller_identity": {"pid": 57, "creation_time": "native-57"},
+                "dispatch_binding": memory_handoff.dispatch_binding(
+                    envelope=self.envelope,
+                    context=memory_handoff.load_final_context(
+                        worktree_path=self.worktree, envelope=self.envelope
+                    ),
+                ),
+            }),
+        ):
+            result = launch.run_launch("launch-lane")
+        self.assertTrue(result["ok"], result)
+        spawn.assert_called_once()
+        child.terminate.assert_not_called()
+
+    def test_control_credentials_are_excluded_from_worker_environment(self) -> None:
+        card = dict(self.card)
+        card["worker_task_credentials"] = ["TASK_ONLY_TOKEN"]
+        card["content_hash"] = contracts.content_hash(card)
+        prepared, _ = self.fixture.run_bootstrap(lane_id="task-credential-lane", card=card)
+        self.assertTrue(prepared["ok"], prepared)
+        control = {
+            "MEMORY_HARNESS_APPROVAL_TOKEN": "approval-secret",
+            "MEMORY_HARNESS_PUBLICATION_KEY": "publication-secret",
+            "MEMORY_HARNESS_REVOCATION_TOKEN": "revocation-secret",
+            "MEMORY_HARNESS_POLICY_MUTATION_CREDENTIAL": "policy-secret",
+        }
+        with patch.dict(os.environ, {
+            **control,
+            "TASK_ONLY_TOKEN": "task-secret",
+            "TASK_ONLY_UNDECLARED_TOKEN": "unscoped-secret",
+        }):
+            result, spawn = self.fixture.run_launch(lane_id="task-credential-lane")
+        self.assertTrue(result["ok"], result)
+        env = spawn.call_args.kwargs["env"]
+        self.assertFalse(set(control) & set(env))
+        self.assertFalse("TASK_ONLY_TOKEN" in env, "unvalidated task token reached the worker")
+        self.assertFalse(
+            "TASK_ONLY_UNDECLARED_TOKEN" in env,
+            "undeclared task credential reached the worker",
+        )
+        prompt = (self.fixture.lane_record("task-credential-lane")["worktree_path"])
+        self.assertIn(
+            "Stop the dependent action",
+            (Path(prompt) / ".agent-workspace" / "worker-prompt.md").read_text(encoding="utf-8"),
+        )
+
+    def test_control_credential_in_prompt_fails_before_intent(self) -> None:
+        prompt = self.worktree / ".agent-workspace" / "worker-prompt.md"
+        prompt.write_text(
+            prompt.read_text(encoding="utf-8") + "\nMEMORY_HARNESS_APPROVAL_TOKEN=approval-secret\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"MEMORY_HARNESS_APPROVAL_TOKEN": "approval-secret"}):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        self.assertNotIn("approval-secret", result["summary"])
+        spawn.assert_not_called()
+        memory_store = self.fixture.open_store(self.worktree)
+        try:
+            self.assertEqual([], memory_store.list_operations(self.envelope["decision_id"]))
+        finally:
+            memory_store.close()
+
+    def test_launch_diagnostic_redacts_a_control_credential(self) -> None:
+        _, envelope_path = self.fixture.memory_paths(self.worktree)
+        changed = dict(self.envelope)
+        changed["route"] = "diagnostic-control-secret"
+        changed["content_hash"] = contracts.content_hash(changed)
+        self.fixture.write_json(envelope_path, changed)
+        with patch.dict(os.environ, {"MEMORY_HARNESS_CONTROL_TOKEN": "diagnostic-control-secret"}):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertNotIn("diagnostic-control-secret", result["summary"])
+        spawn.assert_not_called()
+
+    def test_control_credential_in_worker_tool_config_fails_before_intent(self) -> None:
+        config_path = self.worktree / ".codex" / "config.toml"
+        self.fixture.write_text(
+            config_path,
+            '[mcp_servers.product_approval]\ncommand = "approve"\n'
+            'token = "publication-secret"\n',
+        )
+        with patch.dict(os.environ, {"MEMORY_HARNESS_PUBLICATION_KEY": "publication-secret"}):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        self.assertNotIn("publication-secret", result["summary"])
+        spawn.assert_not_called()
+
+    def test_standalone_control_tool_config_fails_without_an_environment_key(self) -> None:
+        config_path = self.worktree / ".codex" / "config.toml"
+        self.fixture.write_text(
+            config_path,
+            '[mcp_servers.product_approval]\ncommand = "approve"\n'
+            'approval_token = "local-config-secret"\n',
+        )
+        result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        self.assertNotIn("local-config-secret", result["summary"])
+        spawn.assert_not_called()
+
+    def test_control_tool_with_neutral_name_and_approve_argument_is_refused(self) -> None:
+        self.fixture.write_text(
+            self.worktree / ".codex" / "config.toml",
+            '[mcp_servers.prod]\ncommand = "productctl"\nargs = ["approve"]\n',
+        )
+        result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        spawn.assert_not_called()
+
+    def test_global_provider_control_tool_config_is_refused(self) -> None:
+        codex_home = self.fixture.root / "global-codex"
+        self.fixture.write_text(
+            codex_home / "config.toml",
+            '[mcp_servers.prod]\ncommand = "productctl"\nargs = ["approve"]\n',
+        )
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        spawn.assert_not_called()
+
+    def test_expired_allowance_inside_dispatch_lock_creates_no_intent(self) -> None:
+        clock = [0.0]
+
+        def slow_operation(**kwargs: object) -> None:
+            clock[0] = 100.0
+            return None
+
+        with (
+            patch.object(launch.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(memory_handoff, "get_dispatch_operation", side_effect=slow_operation),
+        ):
+            result, spawn = self.fixture.run_launch(
+                lane_id="launch-lane", allowance_seconds=1.0
+            )
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_ALLOWANCE_EXPIRED, result["code"], result["summary"])
+        spawn.assert_not_called()
+        memory_store = self.fixture.open_store(self.worktree)
+        try:
+            self.assertEqual([], memory_store.list_operations(self.envelope["decision_id"]))
+        finally:
+            memory_store.close()
 
     def test_removed_envelope_is_pending_plan_and_never_spawns(self) -> None:
         store_path, envelope_path = self.fixture.memory_paths(self.worktree)
@@ -641,6 +1132,24 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
         )
         task_card_path = self.worktree / ".agent-workspace" / "task-card.json"
         self.fixture.write_json(task_card_path, replacement)
+        result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        spawn.assert_not_called()
+
+    def test_exact_accepted_plan_swap_refuses_before_intent(self) -> None:
+        revised = contracts.revise_plan(
+            self.plan, new_plan_id="revised-plan", new_content={"steps": ["new"]}
+        )
+        card = contracts.make_task_card(
+            task=self.card["task"],
+            base_commit=self.card["base_commit"],
+            branch=self.card["branch"],
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id=self.plan["objective_id"], route=self.plan["route"], plan=revised
+            ),
+        )
+        self.fixture.write_json(self.worktree / ".agent-workspace" / "task-card.json", card)
         result, spawn = self.fixture.run_launch(lane_id="launch-lane")
         self.assertFalse(result["ok"], result)
         self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
@@ -886,6 +1395,24 @@ class Step04ResumeBoundaryTests(unittest.TestCase):
         self.assertIn("cannot read memory dispatch envelope", resumed["summary"])
         self.assertEqual(prior_run, self.fixture.lane_record("unreadable-lane")["run_id"])
         self.assertEqual("{unreadable", envelope_path.read_text(encoding="utf-8"))
+
+    def test_resume_cannot_replace_an_unresolved_dispatch_run(self) -> None:
+        card, _ = accepted_card()
+        result, worktree = self.fixture.run_bootstrap(
+            lane_id="unresolved-resume", card=card
+        )
+        self.assertTrue(result["ok"], result)
+        envelope = memory_handoff.load_envelope(worktree)
+        prior_run = self.fixture.lane_record("unresolved-resume")["run_id"]
+        memory_handoff.record_dispatch_intent(
+            worktree_path=worktree, envelope=envelope
+        )
+        self.fixture.make_resumable("unresolved-resume")
+        resumed = self.fixture.run_resume(lane_id="unresolved-resume", card=card)
+        self.assertFalse(resumed["ok"], resumed)
+        self.assertIn("dispatch", resumed["summary"])
+        self.assertEqual(prior_run, self.fixture.lane_record("unresolved-resume")["run_id"])
+        self.assertEqual(envelope, memory_handoff.load_envelope(worktree))
 
     def test_resume_of_legacy_lane_keeps_the_ordinary_path(self) -> None:
         card = legacy_card()

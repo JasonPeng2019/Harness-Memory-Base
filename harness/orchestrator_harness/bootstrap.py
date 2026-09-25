@@ -12,7 +12,7 @@ skills.  Source trees stay unchanged.
 
 from __future__ import annotations
 
-import json
+import hashlib
 import json
 import shutil
 import subprocess
@@ -333,6 +333,14 @@ def _write_worker_prompt(
 ) -> Path:
     lines = [str(task_card["task"]).strip()]
     lines.extend(_render_memory_context(worktree))
+    if task_card.get("worker_task_credentials"):
+        lines.append(
+            "\n## Task credentials\n"
+            "The declared task credentials are withheld because their authority "
+            "has not been independently validated. Continue work that does not "
+            "need them. Stop the dependent action and request the required task "
+            "authority through the lane's escalation path."
+        )
     if rationale and rationale.strip():
         lines.append(f"\n## Resume rationale\n{rationale.strip()}")
     if managed:
@@ -375,6 +383,7 @@ def _write_invocation(
     model: str,
     launch_config: dict[str, str],
     exclusive_resources: list[str],
+    memory_envelope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     agent_workspace = worktree / ".agent-workspace"
     invocation = {
@@ -406,6 +415,16 @@ def _write_invocation(
         },
         "created_at": iso_utc(),
     }
+    if memory_envelope is not None:
+        context = memory_handoff.load_final_context(
+            worktree_path=worktree, envelope=memory_envelope
+        )
+        invocation["dispatch_binding"] = memory_handoff.dispatch_binding(
+            envelope=memory_envelope, context=context
+        )
+        invocation["prompt_digest"] = hashlib.sha256(
+            (agent_workspace / "worker-prompt.md").read_bytes()
+        ).hexdigest()
     invocation["content_hash"] = content_hash(invocation)
     atomic_write_json(agent_workspace / "invocation.json", invocation)
     return invocation
@@ -904,6 +923,7 @@ def run_bootstrap(
             model=model,
             launch_config=configured_launch,
             exclusive_resources=list(exclusive_resources),
+            memory_envelope=memory.envelope,
         )
 
         lane = base_lane_record()

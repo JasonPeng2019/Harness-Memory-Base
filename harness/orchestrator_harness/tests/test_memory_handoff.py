@@ -842,6 +842,52 @@ class MemoryHandoffSeamTests(unittest.TestCase):
                 envelope=envelope,
             )
 
+    def test_conflicting_envelope_cannot_create_another_intent_for_one_run(self) -> None:
+        envelope = memory_handoff.prepare_bootstrap_envelope(
+            task_card=self.card,
+            lane_id="lane-1",
+            run_id="run-1",
+            worktree_path=self.worktree,
+            base_commit="base-1",
+        )
+        first = memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=envelope
+        )
+        changed = dict(envelope)
+        changed["optional_content"] = [
+            {"id": "later", "kind": "memory", "content": "changed"}
+        ]
+        changed["content_hash"] = contracts.content_hash(changed)
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "conflicting"):
+            memory_handoff.record_dispatch_intent(
+                worktree_path=self.worktree, envelope=changed
+            )
+        memory_store = store.MemoryStore(memory_handoff.memory_paths(self.worktree)[0])
+        memory_store.initialize()
+        try:
+            self.assertEqual([first], memory_store.list_operations(envelope["decision_id"]))
+        finally:
+            memory_store.close()
+
+    def test_changed_decision_cannot_create_another_intent_for_one_run(self) -> None:
+        envelope = memory_handoff.prepare_bootstrap_envelope(
+            task_card=self.card,
+            lane_id="lane-1",
+            run_id="run-1",
+            worktree_path=self.worktree,
+            base_commit="base-1",
+        )
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=envelope
+        )
+        changed = dict(envelope)
+        changed["decision_id"] = "another-decision"
+        changed["content_hash"] = contracts.content_hash(changed)
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "conflicting"):
+            memory_handoff.record_dispatch_intent(
+                worktree_path=self.worktree, envelope=changed
+            )
+
     def test_optional_omission_preserves_plan_and_updates_delivery_trace(self) -> None:
         card_with_optional = contracts.make_task_card(
             task="Fix the regression",

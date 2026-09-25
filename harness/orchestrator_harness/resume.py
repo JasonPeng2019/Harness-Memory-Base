@@ -22,8 +22,8 @@ from .bootstrap import (
 from .config import find_harness_root, load_config
 from .core import content_hash, iso_utc, new_id, read_json, require_schema
 from .epochs import lane_record_dir
-from .lanes import find_active_lane, update_lane
-from .records import atomic_write_json, remove_record
+from .lanes import find_active_lane, read_lane, update_lane
+from .records import RecordLock, atomic_write_json, remove_record
 from .manager_queue import acknowledge_event, close_event, read_manager_queue
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
@@ -174,6 +174,7 @@ def run_resume(
             "next_action": "check the lane id or bootstrap a fresh lane",
         }
 
+    dispatch_lock: RecordLock | None = None
     try:
         if _has_valid_acceptance_chain(rt, epoch_id, lane):
             return {
@@ -263,6 +264,28 @@ def run_resume(
             raise memory_handoff.MemoryHandoffError(
                 "resume task card changed the lane's accepted memory plan state"
             )
+        if current_memory_state == "execution_accepted":
+            # Launch uses this same lock for the final intent/spawn transition.
+            # Keep it through the new run record so the old run cannot dispatch
+            # after resume has checked its operation.
+            dispatch_lock = RecordLock(memory_handoff.memory_paths(worktree)[1])
+            dispatch_lock.__enter__()
+            locked_lane = read_lane(rt, epoch_id, lane_id)
+            if any(
+                locked_lane.get(field) != lane.get(field)
+                for field in ("lane_id", "run_id", "worktree_path", "provider")
+            ) or locked_lane.get("lifecycle") == "accepted":
+                raise memory_handoff.MemoryHandoffError(
+                    "lane ownership changed before resume could reconcile dispatch"
+                )
+            locked_process = locked_lane.get("process") or {}
+            if locked_lane.get("lifecycle") == "running" and processes.identity_matches(
+                locked_process.get("pid"), locked_process.get("creation_time")
+            ):
+                raise memory_handoff.MemoryHandoffError(
+                    "a native controller started before resume acquired dispatch ownership"
+                )
+            lane = locked_lane
         memory_handoff.validate_resume_handoff(
             task_card=task_card,
             lane_id=lane_id,
@@ -270,6 +293,45 @@ def run_resume(
             worktree_path=worktree,
             base_commit=str(task_card.get("base_commit") or "HEAD"),
         )
+        if current_memory_state == "execution_accepted":
+            prior_envelope = memory_handoff.load_envelope(worktree)
+            assert prior_envelope is not None
+            prior_operation = memory_handoff.get_dispatch_operation(
+                worktree_path=worktree, envelope=prior_envelope
+            )
+            if prior_operation is not None and prior_operation["status"] in ("pending", "ambiguous"):
+                from . import launch
+
+                prior_context = memory_handoff.load_final_context(
+                    worktree_path=worktree, envelope=prior_envelope
+                )
+                try:
+                    native = launch._lookup_native_invocation(
+                        rt, epoch_id, lane,
+                        expected_binding=memory_handoff.dispatch_binding(
+                            envelope=prior_envelope, context=prior_context
+                        ),
+                    )
+                except launch.LaunchError as exc:
+                    raise memory_handoff.MemoryHandoffError(
+                        "prior dispatch has conflicting native ownership; reconcile before resume"
+                    ) from exc
+                if native is None:
+                    raise memory_handoff.MemoryHandoffError(
+                        "prior dispatch intent has unresolved native ownership; resume cannot replace its run"
+                    )
+                memory_handoff.record_observed_invocation(
+                    worktree_path=worktree,
+                    envelope=prior_envelope,
+                    observed_invocation=memory_handoff.native_observation(
+                        envelope=prior_envelope,
+                        context=prior_context,
+                        controller_identity=native,
+                    ),
+                )
+                raise memory_handoff.MemoryHandoffError(
+                    "prior dispatch was reconciled; review its native lifecycle before resume"
+                )
         run_id = new_id()
         managed = config.profile == "managed"
         # Resume is the same logical decision as the original bootstrap: it
@@ -350,6 +412,7 @@ def run_resume(
             model=lane["provider"]["model"],
             launch_config=lane["provider"]["launch_config"],
             exclusive_resources=exclusive_resources,
+            memory_envelope=memory.envelope,
         )
         invocation_path = worktree / ".agent-workspace" / "invocation.json"
         written_invocation = read_json(invocation_path)
@@ -400,6 +463,9 @@ def run_resume(
             "evidence_paths": [],
             "next_action": "resolve the error and retry resume",
         }
+    finally:
+        if dispatch_lock is not None:
+            dispatch_lock.__exit__(None, None, None)
 
     return {
         "ok": True,

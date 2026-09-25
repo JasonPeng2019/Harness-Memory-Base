@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -884,12 +886,204 @@ def _open_runtime(worktree_path: str | Path):
     return memory_store, runtime.MemoryRuntime(memory_store)
 
 
-def worker_environment() -> dict[str, str]:
-    """Return the inherited environment without product control credentials."""
+_PROVIDER_CREDENTIAL_KEYS = {
+    "codex": frozenset({"OPENAI_API_KEY"}),
+    "claude-code": frozenset({"ANTHROPIC_API_KEY"}),
+    "qwen-code": frozenset({"QWEN_API_KEY", "DASHSCOPE_API_KEY", "GEMINI_API_KEY"}),
+}
+
+
+def _task_credential_keys(task_card: Mapping[str, Any] | None) -> frozenset[str]:
+    """Validate declared names; a name cannot prove a token's authority."""
+
+    declared = (task_card or {}).get("worker_task_credentials", [])
+    if not isinstance(declared, list) or any(not isinstance(key, str) for key in declared):
+        raise MemoryHandoffError("worker_task_credentials must list environment names")
+    if len(declared) != len(set(declared)):
+        raise MemoryHandoffError("worker_task_credentials contains duplicate names")
+    for key in declared:
+        if (
+            re.fullmatch(r"TASK_ONLY_[A-Z0-9_]+", key) is None
+            or not _credential_key(key)
+            or _control_credential_key(key)
+        ):
+            raise MemoryHandoffError("worker_task_credentials contains a non-task credential name")
+    return frozenset(declared)
+
+
+def worker_environment(
+    task_card: Mapping[str, Any] | None = None, *, provider_id: str = "codex"
+) -> dict[str, str]:
+    """Return a worker environment without product control credentials.
+
+    A task card supplies credential names but cannot attest the authority of
+    their values.  Withhold them until a separate validated channel exists;
+    actions that require them must stop. Provider model-auth keys are separate
+    from task authority.
+    """
 
     from memory_harness import privacy
 
-    return privacy.worker_environment(os.environ)
+    inherited = privacy.worker_environment(os.environ)
+    _task_credential_keys(task_card)
+    allowed_provider = _PROVIDER_CREDENTIAL_KEYS.get(provider_id, frozenset())
+    forbidden = {
+        key: value for key, value in os.environ.items()
+        if _control_credential_key(key) and isinstance(value, str) and value
+    }
+    return {
+        key: value for key, value in inherited.items()
+        if not _control_credential_key(key)
+        and value not in forbidden.values()
+        and (not _credential_key(key) or key in allowed_provider)
+    }
+
+
+_CONTROL_AUTHORITY_WORDS = frozenset({
+    "APPROVAL", "APPROVE", "PUBLICATION", "PUBLISH", "REVOCATION",
+    "REVOKE", "POLICY", "CONTROL",
+})
+_CREDENTIAL_WORDS = frozenset({
+    "TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "CREDENTIALS", "AUTH", "ASKPASS",
+})
+
+
+def _credential_key(key: str) -> bool:
+    return bool(set(re.split(r"[^A-Z0-9]+", key.upper())) & _CREDENTIAL_WORDS)
+
+
+def _control_credential_key(key: str) -> bool:
+    words = set(re.split(r"[^A-Z0-9]+", key.upper()))
+    if not _credential_key(key):
+        return False
+    if words & _CONTROL_AUTHORITY_WORDS:
+        return True
+    return key.upper().startswith("MEMORY_HARNESS_") and not key.upper().startswith(
+        "MEMORY_HARNESS_TASK_ONLY_"
+    )
+
+
+def redact_control_diagnostic(message: str) -> str:
+    """Never echo a ROOT control credential through launch diagnostics."""
+
+    values = sorted(
+        {
+            value for key, value in os.environ.items()
+            if _control_credential_key(key) and isinstance(value, str) and value
+        },
+        key=len,
+        reverse=True,
+    )
+    for value in values:
+        message = message.replace(value, "[REDACTED]")
+    return message
+
+
+def validate_worker_material(
+    *, worktree_path: str | Path, invocation: Mapping[str, Any],
+    environment: Mapping[str, str], task_card: Mapping[str, Any] | None = None,
+) -> None:
+    """Check the actual restricted worker inputs before recording an intent.
+
+    The prompt and provider tool configuration may not embed a product
+    control credential from the ROOT environment.  Report only the artifact
+    name: a refusal must not echo the credential into launch diagnostics.
+    """
+
+    worktree = Path(worktree_path)
+    workspace = worktree / ".agent-workspace"
+    prompt = workspace / "worker-prompt.md"
+    if not prompt.is_file():
+        raise MemoryHandoffError("restricted worker prompt is missing")
+    forbidden = {
+        key: value for key, value in os.environ.items()
+        if _control_credential_key(key) and isinstance(value, str) and value
+    }
+    if any(_control_credential_key(key) for key in environment):
+        raise MemoryHandoffError("restricted worker environment has product control authority")
+    if any(value in environment.values() for value in forbidden.values()):
+        raise MemoryHandoffError("restricted worker environment aliases product control authority")
+    _task_credential_keys(task_card)
+    provider_id = invocation.get("provider", {}).get("id")
+    allowed_provider = _PROVIDER_CREDENTIAL_KEYS.get(provider_id, frozenset())
+    if any(
+        _credential_key(key) and key not in allowed_provider
+        for key in environment
+    ):
+        raise MemoryHandoffError("restricted worker environment has an undeclared credential")
+    artifacts = [
+        prompt,
+        workspace / "invocation.json",
+        worktree / ".codex" / "config.toml",
+        worktree / ".codex" / "mcp.json",
+        worktree / ".claude" / "settings.json",
+        worktree / ".claude" / "settings.local.json",
+        worktree / ".qwen" / "settings.json",
+    ]
+    if provider_id == "codex":
+        artifacts.append(
+            Path(environment.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+        )
+    elif provider_id == "claude-code":
+        artifacts.append(
+            Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+            / "settings.json"
+        )
+    elif provider_id == "qwen-code":
+        artifacts.append(Path.home() / ".qwen" / "settings.json")
+    for artifact in artifacts:
+        if not artifact.is_file():
+            continue
+        try:
+            contents = artifact.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise MemoryHandoffError(
+                f"restricted worker material is unreadable: {artifact.name}"
+            ) from exc
+        configured_control = any(
+            _control_credential_key(match.group(1))
+            for match in re.finditer(
+                r"(?im)[\"']?([A-Za-z][A-Za-z0-9_-]+)[\"']?\s*[:=]",
+                contents,
+            )
+        )
+        try:
+            config = (
+                tomllib.loads(contents)
+                if artifact.suffix == ".toml"
+                else json.loads(contents) if artifact.suffix == ".json" else None
+            )
+        except (ValueError, TypeError) as exc:
+            raise MemoryHandoffError(
+                f"restricted worker configuration is invalid: {artifact.name}"
+            ) from exc
+        tool_authority = _control_tool_config(config)
+        if (
+            any(key in contents or value in contents for key, value in forbidden.items())
+            or configured_control
+            or (artifact != prompt and tool_authority)
+        ):
+            raise MemoryHandoffError(
+                f"restricted worker material contains product control authority: {artifact.name}"
+            )
+    if invocation.get("env") != {}:
+        raise MemoryHandoffError("restricted invocation declares an unexpected environment")
+
+
+def _control_tool_config(config: Any) -> bool:
+    """Recognize control actions in a provider's external-tool settings."""
+
+    if not isinstance(config, Mapping):
+        return False
+    for key, value in config.items():
+        name = str(key).lower()
+        if "mcp" in name or name == "tools":
+            rendered = json.dumps(value, sort_keys=True).lower()
+            if any(word.lower() in rendered for word in _CONTROL_AUTHORITY_WORDS):
+                return True
+        if _control_tool_config(value):
+            return True
+    return False
 
 
 def dispatch(
@@ -915,11 +1109,109 @@ def record_dispatch_intent(
 
     memory_store, memory_runtime = _open_runtime(worktree_path)
     try:
-        return memory_runtime.record_dispatch_intent(envelope)
+        existing = _dispatch_operation(memory_store, envelope)
+        if existing is not None:
+            raise MemoryHandoffError(
+                f"{existing['status']} dispatch intent already exists; reconcile exact native ownership"
+            )
+        intent = memory_runtime.record_dispatch_intent(envelope)
+        confirmed = _dispatch_operation(memory_store, envelope)
+        if confirmed is None or confirmed["operation_id"] != intent["operation_id"] or confirmed["status"] != "pending":
+            raise MemoryHandoffError("dispatch intent was not durably confirmed")
+        return confirmed
+    except MemoryHandoffError:
+        raise
     except Exception as exc:
         raise MemoryHandoffError(f"cannot record dispatch intent: {exc}") from exc
     finally:
         memory_store.close()
+
+
+def _dispatch_operation(memory_store: Any, envelope: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Find the one intent for this run; reject changed decisions/envelopes.
+
+    Lane 1's current public selector is decision-scoped.  Read the existing
+    operation table for a run conflict until its joined run selector lands;
+    this creates no second receipt or state owner.
+    """
+
+    from memory_harness import contracts
+
+    expected = contracts.make_operation(kind="dispatch", envelope=envelope)
+    rows = memory_store._require_connection().execute(
+        "SELECT operation_id FROM operations WHERE kind = 'dispatch' AND run_id = ?",
+        (envelope["run_id"],),
+    ).fetchall()
+    if any(row["operation_id"] != expected["operation_id"] for row in rows):
+        raise MemoryHandoffError(
+            "conflicting dispatch ownership exists for this lane and run"
+        )
+    matches = [
+        operation for operation in memory_store.list_operations(envelope["decision_id"])
+        if operation["kind"] == "dispatch" and operation["run_id"] == envelope["run_id"]
+    ]
+    if any(operation["operation_id"] != expected["operation_id"] for operation in matches):
+        raise MemoryHandoffError(
+            "conflicting dispatch ownership exists for this decision and run"
+        )
+    return matches[0] if matches else None
+
+
+def get_dispatch_operation(
+    *, worktree_path: str | Path, envelope: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    memory_store, _ = _open_runtime(worktree_path)
+    try:
+        return _dispatch_operation(memory_store, envelope)
+    except MemoryHandoffError:
+        raise
+    except Exception as exc:
+        raise MemoryHandoffError(f"cannot read dispatch intent: {exc}") from exc
+    finally:
+        memory_store.close()
+
+
+def native_observation(
+    *, envelope: Mapping[str, Any], context: Mapping[str, Any],
+    controller_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind one observed controller incarnation to the accepted dispatch."""
+
+    pid = controller_identity.get("pid")
+    creation = controller_identity.get("creation_time")
+    if not isinstance(pid, int) or pid <= 0 or not isinstance(creation, str) or not creation:
+        raise MemoryHandoffError("observed controller has no exact process identity")
+    return {
+        **dispatch_binding(envelope=envelope, context=context),
+        "invocation_id": f"controller:{pid}:{creation}",
+        "pid": pid,
+        "creation_time": creation,
+    }
+
+
+def dispatch_binding(
+    *, envelope: Mapping[str, Any], context: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Identity the controller invocation must carry before native spawn."""
+
+    context_id = context.get("context_id")
+    context_digest = context.get("content_hash")
+    if not isinstance(context_id, str) or not context_id or not isinstance(context_digest, str) or not context_digest:
+        raise MemoryHandoffError("dispatch has no exact final context")
+    return {
+        "task_card_digest": envelope["task_card_digest"],
+        "decision_id": envelope["decision_id"],
+        "plan_id": envelope["plan_id"],
+        "plan_digest": envelope["plan_digest"],
+        "context_id": context_id,
+        "context_digest": context_digest,
+        "envelope_digest": envelope["content_hash"],
+        "lane_id": envelope["lane_id"],
+        "run_id": envelope["run_id"],
+        "base_commit": envelope["base_commit"],
+        "route": envelope["route"],
+        "configuration_digest": envelope["configuration_digest"],
+    }
 
 
 def record_observed_invocation(
@@ -934,12 +1226,31 @@ def record_observed_invocation(
 
     memory_store, _ = _open_runtime(worktree_path)
     try:
+        context = load_final_context(worktree_path=worktree_path, envelope=envelope)
+        expected = native_observation(
+            envelope=envelope,
+            context=context,
+            controller_identity=observed_invocation,
+        )
+        if dict(observed_invocation) != expected:
+            raise MemoryHandoffError("observed native invocation does not match the exact dispatch")
+        existing = _dispatch_operation(memory_store, envelope)
+        if existing is None:
+            raise MemoryHandoffError("observed invocation has no durable dispatch intent")
+        if existing["status"] == "delivered":
+            if existing["observed_invocation"] != expected:
+                raise MemoryHandoffError("a conflicting native invocation already owns this dispatch")
+            return existing
         operation = contracts.make_operation(
             kind="dispatch",
             envelope=envelope,
             status="delivered",
             observed_invocation=observed_invocation,
         )
+        if existing["status"] == "ambiguous":
+            return _memory_module("runtime").MemoryRuntime(memory_store).reconcile_ambiguous_dispatch(
+                envelope, observed_invocation
+            )
         return memory_store.record_operation(operation)
     finally:
         memory_store.close()
@@ -992,16 +1303,19 @@ __all__ = [
     "MemoryHandoffError",
     "PendingPlanError",
     "dispatch",
+    "dispatch_binding",
     "enabled_handoff_state",
     "finalize_envelope",
     "handoff_from_task_card",
     "handoff_plan",
     "handoff_plan_state",
+    "get_dispatch_operation",
     "lane_handoff_state",
     "prepare_lane_memory",
     "load_envelope",
     "load_final_context",
     "memory_paths",
+    "native_observation",
     "omit_optional_content",
     "plan_state_summary",
     "prepare_bootstrap_envelope",
@@ -1009,10 +1323,12 @@ __all__ = [
     "record_ambiguous_dispatch",
     "record_dispatch_intent",
     "record_observed_invocation",
+    "redact_control_diagnostic",
     "require_accepted_handoff",
     "validate_envelope_for_launch",
     "validate_final_context_for_launch",
     "validate_resume_handoff",
     "validate_task_card",
+    "validate_worker_material",
     "worker_environment",
 ]
