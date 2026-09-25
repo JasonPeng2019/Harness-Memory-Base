@@ -454,6 +454,7 @@ def _run_provider(
     *,
     attempt_number: int = 1,
     resume: bool | None = None,
+    requested_network_profile: str | None = None,
 ) -> ProviderExecution:
     """Start the provider, stream output, and return its exact process boundary."""
     worktree = Path(lane["worktree_path"])
@@ -479,6 +480,25 @@ def _run_provider(
         session_id=session_id,
         resume=resume,
     )
+    if requested_network_profile is not None:
+        from .provider_network_payload import resolve_launch
+
+        try:
+            argv, network_facts = resolve_launch(
+                binding.PROVIDER_ID, worktree, argv, requested_network_profile,
+            )
+        except ValueError as exc:
+            raise ControllerError(
+                LAUNCH_INVOCATION_INVALID, str(exc), no_provider_started=True,
+            ) from exc
+        lane["_network_payload"] = network_facts
+        _append_event(lane, "provider_network_payload", json.dumps(network_facts, sort_keys=True))
+        if network_facts["effective_profile"] == "uncontrolled_network":
+            raise ControllerError(
+                LAUNCH_PROVIDER_START_FAILED,
+                network_facts["reason"],
+                no_provider_started=True,
+            )
     lane["_attempt_argv"] = list(argv)
     _append_event(lane, "provider_started", " ".join(argv))
     pre_spawn_offset: int = 0
