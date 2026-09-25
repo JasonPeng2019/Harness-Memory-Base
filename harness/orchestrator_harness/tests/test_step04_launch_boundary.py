@@ -241,6 +241,7 @@ class LaunchBoundaryFixture:
 
     def run_launch(
         self, *, lane_id: str, status: dict | None = None,
+        status_after_attestation: dict | None = None,
         allowance_seconds: float | None = None,
     ) -> tuple[dict, MagicMock]:
         child = MagicMock(pid=41)
@@ -279,7 +280,11 @@ class LaunchBoundaryFixture:
                 "process_identity",
                 return_value={"pid": 41, "creation_time": "ct-1"},
             ),
-            patch.object(launch, "_read_controller_status", return_value=terminal),
+            patch.object(
+                launch, "_read_controller_status", return_value=terminal,
+                side_effect=([terminal, status_after_attestation]
+                             if status_after_attestation is not None else None),
+            ),
         ):
             result = launch.run_launch(lane_id, allowance_seconds=allowance_seconds)
         return result, spawn
@@ -631,6 +636,76 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
         lane = self.fixture.lane_record("launch-lane")
         self.assertEqual("running", lane["lifecycle"])
         self.assertFalse(lane["launch_pending"])
+
+    def _assert_changed_success_status_is_ambiguous(
+        self, *, terminal: bool, changes: dict
+    ) -> None:
+        binding = memory_handoff.dispatch_binding(
+            envelope=self.envelope,
+            context=memory_handoff.load_final_context(
+                worktree_path=self.worktree, envelope=self.envelope
+            ),
+        )
+        attested = {
+            "lane_id": "launch-lane", "run_id": self.envelope["run_id"],
+            "controller_state": "starting", "provider_state": {"state": "starting"},
+            "controller_identity": {"pid": 41, "creation_time": "ct-1"},
+            "dispatch_binding": binding,
+        }
+        later = {
+            **attested,
+            "controller_state": "exited" if terminal else "running",
+            "provider_state": {"state": "exited" if terminal else "running"},
+            "cleanup_proven": terminal,
+            "recorded_status": "review_pending" if terminal else None,
+            **changes,
+        }
+        result, spawn = self.fixture.run_launch(
+            lane_id="launch-lane", status=attested, status_after_attestation=later
+        )
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, result["code"])
+        spawn.assert_called_once()
+        spawn.return_value.terminate.assert_not_called()
+        self.assertEqual(
+            {"pid": 41, "creation_time": "ct-1"},
+            self.fixture.lane_record("launch-lane")["process"],
+        )
+        memory_store = self.fixture.open_store(self.worktree)
+        try:
+            operation = memory_store.list_operations(self.envelope["decision_id"])[0]
+            self.assertEqual("delivered", operation["status"])
+            self.assertEqual(41, operation["observed_invocation"]["pid"])
+        finally:
+            memory_store.close()
+
+    def test_running_handshake_rejects_controller_identity_changed_after_attestation(self) -> None:
+        self._assert_changed_success_status_is_ambiguous(
+            terminal=False,
+            changes={"controller_identity": {"pid": 58, "creation_time": "ct-2"}},
+        )
+
+    def test_terminal_handshake_rejects_binding_changed_after_attestation(self) -> None:
+        binding = memory_handoff.dispatch_binding(
+            envelope=self.envelope,
+            context=memory_handoff.load_final_context(
+                worktree_path=self.worktree, envelope=self.envelope
+            ),
+        )
+        self._assert_changed_success_status_is_ambiguous(
+            terminal=True,
+            changes={"dispatch_binding": {**binding, "plan_digest": "different-plan"}},
+        )
+
+    def test_running_handshake_rejects_missing_proof_after_attestation(self) -> None:
+        self._assert_changed_success_status_is_ambiguous(
+            terminal=False, changes={"controller_identity": None},
+        )
+
+    def test_terminal_handshake_rejects_invalid_proof_after_attestation(self) -> None:
+        self._assert_changed_success_status_is_ambiguous(
+            terminal=True, changes={"dispatch_binding": {"plan_digest": "incomplete"}},
+        )
 
     def test_lost_acknowledgement_reconciles_exact_native_lane_without_spawning(self) -> None:
         memory_handoff.record_dispatch_intent(

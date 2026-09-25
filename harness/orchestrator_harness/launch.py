@@ -311,6 +311,7 @@ def _wait_for_spawn_attestation(
 def _delivered_provider_outcome(
     lane: Mapping[str, Any], identity: Mapping[str, Any],
     expected_binding: Mapping[str, Any],
+    *, status: Mapping[str, Any] | None = None,
 ) -> tuple[str, str] | None:
     """Read the exact controller's provider outcome, not just its delivery.
 
@@ -319,7 +320,8 @@ def _delivered_provider_outcome(
     The existing status and run-scoped events retain that failure without a
     second dispatch receipt.
     """
-    status = _read_controller_status(dict(lane))
+    if status is None:
+        status = _read_controller_status(dict(lane))
     if (
         status is None
         or status.get("dispatch_binding") != expected_binding
@@ -898,6 +900,16 @@ def run_launch(
                         LAUNCH_DISPATCH_AMBIGUOUS,
                         "lane run changed during native launch handshake",
                     )
+                if memory_envelope is not None:
+                    outcome = _delivered_provider_outcome(
+                        lane, controller_identity, invocation["dispatch_binding"],
+                        status=status,
+                    )
+                    if outcome is None or outcome[0] != "LAUNCH_OK":
+                        raise LaunchError(
+                            LAUNCH_DISPATCH_AMBIGUOUS,
+                            "native controller provider-success proof changed during launch handshake",
+                        )
                 state = status.get("recorded_status") if terminal else "running"
                 return {
                     "ok": True,
