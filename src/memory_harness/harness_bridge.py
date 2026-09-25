@@ -46,6 +46,16 @@ class ApcChildRejectedError(HarnessBridgeError):
     """The child result violated its bounded contract."""
 
 
+# The one enclosing absolute deadline is handed to a launcher only through
+# this exact opt-in channel: a launcher that can bound its own native phases
+# declares the attribute below on its callable, receives the effective cutoff
+# under the key below, and must remove the key before it validates, hashes, or
+# embeds the request, so the request record stays exact for every other
+# consumer.  Every launcher that does not opt in keeps the exact request.
+APC_ENCLOSING_DEADLINE_ATTRIBUTE = "apc_child_receives_enclosing_deadline"
+APC_ENCLOSING_DEADLINE_KEY = "enclosing_deadline_monotonic"
+
+
 @dataclass(frozen=True)
 class ApcAttempt:
     """The recorded child operation and, when valid, its proposed artifact."""
@@ -169,8 +179,19 @@ def run_apc_child(
             )
         raise ApcChildTimeoutError("the child stage allowance expired before launch")
 
+    launch_request: Mapping[str, Any] = request
+    if (
+        deadline is not None
+        and getattr(launcher, APC_ENCLOSING_DEADLINE_ATTRIBUTE, None) is True
+    ):
+        # The launcher opts into the one effective cutoff for this attempt;
+        # it strips the key before any request validation or child-card use.
+        launch_request = {
+            **request,
+            APC_ENCLOSING_DEADLINE_KEY: float(deadline),
+        }
     try:
-        observed = launcher(request)
+        observed = launcher(launch_request)
     except ApcChildUnavailableError as exc:
         # The product harness proved that no child was launched, so the
         # recorded attempt becomes terminal instead of an unresolved claim

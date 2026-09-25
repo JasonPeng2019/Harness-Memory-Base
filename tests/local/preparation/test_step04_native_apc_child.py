@@ -381,11 +381,11 @@ class NativeApcChildTests(unittest.TestCase):
             stack.enter_context(item)
         real_force_stop = launch.run_force_stop
 
-        def stop_side_effect(lane_id):
+        def stop_side_effect(lane_id, **kwargs):
             self.fixture.stop_calls.append(lane_id)
             if force_stop is not None:
                 return force_stop
-            return real_force_stop(lane_id)
+            return real_force_stop(lane_id, **kwargs)
 
         stack.enter_context(patch.object(launch, "run_force_stop", side_effect=stop_side_effect))
         return stack
@@ -706,7 +706,7 @@ class NativeApcChildTests(unittest.TestCase):
             }
         )
 
-        def blocking_launch(lane_id: str):
+        def blocking_launch(lane_id: str, **kwargs):
             holder.append(threading.current_thread())
             gate.wait(timeout=10.0)
             # The acknowledgement lands late, after the allowance expired; a
@@ -961,7 +961,7 @@ class NativeApcChildTests(unittest.TestCase):
                 deadline=self.clock() + 240.0,
                 clock=self.clock,
                 lane_lookup=self.fixture.lane_lookup,
-                launch_fn=lambda lane_id: "not-a-mapping-launch-ack",
+                launch_fn=lambda lane_id, **kwargs: "not-a-mapping-launch-ack",
                 sleep=lambda seconds: None,
             )
             with patch(
@@ -1112,7 +1112,7 @@ class NativeApcChildTests(unittest.TestCase):
                 deadline=self.clock() + 240.0,
                 clock=self.clock,
                 lane_lookup=self.fixture.lane_lookup,
-                launch_fn=lambda lane_id: identity_less,
+                launch_fn=lambda lane_id, **kwargs: identity_less,
                 sleep=lambda seconds: None,
             )
             with patch(
@@ -1148,6 +1148,362 @@ class NativeApcChildTests(unittest.TestCase):
         self.assertEqual(lane_id, ambiguous["launch_intent"]["lane_id"])
         self.assertIsNone(ambiguous.get("observed_invocation"))
 
+
+    # -- the remaining reviewed defects -------------------------------------
+
+    def test_expired_native_queue_refuses_without_creating_a_lane(self) -> None:
+        """An expired queue allowance cannot start a late lane creation."""
+
+        card = contracts.make_task_card(
+            task="restricted drafting child", base_commit="test-base"
+        )
+        card["worker_environment"] = "scrubbed"
+        card_path = self.fixture.root / "expired-cards" / "expired-lane.task-card.json"
+        card_path.parent.mkdir(parents=True, exist_ok=True)
+        card_path.write_text(
+            json.dumps(card, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            queued = bootstrap.run_bootstrap(
+                lane_id="expired-lane",
+                provider=BINDING["provider"],
+                model=BINDING["model"],
+                launch_config={"reasoning_effort": BINDING["effort"]},
+                exclusive_resources=[],
+                task_card_path=str(card_path),
+                allowance_seconds=0.0,
+            )
+
+        self.assertFalse(queued.get("ok"), queued)
+        self.assertEqual("BOOTSTRAP_ALLOWANCE_EXPIRED", queued.get("code"))
+        worktree = self.fixture.runtime / "worktrees" / self.fixture.EPOCH / "expired-lane"
+        self.assertFalse(worktree.exists())
+
+    def test_expired_native_launch_and_cleanup_refuse_without_effects(self) -> None:
+        """Launch and cancellation both refuse a spent allowance.
+
+        The prepared lane exists, so the refusal must leave its exact
+        ownership visible (never a fabricated launch) and no controller or
+        termination effect may start after the allowance.
+        """
+
+        card = contracts.make_task_card(
+            task="restricted drafting child", base_commit="test-base"
+        )
+        card["worker_environment"] = "scrubbed"
+        card_path = (
+            self.fixture.root / "expired-cards" / "expired-launch-lane.task-card.json"
+        )
+        card_path.parent.mkdir(parents=True, exist_ok=True)
+        card_path.write_text(
+            json.dumps(card, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            queued = bootstrap.run_bootstrap(
+                lane_id="expired-launch-lane",
+                provider=BINDING["provider"],
+                model=BINDING["model"],
+                launch_config={"reasoning_effort": BINDING["effort"]},
+                exclusive_resources=[],
+                task_card_path=str(card_path),
+            )
+            self.assertTrue(queued.get("ok"), queued)
+
+            launched = launch.run_launch(
+                "expired-launch-lane", allowance_seconds=0.0
+            )
+            stopped = launch.run_force_stop(
+                "expired-launch-lane", allowance_seconds=0.0
+            )
+            termination_calls = launch.processes.terminate_process.call_count
+
+        self.assertFalse(launched.get("ok"), launched)
+        self.assertEqual("LAUNCH_ALLOWANCE_EXPIRED", launched.get("code"))
+        self.assertEqual(
+            "prepared", self.fixture.lane_lookup("expired-launch-lane")["lifecycle"]
+        )
+        self.assertFalse(stopped.get("ok"), stopped)
+        self.assertEqual("FORCE_STOP_ALLOWANCE_EXPIRED", stopped.get("code"))
+        self.assertEqual(0, termination_calls)
+
+    def test_native_phases_receive_the_effective_cutoff_not_the_default(self) -> None:
+        """The bridge's effective cutoff governs every native phase.
+
+        The launcher is deliberately built with a longer default; the exact
+        deadline handed to ``run_apc_child`` must be the one the native
+        queue, launch, and cancellation consumers receive, so queue, launch,
+        collection, validation, and cleanup all answer to one absolute bound.
+        """
+
+        seen: dict = {}
+        real_bootstrap = bootstrap.run_bootstrap
+        real_launch = launch.run_launch
+        real_force_stop = launch.run_force_stop
+
+        def recording_bootstrap(**kwargs):
+            seen["queue"] = dict(kwargs)
+            return real_bootstrap(**kwargs)
+
+        def recording_launch(lane_id, **kwargs):
+            seen["launch"] = dict(kwargs)
+            return real_launch(lane_id, **kwargs)
+
+        def recording_stop(lane_id, **kwargs):
+            seen["cleanup"] = dict(kwargs)
+            return real_force_stop(lane_id, **kwargs)
+
+        effective = self.clock() + 120.0
+        with self._native_stack(provider_behavior=self.fixture.deterministic_child()):
+            launcher = harness_child.make_native_apc_launcher(
+                session=harness_child.DraftingChildSession(
+                    runtime_root=self.fixture.runtime,
+                    task_card_dir=self.fixture.root / "apc-cards",
+                    base_commit="test-base",
+                    provider=BINDING["provider"],
+                    model=BINDING["model"],
+                ),
+                deadline=self.clock() + 400.0,
+                clock=self.clock,
+                lane_lookup=self.fixture.lane_lookup,
+                bootstrap_fn=recording_bootstrap,
+                launch_fn=recording_launch,
+                stop_fn=recording_stop,
+                sleep=lambda seconds: None,
+            )
+            request = apc.make_apc_request(
+                template={
+                    "template_id": "template-1",
+                    "version": 1,
+                    "allowed_edits": ["bindings"],
+                    "fixed_steps": [],
+                    "verification_intent": "verify",
+                },
+                parent_decision_id="decision-1",
+                parent_objective_id="objective-1",
+                permitted_edits=["bindings"],
+                binding=BINDING,
+            )
+            attempt = harness_bridge.run_apc_child(
+                request=request,
+                template_record={
+                    "template_id": "template-1",
+                    "fixed_steps": [],
+                    "verification_intent": "verify",
+                },
+                launcher=launcher,
+                store=self.memory_store,
+                limits=self.limits,
+                clock=self.clock,
+                deadline=effective,
+            )
+
+        self.assertEqual("reconciled", attempt.child_operation["status"])
+        remaining = effective - self.clock()
+        self.assertEqual(remaining, seen["queue"]["allowance_seconds"])
+        self.assertEqual(remaining, seen["launch"]["allowance_seconds"])
+        self.assertEqual(remaining, seen["cleanup"]["allowance_seconds"])
+
+    # -- a late effect may not outlive the one enclosing deadline ----------
+
+    def test_queue_that_runs_long_cannot_create_a_late_lane(self) -> None:
+        """A queue call that outruns the allowance leaves no late lane.
+
+        The call enters inside the allowance and then runs past that one
+        absolute instant; the first effectful phase (the lane worktree) must
+        refuse instead of materializing a lane the enclosing attempt already
+        stopped waiting for.
+        """
+
+        card = contracts.make_task_card(
+            task="restricted drafting child", base_commit="test-base"
+        )
+        card["worker_environment"] = "scrubbed"
+        card_path = self.fixture.root / "late-cards" / "late-lane.task-card.json"
+        card_path.parent.mkdir(parents=True, exist_ok=True)
+        card_path.write_text(
+            json.dumps(card, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        worktree_add = MagicMock()
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            fixture_open_epoch = bootstrap.open_epoch
+
+            def slow_open_epoch(*args, **kwargs):
+                time.sleep(0.2)
+                return fixture_open_epoch(*args, **kwargs)
+
+            with patch.object(bootstrap, "open_epoch", side_effect=slow_open_epoch):
+                with patch.object(bootstrap, "_git_worktree_add", worktree_add):
+                    queued = bootstrap.run_bootstrap(
+                        lane_id="late-lane",
+                        provider=BINDING["provider"],
+                        model=BINDING["model"],
+                        launch_config={"reasoning_effort": BINDING["effort"]},
+                        exclusive_resources=[],
+                        task_card_path=str(card_path),
+                        allowance_seconds=0.05,
+                    )
+
+        self.assertFalse(queued.get("ok"), queued)
+        self.assertEqual("BOOTSTRAP_ALLOWANCE_EXPIRED", queued.get("code"))
+        worktree_add.assert_not_called()
+        worktree = (
+            self.fixture.runtime / "worktrees" / self.fixture.EPOCH / "late-lane"
+        )
+        self.assertFalse(worktree.exists())
+
+    def test_queue_that_runs_long_cannot_publish_a_lane_record(self) -> None:
+        """A queue call that outruns the allowance publishes no lane record.
+
+        The worktree may already exist when the allowance expires mid-call,
+        but the durable lane record is the ownership claim and may not appear
+        after the caller stopped waiting; the attempt refuses without
+        publishing instead of leaving a late lane behind.
+        """
+
+        card = contracts.make_task_card(
+            task="restricted drafting child", base_commit="test-base"
+        )
+        card["worker_environment"] = "scrubbed"
+        card_path = (
+            self.fixture.root / "late-cards" / "late-publish-lane.task-card.json"
+        )
+        card_path.parent.mkdir(parents=True, exist_ok=True)
+        card_path.write_text(
+            json.dumps(card, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        prepare_lane_memory = bootstrap.memory_handoff.prepare_lane_memory
+
+        def slow_prepare_lane_memory(*args, **kwargs):
+            time.sleep(0.2)
+            return prepare_lane_memory(*args, **kwargs)
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            with patch.object(
+                bootstrap.memory_handoff,
+                "prepare_lane_memory",
+                side_effect=slow_prepare_lane_memory,
+            ):
+                queued = bootstrap.run_bootstrap(
+                    lane_id="late-publish-lane",
+                    provider=BINDING["provider"],
+                    model=BINDING["model"],
+                    launch_config={"reasoning_effort": BINDING["effort"]},
+                    exclusive_resources=[],
+                    task_card_path=str(card_path),
+                    allowance_seconds=0.05,
+                )
+
+        self.assertFalse(queued.get("ok"), queued)
+        self.assertEqual("BOOTSTRAP_ALLOWANCE_EXPIRED", queued.get("code"))
+        record_path = lanes.lane_record_path(
+            self.fixture.runtime, self.fixture.EPOCH, "late-publish-lane"
+        )
+        self.assertFalse(record_path.is_file())
+
+    def test_launch_that_runs_long_cannot_start_a_late_controller(self) -> None:
+        """A launch call that outruns the allowance starts no controller.
+
+        The prepared lane exists; the launch's first blocking native phase
+        consumes the allowance, so the controller spawn must refuse and the
+        prepared lane keeps its exact ownership instead of a late launch.
+        """
+
+        card = contracts.make_task_card(
+            task="restricted drafting child", base_commit="test-base"
+        )
+        card["worker_environment"] = "scrubbed"
+        card_path = (
+            self.fixture.root / "late-cards" / "late-launch-lane.task-card.json"
+        )
+        card_path.parent.mkdir(parents=True, exist_ok=True)
+        card_path.write_text(
+            json.dumps(card, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            queued = bootstrap.run_bootstrap(
+                lane_id="late-launch-lane",
+                provider=BINDING["provider"],
+                model=BINDING["model"],
+                launch_config={"reasoning_effort": BINDING["effort"]},
+                exclusive_resources=[],
+                task_card_path=str(card_path),
+            )
+            self.assertTrue(queued.get("ok"), queued)
+            fixture_read_state = launch.read_runtime_state
+
+            def slow_read_runtime_state(*args, **kwargs):
+                time.sleep(0.2)
+                return fixture_read_state(*args, **kwargs)
+
+            with patch.object(
+                launch, "read_runtime_state", side_effect=slow_read_runtime_state
+            ):
+                launched = launch.run_launch(
+                    "late-launch-lane", allowance_seconds=0.05
+                )
+
+        self.assertFalse(launched.get("ok"), launched)
+        self.assertEqual("LAUNCH_ALLOWANCE_EXPIRED", launched.get("code"))
+        self.assertEqual([], self.fixture.spawn_calls)
+        self.assertEqual(
+            "prepared", self.fixture.lane_lookup("late-launch-lane")["lifecycle"]
+        )
+
+    def test_cleanup_that_runs_long_cannot_start_a_late_termination(self) -> None:
+        """A cancellation call that outruns the allowance starts no stop.
+
+        The lane lookup is the first blocking native phase of force-stop;
+        when it consumes the allowance, the termination phase must refuse
+        instead of retiring the lane after the caller stopped waiting, so the
+        exact prepared ownership stays visible and no stop effect starts.
+        """
+
+        card = contracts.make_task_card(
+            task="restricted drafting child", base_commit="test-base"
+        )
+        card["worker_environment"] = "scrubbed"
+        card_path = (
+            self.fixture.root / "late-cards" / "late-stop-lane.task-card.json"
+        )
+        card_path.parent.mkdir(parents=True, exist_ok=True)
+        card_path.write_text(
+            json.dumps(card, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            queued = bootstrap.run_bootstrap(
+                lane_id="late-stop-lane",
+                provider=BINDING["provider"],
+                model=BINDING["model"],
+                launch_config={"reasoning_effort": BINDING["effort"]},
+                exclusive_resources=[],
+                task_card_path=str(card_path),
+            )
+            self.assertTrue(queued.get("ok"), queued)
+            fixture_find_active_lane = launch.find_active_lane
+
+            def slow_find_active_lane(*args, **kwargs):
+                time.sleep(0.2)
+                return fixture_find_active_lane(*args, **kwargs)
+
+            with patch.object(
+                launch, "find_active_lane", side_effect=slow_find_active_lane
+            ):
+                stopped = launch.run_force_stop(
+                    "late-stop-lane", allowance_seconds=0.05
+                )
+            termination_calls = launch.processes.terminate_process.call_count
+
+        self.assertFalse(stopped.get("ok"), stopped)
+        self.assertEqual("FORCE_STOP_ALLOWANCE_EXPIRED", stopped.get("code"))
+        self.assertEqual(0, termination_calls)
+        self.assertEqual(
+            "prepared", self.fixture.lane_lookup("late-stop-lane")["lifecycle"]
+        )
 
 if __name__ == "__main__":
     unittest.main()

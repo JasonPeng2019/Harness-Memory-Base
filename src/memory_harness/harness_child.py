@@ -233,12 +233,21 @@ def make_native_apc_launcher(
     clock: Callable[[], float] | None = None,
     lane_lookup: Callable[[str], Mapping[str, Any]] | None = None,
     bootstrap_fn: Callable[..., Mapping[str, Any]] | None = None,
-    launch_fn: Callable[[str], Mapping[str, Any]] | None = None,
-    stop_fn: Callable[[str], Mapping[str, Any]] | None = None,
+    launch_fn: Callable[..., Mapping[str, Any]] | None = None,
+    stop_fn: Callable[..., Mapping[str, Any]] | None = None,
     sleep: Callable[[float], None] | None = None,
     poll_seconds: float = 0.2,
 ) -> Callable[[Mapping[str, Any]], Mapping[str, Any] | None]:
-    """Build the native launcher consumed by ``harness_bridge.run_apc_child``."""
+    """Build the native launcher consumed by ``harness_bridge.run_apc_child``.
+
+    The launcher opts into the bridge's one enclosing-deadline channel: the
+    effective cutoff computed by the enclosing attempt (the stage deadline
+    minus the execution reserve) governs this exact child, and the
+    construction-time ``deadline`` is only its default when no enclosing
+    attempt supplied one.  Every native phase (queue, launch, collection,
+    validation, and cleanup) answers to that one bound, and each blocking
+    call receives its remaining share as an explicit allowance.
+    """
 
     now = clock or time.monotonic
     pause = sleep or time.sleep
@@ -272,8 +281,26 @@ def make_native_apc_launcher(
         return lanes.find_active_lane(Path(session.runtime_root), lane_id)[1]
 
     def launcher(request: Mapping[str, Any]) -> Mapping[str, Any] | None:
-        from .harness_bridge import ApcChildUnavailableError, HarnessBridgeError
+        from .harness_bridge import (
+            APC_ENCLOSING_DEADLINE_KEY,
+            ApcChildUnavailableError,
+            HarnessBridgeError,
+        )
 
+        carried_deadline = request.get(APC_ENCLOSING_DEADLINE_KEY)
+        attempt_deadline = deadline
+        if isinstance(carried_deadline, (int, float)) and not isinstance(
+            carried_deadline, bool
+        ):
+            # The enclosing caller's effective cutoff governs this attempt; a
+            # construction-time default must never loosen the one absolute
+            # bound the enclosing attempt already computed.
+            attempt_deadline = float(carried_deadline)
+        request = {
+            key: value
+            for key, value in request.items()
+            if key != APC_ENCLOSING_DEADLINE_KEY
+        }
         binding = request.get("binding")
         if not isinstance(binding, Mapping) or binding.get("source") != "explicit":
             raise ApcChildUnavailableError(
@@ -287,7 +314,7 @@ def make_native_apc_launcher(
             raise ApcChildUnavailableError(
                 "the APC child session model does not match the explicit binding"
             )
-        if now() >= deadline:
+        if now() >= attempt_deadline:
             raise ApcChildUnavailableError(
                 "the child stage allowance expired before the child was queued"
             )
@@ -338,6 +365,7 @@ def make_native_apc_launcher(
             json.dumps(card, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
 
+        queue_remaining = attempt_deadline - now()
         queued_done, queued = _bounded_call(
             lambda: _bootstrap()(
                 lane_id=lane_id,
@@ -346,8 +374,9 @@ def make_native_apc_launcher(
                 launch_config=launch_config,
                 exclusive_resources=list(session.exclusive_resources),
                 task_card_path=str(task_card_path),
+                allowance_seconds=queue_remaining,
             ),
-            remaining=deadline - now(),
+            remaining=queue_remaining,
         )
         if not queued_done:
             # The queue call has not acknowledged inside the allowance, so the
@@ -379,8 +408,10 @@ def make_native_apc_launcher(
                 f"{queued.get('summary')}"
             )
 
+        launch_remaining = attempt_deadline - now()
         launched_done, launched = _bounded_call(
-            lambda: _launch()(lane_id), remaining=deadline - now()
+            lambda: _launch()(lane_id, allowance_seconds=launch_remaining),
+            remaining=launch_remaining,
         )
         if not launched_done:
             # The launch acknowledgement is outside the allowance; the exact
@@ -424,7 +455,7 @@ def make_native_apc_launcher(
             # The queue succeeded, so a prepared lane exists.  It is retired
             # before the refusal is recorded; an unproven retirement keeps the
             # exact child unresolved instead of hiding it behind a refusal.
-            cleanup = _retire(lane_id)
+            cleanup = _retire(lane_id, attempt_deadline=attempt_deadline)
             if not cleanup.get("cleanup_proven"):
                 return _unresolved_phase(
                     "launch",
@@ -468,7 +499,7 @@ def make_native_apc_launcher(
                 "the product harness recorded a launch configuration that does not "
                 f"carry the explicit binding effort for lane {lane_id}"
             )
-            cleanup = _retire(lane_id)
+            cleanup = _retire(lane_id, attempt_deadline=attempt_deadline)
             if not cleanup.get("cleanup_proven"):
                 # The exact child may still be live; its identity and the
                 # unproven retirement stay visible instead of a claim that it
@@ -519,7 +550,7 @@ def make_native_apc_launcher(
             "launch_config": dict(launch_config),
         }
 
-        if now() >= deadline:
+        if now() >= attempt_deadline:
             # The launch itself consumed the one enclosing allowance.  Result
             # collection and cancellation are later phases, so neither starts;
             # the exact owned child stays visible as unresolved instead of
@@ -543,13 +574,13 @@ def make_native_apc_launcher(
                 # terminal cleanup is already proven by the harness.
                 artifact = None
                 break
-            if now() >= deadline:
+            if now() >= attempt_deadline:
                 expired = True
                 break
             pause(poll_seconds)
 
         if not expired:
-            cleanup = _retire(lane_id)
+            cleanup = _retire(lane_id, attempt_deadline=attempt_deadline)
         else:
             # The one enclosing allowance is already spent, so no further
             # effectful native call may start; the exact owned lane stays
@@ -601,7 +632,7 @@ def make_native_apc_launcher(
             observation["cleanup"] = dict(cleanup)
         return observation
 
-    def _retire(lane_id: str) -> dict[str, Any]:
+    def _retire(lane_id: str, *, attempt_deadline: float) -> dict[str, Any]:
         """Prove the exact child retired inside the shared allowance.
 
         Cancellation is itself a blocking native call, so it runs under the
@@ -610,9 +641,11 @@ def make_native_apc_launcher(
         allowance.
         """
 
+        stop_remaining = attempt_deadline - now()
         try:
             stopped_done, stopped = _bounded_call(
-                lambda: _stop()(lane_id), remaining=deadline - now()
+                lambda: _stop()(lane_id, allowance_seconds=stop_remaining),
+                remaining=stop_remaining,
             )
         except Exception as exc:  # pragma: no cover - defensive
             return {
@@ -652,6 +685,7 @@ def make_native_apc_launcher(
             "cleanup_proven": False,
         }
 
+    launcher.apc_child_receives_enclosing_deadline = True
     return launcher
 
 

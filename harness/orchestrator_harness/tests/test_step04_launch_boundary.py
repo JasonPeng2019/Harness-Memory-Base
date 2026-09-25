@@ -684,6 +684,56 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
         self.assertFalse(store_path.exists())
 
 
+class Step04ScrubbedWorkerEnvironmentTests(unittest.TestCase):
+    """A prepared scrubbed lane fails closed without its durable card."""
+
+    def setUp(self) -> None:
+        self.fixture = LaunchBoundaryFixture()
+        self.addCleanup(self.fixture.close)
+        self.card = contracts.make_task_card(
+            task="Draft only inside the bounded allowance",
+            base_commit="test-base",
+            branch="lane/scrubbed-lane",
+            worker_environment="scrubbed",
+        )
+        result, self.worktree = self.fixture.run_bootstrap(
+            lane_id="scrubbed-lane", card=self.card
+        )
+        self.assertTrue(result["ok"], result)
+
+    def test_durable_scrubbed_requirement_is_recorded_at_bootstrap(self) -> None:
+        lane = self.fixture.lane_record("scrubbed-lane")
+        self.assertEqual("scrubbed", lane.get("worker_environment"))
+
+    def test_missing_copied_card_fails_closed_without_inheriting(self) -> None:
+        task_card_path = self.worktree / ".agent-workspace" / "task-card.json"
+        task_card_path.unlink()
+        result, spawn = self.fixture.run_launch(lane_id="scrubbed-lane")
+        self.assertFalse(result["ok"], result)
+        spawn.assert_not_called()
+
+    def test_altered_copied_card_fails_closed_without_inheriting(self) -> None:
+        task_card_path = self.worktree / ".agent-workspace" / "task-card.json"
+        altered = {
+            key: value
+            for key, value in self.card.items()
+            if key != "worker_environment"
+        }
+        self.fixture.write_json(task_card_path, altered)
+        result, spawn = self.fixture.run_launch(lane_id="scrubbed-lane")
+        self.assertFalse(result["ok"], result)
+        spawn.assert_not_called()
+
+    def test_intact_scrubbed_card_still_launches_with_a_scrubbed_environment(self) -> None:
+        result, spawn = self.fixture.run_launch(lane_id="scrubbed-lane")
+        self.assertTrue(result["ok"], result)
+        spawn.assert_called_once()
+        env = spawn.call_args.kwargs.get("env")
+        self.assertIsInstance(env, dict)
+        for key in ("MEMORY_HARNESS_CONTROL_TOKEN", "MEMORY_HARNESS_POLICY_TOKEN"):
+            self.assertNotIn(key, env)
+
+
 class Step04ResumeBoundaryTests(unittest.TestCase):
     """run_resume carries the same meaning as bootstrap for every state."""
 

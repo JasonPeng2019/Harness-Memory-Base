@@ -16,6 +16,7 @@ import json
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,7 @@ BOOTSTRAP_ADAPTER_MISSING = "BOOTSTRAP_ADAPTER_MISSING"
 BOOTSTRAP_CACHE_MISSING = "BOOTSTRAP_CACHE_MISSING"
 BOOTSTRAP_RESOURCE_UNDECLARED = "BOOTSTRAP_RESOURCE_UNDECLARED"
 BOOTSTRAP_PLAN_PENDING = "BOOTSTRAP_PLAN_PENDING"
+BOOTSTRAP_ALLOWANCE_EXPIRED = "BOOTSTRAP_ALLOWANCE_EXPIRED"
 
 # Managed-only helpers carried by the workspace base; plain bootstrap omits them.
 PLAIN_EXCLUDED_HELPERS = (
@@ -542,8 +544,18 @@ def run_bootstrap(
     launch_config: dict[str, Any],
     exclusive_resources: list[str],
     task_card_path: str,
+    allowance_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Execute ``lane bootstrap`` and return the structured result."""
+    """Execute ``lane bootstrap`` and return the structured result.
+
+    ``allowance_seconds`` is the caller's remaining share of one enclosing
+    absolute deadline.  A spent allowance refuses before any worktree, epoch,
+    or lane record exists, and the same absolute instant is re-checked
+    immediately before each effect of this call, so a call that started inside
+    the allowance and then ran long can never create a lane the caller has
+    already stopped waiting for.  ``None`` keeps the ordinary caller's
+    unbounded behaviour.
+    """
     try:
         from .config import find_harness_root
 
@@ -599,6 +611,35 @@ def run_bootstrap(
                 "evidence_paths": [],
                 "next_action": "fix the manifest (requires shutdown) or drop the resource",
             }
+    allowance_deadline: float | None = None
+    if allowance_seconds is not None:
+        allowance_deadline = time.monotonic() + float(allowance_seconds)
+        if allowance_seconds <= 0:
+            return {
+                "ok": False,
+                "code": BOOTSTRAP_ALLOWANCE_EXPIRED,
+                "summary": (
+                    "the enclosing allowance is spent; no lane was created and "
+                    "nothing may be queued after it"
+                ),
+                "evidence_paths": [],
+                "next_action": (
+                    "reconcile the exact child of the enclosing attempt or "
+                    "prepare again inside the remaining decision time"
+                ),
+            }
+
+    def allowance_expired() -> bool:
+        """Report one absolute expiry without touching any effectful phase."""
+
+        return allowance_deadline is not None and time.monotonic() >= allowance_deadline
+
+    def refuse_expired_allowance(phase: str) -> "BootstrapError":
+        return BootstrapError(
+            BOOTSTRAP_ALLOWANCE_EXPIRED,
+            f"the enclosing allowance expired before the {phase}; nothing was "
+            "created after the caller stopped waiting",
+        )
 
     rt = config.runtime_root
     worktree_path: Path | None = None
@@ -639,6 +680,11 @@ def run_bootstrap(
         worktree_path = rt / "worktrees" / epoch_id / lane_id
         branch = str(task_card.get("branch") or f"lane/{lane_id}")
         base_commit = str(task_card.get("base_commit") or "HEAD")
+        if allowance_expired():
+            # The call entered inside the allowance and ran long; its first
+            # effectful phase may not start now that the caller has stopped
+            # waiting, so no late lane appears.
+            raise refuse_expired_allowance("lane worktree was created")
         _git_worktree_add(config.root_workspace, branch, worktree_path, base_commit)
         worktree_created = True
         agent_workspace = worktree_path / ".agent-workspace"
@@ -690,6 +736,10 @@ def run_bootstrap(
         def publish_lane(lane: dict[str, Any]) -> None:
             """Persist one prepared-or-pending lane record and declare it active."""
             nonlocal lane_record_written
+            if allowance_expired():
+                # The durable lane record is the ownership claim; it is the
+                # last effect that may not appear after the caller's deadline.
+                raise refuse_expired_allowance("lane record was published")
             write_lane(rt, epoch_id, lane_id, lane)
             lane_record_written = True
             entries = read_active_lanes(rt, epoch_id)
@@ -729,6 +779,9 @@ def run_bootstrap(
                 "acceptance_advancement": None,
                 "last_reported_actionable_status": None,
             }
+            declared_environment = task_card.get("worker_environment")
+            if isinstance(declared_environment, str) and declared_environment:
+                record["worker_environment"] = declared_environment
             if managed:
                 record["incoming_queue_path"] = str(agent_workspace / "QUEUE.json")
                 record["incoming_queue_command"] = str(agent_workspace / "lane-queue.py")
