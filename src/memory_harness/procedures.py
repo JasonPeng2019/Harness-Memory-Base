@@ -657,7 +657,6 @@ class TrustedProcedureService:
             raise ProcedureIneligibleError("publication is no longer eligible for remote submission")
         try:
             remote = adapter.write_publication(publication)
-            snapshot = adapter.exact_read(publication["publication_id"])
         except atlas.AtlasProcedureFencedError as exc:
             self._update_publication(publication, status="fenced", error="remote publication fenced")
             self._update_remote_operation(operation, status="fenced", error="remote publication fenced")
@@ -672,7 +671,50 @@ class TrustedProcedureService:
             self._update_publication(publication, status="blocked", error="remote publication failed")
             self._update_remote_operation(operation, status="blocked", error="remote publication failed")
             raise ProcedureError("remote publication failed") from exc
+        try:
+            snapshot = adapter.exact_read(publication["publication_id"])
+        except atlas.AtlasProcedureError as exc:
+            self._update_publication(
+                publication, status="ambiguous", error="remote exact read after write failed"
+            )
+            self._update_remote_operation(
+                operation, status="ambiguous", error="remote exact read after write failed"
+            )
+            raise ProcedureRemoteAmbiguityError(
+                "remote publication write lacks authoritative exact readback"
+            ) from exc
         if not self._snapshot_matches_publication(snapshot, publication):
+            remote_publication = (
+                snapshot.document.get("publication") if snapshot is not None else None
+            )
+            incomplete_readback = snapshot is None or (
+                isinstance(remote_publication, Mapping)
+                and remote_publication.get("payload_digest") == publication["payload_digest"]
+                and snapshot.revocation is None
+                and (
+                    snapshot.current is None
+                    or self._current_matches_designation(
+                        snapshot.current, publication["designation"]
+                    )
+                )
+                and (
+                    snapshot.publication_state is None
+                    or self._snapshot_matches_publication_state(
+                        snapshot, publication, state="active"
+                    )
+                )
+                and (snapshot.current is None or snapshot.publication_state is None)
+            )
+            if incomplete_readback:
+                self._update_publication(
+                    publication, status="ambiguous", error="remote publication lacks exact readback"
+                )
+                self._update_remote_operation(
+                    operation, status="ambiguous", error="remote publication lacks exact readback"
+                )
+                raise ProcedureRemoteAmbiguityError(
+                    "remote publication write lacks authoritative exact readback"
+                )
             self._update_publication(publication, status="fenced", error="remote lifecycle changed")
             self._update_remote_operation(operation, status="fenced", error="remote lifecycle changed")
             raise ProcedureIneligibleError("remote publication failed exact lifecycle validation")

@@ -539,7 +539,10 @@ class AtlasProcedureAdapter:
         identifier = document.get("_id")
         if not isinstance(identifier, str) or not identifier:
             raise AtlasProcedureError(f"{description} has no stable id")
-        existing = self._find_one(identifier)
+        try:
+            existing = self._find_one(identifier)
+        except Exception as exc:
+            raise AtlasProcedureError(f"{description} exact read before write failed") from exc
         if existing is not None:
             if existing.get("content_hash") == document.get("content_hash"):
                 return existing
@@ -549,13 +552,23 @@ class AtlasProcedureAdapter:
         except Exception as exc:
             # A lost response may have committed. Exact-read only the same id;
             # never generate a replacement operation identity on retry.
-            reconciled = self._find_one(identifier)
+            try:
+                reconciled = self._find_one(identifier)
+            except Exception as read_exc:
+                raise AtlasProcedureAmbiguityError(
+                    f"{description} write acknowledgement and readback are ambiguous"
+                ) from read_exc
             if reconciled is not None and reconciled.get("content_hash") == document.get("content_hash"):
                 return reconciled
             raise AtlasProcedureAmbiguityError(
                 f"{description} write acknowledgement is ambiguous"
             ) from exc
-        reconciled = self._find_one(identifier)
+        try:
+            reconciled = self._find_one(identifier)
+        except Exception as exc:
+            raise AtlasProcedureAmbiguityError(
+                f"{description} did not exact-read after its write"
+            ) from exc
         if reconciled is None or reconciled.get("content_hash") != document.get("content_hash"):
             raise AtlasProcedureAmbiguityError(
                 f"{description} did not exact-read after its write"
@@ -668,8 +681,15 @@ class AtlasProcedureAdapter:
         persisted = self._insert_exact(document, description="Atlas procedure publication")
         validate_atlas_procedure_document(persisted)
         state = make_atlas_publication_state_document(publication, state="active")
-        persisted_state = self._insert_exact(state, description="Atlas publication state")
-        validate_atlas_publication_state_document(persisted_state)
+        try:
+            persisted_state = self._insert_exact(state, description="Atlas publication state")
+            validate_atlas_publication_state_document(persisted_state)
+        except AtlasProcedureFencedError:
+            raise
+        except AtlasProcedureError as exc:
+            raise AtlasProcedureAmbiguityError(
+                "Atlas publication state is uncertain after publication write"
+            ) from exc
         return persisted
 
     def write_publication_state(
@@ -781,19 +801,27 @@ class AtlasProcedureAdapter:
     def exact_read(self, publication_id: str) -> AtlasExactProcedureSnapshot | None:
         """Read the selected procedure and all lifecycle evidence by exact id."""
 
-        document = self._find_one(publication_id)
+        def read(identifier: str) -> dict[str, Any] | None:
+            try:
+                return self._find_one(identifier)
+            except AtlasProcedureError:
+                raise
+            except Exception as exc:
+                raise AtlasProcedureError("Atlas exact read failed") from exc
+
+        document = read(publication_id)
         if document is None:
             return None
         validate_atlas_procedure_document(document)
-        current = self._find_one(
+        current = read(
             current_document_id(document["logical_id"], document["partition_id"])
         )
         if current is not None:
             validate_atlas_current_document(current)
-        state = self._find_one(publication_state_document_id(publication_id))
+        state = read(publication_state_document_id(publication_id))
         if state is not None:
             validate_atlas_publication_state_document(state)
-        revocation = self._find_one(revocation_document_id(document["revision_id"]))
+        revocation = read(revocation_document_id(document["revision_id"]))
         if revocation is not None:
             validate_atlas_revocation_document(revocation)
         return AtlasExactProcedureSnapshot(
