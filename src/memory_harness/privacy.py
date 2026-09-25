@@ -15,12 +15,15 @@ from typing import Any, Mapping
 REDACTION_MARKER = "[REDACTED]"
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 _ASSIGNMENT = re.compile(r"(?<![\w.-])([A-Za-z][\w.-]{2,})[\"']?\s*[:=]", re.MULTILINE)
-_CAMEL = re.compile(r"([a-z0-9])([A-Z])")
 _CREDENTIAL_WORDS = {"password", "passwd", "secret", "credential", "authorization", "bearer", "privatekey"}
 _AUTHORITY_ACTIONS = {"approve", "approval", "publish", "publication", "revoke", "revocation",
                       "mutate", "mutation", "policy", "control"}
 _AUTHORITY_GRANTS = {"allow", "enabled", "enable", "may", "can", "grant", "write", "authority", "permission"}
 _SAFE_AUTHORITY = {"none", "excluded", "historical_evidence_only", "evidence_only", "false"}
+_CONCEPTS = tuple(sorted(_CREDENTIAL_WORDS | _AUTHORITY_ACTIONS | _AUTHORITY_GRANTS | {
+    "api", "access", "refresh", "root", "role", "token", "manager", "admin", "execute", "parent",
+    "memory", "plane", "private", "key", "approval", "publication", "mutation",
+}, key=len, reverse=True))
 
 
 class PrivacyError(ValueError):
@@ -72,49 +75,82 @@ def _decode_unicode(value: str) -> str:
     return _UNICODE_ESCAPE.sub(lambda match: chr(int(match.group(1), 16)), value)
 
 
-def _json_fragments(value: str) -> list[Any]:
-    """Read bounded JSON objects/arrays even when quoted inside ordinary prose."""
+def _structured_views(value: str) -> list[tuple[list[Any], str]]:
+    """Parse each bounded JSON span once; leave only prose for assignment scanning."""
     views = (value, re.sub(r'\\(["\\])', r'\1', value))
     decoder = json.JSONDecoder()
-    fragments: list[Any] = []
+    result: list[tuple[list[Any], str]] = []
     for view in views:
-        for index, char in enumerate(view):
-            if char not in "{[":
+        fragments: list[Any] = []
+        residual = list(view)
+        index = 0
+        while index < len(view):
+            if view[index] not in "{[":
+                index += 1
                 continue
             try:
-                parsed, _end = decoder.raw_decode(view[index:])
+                parsed, end = decoder.raw_decode(view, index)
             except ValueError:
+                index += 1
                 continue
             if isinstance(parsed, (dict, list)):
                 fragments.append(parsed)
-    return fragments
+                residual[index:end] = " " * (end - index)
+                index = end
+            else:
+                index += 1
+        result.append((fragments, "".join(residual)))
+    return result
+
+
+def _canonical_key(key: str) -> str:
+    return "".join(char for char in _decode_unicode(key).casefold() if char.isascii() and char.isalnum())
+
+
+def _concepts(key: str) -> list[str]:
+    """Find governed concepts in canonical identity regardless of case or separators."""
+    result: list[str] = []
+    index = 0
+    while index < len(key):
+        concept = next((word for word in _CONCEPTS if key.startswith(word, index)), None)
+        if concept:
+            result.append(concept)
+            index += len(concept)
+        else:
+            index += 1
+    return result
 
 
 def _key_kind(key: str) -> str | None:
-    expanded = _CAMEL.sub(r"\1_\2", _decode_unicode(key))
-    words = re.findall(r"[a-z0-9]+", expanded.lower())
-    normalized = "".join(words)
-    if normalized in {"taskcredentialchannel", "rolelabel", "sharedpublication"}:
+    normalized = _canonical_key(key)
+    if len(normalized) > 256:
+        return "credential"
+    if normalized == "taskcredentialchannel":
+        return "task_channel"
+    if normalized in {"rolelabel", "sharedpublication"}:
         return None
-    if normalized.endswith(("apikey", "apitoken", "accesstoken", "refreshtoken",
-                            "controltoken", "policytoken", "privatekey")) or any(
-        word in _CREDENTIAL_WORDS for word in words
-    ):
+    words = _concepts(normalized)
+    concepts = set(words)
+    if concepts & _CREDENTIAL_WORDS or ("key" in concepts and concepts & {"api", "private"}):
         return "credential"
-    if "token" in words and ({"api", "access", "refresh", "root", "approval", "approve",
-                              "control", "policy", "publish", "manager", "admin"} & set(words)):
+    if "token" in concepts and concepts & {"api", "access", "refresh", "root", "approval", "approve",
+                                               "control", "policy", "publish", "manager", "admin"}:
         return "credential"
-    if "role" in words and "enabled" in words and ({"root", "manager", "admin", "control"} & set(words)):
+    if {"role", "enabled"} <= concepts and concepts & {"root", "manager", "admin", "control"}:
         return "authority"
-    if set(words) & _AUTHORITY_ACTIONS and set(words) & _AUTHORITY_GRANTS:
+    if concepts & _AUTHORITY_ACTIONS and concepts & _AUTHORITY_GRANTS:
         return "authority"
-    if normalized in {"publishauthority", "publicationauthority", "mutationauthority",
-                      "memoryauthority", "controlplaneauthority", "maypublish", "mayapprove",
-                      "mayrevoke", "maymutate", "mayexecuteparent"}:
+    if {"memory", "authority"} <= concepts or {"may", "execute", "parent"} <= concepts:
         return "authority"
     if normalized == "authority":
         return "authority_value"
     return None
+
+
+def _safe_authority_value(value: Any) -> bool:
+    return value is None or value is False or value == 0 or (
+        isinstance(value, str) and value.casefold() in _SAFE_AUTHORITY | {"0", "null"}
+    )
 
 
 def _task_channel(value: Any) -> bool:
@@ -134,8 +170,6 @@ def worker_bound_finding(value: Any, policy: PrivacyPolicy | None = None) -> str
         if depth > 24 or seen > 10000:
             return "scan limit"
         if isinstance(item, Mapping):
-            if "task_credential_channel" in item and not _task_channel(item["task_credential_channel"]):
-                return "invalid task credential channel"
             if item.get("content_hash") in selected.trusted_approval_hashes:
                 try:
                     from . import contracts
@@ -171,13 +205,18 @@ def worker_bound_finding(value: Any, policy: PrivacyPolicy | None = None) -> str
                         return "credential in approval evidence"
                     continue
                 kind = _key_kind(key)
+                if kind == "task_channel":
+                    if not _task_channel(child):
+                        return "invalid task credential channel"
+                    finding = visit(child, depth + 1)
+                    if finding:
+                        return finding
+                    continue
                 if kind == "credential":
                     return "credential field"
-                if kind == "authority" and child not in (None, False, "none", "excluded"):
+                if kind == "authority" and not _safe_authority_value(child):
                     return "worker authority field"
-                if kind == "authority_value" and child not in (None, False, "none", "excluded") and (
-                    not isinstance(child, str) or child.lower() not in _SAFE_AUTHORITY
-                ):
+                if kind == "authority_value" and not _safe_authority_value(child):
                     return "worker authority field"
                 finding = visit(child, depth + 1, (approved_pair and key == "approval")
                                 or (approved_compact and key == "compact_approval"))
@@ -196,15 +235,16 @@ def worker_bound_finding(value: Any, policy: PrivacyPolicy | None = None) -> str
                 return "scan limit"
             if _find_known_secrets(decoded, selected.known_secrets):
                 return "configured secret"
-            for fragment in _json_fragments(decoded):
-                finding = visit(fragment, depth + 1)
-                if finding:
-                    return finding
-            for match in _ASSIGNMENT.finditer(decoded):
-                kind = _key_kind(match.group(1))
-                assigned = decoded[match.end():].splitlines()[0].split(",", 1)[0].split(";", 1)[0].strip().strip("\"' ")
-                if kind == "credential" or (kind in {"authority", "authority_value"} and assigned.lower() not in _SAFE_AUTHORITY | {"0", "null"}):
-                    return "worker assignment"
+            for fragments, residual in _structured_views(decoded):
+                for fragment in fragments:
+                    finding = visit(fragment, depth + 1)
+                    if finding:
+                        return finding
+                for match in _ASSIGNMENT.finditer(residual):
+                    kind = _key_kind(match.group(1))
+                    assigned = residual[match.end():].splitlines()[0].split(",", 1)[0].split(";", 1)[0].strip().strip("\"' ")
+                    if kind in {"credential", "task_channel"} or (kind in {"authority", "authority_value"} and not _safe_authority_value(assigned)):
+                        return "worker assignment"
         return None
 
     return visit(value)
@@ -282,13 +322,14 @@ def _credential_field_finding(value: Any) -> bool:
         return any(_credential_field_finding(child) for child in value)
     if isinstance(value, str):
         decoded = _decode_unicode(value)
-        try:
-            parsed = json.loads(decoded)
-        except ValueError:
-            parsed = None
-        if isinstance(parsed, (dict, list)):
-            return _credential_field_finding(parsed)
-        return any(_key_kind(match.group(1)) == "credential" for match in _ASSIGNMENT.finditer(decoded))
+        if len(decoded) > 65536 or decoded.count("{") + decoded.count("[") > 64:
+            return True
+        for fragments, residual in _structured_views(decoded):
+            if any(_credential_field_finding(fragment) for fragment in fragments):
+                return True
+            if any(_key_kind(match.group(1)) == "credential" for match in _ASSIGNMENT.finditer(residual)):
+                return True
+        return False
     return False
 
 
@@ -301,7 +342,7 @@ def worker_environment(
         if not isinstance(key, str) or key.upper() in {
             item.upper() for item in selected_policy.forbidden_environment_keys
         } or (key != "OPENAI_API_KEY" and (
-            _key_kind(key) in {"credential", "authority", "authority_value"}
+            _key_kind(key) in {"credential", "authority", "authority_value", "task_channel"}
             or (key.upper().startswith("MEMORY_HARNESS_") and any(
                 part in key.upper().split("_") for part in ("CONTROL", "POLICY", "PUBLISH", "APPROVAL", "ADMIN", "MANAGER")
             ))

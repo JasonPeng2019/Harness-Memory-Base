@@ -266,6 +266,64 @@ class PrivacyBoundaryTests(unittest.TestCase):
                                        optional_content=[value], privacy_policy=self.policy)
         self.assertNotIn("publish_authority", prompt)
 
+    def test_canonical_key_spelling_matrix_across_worker_sinks(self) -> None:
+        cases = (
+            ("ROOTApprovalToken", "credential"),
+            ("ROOT_APPROVALTOKEN", "credential"),
+            ("MEMORY_HARNESS_ROOT_APPROVALTOKEN", "credential"),
+            ("ROOTRoleEnabled", "authority"),
+            ("allowPOLICYWrite", "authority"),
+        )
+        for key, kind in cases:
+            for value in ({key: True}, f"{key}=true", f"note: {json.dumps({key: True})}"):
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(privacy.MandatorySecretError) as error:
+                        privacy.guard_mandatory(value, self.policy)
+                    self.assertNotIn(key, str(error.exception))
+                    self.assertIsNone(privacy.sanitize_optional(value, self.policy))
+                    with self.assertRaises(privacy.RemotePayloadPrivacyError):
+                        privacy.safe_query_payload(value, self.policy)
+                    with self.assertRaises(privacy.RemotePayloadPrivacyError):
+                        privacy.guard_worker_bound_remote(value, self.policy)
+                    if kind == "credential":
+                        with self.assertRaises(privacy.RemotePayloadPrivacyError):
+                            privacy.guard_remote_payload(value, self.policy)
+                    else:
+                        privacy.guard_remote_payload(value, self.policy)
+            self.assertNotIn(key, privacy.worker_environment({key: "true"}, self.policy))
+
+    def test_parsed_json_spans_preserve_safe_values(self) -> None:
+        safe = (
+            'note: {"publish_authority":false}',
+            'note: {"ROOT_ROLE_ENABLED":false}',
+            'note: {"authority":"historical_evidence_only"}',
+            'note: "{\\"publish_authority\\":false}"',
+            'note: {"ROOT_\\u0052OLE_ENABLED":false}',
+        )
+        for value in safe:
+            with self.subTest(value=value):
+                privacy.guard_mandatory(value, self.policy)
+                self.assertEqual(value, privacy.sanitize_optional(value, self.policy))
+                privacy.safe_query_payload(value, self.policy)
+                privacy.guard_worker_bound_remote(value, self.policy)
+        for value in ('note: {"ROOTRoleEnabled":true}',
+                      'note: "{\\"ROOTApprovalToken\\":true}"',
+                      'note: {"ROOT_\\u0041PPROVALTOKEN":true}'):
+            with self.subTest(value=value):
+                with self.assertRaises(privacy.MandatorySecretError):
+                    privacy.guard_mandatory(value, self.policy)
+
+    def test_task_channel_variant_requires_valid_shape(self) -> None:
+        valid = {"TaskCredentialChannel": {"scope": "task_only", "validated": True,
+                                            "channel_id": "task-channel"}}
+        privacy.guard_mandatory(valid, self.policy)
+        invalid = {"TaskCredentialChannel": {**valid["TaskCredentialChannel"], "validated": False}}
+        with self.assertRaises(privacy.MandatorySecretError):
+            privacy.guard_mandatory(invalid, self.policy)
+        self.assertIsNone(privacy.sanitize_optional(invalid, self.policy))
+        with self.assertRaises(privacy.RemotePayloadPrivacyError):
+            privacy.safe_query_payload(invalid, self.policy)
+
 
 if __name__ == "__main__":
     unittest.main()

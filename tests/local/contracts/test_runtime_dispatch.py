@@ -153,6 +153,25 @@ class RuntimeDispatchTests(unittest.TestCase):
                 self.assertEqual([], calls)
                 self.assertEqual(0, self.memory_store.connection.execute("SELECT COUNT(*) FROM operations").fetchone()[0])
 
+    def test_canonical_variants_reject_dispatch_and_intent_before_effects(self) -> None:
+        for value in ({"ROOTApprovalToken": "synthetic-control-value"},
+                      {"ROOTRoleEnabled": True}, {"allowPOLICYWrite": True},
+                      'note: {"ROOTRoleEnabled":true}'):
+            with self.subTest(value=value):
+                envelope = dict(self.envelope)
+                envelope["optional_content"] = [{"id": "unsafe", "kind": "memory", "content": value}]
+                envelope["optional_digest"] = contracts.sha256_hex(envelope["optional_content"])
+                envelope["delivery"] = {**envelope["delivery"], "optional": ["unsafe"]}
+                envelope["content_hash"] = contracts.content_hash(envelope)
+                calls = []
+                with self.assertRaises(privacy.MandatorySecretError):
+                    self.runtime.dispatch(envelope, lambda packet: calls.append(packet))
+                with self.assertRaises(privacy.MandatorySecretError):
+                    self.runtime.record_dispatch_intent(envelope)
+                self.assertEqual([], calls)
+                self.assertEqual(0, self.memory_store.connection.execute(
+                    "SELECT COUNT(*) FROM operations").fetchone()[0])
+
     def test_lost_ack_is_reconciled_and_blocks_duplicate_dispatch(self) -> None:
         calls: list[object] = []
 
