@@ -324,6 +324,77 @@ class PrivacyBoundaryTests(unittest.TestCase):
         with self.assertRaises(privacy.RemotePayloadPrivacyError):
             privacy.safe_query_payload(invalid, self.policy)
 
+    def test_residual_assignment_lexer_blocks_spaced_governed_keys(self) -> None:
+        cases = (
+            ("ROOT ROLE ENABLED", "authority"),
+            ("allow POLICY write", "authority"),
+            ("ROOT APPROVAL TOKEN", "credential"),
+            ("root-APPROVAL token", "credential"),
+            ("memory_harness ROOT approval.token", "credential"),
+        )
+        for key, kind in cases:
+            assigned = f"note: {key}=synthetic-control-value"
+            for value in ({key: True}, assigned,
+                          f"note: {json.dumps({key: True})}",
+                          f'note: "{json.dumps({key: True}).replace(chr(34), chr(92) + chr(34))}"'):
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(privacy.MandatorySecretError) as error:
+                        privacy.guard_mandatory(value, self.policy)
+                    self.assertNotIn("synthetic-control-value", str(error.exception))
+                    self.assertIsNone(privacy.sanitize_optional(value, self.policy))
+                    with self.assertRaises(privacy.RemotePayloadPrivacyError):
+                        privacy.safe_query_payload(value, self.policy)
+                    with self.assertRaises(privacy.RemotePayloadPrivacyError):
+                        privacy.guard_worker_bound_remote(value, self.policy)
+                    if kind == "credential":
+                        with self.assertRaises(privacy.RemotePayloadPrivacyError):
+                            privacy.guard_remote_payload(value, self.policy)
+                    else:
+                        privacy.guard_remote_payload(value, self.policy)
+            self.assertNotIn("NOTE", privacy.worker_environment({"NOTE": assigned}, self.policy))
+        self.assertEqual(
+            {"OPENAI_API_KEY": "provider-transport-secret", "HISTORY": "prior approval discussion"},
+            privacy.worker_environment({
+                "OPENAI_API_KEY": "provider-transport-secret", "HISTORY": "prior approval discussion",
+                "CONTROL_NOTE": "ROOT APPROVAL TOKEN=synthetic-control-value",
+            }, self.policy),
+        )
+
+    def test_residual_assignment_scalar_boundaries(self) -> None:
+        safe = (
+            "note: publish_authority=false.",
+            "note: authority=historical_evidence_only.",
+            'note: {"publish_authority":false} and authority=excluded.',
+            "note: ROOT ROLE ENABLED=false.",
+            "note: authority='evidence_only'.",
+            "note: publish_authority=null)",
+            "The historical report discussed approval and publication authority.",
+            {"role_label": "publisher", "shared_publication": "historical example"},
+        ) + tuple(f"note: authority={token}." for token in
+                  ("none", "false", "0", "null", "excluded",
+                   "historical_evidence_only", "evidence_only"))
+        for value in safe:
+            with self.subTest(value=value):
+                privacy.guard_mandatory(value, self.policy)
+                self.assertEqual(value, privacy.sanitize_optional(value, self.policy))
+                privacy.safe_query_payload(value, self.policy)
+                privacy.guard_worker_bound_remote(value, self.policy)
+        unsafe = (
+            "note: ROOT ROLE ENABLED=true.",
+            "note: authority=false.evil",
+            "note: authority=false0",
+            "note: authority=historical_evidence_only_extra",
+            'note: authority="false.evil"',
+            "note: authority=excluded. and ROOT APPROVAL TOKEN=x",
+            'note: {"publish_authority":false} and allow POLICY write=true',
+        )
+        for value in unsafe:
+            with self.subTest(value=value):
+                with self.assertRaises(privacy.MandatorySecretError):
+                    privacy.guard_mandatory(value, self.policy)
+                self.assertIsNone(privacy.sanitize_optional(value, self.policy))
+                self.assertEqual(privacy.REDACTION_MARKER, privacy.sanitize_text(value, self.policy))
+
 
 if __name__ == "__main__":
     unittest.main()

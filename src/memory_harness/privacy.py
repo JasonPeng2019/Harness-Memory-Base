@@ -14,12 +14,20 @@ from typing import Any, Mapping
 
 REDACTION_MARKER = "[REDACTED]"
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
-_ASSIGNMENT = re.compile(r"(?<![\w.-])([A-Za-z][\w.-]{2,})[\"']?\s*[:=]", re.MULTILINE)
+_ASSIGNMENT = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?P<key>[A-Za-z][A-Za-z0-9]*(?:[ \t_.-]+[A-Za-z0-9]+){0,7})"
+    r"[ \t]*[\"']?[ \t]*[:=]"
+)
 _CREDENTIAL_WORDS = {"password", "passwd", "secret", "credential", "authorization", "bearer", "privatekey"}
 _AUTHORITY_ACTIONS = {"approve", "approval", "publish", "publication", "revoke", "revocation",
                       "mutate", "mutation", "policy", "control"}
 _AUTHORITY_GRANTS = {"allow", "enabled", "enable", "may", "can", "grant", "write", "authority", "permission"}
 _SAFE_AUTHORITY = {"none", "excluded", "historical_evidence_only", "evidence_only", "false"}
+_SAFE_SCALAR = re.compile(
+    "|".join(re.escape(token) for token in sorted(_SAFE_AUTHORITY | {"0", "null"}, key=len, reverse=True)),
+    re.IGNORECASE,
+)
 _CONCEPTS = tuple(sorted(_CREDENTIAL_WORDS | _AUTHORITY_ACTIONS | _AUTHORITY_GRANTS | {
     "api", "access", "refresh", "root", "role", "token", "manager", "admin", "execute", "parent",
     "memory", "plane", "private", "key", "approval", "publication", "mutation",
@@ -153,6 +161,51 @@ def _safe_authority_value(value: Any) -> bool:
     )
 
 
+def _safe_assignment_scalar(text: str, start: int) -> bool:
+    """Accept only an exact safe scalar at a real value boundary."""
+    index = start
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    opening = text[index] if index < len(text) and text[index] in "\"'" else None
+    if opening:
+        index += 1
+    match = _SAFE_SCALAR.match(text, index)
+    if match is None:
+        return False
+    index = match.end()
+    if opening:
+        if index >= len(text) or text[index] != opening:
+            return False
+        index += 1
+    elif index < len(text) and text[index] in "\"'":
+        index += 1
+    while index < len(text) and text[index] in ")]}":
+        index += 1
+    if index < len(text) and text[index] in ".?!,;":
+        index += 1
+    return index == len(text) or text[index].isspace()
+
+
+def _residual_assignments(text: str):
+    """Yield governed assignments from at most eight adjacent key components."""
+    for match in _ASSIGNMENT.finditer(text):
+        components = re.findall(r"[A-Za-z0-9]+", match.group("key"))
+        # An incidental prose prefix must not turn task-only channel metadata
+        # into a generic credential field.
+        channel = next((index for index in range(len(components))
+                        if _key_kind("".join(components[index:])) == "task_channel"), None)
+        if channel is not None:
+            yield "task_channel", _safe_assignment_scalar(text, match.end())
+            continue
+        for index, component in enumerate(components):
+            if not _concepts(_canonical_key(component)):
+                continue
+            kind = _key_kind("".join(components[index:]))
+            if kind:
+                yield kind, _safe_assignment_scalar(text, match.end())
+                break
+
+
 def _task_channel(value: Any) -> bool:
     return (isinstance(value, Mapping) and set(value) == {"scope", "validated", "channel_id"}
             and value.get("scope") == "task_only" and value.get("validated") is True
@@ -240,10 +293,8 @@ def worker_bound_finding(value: Any, policy: PrivacyPolicy | None = None) -> str
                     finding = visit(fragment, depth + 1)
                     if finding:
                         return finding
-                for match in _ASSIGNMENT.finditer(residual):
-                    kind = _key_kind(match.group(1))
-                    assigned = residual[match.end():].splitlines()[0].split(",", 1)[0].split(";", 1)[0].strip().strip("\"' ")
-                    if kind in {"credential", "task_channel"} or (kind in {"authority", "authority_value"} and not _safe_authority_value(assigned)):
+                for kind, safe_scalar in _residual_assignments(residual):
+                    if kind in {"credential", "task_channel"} or (kind in {"authority", "authority_value"} and not safe_scalar):
                         return "worker assignment"
         return None
 
@@ -327,7 +378,7 @@ def _credential_field_finding(value: Any) -> bool:
         for fragments, residual in _structured_views(decoded):
             if any(_credential_field_finding(fragment) for fragment in fragments):
                 return True
-            if any(_key_kind(match.group(1)) == "credential" for match in _ASSIGNMENT.finditer(residual)):
+            if any(kind == "credential" for kind, _safe in _residual_assignments(residual)):
                 return True
         return False
     return False
