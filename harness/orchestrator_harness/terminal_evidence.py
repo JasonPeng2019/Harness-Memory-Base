@@ -321,15 +321,30 @@ def read_terminal_evidence(
         record = read_json(path)
         validate_terminal_evidence(record, lane_id=lane_id, run_id=run_id)
         _require(record["epoch_id"] == epoch_id, "terminal evidence epoch mismatch")
-        if scoped is not None and folder == scoped and (lane_record_dir(rt, epoch_id, lane_id) / TERMINAL_EVIDENCE_NAME).exists():
-            root_record = read_json(lane_record_dir(rt, epoch_id, lane_id) / TERMINAL_EVIDENCE_NAME)
-            _require(root_record.get("run_id") != run_id, "two terminal publications claim the same run")
         for name, field in (
             ("COMPLETION_REVIEW.json", "review"),
             ("ORCHESTRATOR_ACCEPTANCE.json", "acceptance"),
         ):
             sibling = read_json(folder / name)
             _require(sibling == record[field], f"{name} conflicts with terminal evidence")
+        if scoped is not None and folder == scoped:
+            root = lane_record_dir(rt, epoch_id, lane_id)
+            for name, field, schema in (
+                ("COMPLETION_REVIEW.json", "review", "completion-review/v1"),
+                ("ORCHESTRATOR_ACCEPTANCE.json", "acceptance", "orchestrator-acceptance/v1"),
+                (TERMINAL_EVIDENCE_NAME, None, TERMINAL_EVIDENCE_SCHEMA),
+            ):
+                root_path = root / name
+                if not root_path.exists():
+                    continue
+                historical = read_json(root_path)
+                if historical.get("run_id") != run_id:
+                    continue
+                _hashed(historical, schema, f"root {name}")
+                if field is None:
+                    validate_terminal_evidence(historical, lane_id=lane_id, run_id=run_id)
+                _require(historical == (record if field is None else record[field]),
+                         f"root {name} conflicts with scoped terminal evidence")
     except (OSError, ValueError) as exc:
         if isinstance(exc, TerminalEvidenceError):
             raise

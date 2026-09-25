@@ -525,6 +525,58 @@ def _replay_retained_pair(
     return review, acceptance
 
 
+def _replay_retained_preparation(
+    rt: Path, epoch_id: str, lane: dict[str, Any], *, review_outcome: str,
+    review_summary: str, evidence: list[str], approval: str,
+    force_accept_reason: str | None, managed_event: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Finish only the missing acceptance from validated native preparation."""
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+    review_path = folder / "COMPLETION_REVIEW.json"
+    acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
+    with RecordLock(review_path):
+        review = _existing_record(review_path, COMPLETION_REVIEW_SCHEMA)
+        terminal = _existing_record(
+            folder / terminal_evidence.TERMINAL_EVIDENCE_NAME,
+            terminal_evidence.TERMINAL_EVIDENCE_SCHEMA,
+        )
+        if review is None or terminal is None or acceptance_path.exists():
+            raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained preparation is absent or already published")
+        try:
+            terminal_evidence.validate_terminal_evidence(
+                terminal, lane_id=lane["lane_id"], run_id=lane["run_id"],
+            )
+        except terminal_evidence.TerminalEvidenceError as exc:
+            raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
+        acceptance = terminal["acceptance"]
+        if (
+            terminal["epoch_id"] != epoch_id
+            or terminal["review"] != review
+            or not validate_acceptance_chain(
+                review, acceptance, lane_id=lane["lane_id"], run_id=lane["run_id"],
+            )
+            or review.get("review_outcome") != review_outcome
+            or review.get("review_summary") != review_summary
+            or review.get("evidence") != evidence
+            or acceptance.get("approval") != approval
+            or acceptance.get("force_accept_reason") != force_accept_reason
+        ):
+            raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained preparation conflicts with this retry")
+        if managed_event.get("state") != "COMPLETE":
+            try:
+                close_event(
+                    rt, managed_event["event_id"], "COMPLETE",
+                    summary=f"completion review recorded: {review_outcome} / {approval}",
+                )
+            except ManagerQueueError as exc:
+                raise ReviewError(
+                    COMPLETION_REVIEW_WRITE_FAILED,
+                    f"review prepared but the event could not be closed: {exc}",
+                ) from exc
+        atomic_write_json(acceptance_path, acceptance)
+    return review, acceptance
+
+
 def run_completion_review(
     *,
     event_id: str | None,
@@ -586,13 +638,20 @@ def run_completion_review(
                 "select the lane with --event-id (managed) or --lane-id (plain)",
             )
         folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+        retained_preparation = (
+            event is not None
+            and lane.get("memory_plan_state") == "execution_accepted"
+            and (folder / "COMPLETION_REVIEW.json").is_file()
+            and (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file()
+            and not (folder / "ORCHESTRATOR_ACCEPTANCE.json").exists()
+        )
         if lane.get("lifecycle") not in ("review_pending", "result_invalid"):
             if not (
                 (lane.get("lifecycle") == "accepted" or (
                     lane.get("lifecycle") == "retired" and event is not None
                 ))
                 and (folder / "COMPLETION_REVIEW.json").is_file()
-                and (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file()
+                and ((folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file() or retained_preparation)
             ):
                 raise ReviewError(
                     COMPLETION_REVIEW_STALE_SOURCE,
@@ -611,7 +670,14 @@ def run_completion_review(
                     "completed review event has no durable review preparation",
                 )
         exact_reason = force_reason if (force_accept and approval == "ACCEPTED" and review_outcome != "PASS") else None
-        if event is not None and (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file():
+        if retained_preparation:
+            review, acceptance = _replay_retained_preparation(
+                rt, epoch_id, lane, review_outcome=review_outcome,
+                review_summary=review_summary, evidence=evidence,
+                approval=approval, force_accept_reason=exact_reason,
+                managed_event=event,
+            )
+        elif event is not None and (folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file():
             review, acceptance = _replay_retained_pair(
                 rt, epoch_id, lane, review_outcome=review_outcome,
                 review_summary=review_summary, evidence=evidence,

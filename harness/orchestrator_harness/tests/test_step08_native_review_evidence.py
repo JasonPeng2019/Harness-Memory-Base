@@ -255,10 +255,21 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         closed_event = {
             "type": "COMPLETION_REVIEW_REQUIRED", "lane_id": self.lane_id,
             "run_id": self.run_id, "state": "COMPLETE",
+            "dedup_key": f"review:{self.lane_id}:{self.run_id}:{self.epoch_id}",
         }
         with (
             patch.object(monitor, "read_manager_queue", return_value={"events": [closed_event]}),
+            patch.object(monitor, "promote_event", return_value={"event_id": "recovery"}) as promote,
+            patch.object(monitor, "update_lane"),
+        ):
+            self.assertEqual([{"event_id": "recovery"}], monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane))
+        promote.assert_called_once()
+        self.assertIsNone(promote.call_args.kwargs["dedup_key"])
+        open_event = {**closed_event, "state": "ACKNOWLEDGED"}
+        with (
+            patch.object(monitor, "read_manager_queue", return_value={"events": [closed_event, open_event]}),
             patch.object(monitor, "promote_event") as promote,
+            patch.object(monitor, "update_lane"),
         ):
             self.assertEqual([], monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane))
         promote.assert_not_called()
@@ -269,9 +280,110 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         ):
             self.assertEqual([{"event_id": "replacement"}], monitor._recover_lost_review_event(self.rt, self.epoch_id, self.lane))
         promote.assert_called_once()
-        replay = self._review(managed=True, event_state="COMPLETE")
+
+        def close_recovery(*_args, **_kwargs):
+            self.assertFalse((self.folder / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+
+        replay = self._review(managed=True, close_side_effect=close_recovery)
         self.assertTrue(replay["ok"], replay)
         self.assertEqual(before, (self.folder / "NATIVE_TERMINAL_EVIDENCE.json").read_bytes())
+
+    def test_closed_preparation_replays_after_retirement_without_worktree(self) -> None:
+        original_write = review.atomic_write_json
+
+        def crash_before_acceptance(path: Path, value: dict) -> None:
+            if path.name == "ORCHESTRATOR_ACCEPTANCE.json":
+                raise OSError("crash before acceptance publication")
+            original_write(path, value)
+
+        with patch.object(review, "atomic_write_json", side_effect=crash_before_acceptance):
+            self.assertFalse(self._review(managed=True)["ok"])
+        retained = review.read_json(self.folder / terminal_evidence.TERMINAL_EVIDENCE_NAME)
+        self.assertFalse((self.folder / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+        self.lane["lifecycle"] = "retired"
+        import shutil
+
+        shutil.rmtree(self.worktree)
+        conflict = self._review(managed=True, event_state="COMPLETE", approval="REJECTED")
+        self.assertEqual(review.COMPLETION_REVIEW_OUTPUT_CONFLICT, conflict["code"])
+        self.assertFalse((self.folder / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+        terminal_path = self.folder / terminal_evidence.TERMINAL_EVIDENCE_NAME
+        damaged = copy.deepcopy(retained)
+        damaged["decision_id"] = "other-decision"
+        damaged["content_hash"] = content_hash(damaged)
+        atomic_write_json(terminal_path, damaged)
+        self.assertEqual(review.COMPLETION_REVIEW_OUTPUT_CONFLICT,
+                         self._review(managed=True, event_state="COMPLETE")["code"])
+        self.assertFalse((self.folder / "ORCHESTRATOR_ACCEPTANCE.json").exists())
+        atomic_write_json(terminal_path, retained)
+        replay = self._review(managed=True, event_state="COMPLETE")
+        self.assertTrue(replay["ok"], replay)
+        self.assertEqual(retained["acceptance"], review.read_json(self.folder / "ORCHESTRATOR_ACCEPTANCE.json"))
+        self.assertEqual(retained, self._evidence())
+
+    def test_scoped_reader_and_consumers_reject_same_run_root_siblings(self) -> None:
+        self.assertTrue(self._review()["ok"])
+        original = self._evidence()
+        scoped = terminal_evidence.run_publication_dir(self.rt, self.epoch_id, self.lane_id, self.run_id)
+        scoped.mkdir(parents=True)
+        for name in ("COMPLETION_REVIEW.json", "ORCHESTRATOR_ACCEPTANCE.json", terminal_evidence.TERMINAL_EVIDENCE_NAME):
+            (scoped / name).write_bytes((self.folder / name).read_bytes())
+        self.lane["resume_from_run_id"] = "prior-run"
+        self.assertEqual(original, self._evidence())
+        (self.folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).unlink()
+        altered_review = copy.deepcopy(original["review"])
+        altered_review["review_summary"] = "contradictory ROOT review"
+        altered_review["content_hash"] = content_hash(altered_review)
+        altered_acceptance = copy.deepcopy(original["acceptance"])
+        altered_acceptance["review_ref"] = altered_review["content_hash"]
+        altered_acceptance["content_hash"] = content_hash(altered_acceptance)
+        atomic_write_json(self.folder / "COMPLETION_REVIEW.json", altered_review)
+        atomic_write_json(self.folder / "ORCHESTRATOR_ACCEPTANCE.json", altered_acceptance)
+        self.assertTrue(review.validate_acceptance_chain(altered_review, altered_acceptance, lane_id=self.lane_id, run_id=self.run_id))
+        with self.assertRaises(terminal_evidence.TerminalEvidenceError):
+            self._evidence()
+        self.assertIsNone(controller._read_acceptance_chain(self.rt, self.epoch_id, self.lane))
+        self.assertIsNone(monitor._read_acceptance_chain(self.rt, self.epoch_id, self.lane_id, self.lane))
+        self.assertEqual("review_pending", monitor.derive_lane_status(
+            self.rt, self.epoch_id, self.lane,
+            {"recorded_status": "review_pending", "cleanup_proven": True},
+        ))
+        with (
+            patch.object(launch, "find_harness_root", return_value=self.root),
+            patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.rt, root_workspace=self.root)),
+            patch.object(launch, "find_active_lane", return_value=(self.epoch_id, self.lane)),
+            patch.object(launch, "release_leases") as release,
+        ):
+            retired = launch.run_retire(str(scoped / "ORCHESTRATOR_ACCEPTANCE.json"))
+        self.assertFalse(retired["ok"])
+        release.assert_not_called()
+
+        for name, changed in (
+            ("COMPLETION_REVIEW.json", altered_review),
+            ("ORCHESTRATOR_ACCEPTANCE.json", altered_acceptance),
+        ):
+            with self.subTest(root_slot=name):
+                (self.folder / "COMPLETION_REVIEW.json").unlink(missing_ok=True)
+                (self.folder / "ORCHESTRATOR_ACCEPTANCE.json").unlink(missing_ok=True)
+                atomic_write_json(self.folder / name, changed)
+                with self.assertRaises(terminal_evidence.TerminalEvidenceError):
+                    self._evidence()
+        (self.folder / "COMPLETION_REVIEW.json").unlink(missing_ok=True)
+        (self.folder / "ORCHESTRATOR_ACCEPTANCE.json").unlink(missing_ok=True)
+        changed_terminal = copy.deepcopy(original)
+        changed_terminal["review"] = altered_review
+        changed_terminal["acceptance"] = altered_acceptance
+        changed_terminal["content_hash"] = content_hash(changed_terminal)
+        terminal_evidence.validate_terminal_evidence(changed_terminal, lane_id=self.lane_id, run_id=self.run_id)
+        atomic_write_json(self.folder / terminal_evidence.TERMINAL_EVIDENCE_NAME, changed_terminal)
+        with self.assertRaises(terminal_evidence.TerminalEvidenceError):
+            self._evidence()
+        historical = copy.deepcopy(original["review"])
+        historical["run_id"] = "prior-run"
+        historical["content_hash"] = content_hash(historical)
+        (self.folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).unlink()
+        atomic_write_json(self.folder / "COMPLETION_REVIEW.json", historical)
+        self.assertEqual(original, self._evidence())
 
     def test_retired_managed_close_retry_uses_retained_exact_publication(self) -> None:
         fresh_response = self._review()

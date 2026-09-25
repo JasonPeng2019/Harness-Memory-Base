@@ -324,33 +324,6 @@ def _recover_lost_review_event(
         return []
     if _review_pair_is_valid(rt, epoch_id, lane):
         return []
-    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
-    if (
-        lane.get("memory_plan_state") == "execution_accepted"
-        and (folder / "COMPLETION_REVIEW.json").is_file()
-        and (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file()
-        and not (folder / "ORCHESTRATOR_ACCEPTANCE.json").exists()
-    ):
-        # Managed close may have committed immediately before acceptance
-        # publication. Keep the original event as the retry handle only for
-        # an exact, valid preparation.
-        try:
-            prepared = read_json(folder / terminal_evidence.TERMINAL_EVIDENCE_NAME)
-            terminal_evidence.validate_terminal_evidence(
-                prepared, lane_id=lane["lane_id"], run_id=lane["run_id"],
-            )
-            if prepared["review"] == read_json(folder / "COMPLETION_REVIEW.json"):
-                queue = read_manager_queue(rt)
-                if any(
-                    event.get("type") == "COMPLETION_REVIEW_REQUIRED"
-                    and event.get("lane_id") == lane["lane_id"]
-                    and event.get("run_id") == lane["run_id"]
-                    and event.get("state") == "COMPLETE"
-                    for event in queue.get("events", [])
-                ):
-                    return []
-        except (OSError, ValueError):
-            pass
     if _has_open_review_event(rt, lane):
         update_lane(
             rt,
