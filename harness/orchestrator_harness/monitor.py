@@ -250,6 +250,13 @@ def _recover_broken_review_pair(
             return False
         if _review_pair_is_valid(rt, epoch_id, lane):
             return False
+        # An enhanced parent's partially published review may be completed by
+        # an exact retry. Its existing bytes are also the conflict witness if
+        # they disagree with that retry, so recovery must not remove them.
+        if lane.get("memory_plan_state") == "execution_accepted" or (
+            folder / "NATIVE_TERMINAL_EVIDENCE.json"
+        ).exists():
+            return False
         for path in (review_path, acceptance_path):
             try:
                 path.unlink()
