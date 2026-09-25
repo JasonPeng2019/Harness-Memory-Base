@@ -579,11 +579,17 @@ class MemoryStore:
             result["configuration"] = json.loads(result["configuration"])
         if not result.get("content_hash"):
             # An accepted-baseline row predates the additive content-hash
-            # column.  Rebuild the exact identity from its durable fields so the
-            # reopened database still round-trips as a canonical decision.
-            result["content_hash"] = contracts.content_hash(
-                {key: value for key, value in result.items() if key != "content_hash"}
-            )
+            # column. Rebuild the canonical decision, excluding SQLite-only
+            # updated_at and including the contract schema discriminator.
+            canonical = {
+                "schema": contracts.DECISION_SCHEMA,
+                **{key: result[key] for key in (
+                    "decision_id", "task_card_digest", "objective_id", "route",
+                    "plan_id", "plan_state", "plan_digest", "strategy",
+                    "configuration", "configuration_digest", "state", "created_at",
+                )},
+            }
+            result["content_hash"] = contracts.content_hash(canonical)
         return result
 
     def find_logical_decision(
@@ -625,15 +631,21 @@ class MemoryStore:
             # Preparations retain the exact plan identity independently of the
             # decision columns. Consult this durable owner before deciding that
             # a damaged decision row is absent.
-            prepared_rows = connection.execute(
-                "SELECT * FROM preparations ORDER BY preparation_id"
-            ).fetchall()
-            prepared_owners = set()
             indexed_fields = (
                 "preparation_id", "decision_id", "task_card_digest", "objective_id",
                 "route", "strategy", "current_plan_state", "status", "supersedes",
                 "superseded_by",
             )
+            try:
+                prepared_rows = connection.execute(
+                    "SELECT " + ", ".join((*indexed_fields, "record", "created_at", "updated_at"))
+                    + " FROM preparations ORDER BY preparation_id"
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such column" in str(exc) or "no such table" in str(exc):
+                    raise StoreError(f"incompatible preparations schema: {exc}") from exc
+                raise
+            prepared_owners = set()
             for stored in prepared_rows:
                 if any(stored[key] != identity[key] for key in (
                     "task_card_digest", "objective_id", "route"
