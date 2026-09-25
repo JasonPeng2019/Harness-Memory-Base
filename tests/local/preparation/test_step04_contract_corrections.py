@@ -59,6 +59,30 @@ class FakeClock:
         self.value += float(seconds)
 
 
+class FlakyDurableReadStore:
+    """Delegate to one real store while its durable reads fail transiently.
+
+    Only ``get_preparation`` is intercepted: one Level 0 replay can exercise
+    exactly one transient durable read failure while every other store call
+    still reaches the real durable record.
+    """
+
+    def __init__(self, inner, failures: int = 1) -> None:
+        self._inner = inner
+        self.failures_remaining = int(failures)
+        self.read_attempts = 0
+
+    def get_preparation(self, preparation_id: str) -> dict:
+        self.read_attempts += 1
+        if self.failures_remaining > 0:
+            self.failures_remaining -= 1
+            raise OSError("transient durable read failure")
+        return self._inner.get_preparation(preparation_id)
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+
 def representation(limits: config.PreparationLimits, tokens: list[str]) -> dict:
     return templates.representation_identity(limits=limits) | {
         "tokens": tokens,
@@ -917,6 +941,97 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             reopened.close()
         self.memory_store = store.MemoryStore(self.store_path)
         self.memory_store.initialize()
+
+    def test_unreadable_durable_replay_fails_closed_without_a_second_optional_search(
+        self,
+    ) -> None:
+        """An unreadable durable record is not proof of no prior correction.
+
+        ROOT reproduced one optional query on the first Level 0 correction and
+        a second query on replay after a one-call OSError, because the failed
+        durable read was treated as a missing correction.  An unreadable or
+        missing durable preparation must instead continue explicitly without
+        memory, and the no-store path keeps its one bounded ordinary re-prepare.
+        """
+
+        queried: list[object] = []
+
+        def recording(query):
+            queried.append(query)
+            return []
+
+        stores = [
+            search.SearchStore(
+                store_id="everos", kind="historical_evidence", query=recording
+            )
+        ]
+        first = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            route="ordinary",
+        )
+        self.clock.advance(30.0)
+        revised = self.service.apply_level_zero(
+            preparation=first.preparation,
+            decision=first.decision,
+            task_card=self.card,
+            plan=first.plan,
+            objective_id="objective-1",
+            stores=stores,
+        )
+        self.assertEqual("planning", revised.mode)
+        self.assertEqual(1, len(queried), "the one correction performs one optional query")
+        self.assertEqual(
+            2,
+            len(self.memory_store.list_preparations(first.decision["decision_id"])),
+        )
+
+        # A restarted service whose durable read fails exactly once, as ROOT
+        # reproduced the second optional query on replay.
+        flaky = FlakyDurableReadStore(self.memory_store)
+        restarted = preparation.PreparationService(
+            store=flaky, limits=self.limits, clock=self.clock
+        )
+        again = restarted.apply_level_zero(
+            preparation=first.preparation,
+            decision=first.decision,
+            task_card=self.card,
+            plan=first.plan,
+            objective_id="objective-1",
+            stores=stores,
+        )
+        self.assertEqual(1, flaky.read_attempts, "the replay made one durable read attempt")
+        self.assertEqual(0, flaky.failures_remaining, "the transient failure was consumed")
+        self.assertEqual("no_memory_continuation", again.mode)
+        self.assertIsNone(again.trace)
+        self.assertEqual(
+            1, len(queried), "an unreadable durable replay must not search again"
+        )
+        self.assertEqual(
+            first.preparation["preparation_id"],
+            again.preparation["preparation_id"],
+            "the failed replay must not mint a replacement packet",
+        )
+        self.assertEqual(
+            2,
+            len(self.memory_store.list_preparations(first.decision["decision_id"])),
+            "the failed replay must not record a second replacement preparation",
+        )
+
+        # Without a store there is no durable authority to read, so the
+        # accepted no-store behavior keeps its one bounded ordinary re-prepare.
+        unstored = preparation.PreparationService(limits=self.limits, clock=self.clock)
+        no_store = unstored.apply_level_zero(
+            preparation=first.preparation,
+            decision=first.decision,
+            task_card=self.card,
+            plan=first.plan,
+            objective_id="objective-1",
+            stores=stores,
+        )
+        self.assertEqual("planning", no_store.mode)
+        self.assertEqual(2, len(queried), "the no-store path still re-prepares once")
 
 
 if __name__ == "__main__":

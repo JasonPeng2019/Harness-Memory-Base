@@ -122,14 +122,18 @@ class PreparationService:
         )
 
     def _durable_preparation(self, preparation_id: str) -> dict[str, Any] | None:
-        """Read one exact durable preparation record, or `None`."""
+        """Read one exact durable preparation record.
+
+        `None` is returned only when no store is configured, because then no
+        durable authority exists to consult.  With a configured store the
+        exact record is required: an unreadable or missing record propagates
+        instead of being reported as absence, since a failed read is not proof
+        that no prior correction happened.
+        """
 
         if self.store is None:
             return None
-        try:
-            return self.store.get_preparation(preparation_id)
-        except Exception:
-            return None
+        return self.store.get_preparation(preparation_id)
 
     @staticmethod
     def _plan_state_error(exc: Exception, objective_id: str) -> MandatoryStateFailure:
@@ -606,8 +610,34 @@ class PreparationService:
             )
         # The durable record is the authority across restart: once this exact
         # packet has been superseded, another Level 0 verdict for it must not
-        # launch a second ordinary re-prepare or hand out fresh time.
-        durable = self._durable_preparation(preparation["preparation_id"])
+        # launch a second ordinary re-prepare or hand out fresh time.  With a
+        # configured store the exact durable record is required, and an
+        # unreadable or missing record is an unknown durability state rather
+        # than proof of no prior correction, so it fails closed into the same
+        # explicit continuation without memory.
+        durable: dict[str, Any] | None = None
+        unreadable = ""
+        if self.store is not None:
+            try:
+                durable = self._durable_preparation(preparation["preparation_id"])
+            except Exception as exc:
+                unreadable = f"{type(exc).__name__}: {exc}"
+            if durable is None:
+                return PreparationOutcome(
+                    mode="no_memory_continuation",
+                    decision=dict(decision),
+                    preparation=dict(preparation),
+                    trace=None,
+                    disposition=None,
+                    plan=dict(plan),
+                    reason=(
+                        "the exact packet's durable record is unreadable or "
+                        "missing, so an earlier Level 0 correction cannot be "
+                        "ruled out; continue explicitly without memory instead "
+                        "of risking a second optional call"
+                        + (f" ({unreadable})" if unreadable else "")
+                    ),
+                )
         if durable is not None and (
             durable.get("superseded_by") or durable.get("status") == "superseded"
         ):
