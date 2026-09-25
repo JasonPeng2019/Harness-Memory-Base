@@ -660,6 +660,59 @@ class FinalContextDispatchTests(unittest.TestCase):
                 self.assertEqual(finalized[0].envelope["optional_content"], revised.envelope["optional_content"])
                 self.assertNotEqual(finalized[0].context["context_id"], revised.context["context_id"])
 
+    def test_selected_nested_provenance_does_not_alias_source_after_finalization(self) -> None:
+        payload = {"summary": "stable rendered content"}
+        candidate = contracts.make_candidate(
+            kind="historical_evidence", logical_id="case-1", revision_id="r1",
+            origin="everos", source_id="source-a",
+            payload_digest=contracts.sha256_hex(payload), payload=payload,
+            scope={"project": {"name": "original"}},
+            provenance=[{"store_id": "everos", "source": {"branch": "main"}}],
+            freshness="frozen", disposition="selected",
+        )
+        outcome = preparation.PreparationOutcome(
+            mode="planning", decision=self.decision, preparation=None,
+            trace={"candidates": [candidate]}, disposition=None, plan=self.accepted,
+        )
+        finalized = preparation.PreparationService(limits=self.limits)._finalize(
+            outcome=outcome, task_card=self.card, plan=self.accepted,
+            lane_id="lane-1", run_id="run-1", worktree_path=str(self.worktree),
+            base_commit="base-1", checkpoint="checkpoint-1",
+            execution_role="worker", invocation_target="harness:worker",
+            recipient="worker:lane-1", mandatory_content=self._finalize().envelope["mandatory_content"],
+            optional_items=(), freshness_check=None,
+        )
+        selected = finalized.context["delivery_trace"]["selected"][0]
+        self.assertEqual(candidate["scope"], selected["provenance"]["scope"])
+        self.assertEqual(candidate["provenance"], selected["provenance"]["provenance"])
+        before_context = contracts.canonical_json(finalized.context)
+        before_envelope = contracts.canonical_json(finalized.envelope)
+        before_trace = contracts.canonical_json(finalized.context["delivery_trace"])
+        before_hashes = (
+            finalized.context["context_id"], finalized.context["integrity"],
+            finalized.context["content_hash"], finalized.envelope["content_hash"],
+            selected["provenance_digest"], selected["content_digest"],
+        )
+
+        candidate["scope"]["project"]["name"] = "changed"
+        candidate["provenance"][0]["source"]["branch"] = "changed"
+
+        self.assertEqual(before_context, contracts.canonical_json(finalized.context))
+        self.assertEqual(before_envelope, contracts.canonical_json(finalized.envelope))
+        self.assertEqual(before_trace, contracts.canonical_json(finalized.context["delivery_trace"]))
+        self.assertEqual(before_hashes, (
+            finalized.context["context_id"], finalized.context["integrity"],
+            finalized.context["content_hash"], finalized.envelope["content_hash"],
+            selected["provenance_digest"], selected["content_digest"],
+        ))
+        context.validate_final_context(
+            finalized.context, envelope=finalized.envelope, task_card=self.card,
+            plan=self.accepted, lane_id="lane-1", run_id="run-1",
+            base_commit="base-1", worktree_path=str(self.worktree),
+            checkpoint="checkpoint-1", execution_role="worker",
+            invocation_target="harness:worker", recipient="worker:lane-1",
+        )
+
     # -- all-off and legacy cards stay ordinary ----------------------------
 
     def test_all_off_finalization_writes_no_envelope(self) -> None:

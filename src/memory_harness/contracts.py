@@ -144,7 +144,9 @@ def _validate_final_mandatory(
 
 
 def _optional_descriptor(item: Mapping[str, Any]) -> dict[str, Any]:
-    provenance = {key: value for key, value in item.items() if key not in {"id", "content"}}
+    provenance = json.loads(canonical_json({
+        key: value for key, value in item.items() if key not in {"id", "content"}
+    }))
     return {
         "id": _require_canonical_identity(item.get("id"), "optional item id"),
         "provenance": provenance,
