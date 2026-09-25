@@ -190,6 +190,8 @@ class EverOSPublicSurface:
     make_search_request: Callable[..., Any]
     memory_root: Path
     resolve_memory_root: Callable[[], str | Path]
+    get: Callable[[Any], Awaitable[Any]] | None = None
+    make_get_request: Callable[..., Any] | None = None
 
     @classmethod
     def from_object(
@@ -202,8 +204,12 @@ class EverOSPublicSurface:
         memorize = getattr(value, "memorize", None)
         search = getattr(value, "search", None)
         make_search_request = getattr(value, "make_search_request", None)
+        get = getattr(value, "get", None)
+        make_get_request = getattr(value, "make_get_request", None)
         if not callable(memorize) or not callable(search) or not callable(make_search_request):
             raise TypeError("EverOS public surface requires memorize, search, and SearchRequest")
+        if callable(get) != callable(make_get_request):
+            raise TypeError("EverOS public get requires both get and GetRequest")
         if not callable(resolve_memory_root):
             raise TypeError("EverOS public surface requires a MemoryRoot resolver")
         return cls(
@@ -212,6 +218,8 @@ class EverOSPublicSurface:
             make_search_request=make_search_request,
             memory_root=_normalize_memory_root(memory_root, "captured EverOS root"),
             resolve_memory_root=resolve_memory_root,
+            get=get,
+            make_get_request=make_get_request,
         )
 
 
@@ -224,7 +232,7 @@ def _normalize_memory_root(value: str | Path, label: str) -> Path:
 def load_vendored_everos_public_surface(
     *, memory_root: str | Path
 ) -> EverOSPublicSurface:
-    """Load vendored EverOS through its public service and search DTO exports.
+    """Load vendored EverOS through its public service and request DTO exports.
 
     The product package keeps this import lazy so ordinary all-off installs do
     not acquire EverOS's optional runtime dependency set.  The caller must
@@ -258,8 +266,9 @@ def load_vendored_everos_public_surface(
             )
         try:
             from everos.core.persistence import MemoryRoot
+            from everos.memory.get import GetRequest
             from everos.memory.search import SearchRequest
-            from everos.service import memorize, search
+            from everos.service import get, memorize, search
         except ModuleNotFoundError as exc:
             raise EverOSUnavailableError(
                 "EverOS is unavailable; install the vendored EverOS runtime before "
@@ -283,6 +292,8 @@ def load_vendored_everos_public_surface(
             make_search_request=SearchRequest,
             memory_root=captured_root,
             resolve_memory_root=resolve_memory_root,
+            get=get,
+            make_get_request=GetRequest,
         )
 
 
@@ -422,6 +433,68 @@ class EverOSAdapter:
         self._assert_bound_memory_root()
         result = await self.surface.memorize(dict(payload), is_final=True)
         return _model_mapping(result, "EverOS memorize result")
+
+    async def readback_cases(
+        self, *, session_id: str, query: str
+    ) -> list[dict[str, Any]]:
+        """Read one original session through public get when available.
+
+        Older public-surface doubles retain the accepted scoped search path.
+        A failed or incomplete get never falls through to ranked search.
+        """
+
+        self._assert_bound_memory_root()
+        if not isinstance(session_id, str) or not session_id:
+            raise ExperienceError("EverOS readback requires the original session_id")
+        if self.surface.get is None or self.surface.make_get_request is None:
+            result = await self.search_representation(session_id=session_id, query=query)
+            return result["agent_cases"]
+        cases: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        expected_total: int | None = None
+        page = 1
+        page_size = 100  # Vendored GetRequest's maximum page size.
+        while True:
+            self._assert_bound_memory_root()
+            request = self.surface.make_get_request(
+                agent_id=self.everos_owner_id,
+                app_id=self.everos_application_id,
+                project_id=self.everos_project_id,
+                memory_type="agent_case",
+                filters={"session_id": session_id},
+                page=page,
+                page_size=page_size,
+            )
+            response = _model_mapping(await self.surface.get(request), "EverOS get response")
+            data = response.get("data")
+            if not isinstance(data, Mapping):
+                raise ExperienceError("EverOS get response has no data object")
+            items = data.get("agent_cases")
+            count = data.get("count")
+            total_count = data.get("total_count")
+            if (
+                not isinstance(items, list)
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or isinstance(total_count, bool)
+                or not isinstance(total_count, int)
+                or total_count < 0
+                or (expected_total is not None and total_count != expected_total)
+                or count != len(items)
+                or count != min(page_size, total_count - len(cases))
+            ):
+                raise ExperienceError("EverOS get case listing is incomplete or malformed")
+            expected_total = total_count
+            for item in items:
+                source_case = _model_mapping(item, "EverOS get case")
+                self.validate_case(source_case, session_id=session_id)
+                if source_case["id"] in seen_ids:
+                    raise ExperienceError("EverOS get returned duplicate case identities")
+                seen_ids.add(source_case["id"])
+                cases.append(source_case)
+            if len(cases) == expected_total:
+                return cases
+            page += 1
 
     async def search_representation(
         self, *, session_id: str, query: str
@@ -768,19 +841,31 @@ class ReviewedExperienceService:
         return self.store.record_reviewed_trajectory(trajectory)
 
     async def extract_trajectory(
-        self, trajectory_id: str, adapter: EverOSAdapter
-    ) -> dict[str, Any]:
+        self,
+        trajectory_id: str,
+        adapter: EverOSAdapter,
+        *,
+        experience_write: bool = True,
+    ) -> dict[str, Any] | None:
         """Submit one optional EverOS extraction without unsafe replay.
 
         The local intent exists before the networked call. Any existing intent,
         including one left uncertain by a lost response, is reconciled only by
         exact receipt lookup and is never sent to EverOS a second time here.
+        When the captured operation disables experience writing, return the
+        existing local intent unchanged (or ``None``) without contacting EverOS.
         """
 
         trajectory = self.get_trajectory(trajectory_id)
         adapter.assert_scope(trajectory["scope"])
         existing = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
+        if not experience_write:
+            return existing
         if existing is not None:
+            if existing["status"] in {"pending", "uncertain"}:
+                return await self.reconcile_extraction(
+                    trajectory_id, adapter, experience_write=experience_write
+                )
             return existing
         session_id = adapter.session_id_for(trajectory_id)
         payload = adapter.add_payload(trajectory, session_id=session_id)
@@ -810,30 +895,38 @@ class ReviewedExperienceService:
                 if latest["version"] != ingestion["version"]:
                     return latest
                 raise update_error from exc
-        return await self.reconcile_extraction(trajectory_id, adapter)
+        return await self.reconcile_extraction(
+            trajectory_id, adapter, experience_write=experience_write
+        )
 
     async def reconcile_extraction(
-        self, trajectory_id: str, adapter: EverOSAdapter
-    ) -> dict[str, Any]:
-        """Confirm representation only from exact scoped EverOS case receipts."""
+        self,
+        trajectory_id: str,
+        adapter: EverOSAdapter,
+        *,
+        experience_write: bool = True,
+    ) -> dict[str, Any] | None:
+        """Confirm exact case receipts, or pause reconciliation while writing is off."""
 
         trajectory = self.get_trajectory(trajectory_id)
         adapter.assert_scope(trajectory["scope"])
         ingestion = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
+        if not experience_write:
+            return ingestion
         if ingestion is None:
             raise ExperienceError("no reviewed-experience ingestion exists to reconcile")
         if ingestion["status"] == "confirmed":
             return ingestion
         try:
-            result = await adapter.search_representation(
+            source_cases = await adapter.readback_cases(
                 session_id=ingestion["session_id"], query=trajectory["task_text"]
             )
         except Exception:
-            # A search retry is read-only. Leave local state truthful and retain
+            # Readback is read-only. Leave local state truthful and retain
             # the recent evidence rather than relabeling unknown remote state.
             return ingestion
         receipts: list[dict[str, Any]] = []
-        for source_case in result["agent_cases"]:
+        for source_case in source_cases:
             adapter.validate_case(source_case, session_id=ingestion["session_id"])
             sanitized_case = privacy_module.sanitize_payload(source_case, self.privacy_policy)
             if not isinstance(sanitized_case, Mapping):
@@ -863,14 +956,19 @@ class ReviewedExperienceService:
         self,
         source_skill: Mapping[str, Any],
         adapter: EverOSAdapter,
-    ) -> dict[str, Any]:
+        *,
+        generated_skill_creation: bool = True,
+    ) -> dict[str, Any] | None:
         """Resolve a returned EverOS skill to exact reviewed source receipts.
 
         The result remains a generated, non-authoritative candidate. This
         operation neither approves the candidate nor executes any text/script it
-        contains.
+        contains. Disabling creation suppresses local candidate persistence;
+        EverOS's public memorize call has no per-call skill-only extraction gate.
         """
 
+        if not generated_skill_creation:
+            return None
         adapter.validate_skill(source_skill)
         source_case_ids = source_skill.get("source_case_ids")
         if not isinstance(source_case_ids, list) or not source_case_ids:
