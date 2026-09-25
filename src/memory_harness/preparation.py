@@ -10,7 +10,7 @@ packet and permits at most one bounded ordinary re-prepare.
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import apc, contracts, context as context_module, harness_bridge, templates
@@ -102,6 +102,34 @@ class PreparationService:
         if self.config is not None and requested is None:
             return self.config
         return resolve_config(dict(requested or {}))
+
+    def _captured_config(self, preparation: Mapping[str, Any]) -> MemoryConfig:
+        """Continue the exact configuration one preparation captured.
+
+        A restarted service, a retry, and a route correction all continue one
+        logical decision, so its fixed strategy and feature gates come from
+        the recorded preparation instead of whatever a new service instance
+        currently resolves by default.
+        """
+
+        recorded = preparation["configuration"]
+        return MemoryConfig(
+            **{
+                field.name: recorded[field.name]
+                for field in fields(MemoryConfig)
+                if field.name in recorded
+            }
+        )
+
+    def _durable_preparation(self, preparation_id: str) -> dict[str, Any] | None:
+        """Read one exact durable preparation record, or `None`."""
+
+        if self.store is None:
+            return None
+        try:
+            return self.store.get_preparation(preparation_id)
+        except Exception:
+            return None
 
     @staticmethod
     def _plan_state_error(exc: Exception, objective_id: str) -> MandatoryStateFailure:
@@ -576,6 +604,26 @@ class PreparationService:
                     "without memory instead of replenishing spent time"
                 ),
             )
+        # The durable record is the authority across restart: once this exact
+        # packet has been superseded, another Level 0 verdict for it must not
+        # launch a second ordinary re-prepare or hand out fresh time.
+        durable = self._durable_preparation(preparation["preparation_id"])
+        if durable is not None and (
+            durable.get("superseded_by") or durable.get("status") == "superseded"
+        ):
+            return PreparationOutcome(
+                mode="no_memory_continuation",
+                decision=dict(decision),
+                preparation=durable,
+                trace=None,
+                disposition=None,
+                plan=dict(plan),
+                reason=(
+                    "a late Level 0 supersedes only one packet; this exact packet "
+                    "is already durably superseded, so continue explicitly without "
+                    "memory instead of launching a second re-prepare"
+                ),
+            )
         replacement_id = contracts.sha256_hex(
             {
                 "domain": "memory-preparation/v1",
@@ -598,7 +646,7 @@ class PreparationService:
             granted = prior_spent + float(prior_remaining)
         else:
             granted = None
-        replacement_config = self._resolve(None)
+        replacement_config = self._captured_config(preparation)
         unknown_time = preparation["budget_source"] == "unknown_time"
         remaining_value = None if remaining is None else max(0.0, float(remaining))
         if granted is None:
@@ -606,9 +654,11 @@ class PreparationService:
             remaining_value = prior_remaining
         else:
             spent = max(0.0, granted - float(remaining_value or 0.0))
-        # Re-resolve the effective fixed strategy and configuration for the one
-        # bounded ordinary re-prepare instead of replaying the abandoned
-        # packet's recorded values.
+        # One logical decision owns one captured configuration: the one
+        # bounded ordinary re-prepare continues under the abandoned packet's
+        # recorded fixed strategy and gates.  A restarted service's current
+        # defaults never replace them; only the remaining-time admission may
+        # demote the recipe once.
         replacement_config, admitted, admission_reason = self._admit_config(
             replacement_config,
             remaining=float(remaining_value or 0.0),

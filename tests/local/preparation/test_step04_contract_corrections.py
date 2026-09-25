@@ -808,6 +808,116 @@ class Step04ContractCorrectionTests(unittest.TestCase):
         )
         self.assertEqual(30.0, revised.preparation["spent_seconds"])
 
+    def test_restarted_level_zero_continues_the_recorded_gates_and_budget(self) -> None:
+        """A restarted service cannot loosen or re-scope one Level 0 correction.
+
+        The original packet captured its own problem-focused strategy under
+        disabled template/Atlas/experience gates.  The restarted service below
+        carries conflicting all-on Deeper defaults and a spent clock: the one
+        bounded ordinary re-prepare must continue the recorded configuration
+        and strategy, the shared absolute deadline and recomputed spent cost,
+        and the supersession lineage, and any repeated Level 0 for the
+        abandoned packet must continue without a second optional search.
+        """
+
+        queried: list[object] = []
+
+        def recording(query):
+            queried.append(query)
+            return []
+
+        stores = [
+            search.SearchStore(store_id="templates", kind="template", query=recording)
+        ]
+        first = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            route="ordinary",
+            request={
+                "strategy": "problem_focused",
+                "template_memory": False,
+                "atlas_shared_retrieval": False,
+                "experience_read": False,
+            },
+            failure_context="the parser test fails with an unexpected TypeError",
+        )
+        recorded_configuration = first.preparation["configuration"]
+        self.assertEqual("problem_focused", recorded_configuration["strategy"])
+        self.assertFalse(recorded_configuration["template_memory"])
+        self.assertFalse(recorded_configuration["atlas_shared_retrieval"])
+        self.assertFalse(recorded_configuration["experience_read"])
+
+        self.memory_store.close()
+        self.clock.advance(30.0)
+        reopened = store.MemoryStore(self.store_path)
+        reopened.initialize()
+        try:
+            restarted = preparation.PreparationService(
+                store=reopened,
+                limits=self.limits,
+                config=config.resolve_config({"strategy": "deeper", "deeper": True}),
+                clock=self.clock,
+            )
+            revised = restarted.apply_level_zero(
+                preparation=first.preparation,
+                decision=first.decision,
+                task_card=self.card,
+                plan=first.plan,
+                objective_id="objective-1",
+                stores=stores,
+            )
+            # The restarted service's current defaults are not the decision:
+            # the captured effective strategy and its gates continue exactly.
+            self.assertEqual(
+                recorded_configuration, revised.preparation["configuration"]
+            )
+            self.assertEqual("problem_focused", revised.preparation["strategy"])
+            self.assertEqual(
+                self.limits.problem_focused_stage_seconds,
+                revised.preparation["stage_allowance_seconds"],
+            )
+            attempts = {entry["store_id"]: entry for entry in revised.trace["attempts"]}
+            self.assertEqual("disabled", attempts["templates"]["status"])
+            self.assertEqual([], queried, "recorded gates must not be loosened")
+            # One decision keeps one deadline and one granted budget: the
+            # correction shares the recorded absolute deadline and recomputes
+            # the cost already paid instead of replenishing it.
+            self.assertEqual(
+                first.preparation["deadline_monotonic"],
+                revised.preparation["deadline_monotonic"],
+            )
+            self.assertEqual(270.0, revised.preparation["remaining_seconds"])
+            self.assertEqual(30.0, revised.preparation["spent_seconds"])
+            self.assertEqual(
+                first.preparation["preparation_id"], revised.preparation["supersedes"]
+            )
+            abandoned = reopened.get_preparation(first.preparation["preparation_id"])
+            self.assertEqual("superseded", abandoned["status"])
+            self.assertEqual(
+                revised.preparation["preparation_id"], abandoned["superseded_by"]
+            )
+            # A repeated Level 0 continues explicitly without memory: neither
+            # the corrected packet nor the abandoned one may launch a second
+            # optional search or hand out fresh time.
+            for replay in (revised.preparation, first.preparation):
+                with self.subTest(replay=replay["preparation_id"]):
+                    again = restarted.apply_level_zero(
+                        preparation=replay,
+                        decision=revised.decision,
+                        task_card=self.card,
+                        plan=revised.plan,
+                        objective_id="objective-1",
+                        stores=stores,
+                    )
+                    self.assertEqual("no_memory_continuation", again.mode)
+                    self.assertIsNone(again.trace)
+                    self.assertEqual([], queried)
+        finally:
+            reopened.close()
+        self.memory_store = store.MemoryStore(self.store_path)
+        self.memory_store.initialize()
+
 
 if __name__ == "__main__":
     unittest.main()
