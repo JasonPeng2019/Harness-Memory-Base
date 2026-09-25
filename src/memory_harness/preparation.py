@@ -609,6 +609,17 @@ class PreparationService:
                         "ROOT must replan"
                     ),
                 )
+            if not all((checkpoint, execution_role, invocation_target, recipient)):
+                # A failed budget cannot supply the missing dispatch target.
+                # A raw plan-affecting claim remains unverified here: it must
+                # not become dependency authority, and it cannot turn this
+                # incomplete target into a finalized context.
+                claimed = any(item.get("plan_affecting") is True for item in supplied_optional)
+                detail = (
+                    "unverified plan-affecting optional guidance and incomplete finalization target"
+                    if claimed else "incomplete finalization target"
+                )
+                return replace(outcome, reason=f"{outcome.reason}; {detail}")
             # The accepted plan and caller-supplied mandatory state can still
             # be finalized. Record every omitted optional item and the failed
             # memory stage in the existing delivery trace.
@@ -2066,6 +2077,7 @@ class PreparationService:
                 if key not in {
                     "candidate_id", "payload", "payload_digest", "content_hash",
                     "score", "comparable", "disposition", "reasons", "id", "content",
+                    "frozen_contract", "compact_representation", "compact_approval",
                 }
             }
             packed_item = {
@@ -2075,26 +2087,6 @@ class PreparationService:
                 "content": candidate["payload"],
                 "revision_id": candidate["revision_id"],
             }
-            if candidate["kind"] == "procedure":
-                for field in ("compact_representation", "compact_approval"):
-                    if field in candidate["payload"]:
-                        packed_item[field] = candidate["payload"][field]
-            if candidate.get("freshness") == "frozen":
-                expected_contract = {
-                    "source_id": candidate["source_id"],
-                    "revision_id": candidate["revision_id"],
-                    "content_digest": candidate["payload_digest"],
-                }
-                sightings = candidate.get("provenance")
-                selected_store_id = (
-                    sightings[0].get("store_id")
-                    if isinstance(sightings, list) and sightings else None
-                )
-                source_store = next((store for store in stores if store.store_id == selected_store_id), None)
-                if source_store is not None and source_store.freshness == "frozen":
-                    selected_provenance[candidate["candidate_id"]]["frozen_contract"] = expected_contract
-                elif isinstance(candidate.get("frozen_contract"), Mapping):
-                    selected_provenance[candidate["candidate_id"]]["frozen_contract"] = dict(candidate["frozen_contract"])
             packed_optional.append(packed_item)
         for item in optional_items:
             packed_optional.append(dict(item))
@@ -2123,7 +2115,7 @@ class PreparationService:
             privacy_policy=self.privacy_policy,
             limits=self.limits,
             freshness_check=freshness_check,
-            source_recheck=source_recheck,
+            source_owner_recheck=source_recheck,
         )
         if self.store is not None:
             self.store.record_final_context(
@@ -2159,9 +2151,14 @@ class PreparationService:
         The finalizer consumes only a finite observation of that fresh read.
         """
 
-        by_store = {store.store_id: store for store in stores}
+        by_store: dict[str, SearchStore] = {}
+        ambiguous_stores: set[str] = set()
+        for store in stores:
+            if store.store_id in by_store:
+                ambiguous_stores.add(store.store_id)
+            else:
+                by_store[store.store_id] = store
         selected_by_id = {candidate["candidate_id"]: candidate for candidate in selected}
-        cache: dict[str, list[Mapping[str, Any]] | None] = {}
         if preparation is not None and preparation.get("budget_source") == "trusted_deadline":
             cutoff = preparation.get("deadline_monotonic")
             reserve = preparation.get("execution_reserve_seconds")
@@ -2193,71 +2190,130 @@ class PreparationService:
         else:
             query = None
 
-        def read_store(store: SearchStore) -> list[Mapping[str, Any]]:
-            # Materialize and freeze the complete observation inside the
-            # bounded worker; a late or subsequently mutated source result
-            # cannot change a finalized trace.
-            query_copy = json.loads(contracts.canonical_json(query))
-            return json.loads(contracts.canonical_json(list(store.query(query_copy) or ())))
+        def observe(
+            store: SearchStore, candidate: Mapping[str, Any], item: Mapping[str, Any],
+        ) -> Mapping[str, Any]:
+            # Everything that can admit an item runs behind the same real
+            # cutoff: query, complete materialization, normalization, exact
+            # matching, owner readback, hashing, and the final decision.
+            digest = contracts.sha256_hex(item["content"])
+            request = {
+                "store_id": store.store_id, "source_id": candidate["source_id"],
+                "logical_id": candidate["logical_id"],
+                "revision_id": candidate["revision_id"],
+                "content_digest": digest, "route": route,
+            }
+            status = "unavailable"
+            observed_revision = None
+            observed_digest = None
+            owner_proof: dict[str, Any] = {}
+            if (store.kind != candidate.get("kind")
+                    or candidate.get("payload_digest") != digest
+                    or candidate.get("revision_id") != item.get("revision_id")):
+                return {"recheck": contracts.make_final_source_recheck(
+                    item=item, status="ineligible",
+                ), "owner_proof": owner_proof}
+            if candidate.get("freshness") == "frozen":
+                if store.final_proof is not None:
+                    returned = store.final_proof(request)
+                    if isinstance(returned, Mapping):
+                        returned = json.loads(contracts.canonical_json(returned))
+                        expected = {
+                            "source_id": candidate["source_id"],
+                            "revision_id": item["revision_id"],
+                            "content_digest": digest,
+                        }
+                        if returned.get("frozen_contract") == expected:
+                            status = "frozen"
+                            observed_revision, observed_digest = item["revision_id"], digest
+                            owner_proof["frozen_contract"] = expected
+                        else:
+                            status = "ineligible"
+                    else:
+                        status = "ineligible"
+            else:
+                query_copy = json.loads(contracts.canonical_json(query))
+                readings = json.loads(contracts.canonical_json(list(store.query(query_copy) or ())))
+                status = "ineligible"
+                for raw in readings:
+                    if not isinstance(raw, Mapping) or raw.get("logical_id") != candidate.get("logical_id"):
+                        continue
+                    observed_revision = raw.get("revision_id") if isinstance(raw.get("revision_id"), str) else None
+                    payload = raw.get("payload")
+                    observed_digest = contracts.sha256_hex(payload) if isinstance(payload, Mapping) else None
+                    if observed_revision != item["revision_id"] or observed_digest != digest:
+                        status = "stale"
+                        continue
+                    if raw.get("revoked") is True or raw.get("withdrawn") is True:
+                        status = "revoked"
+                        break
+                    normalized, _rejection = self.search._normalize(
+                        store, raw, objective=objective, route=route,
+                    )
+                    if (normalized is None or normalized["disposition"] != "eligible"
+                            or normalized["source_id"] != candidate["source_id"]
+                            or normalized["kind"] != candidate["kind"]
+                            or normalized["scope"] != (candidate.get("scope") or {})
+                            or normalized["freshness"] != "live"
+                            or (isinstance(candidate.get("representation"), Mapping)
+                                and normalized["representation"] != candidate["representation"])
+                            or normalized["revision_id"] != item["revision_id"]
+                            or normalized["payload_digest"] != digest):
+                        status = "ineligible"
+                        continue
+                    status = "eligible"
+                    break
+                if status == "eligible" and store.final_proof is not None:
+                    returned = store.final_proof(request)
+                    if isinstance(returned, Mapping):
+                        owner_proof = json.loads(contracts.canonical_json(returned))
+            if status in {"eligible", "frozen"} and candidate["kind"] == "procedure":
+                content = item["content"]
+                representation = owner_proof.get("compact_representation")
+                approval = owner_proof.get("compact_approval")
+                verified = {key: value for key, value in owner_proof.items() if key == "frozen_contract"}
+                if (isinstance(content, Mapping) and isinstance(content.get("procedure"), Mapping)
+                        and isinstance(content.get("approval"), Mapping)
+                        and isinstance(representation, Mapping) and isinstance(approval, Mapping)):
+                    try:
+                        contracts.validate_procedure_approval(content["approval"], procedure=content["procedure"])
+                        contracts.validate_procedure_compact_representation(
+                            representation, procedure=content["procedure"],
+                        )
+                        contracts.validate_procedure_compact_approval(
+                            approval, procedure=content["procedure"],
+                            full_approval=content["approval"], representation=representation,
+                        )
+                    except contracts.ContractError:
+                        pass
+                    else:
+                        verified["compact_representation"] = representation
+                        verified["compact_approval"] = approval
+                owner_proof = verified
+            recheck = contracts.make_final_source_recheck(
+                item=item, status=status,
+                observed_revision_id=observed_revision,
+                observed_content_digest=observed_digest,
+            )
+            return {"recheck": recheck, "owner_proof": owner_proof}
 
         def recheck(item: Mapping[str, Any]) -> Mapping[str, Any]:
             candidate = selected_by_id.get(item["id"])
             provenance = candidate.get("provenance") if candidate else None
             store_id = provenance[0].get("store_id") if isinstance(provenance, list) and provenance else None
-            store = by_store.get(store_id)
-            status = "unavailable"
-            observed_revision = None
-            observed_digest = None
+            store = None if store_id in ambiguous_stores else by_store.get(store_id)
             if store is not None and query is not None and time.monotonic() < real_deadline:
-                if store_id not in cache:
-                    deadline = min(real_deadline, time.monotonic() + self.limits.store_seconds)
-                    try:
-                        produced, bounded = self.search._call_bounded(
-                            lambda: read_store(store),
-                            deadline=deadline, label=f"final-recheck:{store_id}",
-                        )
-                        cache[store_id] = produced if bounded is None else None
-                    except Exception:
-                        cache[store_id] = None
-                readings = cache[store_id]
-                if readings is not None:
-                    status = "ineligible"
-                    for raw in readings:
-                        if not isinstance(raw, Mapping) or raw.get("logical_id") != candidate.get("logical_id"):
-                            continue
-                        observed_revision = raw.get("revision_id") if isinstance(raw.get("revision_id"), str) else None
-                        payload = raw.get("payload")
-                        observed_digest = contracts.sha256_hex(payload) if isinstance(payload, Mapping) else None
-                        if observed_revision != item["revision_id"] or observed_digest != contracts.sha256_hex(item["content"]):
-                            status = "stale"
-                            continue
-                        if raw.get("revoked") is True or raw.get("withdrawn") is True:
-                            status = "revoked"
-                        elif (raw.get("kind") != candidate.get("kind")
-                              or raw.get("source_id", store.store_id) != candidate.get("source_id")
-                              or raw.get("payload_digest", observed_digest) != observed_digest
-                              or raw.get("freshness", store.freshness) != candidate.get("freshness")
-                              or raw.get("scope") != candidate.get("scope")
-                              or (raw.get("routes") is not None and (
-                                  not isinstance(raw["routes"], (str, list, tuple, set, frozenset))
-                                  or route not in raw["routes"]
-                              ))
-                              or raw.get("approval_status", "approved") != "approved"
-                              or raw.get("designation", "current") != "current"
-                              or raw.get("predicates_ok") is False
-                              or (candidate.get("kind") == "procedure"
-                                  and (raw.get("approval_status") != "approved"
-                                       or raw.get("designation") != "current"
-                                       or raw.get("predicates_ok") is not True))):
-                            status = "ineligible"
-                        else:
-                            status = "eligible"
-                        break
-            return contracts.make_final_source_recheck(
-                item=item, status=status,
-                observed_revision_id=observed_revision,
-                observed_content_digest=observed_digest,
-            )
+                deadline = min(real_deadline, time.monotonic() + self.limits.store_seconds)
+                try:
+                    observed, bounded = self.search._call_bounded(
+                        lambda: observe(store, candidate, item),
+                        deadline=deadline, label=f"final-recheck:{store_id}",
+                    )
+                    if bounded is None:
+                        return observed
+                except Exception:
+                    pass
+            return contracts.make_final_source_recheck(item=item, status="unavailable")
 
         return recheck
 

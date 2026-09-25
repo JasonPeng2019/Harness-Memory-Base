@@ -63,23 +63,6 @@ def _normalize_optional_item(item: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _frozen_recheck(item: Mapping[str, Any]) -> dict[str, Any]:
-    contract = item.get("frozen_contract")
-    if contract is None:
-        return contracts.make_final_source_recheck(item=item, status="unavailable")
-    expected = {
-        "source_id": item.get("source_id"),
-        "revision_id": item.get("revision_id"),
-        "content_digest": contracts.sha256_hex(item.get("content")),
-    }
-    if not isinstance(contract, Mapping) or dict(contract) != expected:
-        return contracts.make_final_source_recheck(item=item, status="ineligible")
-    return contracts.make_final_source_recheck(
-        item=item, status="frozen", observed_revision_id=item["revision_id"],
-        observed_content_digest=expected["content_digest"],
-    )
-
-
 def _compact_variant(item: Mapping[str, Any]) -> dict[str, Any] | None:
     representation = item.get("compact_representation")
     approval = item.get("compact_approval")
@@ -117,8 +100,10 @@ def _compact_variant(item: Mapping[str, Any]) -> dict[str, Any] | None:
     return compact
 
 
-def _plan_depends_on(plan: Mapping[str, Any], item: Mapping[str, Any]) -> bool:
-    if item.get("plan_affecting") is True:
+def _plan_depends_on(
+    plan: Mapping[str, Any], item: Mapping[str, Any], *, trusted_dependency: bool = False,
+) -> bool:
+    if trusted_dependency:
         return True
     source = plan.get("source")
     if not isinstance(source, Mapping):
@@ -127,6 +112,11 @@ def _plan_depends_on(plan: Mapping[str, Any], item: Mapping[str, Any]) -> bool:
         return True
     logical_id = item.get("logical_id")
     revision_id = item.get("revision_id")
+    if (isinstance(source.get("source_id"), str) and source["source_id"]
+            and source.get("source_id") == item.get("source_id")
+            and source.get("revision_id") == revision_id
+            and isinstance(revision_id, str) and revision_id):
+        return True
     return bool(logical_id and revision_id and (
         (source.get("logical_id") == logical_id and source.get("revision_id") == revision_id)
         or (source.get("template_id") == logical_id and source.get("template_version") == revision_id)
@@ -157,6 +147,7 @@ def finalize_context(
     limits: PreparationLimits | None = None,
     freshness_check: Callable[[Mapping[str, Any]], bool] | None = None,
     source_recheck: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    source_owner_recheck: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
 ) -> FinalizedContext:
     """Render one exact, safe, dispatch-ready execution context."""
 
@@ -190,6 +181,8 @@ def finalize_context(
                 f"selected source {item.get('source_id', item['id'])} revision "
                 f"{item.get('revision_id', 'unknown')} was omitted before final recheck; ROOT must replan"
             )
+        for claim in ("plan_affecting", "frozen_contract", "compact_representation", "compact_approval"):
+            item.pop(claim, None)
         if detect_secrets({key: value for key, value in item.items() if key != "content"}, policy):
             raise OptionalItemError("optional provenance contains prohibited secret")
         descriptor = contracts._optional_descriptor(item)
@@ -207,6 +200,10 @@ def finalize_context(
         ):
             raise OptionalItemError("selected provenance conflicts with rendered optional content")
         selected_item = {**item, **source}
+        # These raw fields can identify a candidate, but cannot authorize a
+        # frozen readback, compact approval, or plan dependency.
+        for claim in ("frozen_contract", "compact_representation", "compact_approval", "plan_affecting"):
+            selected_item.pop(claim, None)
         requires_source = selected_item.get("kind") == "procedure" or selected_item.get("freshness") == "frozen"
         missing_identity = requires_source and not selected_item.get("source_id")
         if requires_source:
@@ -220,7 +217,9 @@ def finalize_context(
             selected_item["revision_id"] = "unversioned"
         if detect_secrets({key: value for key, value in selected_item.items() if key != "content"}, policy):
             raise OptionalItemError("optional provenance contains prohibited secret")
-        affects_plan = _plan_depends_on(plan, selected_item)
+        affects_plan = _plan_depends_on(
+            plan, selected_item, trusted_dependency=source.get("plan_affecting") is True,
+        )
         if affects_plan:
             selected_item["plan_affecting"] = True
         # A live source must return one exact observation. The Boolean legacy
@@ -229,19 +228,39 @@ def finalize_context(
         recheck: Mapping[str, Any] | None = None
         if missing_identity:
             recheck = contracts.make_final_source_recheck(item=original, status="ineligible")
-        elif selected_item.get("freshness") == "frozen" and selected_item.get("source_id"):
-            recheck = _frozen_recheck(original)
-        elif source_recheck is not None and selected_item.get("source_id"):
+        elif (source_owner_recheck is not None or source_recheck is not None) and selected_item.get("source_id"):
             try:
-                recheck = source_recheck(dict(original))
+                callback = source_owner_recheck or source_recheck
+                observed = callback(dict(original))
             except Exception:
-                recheck = contracts.make_final_source_recheck(item=original, status="unavailable")
+                observed = contracts.make_final_source_recheck(item=original, status="unavailable")
+            owner_proof: Mapping[str, Any] = {}
+            if source_owner_recheck is not None and isinstance(observed, Mapping) and "recheck" in observed:
+                owner_proof = observed.get("owner_proof", {})
+                recheck = observed["recheck"]
+            else:
+                recheck = observed
             if not isinstance(recheck, Mapping):
                 raise OptionalItemError(f"final source recheck is invalid for {item_id}")
             try:
                 contracts.validate_final_source_recheck(recheck, item=original)
             except (contracts.ContractError, TypeError, ValueError) as exc:
                 raise OptionalItemError(f"final source recheck is invalid for {item_id}: {exc}") from exc
+            if recheck["status"] == "frozen":
+                expected = {"source_id": original["source_id"],
+                            "revision_id": original["revision_id"],
+                            "content_digest": contracts.sha256_hex(original["content"])}
+                if not isinstance(owner_proof, Mapping) or owner_proof.get("frozen_contract") != expected:
+                    raise OptionalItemError(f"frozen source proof is invalid for {item_id}")
+                selected_item["frozen_contract"] = expected
+            if recheck["status"] in {"eligible", "frozen"} and isinstance(owner_proof, Mapping):
+                representation = owner_proof.get("compact_representation")
+                approval = owner_proof.get("compact_approval")
+                if representation is not None and approval is not None:
+                    selected_item["compact_representation"] = representation
+                    selected_item["compact_approval"] = approval
+                    item["compact_representation"] = representation
+                    item["compact_approval"] = approval
         elif selected_item.get("source_id"):
             recheck = contracts.make_final_source_recheck(item=original, status="unavailable")
         if recheck is not None:
@@ -269,8 +288,9 @@ def finalize_context(
         if detect_secrets(item, policy):
             omissions.append({**descriptor, "reason": "prohibited secret"})
             continue
-        item.pop("plan_affecting", None)
-        item.pop("frozen_contract", None)
+        for claim in ("plan_affecting", "frozen_contract", "compact_representation", "compact_approval"):
+            if claim not in {"compact_representation", "compact_approval"} or claim not in selected_item:
+                item.pop(claim, None)
         optional.append((sanitize_payload(item, policy), selected_item, affects_plan, slot))
 
     mandatory_render = _render_size(mandatory)
@@ -348,7 +368,7 @@ def finalize_context(
         optional_content=packed,
         delivery_trace=trace,
         role_separation=ROLE_SEPARATION,
-        freshness={"mode": "rechecked" if freshness_check is not None or source_recheck is not None else "not-required"},
+        freshness={"mode": "rechecked" if any((freshness_check, source_recheck, source_owner_recheck)) else "not-required"},
         context_limit=resolved.context_char_limit,
     )
     envelope = contracts.make_envelope(

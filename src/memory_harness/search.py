@@ -85,6 +85,13 @@ class SearchStore:
     ``everos_generated_skill`` is the opposite case: the remote call is
     intrinsic to the source, so the marker is rejected unless it also declares
     ``requires_network=True``.
+
+    ``final_proof`` is an optional, separately invoked source-owner readback.
+    It receives the selected store/source/logical/revision/content-digest/route
+    identity and may return an exact ``frozen_contract`` and/or the distinct
+    ``compact_representation`` and ``compact_approval`` records. It must read
+    owner state rather than echo candidate fields. Preparation invokes it
+    inside the same final cutoff as a live recheck.
     """
 
     store_id: str
@@ -95,6 +102,10 @@ class SearchStore:
     specificity: str = "project"
     requires_network: bool = False
     source_kind: str = "caller"
+    # A distinct readback from this selected source owner. The finalizer may
+    # use it for an immutable frozen contract or a separately approved compact
+    # procedure; candidate fields and store freshness never supply that proof.
+    final_proof: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.store_id, str) or not self.store_id.strip():
@@ -103,6 +114,8 @@ class SearchStore:
             raise UnknownKindError(f"unknown candidate kind: {self.kind!r}")
         if not callable(self.query):
             raise SearchError("store query must be callable")
+        if self.final_proof is not None and not callable(self.final_proof):
+            raise SearchError("store final_proof must be callable")
         if not isinstance(self.requires_network, bool):
             raise SearchError("store requires_network must be boolean")
         if self.source_kind not in STORE_SOURCE_KINDS:

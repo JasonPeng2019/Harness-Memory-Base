@@ -1244,6 +1244,25 @@ class Step04ContractCorrectionTests(unittest.TestCase):
         self.assertEqual([first.preparation], self.memory_store.list_preparations(first.decision["decision_id"]))
         self.assertIsNone(self.memory_store.get_final_context_for_decision(first.decision["decision_id"]))
 
+    def test_failed_budget_raw_dependency_claim_does_not_authorize_replan(self) -> None:
+        card, accepted, first, service, mandatory = self._accepted_budget_finalization_state()
+        outcome = service.prepare(
+            task_card=card, plan=accepted, objective_id="objective-1",
+            lane_id="lane-1", run_id="run-1", worktree_path=str(self.root),
+            base_commit="base-1", finalize=True, mandatory_content=mandatory,
+            checkpoint="checkpoint-1", execution_role="worker",
+            invocation_target="harness:worker", recipient="worker:lane-1",
+            optional_items=[{
+                "id": "unverified-claim", "kind": "historical_evidence",
+                "origin": "everos", "revision_id": "r1",
+                "content": {"summary": "optional hint"}, "plan_affecting": True,
+            }],
+        )
+        self.assertTrue(outcome.dispatchable)
+        self.assertIn("unverified-claim", outcome.envelope["delivery"]["omitted"])
+        self.assertIsNone(outcome.context["delivery_trace"]["selected"][-1]["provenance"].get("plan_affecting"))
+        self.assertEqual(outcome.context, self.memory_store.get_final_context_for_decision(first.decision["decision_id"]))
+
     def test_failed_or_unreadable_budget_lookup_fails_before_optional_work(self) -> None:
         first = self.service.prepare(
             task_card=self.card,
