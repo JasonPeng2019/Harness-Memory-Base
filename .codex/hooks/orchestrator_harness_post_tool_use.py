@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
-"""Codex ROOT PostToolUse hook bootstrap."""
+"""Codex worker PostToolUse hook wrapper.
+
+The super-cache worker payload is copied unchanged into an arbitrary worker
+worktree, so this wrapper resolves the worker agent workspace relative to its
+installed location, asks the shared hook-dispatch.py for a boundary decision,
+and translates that decision into the Codex PostToolUse hook output contract.
+"""
+
 from __future__ import annotations
+
 import json
 import subprocess
 import sys
 from pathlib import Path
-PROVIDER_ID = "codex"
+from typing import Any
+
 BOUNDARY = "post-tool-use"
-WORKER_BINDING_SCHEMA = "harness-hook-binding/v1"
-WORKER_DECISIONS = frozenset({"ALLOW", "NOTICE", "REJECT"})
+DECISIONS = frozenset({"ALLOW", "NOTICE", "REJECT"})
 
-def _failure(reason: str) -> dict[str, object]:
-    return {"continue": False, "stopReason": reason}
 
-def _worker_output() -> dict[str, object] | None:
-    agent_workspace = Path(__file__).resolve().parents[2] / ".agent-workspace"
-    binding_path = agent_workspace / "harness-hook-binding.json"
-    try:
-        binding = json.loads(binding_path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError, TypeError):
-        return None
-    if not isinstance(binding, dict) or binding.get("role") != "worker":
-        return None
-    if binding.get("schema") != WORKER_BINDING_SCHEMA:
-        return _failure("worker hook binding schema mismatch")
-    helper = agent_workspace / "hook-dispatch.py"
+def agent_workspace() -> Path:
+    return Path(__file__).resolve().parents[2] / ".agent-workspace"
+
+
+def dispatch_decision() -> dict[str, Any]:
+    helper = agent_workspace() / "hook-dispatch.py"
     try:
         completed = subprocess.run(
             [
@@ -33,51 +33,49 @@ def _worker_output() -> dict[str, object] | None:
                 "--boundary",
                 BOUNDARY,
                 "--agent-workspace",
-                str(agent_workspace),
+                str(agent_workspace()),
             ],
             capture_output=True,
             text=True,
         )
-        decision = json.loads(completed.stdout)
     except Exception as exc:
-        return _failure(f"worker hook dispatch failed: {exc}")
-    if not isinstance(decision, dict) or decision.get("decision") not in WORKER_DECISIONS:
-        return _failure("worker hook dispatch returned an invalid decision")
-    if decision["decision"] == "ALLOW":
+        return {"decision": "REJECT", "reason": f"hook-dispatch execution failed: {exc}"}
+    if not completed.stdout or not completed.stdout.strip():
+        return {"decision": "REJECT", "reason": f"hook-dispatch produced no output: {helper}"}
+    try:
+        decision = json.loads(completed.stdout)
+    except (ValueError, TypeError) as exc:
+        return {"decision": "REJECT", "reason": f"hook-dispatch output invalid: {exc}"}
+    if not isinstance(decision, dict) or decision.get("decision") not in DECISIONS:
+        return {"decision": "REJECT", "reason": "hook-dispatch output is not a valid decision"}
+    return decision
+
+
+def translate(decision: dict[str, Any]) -> dict[str, Any]:
+    kind = decision.get("decision")
+    if kind == "ALLOW":
         return {}
-    if decision["decision"] == "NOTICE":
+    if kind == "NOTICE":
         notice = decision.get("notice")
         ids = notice if isinstance(notice, list) else []
+        listed = ", ".join(str(item) for item in ids)
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
                 "additionalContext": (
-                    "Worker assignments pending resolution: "
-                    + ", ".join(str(item) for item in ids)
-                    + ". Inspect and resolve the listed worker assignments before continuing."
+                    "Worker assignments pending resolution: " + listed + ". "
+                    "Inspect and resolve the listed worker assignments before continuing."
                 ),
             }
         }
-    return _failure(str(decision.get("reason") or "rejected by harness"))
+    reason = decision.get("reason") or "rejected by harness"
+    return {"continue": False, "stopReason": str(reason)}
+
 
 def main() -> int:
-    worker_output = _worker_output()
-    if worker_output is not None:
-        print(json.dumps(worker_output, sort_keys=True))
-        return 0
-    binding_path = Path(__file__).resolve().parent.parent / "orchestrator-harness-binding.json"
-    try:
-        binding = json.loads(binding_path.read_text(encoding="utf-8-sig"))
-        harness_root = binding.get("harness_root") if isinstance(binding, dict) else None
-        if not isinstance(harness_root, str) or not harness_root or not Path(harness_root).is_absolute():
-            raise ValueError(f"installed {PROVIDER_ID} hook has no bound harness_root")
-        sys.path.insert(0, harness_root)
-        from orchestrator_harness.root_hook_wrapper import run
-        output = run(PROVIDER_ID, BOUNDARY, binding_path)
-    except Exception as exc:
-        output = _failure(str(exc))
-    print(json.dumps(output, sort_keys=True))
+    print(json.dumps(translate(dispatch_decision()), sort_keys=True))
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
