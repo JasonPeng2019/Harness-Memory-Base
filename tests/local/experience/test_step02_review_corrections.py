@@ -35,6 +35,8 @@ class _CountingEverOS:
         self.memorize_calls = 0
         self.search_calls = 0
         self.search_request_calls = 0
+        self.get_calls = 0
+        self.get_request_calls = 0
 
     async def memorize(self, _: dict, **__: object) -> dict:
         self.memorize_calls += 1
@@ -47,6 +49,14 @@ class _CountingEverOS:
     async def search(self, _: object) -> dict:
         self.search_calls += 1
         return {"data": {"agent_cases": [], "agent_skills": []}}
+
+    def make_get_request(self, **kwargs: object) -> dict:
+        self.get_request_calls += 1
+        return dict(kwargs)
+
+    async def get(self, _: object) -> dict:
+        self.get_calls += 1
+        return {"data": {"agent_cases": [], "count": 0, "total_count": 0}}
 
 
 class EverOSRootBindingRegressionTests(unittest.TestCase):
@@ -81,21 +91,26 @@ class EverOSRootBindingRegressionTests(unittest.TestCase):
         persistence.MemoryRoot = memory_root_type
         memory = types.ModuleType("everos.memory")
         memory.__path__ = []  # type: ignore[attr-defined]
+        get = types.ModuleType("everos.memory.get")
+        get.GetRequest = public.make_get_request
         search = types.ModuleType("everos.memory.search")
         search.SearchRequest = public.make_search_request
         service = types.ModuleType("everos.service")
+        service.get = public.get
         service.memorize = public.memorize
         service.search = public.search
         everos.core = core
         everos.memory = memory
         everos.service = service
         core.persistence = persistence
+        memory.get = get
         memory.search = search
         return {
             "everos": everos,
             "everos.core": core,
             "everos.core.persistence": persistence,
             "everos.memory": memory,
+            "everos.memory.get": get,
             "everos.memory.search": search,
             "everos.service": service,
         }
@@ -230,6 +245,8 @@ class EverOSRootBindingRegressionTests(unittest.TestCase):
                                     )
                                 )
                 self.assertEqual(0, public.memorize_calls)
+                self.assertEqual(0, public.get_request_calls)
+                self.assertEqual(0, public.get_calls)
                 self.assertEqual(0, public.search_request_calls)
                 self.assertEqual(0, public.search_calls)
 
