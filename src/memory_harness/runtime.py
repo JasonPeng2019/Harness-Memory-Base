@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Mapping
 
-from . import contracts
+from . import context as context_module, contracts
 from .config import MemoryConfig, resolve_config
-from .privacy import PrivacyPolicy, guard_mandatory, sanitize_payload
+from .privacy import PrivacyPolicy, detect_secrets, guard_mandatory, guard_worker_authority, has_worker_authority, sanitize_payload
 from .store import MemoryStore
 
 
@@ -27,6 +27,30 @@ class PlanNotAcceptedError(RuntimeError):
 class PreparedMemory:
     decision: dict[str, Any]
     envelope: dict[str, Any] | None
+
+
+def _worker_content_authority(items: Any, final_context: Any = None) -> bool:
+    expected = {"security": contracts.FINAL_CONTEXT_SECURITY}
+    if isinstance(final_context, Mapping):
+        expected.update({"task": final_context.get("task"),
+                         "accepted-plan": final_context.get("accepted_plan_content"),
+                         "base": final_context.get("base_commit"),
+                         "route": final_context.get("route"),
+                         "checkpoint": final_context.get("checkpoint")})
+    return isinstance(items, (list, tuple)) and any(
+        has_worker_authority({key: value for key, value in item.items() if key != "content"})
+        if (isinstance(item, Mapping) and isinstance(item.get("id"), str)
+            and item["id"] in expected and item.get("kind", item["id"]) == item["id"]
+            and item.get("content") == expected[item["id"]])
+        else has_worker_authority(item)
+        for item in items
+    )
+
+
+def _worker_optional_authority(items: Any) -> bool:
+    return isinstance(items, (list, tuple)) and any(
+        context_module._optional_worker_authority(item) for item in items
+    )
 
 
 class MemoryRuntime:
@@ -55,6 +79,30 @@ class MemoryRuntime:
         mandatory_content: list[Mapping[str, Any]] | None = None,
         optional_content: list[Mapping[str, Any]] | None = None,
     ) -> PreparedMemory:
+        mandatory = list(mandatory_content or [])
+        optional = list(optional_content or [])
+        omitted_authority = []
+        for item in optional:
+            if _worker_optional_authority([item]):
+                identifier = item.get("id")
+                if (not isinstance(identifier, str) or not identifier.strip()
+                        or identifier != identifier.strip()
+                        or any(ord(char) < 32 for char in identifier)
+                        or detect_secrets(identifier, self.privacy_policy)
+                        or has_worker_authority(identifier)):
+                    identifier = f"omitted-authority-{len(omitted_authority)}"
+                omitted_authority.append(identifier)
+        optional = [item for item in optional if not _worker_optional_authority([item])]
+        configuration = asdict(self.config)
+        guard_mandatory({
+            "task_card": task_card, "plan": plan, "configuration": configuration,
+            "mandatory": mandatory, "optional": optional,
+            "destination": {"lane_id": lane_id, "run_id": run_id,
+                            "worktree_path": str(worktree_path), "base_commit": base_commit},
+        }, self.privacy_policy)
+        guard_worker_authority(configuration)
+        if _worker_content_authority(mandatory):
+            guard_worker_authority(mandatory)
         contracts.validate_task_card(task_card)
         contracts.validate_plan(plan)
         if task_card["base_commit"] != base_commit:
@@ -63,16 +111,14 @@ class MemoryRuntime:
             task_card,
             plan,
             strategy=self.config.strategy,
-            configuration=asdict(self.config),
+            configuration=configuration,
         )
         self.store.record_decision(decision)
 
         if plan["state"] != "accepted":
             return PreparedMemory(decision=decision, envelope=None)
 
-        mandatory = list(mandatory_content or [])
-        guard_mandatory(mandatory, self.privacy_policy)
-        sanitized_optional = sanitize_payload(list(optional_content or []), self.privacy_policy)
+        sanitized_optional = sanitize_payload(optional, self.privacy_policy)
         if not isinstance(sanitized_optional, list):
             raise RuntimeError("sanitized optional content must remain a list")
         envelope = contracts.make_envelope(
@@ -85,8 +131,9 @@ class MemoryRuntime:
             base_commit=base_commit,
             mandatory_content=mandatory,
             optional_content=sanitized_optional,
+            omitted_content=omitted_authority,
             strategy=self.config.strategy,
-            configuration=asdict(self.config),
+            configuration=configuration,
         )
         return PreparedMemory(decision=decision, envelope=envelope)
 
@@ -97,6 +144,13 @@ class MemoryRuntime:
     ) -> dict[str, Any]:
         if not isinstance(envelope, Mapping):
             raise RuntimeError("dispatch envelope must be an object")
+        guard_mandatory(envelope, self.privacy_policy)
+        guard_worker_authority(envelope.get("configuration"))
+        guard_worker_authority(envelope.get("environment"))
+        if _worker_content_authority(envelope.get("mandatory_content"), envelope.get("final_context")):
+            guard_worker_authority(envelope.get("mandatory_content"))
+        if _worker_optional_authority(envelope.get("optional_content")):
+            guard_worker_authority(envelope.get("optional_content"))
         if envelope.get("plan_state") != "accepted":
             raise PlanNotAcceptedError("only a ROOT-accepted plan may dispatch")
         operation = contracts.make_operation(
@@ -139,6 +193,13 @@ class MemoryRuntime:
     def record_dispatch_intent(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
         """Persist one launch intent for callers that use the existing launcher."""
 
+        guard_mandatory(envelope, self.privacy_policy)
+        guard_worker_authority(envelope.get("configuration"))
+        guard_worker_authority(envelope.get("environment"))
+        if _worker_content_authority(envelope.get("mandatory_content"), envelope.get("final_context")):
+            guard_worker_authority(envelope.get("mandatory_content"))
+        if _worker_optional_authority(envelope.get("optional_content")):
+            guard_worker_authority(envelope.get("optional_content"))
         operation = contracts.make_operation(
             kind="dispatch",
             envelope=envelope,
@@ -157,6 +218,13 @@ class MemoryRuntime:
         envelope: Mapping[str, Any],
         observed_invocation: Mapping[str, Any],
     ) -> dict[str, Any]:
+        guard_mandatory(envelope, self.privacy_policy)
+        guard_worker_authority(envelope.get("configuration"))
+        guard_worker_authority(envelope.get("environment"))
+        if _worker_content_authority(envelope.get("mandatory_content"), envelope.get("final_context")):
+            guard_worker_authority(envelope.get("mandatory_content"))
+        if _worker_optional_authority(envelope.get("optional_content")):
+            guard_worker_authority(envelope.get("optional_content"))
         if not isinstance(observed_invocation, Mapping):
             raise RuntimeError("observed harness invocation must be an object")
         invocation_id = observed_invocation.get("invocation_id")
@@ -292,16 +360,6 @@ class MemoryRuntime:
                 ("invocation_target", invocation_target), ("recipient", recipient),
             ):
                 contracts._require_canonical_identity(value, field)
-            contracts.validate_envelope(
-                envelope,
-                task_card=task_card,
-                plan=plan,
-                lane_id=lane_id,
-                run_id=run_id,
-                base_commit=base_commit,
-                worktree_path=str(worktree_path),
-                require_final_context=True,
-            )
             context_module.validate_final_context(
                 context,
                 envelope=envelope,
@@ -315,9 +373,10 @@ class MemoryRuntime:
                 execution_role=execution_role,
                 invocation_target=invocation_target,
                 recipient=recipient,
+                privacy_policy=self.privacy_policy,
             )
-        except Exception as exc:
-            raise RuntimeError(f"finalized dispatch does not match its target: {exc}") from exc
+        except Exception:
+            raise RuntimeError("finalized dispatch does not match its target") from None
         return self.dispatch(envelope, launcher)
 
     def record_apc_child_operation(self, child_operation: Mapping[str, Any]) -> dict[str, Any]:

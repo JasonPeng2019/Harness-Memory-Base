@@ -254,10 +254,12 @@ class FinalContextDispatchTests(unittest.TestCase):
 
     def test_secret_optional_provenance_never_enters_trace(self) -> None:
         policy = privacy.PrivacyPolicy(known_secrets=("super-secret-value",))
-        with self.assertRaises(context.OptionalItemError):
-            self._finalize(optional_items=[{
-                "id": "memory-1", "origin": "super-secret-value", "content": "note",
-            }], privacy_policy=policy)
+        finalized = self._finalize(optional_items=[{
+            "id": "memory-1", "origin": "super-secret-value", "content": "note",
+        }], privacy_policy=policy)
+        self.assertEqual([], finalized.context["optional_content"])
+        self.assertNotIn("super-secret-value", contracts.canonical_json(finalized.context).decode())
+        self.assertEqual("prohibited credential", finalized.omissions[0]["reason"])
 
     def test_finalized_envelope_cannot_downgrade_to_generic_validation(self) -> None:
         finalized = self._finalize()

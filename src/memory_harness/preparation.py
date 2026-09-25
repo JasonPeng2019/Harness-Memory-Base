@@ -25,7 +25,10 @@ from .config import (
     resolve_config,
     resolve_limits,
 )
-from .privacy import PrivacyPolicy, safe_query_payload, sanitize_text
+from .privacy import (
+    MandatorySecretError, PrivacyPolicy, authorize_recipient, detect_secrets,
+    safe_query_payload, sanitize_text,
+)
 from .search import BoundedSearch, SearchStore
 from .store import PreparationConflictError, StoreError
 
@@ -55,6 +58,7 @@ class PreparationOutcome:
     envelope: dict[str, Any] | None = None
     superseded: dict[str, Any] | None = None
     reason: str = ""
+    recovery_identity: dict[str, str] | None = None
 
     @property
     def dispatchable(self) -> bool:
@@ -72,6 +76,55 @@ class PreparationOutcome:
 
 
 _MASKED_STRATEGIES = {"deeper"}
+
+
+def _safe_recovery_plan(plan: Mapping[str, Any], policy: PrivacyPolicy) -> dict[str, Any]:
+    if not detect_secrets(plan, policy):
+        return dict(plan)
+    safe = {"plan_digest": contracts.content_hash(plan), "state": "accepted"}
+    for field in ("plan_id", "revision", "objective_id", "route", "accepted_by"):
+        if field in plan and not detect_secrets(plan[field], policy):
+            safe[field] = plan[field]
+    return safe
+
+
+def _authoritative_recovery_decision_id(
+    outcome: PreparationOutcome, task_card: Mapping[str, Any], plan: Mapping[str, Any],
+    durable_store: Any | None,
+) -> str | None:
+    decision = outcome.decision
+    if not isinstance(decision, Mapping) or durable_store is None:
+        return None
+    try:
+        contracts.validate_decision(decision)
+        identity = contracts.logical_decision_identity(task_card, plan)
+        durable = durable_store.find_logical_decision(identity)
+        if durable is None:
+            return None
+        contracts.validate_decision(durable)
+        for field in (
+            "decision_id", "task_card_digest", "objective_id", "route", "plan_id",
+            "plan_state", "plan_digest", "strategy", "configuration",
+            "configuration_digest", "state", "content_hash",
+        ):
+            if decision[field] != durable[field]:
+                return None
+        preparation = outcome.preparation
+        if preparation is not None:
+            contracts.validate_preparation(preparation)
+            stored_preparation = durable_store.get_preparation(preparation["preparation_id"])
+            if stored_preparation != preparation:
+                return None
+            for field in ("decision_id", "task_card_digest", "objective_id", "route",
+                          "plan_id", "plan_digest", "plan_state"):
+                if preparation[field] != durable[field]:
+                    return None
+        return durable["decision_id"]
+    except Exception:
+        # Readback errors never turn a caller-supplied identity into authority
+        # and must not put raw store diagnostics into a recovery result.
+        pass
+    return None
 
 
 class PreparationService:
@@ -548,15 +601,54 @@ class PreparationService:
         execution_role: str | None = None,
         invocation_target: str | None = None,
         recipient: str | None = None,
+        task_credential_channel: Any = None,
         finalize: bool = False,
     ) -> PreparationOutcome:
-        contracts.validate_task_card(task_card)
+        # STEP-04 search sanitizes known task secrets before tokenization.
+        # The stricter mandatory egress gate applies when preparing final
+        # worker context, preserving that established planning behavior.
+        mandatory_sensitive = (
+            detect_secrets({"task_card": task_card, "plan": plan}, self.privacy_policy)
+            if finalize else []
+        )
+        configuration_sensitive = detect_secrets({
+            "requested_configuration": request,
+            "service_configuration": asdict(self.config) if self.config is not None else None,
+        }, self.privacy_policy)
+        if mandatory_sensitive or configuration_sensitive:
+            reason = ("mandatory content contains a prohibited credential" if mandatory_sensitive
+                      else "configuration contains a prohibited credential")
+            if finalize and isinstance(plan, Mapping) and plan.get("state") == "accepted":
+                try:
+                    contracts.validate_task_card(task_card)
+                    contracts.validate_plan(plan, expected_state="accepted")
+                    contracts.validate_task_plan_binding(task_card, plan)
+                except (contracts.ContractError, TypeError, ValueError):
+                    raise MandatorySecretError(reason) from None
+                return PreparationOutcome(
+                    mode="no_memory_continuation", decision=None, preparation=None,
+                    trace=None, disposition=None,
+                    plan=_safe_recovery_plan(plan, self.privacy_policy), reason=reason,
+                    recovery_identity={
+                        "task_card_digest": contracts.content_hash(task_card),
+                        "plan_digest": contracts.content_hash(plan),
+                    },
+                )
+            raise MandatorySecretError(reason)
+        try:
+            contracts.validate_task_card(task_card)
+        except contracts.ContractError:
+            if detect_secrets(task_card, self.privacy_policy):
+                raise MandatorySecretError("mandatory content contains a prohibited credential") from None
+            raise
         supplied_config = self._resolve(request)
         try:
             current_plan_state = contracts.classify_current_plan(
                 plan, expected_objective_id=objective_id, expected_route=route
             )
         except contracts.PlanStateError as exc:
+            if detect_secrets(plan, self.privacy_policy):
+                raise MandatorySecretError("mandatory content contains a prohibited credential") from None
             raise self._plan_state_error(exc, objective_id) from exc
         # An absent plan is an ordinary fresh-planning state: it keeps its
         # exact identity in the record and never invents an inherited plan.
@@ -635,6 +727,7 @@ class PreparationService:
                 execution_role=execution_role,
                 invocation_target=invocation_target,
                 recipient=recipient,
+                task_credential_channel=task_credential_channel,
                 mandatory_content=mandatory_content,
                 optional_items=(),
                 omitted=["optional-memory-unavailable", *supplied_optional],
@@ -966,6 +1059,7 @@ class PreparationService:
             execution_role=execution_role,
             invocation_target=invocation_target,
             recipient=recipient,
+            task_credential_channel=task_credential_channel,
             mandatory_content=mandatory_content,
             optional_items=optional_items,
             freshness_check=freshness_check,
@@ -2052,6 +2146,7 @@ class PreparationService:
         execution_role: str | None,
         invocation_target: str | None,
         recipient: str | None,
+        task_credential_channel: Any = None,
         mandatory_content: Iterable[Mapping[str, Any]],
         optional_items: Iterable[Mapping[str, Any]],
         freshness_check: Callable[[Mapping[str, Any]], bool] | None,
@@ -2065,9 +2160,10 @@ class PreparationService:
             )
         for field, value in (
             ("checkpoint", checkpoint), ("execution_role", execution_role),
-            ("invocation_target", invocation_target), ("recipient", recipient),
+            ("invocation_target", invocation_target),
         ):
             contracts._require_canonical_identity(value, field)
+        authorized_recipient = authorize_recipient(recipient, self.privacy_policy)
         selected = outcome.selected_candidates
         packed_optional: list[dict[str, Any]] = []
         selected_provenance: dict[str, dict[str, Any]] = {}
@@ -2094,29 +2190,55 @@ class PreparationService:
             selected=selected, stores=stores, objective=objective,
             preparation=outcome.preparation, route=plan["route"],
         ) if selected else None
-        finalized = context_module.finalize_context(
-            task_card=task_card,
-            plan=plan,
-            decision_id=outcome.decision["decision_id"],
-            lane_id=str(lane_id),
-            run_id=str(run_id),
-            worktree_path=str(worktree_path),
-            base_commit=str(base_commit),
-            strategy=(outcome.preparation or outcome.decision)["strategy"],
-            configuration=(outcome.preparation or outcome.decision)["configuration"],
-            checkpoint=str(checkpoint),
-            execution_role=str(execution_role),
-            invocation_target=str(invocation_target),
-            recipient=str(recipient),
-            mandatory_content=list(mandatory_content),
-            optional_items=packed_optional,
-            selected_provenance=selected_provenance,
-            omitted=omitted,
-            privacy_policy=self.privacy_policy,
-            limits=self.limits,
-            freshness_check=freshness_check,
-            source_owner_recheck=source_recheck,
-        )
+        try:
+            finalized = context_module.finalize_context(
+                task_card=task_card,
+                plan=plan,
+                decision_id=outcome.decision["decision_id"],
+                lane_id=str(lane_id),
+                run_id=str(run_id),
+                worktree_path=str(worktree_path),
+                base_commit=str(base_commit),
+                strategy=(outcome.preparation or outcome.decision)["strategy"],
+                configuration=(outcome.preparation or outcome.decision)["configuration"],
+                checkpoint=str(checkpoint),
+                execution_role=str(execution_role),
+                invocation_target=str(invocation_target),
+                recipient=authorized_recipient,
+                task_credential_channel=task_credential_channel,
+                mandatory_content=list(mandatory_content),
+                optional_items=packed_optional,
+                selected_provenance=selected_provenance,
+                omitted=omitted,
+                privacy_policy=self.privacy_policy,
+                limits=self.limits,
+                freshness_check=freshness_check,
+                source_owner_recheck=source_recheck,
+            )
+        except (context_module.MandatoryOverflowError, MandatorySecretError,
+                context_module.TaskCredentialChannelError) as exc:
+            # The accepted decision remains intact. Do not return contaminated
+            # preparation/trace/plan bodies through the recovery result.
+            safe_plan = _safe_recovery_plan(plan, self.privacy_policy)
+            decision_id = _authoritative_recovery_decision_id(
+                outcome, task_card, plan, self.store,
+            )
+            safe_decision = (outcome.decision if decision_id is not None
+                             and not detect_secrets(outcome.decision, self.privacy_policy) else None)
+            safe_preparation = (outcome.preparation if decision_id is not None
+                                and outcome.preparation is not None
+                                and not detect_secrets(outcome.preparation, self.privacy_policy) else None)
+            recovery_identity = {
+                "task_card_digest": contracts.content_hash(task_card),
+                "plan_digest": contracts.content_hash(plan),
+            }
+            if decision_id is not None and not detect_secrets(decision_id, self.privacy_policy):
+                recovery_identity["decision_id"] = decision_id
+            return PreparationOutcome(
+                mode="no_memory_continuation", decision=safe_decision,
+                preparation=safe_preparation, trace=None, disposition=None,
+                plan=safe_plan, reason=str(exc), recovery_identity=recovery_identity,
+            )
         if self.store is not None:
             self.store.record_final_context(
                 finalized.context, envelope_digest=finalized.envelope["content_hash"]

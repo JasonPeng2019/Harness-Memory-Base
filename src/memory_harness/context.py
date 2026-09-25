@@ -15,8 +15,11 @@ from . import contracts
 from .config import PreparationLimits
 from .privacy import (
     PrivacyPolicy,
+    authorize_recipient,
     detect_secrets,
     guard_mandatory,
+    guard_worker_authority,
+    has_worker_authority,
     sanitize_payload,
 )
 
@@ -35,6 +38,10 @@ class PlanAffectingFreshnessError(ContextError):
 
 class OptionalItemError(ContextError):
     """An optional item is malformed and cannot be packed."""
+
+
+class TaskCredentialChannelError(ContextError):
+    """A required task-only worker channel is unavailable or unsafe."""
 
 
 ROLE_SEPARATION = contracts.FINAL_CONTEXT_SECURITY
@@ -61,6 +68,39 @@ def _normalize_optional_item(item: Mapping[str, Any]) -> dict[str, Any]:
     normalized.setdefault("kind", "memory")
     normalized.setdefault("origin", "optional")
     return normalized
+
+
+def _optional_worker_authority(item: Mapping[str, Any]) -> bool:
+    """Inspect delivered content and provenance, excluding trusted procedure proof."""
+    content = item.get("content")
+    if item.get("kind") == "procedure" and isinstance(content, Mapping) and isinstance(content.get("procedure"), Mapping):
+        content = content["procedure"].get("behavior")
+    provenance = {key: value for key, value in item.items()
+                  if key not in {"content", "compact_approval", "compact_representation", "final_recheck", "frozen_contract"}}
+    compact = item.get("compact_representation")
+    compact_content = compact.get("content") if isinstance(compact, Mapping) else None
+    return (has_worker_authority(content) or has_worker_authority(compact_content)
+            or has_worker_authority(provenance))
+
+
+def _mandatory_worker_authority(
+    items: Iterable[Mapping[str, Any]], *, task: str, plan_content: Any,
+    base_commit: str, route: str, checkpoint: str,
+) -> bool:
+    expected = {"task": task, "accepted-plan": plan_content, "base": base_commit,
+                "route": route, "checkpoint": checkpoint, "security": ROLE_SEPARATION}
+    for item in items:
+        identifier = item.get("id")
+        if (isinstance(identifier, str) and identifier in expected
+                and item.get("kind", identifier) == identifier
+                and item.get("content") == expected[identifier]):
+            # Exact domain-owned baseline is checked by the final context
+            # contract; only extra worker-bound item fields need this guard.
+            if has_worker_authority({key: value for key, value in item.items() if key != "content"}):
+                return True
+        elif has_worker_authority(item):
+            return True
+    return False
 
 
 def _compact_variant(item: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -139,6 +179,7 @@ def finalize_context(
     execution_role: str,
     invocation_target: str,
     recipient: str,
+    task_credential_channel: Any = None,
     mandatory_content: Iterable[Mapping[str, Any]],
     optional_items: Iterable[Mapping[str, Any]] = (),
     selected_provenance: Mapping[str, Mapping[str, Any]] | None = None,
@@ -153,13 +194,37 @@ def finalize_context(
 
     policy = privacy_policy or PrivacyPolicy()
     resolved = limits or PreparationLimits()
+    recipient = authorize_recipient(recipient, policy)
+    mandatory = [dict(item) for item in mandatory_content]
+    guard_mandatory({
+        "task_card": task_card, "plan": plan, "configuration": configuration,
+        "mandatory": mandatory, "destination": {
+            "lane_id": lane_id, "run_id": run_id, "worktree_path": worktree_path,
+            "base_commit": base_commit, "checkpoint": checkpoint,
+            "execution_role": execution_role, "invocation_target": invocation_target,
+            "recipient": recipient,
+        },
+    }, policy)
+    guard_worker_authority(configuration)
+    if _mandatory_worker_authority(mandatory, task=task_card["task"],
+                                   plan_content=plan["content"], base_commit=base_commit,
+                                   route=plan["route"], checkpoint=checkpoint):
+        guard_worker_authority(mandatory)
     contracts.validate_task_card(task_card)
     contracts.validate_plan(plan, expected_state="accepted")
     contracts.validate_task_plan_binding(task_card, plan)
     if task_card["base_commit"] != base_commit:
         raise ContextError("task card base does not match the finalization base")
 
-    mandatory = [dict(item) for item in mandatory_content]
+    try:
+        contracts.validate_task_credential_channel(
+            task_credential_channel, task_card_digest=task_card["content_hash"],
+            recipient=recipient, requirement=task_card.get("task_credential_requirement"),
+        )
+    except contracts.ContractError as exc:
+        raise TaskCredentialChannelError(str(exc)) from None
+    if task_credential_channel is not None and detect_secrets(task_credential_channel, policy):
+        raise TaskCredentialChannelError("required task credential channel contains a protected credential")
     for item in mandatory:
         identifier = item.get("id")
         if not isinstance(identifier, str) or not identifier:
@@ -172,19 +237,43 @@ def finalize_context(
 
     selected: list[dict[str, Any] | None] = []
     omissions: list[dict[str, Any]] = []
+
+    def omit_sensitive(item: Mapping[str, Any]) -> None:
+        # The whole item, including its provenance, is outside the delivered
+        # context. Only an independently safe identity and fixed reason remain.
+        item_id = item.get("id")
+        if (not isinstance(item_id, str) or not item_id.strip()
+                or item_id != item_id.strip()
+                or any(ord(char) < 32 for char in item_id)
+                or detect_secrets(item_id, policy) or has_worker_authority(item_id)):
+            item_id = f"omitted-sensitive-{len(selected)}"
+        descriptor = contracts._optional_descriptor({
+            "id": item_id, "kind": "unavailable", "origin": "privacy", "content": None,
+        })
+        selected.append(descriptor)
+        omissions.append({**descriptor, "reason": "prohibited credential"})
+
     for raw in omitted:
         item = _normalize_optional_item(raw) if isinstance(raw, Mapping) else {
             "id": str(raw), "kind": "unavailable", "origin": "preparation", "content": None,
         }
+        sensitive_provenance = detect_secrets(
+            {key: value for key, value in item.items() if key != "content"}, policy,
+        ) or _optional_worker_authority(item)
         if _plan_depends_on(plan, item):
+            if sensitive_provenance:
+                raise PlanAffectingFreshnessError(
+                    "selected source was omitted before final recheck; ROOT must replan"
+                )
             raise PlanAffectingFreshnessError(
                 f"selected source {item.get('source_id', item['id'])} revision "
                 f"{item.get('revision_id', 'unknown')} was omitted before final recheck; ROOT must replan"
             )
         for claim in ("plan_affecting", "frozen_contract", "compact_representation", "compact_approval"):
             item.pop(claim, None)
-        if detect_secrets({key: value for key, value in item.items() if key != "content"}, policy):
-            raise OptionalItemError("optional provenance contains prohibited secret")
+        if sensitive_provenance:
+            omit_sensitive(item)
+            continue
         descriptor = contracts._optional_descriptor(item)
         selected.append(descriptor)
         omissions.append({**descriptor, "reason": "omitted before finalization"})
@@ -215,13 +304,30 @@ def finalize_context(
         )
         if missing_identity:
             selected_item["revision_id"] = "unversioned"
-        if detect_secrets({key: value for key, value in selected_item.items() if key != "content"}, policy):
-            raise OptionalItemError("optional provenance contains prohibited secret")
         affects_plan = _plan_depends_on(
             plan, selected_item, trusted_dependency=source.get("plan_affecting") is True,
         )
         if affects_plan:
             selected_item["plan_affecting"] = True
+        if (detect_secrets({key: value for key, value in selected_item.items()
+                            if key != "content"}, policy)
+                or _optional_worker_authority({key: value for key, value in selected_item.items()
+                                               if key != "content"})):
+            if affects_plan:
+                raise PlanAffectingFreshnessError(
+                    "plan-affecting optional guidance contains a prohibited credential; ROOT must replan"
+                )
+            omit_sensitive(selected_item)
+            continue
+        if detect_secrets(item.get("content"), policy) or _optional_worker_authority(item):
+            descriptor = contracts._optional_descriptor(selected_item)
+            selected.append(descriptor)
+            if affects_plan:
+                raise PlanAffectingFreshnessError(
+                    "plan-affecting optional guidance contains a prohibited credential; ROOT must replan"
+                )
+            omissions.append({**descriptor, "reason": "prohibited credential"})
+            continue
         # A live source must return one exact observation. The Boolean legacy
         # checker remains a freshness-only fallback for caller-owned items.
         original = dict(selected_item)
@@ -250,9 +356,9 @@ def finalize_context(
                 recheck = contracts.make_final_source_recheck(item=original, status="ineligible")
             try:
                 contracts.validate_final_source_recheck(recheck, item=original)
-            except (contracts.ContractError, TypeError, ValueError) as exc:
+            except (contracts.ContractError, TypeError, ValueError):
                 if selected_item.get("freshness") != "frozen":
-                    raise OptionalItemError(f"final source recheck is invalid for {item_id}: {exc}") from exc
+                    raise OptionalItemError("final source recheck is invalid") from None
                 recheck = contracts.make_final_source_recheck(item=original, status="ineligible")
             if selected_item.get("freshness") == "frozen" and recheck["status"] == "frozen":
                 expected = {"source_id": original["source_id"],
@@ -290,6 +396,25 @@ def finalize_context(
             historical = {"procedural_authority": False, "evidence": item.get("content")}
             selected_item["content"] = historical
             item["content"] = historical
+        if (detect_secrets({key: value for key, value in selected_item.items()
+                            if key != "content"}, policy)
+                or _optional_worker_authority({key: value for key, value in selected_item.items()
+                                               if key != "content"})):
+            if affects_plan:
+                raise PlanAffectingFreshnessError(
+                    "plan-affecting optional guidance contains a prohibited credential; ROOT must replan"
+                )
+            omit_sensitive(selected_item)
+            continue
+        if detect_secrets(item, policy) or _optional_worker_authority(item):
+            descriptor = contracts._optional_descriptor(selected_item)
+            selected.append(descriptor)
+            if affects_plan:
+                raise PlanAffectingFreshnessError(
+                    "plan-affecting optional guidance contains a prohibited credential; ROOT must replan"
+                )
+            omissions.append({**descriptor, "reason": "prohibited credential"})
+            continue
         fresh = bool(freshness_check(original)) if recheck is None and freshness_check is not None else True
         status = recheck["status"] if recheck is not None else ("eligible" if fresh else "stale")
         descriptor = contracts._optional_descriptor(selected_item)
@@ -303,9 +428,6 @@ def finalize_context(
                     f"revision {selected_item.get('revision_id', 'unknown')} changed ({status}); ROOT must replan"
                 )
             omissions.append({**descriptor, "reason": f"final recheck: {status}" if recheck is not None else "not fresh"})
-            continue
-        if detect_secrets(item, policy):
-            omissions.append({**descriptor, "reason": "prohibited secret"})
             continue
         for claim in ("plan_affecting", "frozen_contract", "compact_representation", "compact_approval"):
             if claim not in {"compact_representation", "compact_approval"} or claim not in selected_item:
@@ -362,6 +484,7 @@ def finalize_context(
         "omitted": omissions,
         "context_delivered": [contracts._packed_descriptor(item, selected_by_id[item["id"]]) for item in packed],
     }
+    guard_mandatory(trace, policy)
     context = contracts.make_finalized_context(
         lane_id=lane_id,
         run_id=run_id,
@@ -389,6 +512,7 @@ def finalize_context(
         role_separation=ROLE_SEPARATION,
         freshness={"mode": "rechecked" if any((freshness_check, source_recheck, source_owner_recheck)) else "not-required"},
         context_limit=resolved.context_char_limit,
+        task_credential_channel=task_credential_channel,
     )
     envelope = contracts.make_envelope(
         task_card=task_card, plan=plan, decision_id=decision_id,
@@ -397,12 +521,14 @@ def finalize_context(
         omitted_content=[entry["id"] for entry in omissions],
         strategy=strategy, configuration=configuration, final_context=context,
     )
+    guard_mandatory({"context": context, "envelope": envelope}, policy)
     validate_final_context(
         context, envelope=envelope, task_card=task_card, plan=plan,
         lane_id=lane_id, run_id=run_id, base_commit=base_commit,
         worktree_path=str(worktree_path), checkpoint=checkpoint,
         execution_role=execution_role, invocation_target=invocation_target,
         recipient=recipient,
+        privacy_policy=policy,
     )
     return FinalizedContext(envelope=envelope, context=context, omissions=omissions)
 
@@ -421,6 +547,7 @@ def validate_final_context(
     execution_role: str | None = None,
     invocation_target: str | None = None,
     recipient: str | None = None,
+    privacy_policy: PrivacyPolicy | None = None,
 ) -> None:
     """Validate the finalized context against the actual dispatch target.
 
@@ -428,6 +555,26 @@ def validate_final_context(
     fails here as one explicit ``ContextError`` before any launch is attempted.
     """
 
+    policy = privacy_policy or PrivacyPolicy()
+    authorize_recipient(context.get("recipient"), policy)
+    if recipient is not None:
+        authorize_recipient(recipient, policy)
+    if detect_secrets({"context": context, "envelope": envelope}, policy):
+        raise ContextError("finalized context contains a prohibited credential")
+    guard_worker_authority(context.get("configuration"))
+    guard_worker_authority(envelope.get("configuration"))
+    if _mandatory_worker_authority(context.get("mandatory_content", ()), task=task_card["task"],
+                                   plan_content=plan["content"], base_commit=base_commit,
+                                   route=plan["route"], checkpoint=checkpoint):
+        raise ContextError("finalized context contains prohibited worker authority")
+    if _mandatory_worker_authority(envelope.get("mandatory_content", ()), task=task_card["task"],
+                                   plan_content=plan["content"], base_commit=base_commit,
+                                   route=plan["route"], checkpoint=checkpoint):
+        raise ContextError("finalized envelope contains prohibited worker authority")
+    if any(_optional_worker_authority(item) for item in context.get("optional_content", ())):
+        raise ContextError("finalized context contains prohibited worker authority")
+    if any(_optional_worker_authority(item) for item in envelope.get("optional_content", ())):
+        raise ContextError("finalized envelope contains prohibited worker authority")
     try:
         contracts.validate_finalized_context(context)
         contracts.validate_envelope(
@@ -440,8 +587,8 @@ def validate_final_context(
             worktree_path=str(worktree_path),
             require_final_context=True,
         )
-    except contracts.ContractError as exc:
-        raise ContextError(f"finalized envelope does not match the dispatch target: {exc}") from exc
+    except contracts.ContractError:
+        raise ContextError("finalized envelope does not match the dispatch target") from None
     expected = {
         "lane_id": lane_id,
         "run_id": run_id,
@@ -500,10 +647,7 @@ def recheck_plan_affecting(
         if not bool(checker(item)):
             stale.append(dict(item))
     if stale:
-        raise PlanAffectingFreshnessError(
-            "plan-affecting optional guidance is no longer fresh: "
-            + ", ".join(str(item.get("id")) for item in stale)
-        )
+        raise PlanAffectingFreshnessError("plan-affecting optional guidance is no longer fresh")
     return stale
 
 
@@ -512,6 +656,7 @@ __all__ = [
     "FinalizedContext",
     "MandatoryOverflowError",
     "OptionalItemError",
+    "TaskCredentialChannelError",
     "PlanAffectingFreshnessError",
     "ROLE_SEPARATION",
     "finalize_context",

@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
+
+from .privacy import PrivacyPolicy, authorize_recipient, detect_secrets, has_worker_authority
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
 # The explicit worker-environment boundary a task card may declare.  A
@@ -15,6 +18,9 @@ TASK_CARD_SCHEMA = "project-task-card/v1"
 # control credentials; legacy and all-off cards declare nothing and keep the
 # harness's inherited environment.
 WORKER_ENVIRONMENT_MODES = frozenset({"scrubbed"})
+TASK_CREDENTIAL_PURPOSES = frozenset({"task_read", "task_write"})
+TASK_CREDENTIAL_SCOPES = frozenset({"task:repository", "task:artifact", "task:external_data"})
+TASK_CREDENTIAL_TRANSPORT = "worker:task-channel"
 MEMORY_HANDOFF_SCHEMA = "memory-handoff/v1"
 PLAN_SCHEMA = "memory-plan/v1"
 DECISION_SCHEMA = "memory-decision/v1"
@@ -105,7 +111,7 @@ def validate_record(record: Mapping[str, Any], schema: str) -> None:
     if not isinstance(record, Mapping):
         raise ContractError("record must be a JSON object")
     if record.get("schema") != schema:
-        raise ContractError(f"record schema mismatch: expected {schema!r}, got {record.get('schema')!r}")
+        raise ContractError(f"record schema mismatch: expected {schema!r}")
     if "content_hash" not in record:
         raise ContractError("record has no content hash")
     if record["content_hash"] != content_hash(record):
@@ -370,6 +376,7 @@ def make_task_card(
     branch: str | None = None,
     memory_handoff: Mapping[str, Any] | None = None,
     worker_environment: str | None = None,
+    task_credential_requirement: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     task_text = _require_nonempty_str(task, "task")
     base = _require_nonempty_str(base_commit, "base_commit")
@@ -391,6 +398,9 @@ def make_task_card(
         if not isinstance(memory_handoff, Mapping):
             raise ContractError("memory_handoff must be an object")
         record["memory_handoff"] = dict(memory_handoff)
+    if task_credential_requirement is not None:
+        validate_task_credential_requirement(task_credential_requirement)
+        record["task_credential_requirement"] = dict(task_credential_requirement)
     record["content_hash"] = content_hash(record)
     validate_task_card(record)
     return record
@@ -406,6 +416,79 @@ def validate_task_card(record: Mapping[str, Any]) -> None:
             raise ContractError(f"unknown worker environment mode: {mode!r}")
     if "memory_handoff" in record:
         validate_memory_handoff(record["memory_handoff"])
+    if "task_credential_requirement" in record:
+        validate_task_credential_requirement(record["task_credential_requirement"])
+
+
+def validate_task_credential_requirement(requirement: Any) -> None:
+    """A task may request only scoped worker data access, never product authority."""
+
+    if not isinstance(requirement, Mapping) or set(requirement) != {"purpose", "scope", "transport"}:
+        raise ContractError("task credential requirement must be value-free and exact")
+    if not isinstance(requirement.get("purpose"), str) or requirement["purpose"] not in TASK_CREDENTIAL_PURPOSES:
+        raise ContractError("task credential purpose is not task-only")
+    scope = requirement.get("scope")
+    if not isinstance(scope, str) or scope not in TASK_CREDENTIAL_SCOPES:
+        raise ContractError("task credential scope is not task-only")
+    if requirement.get("transport") != TASK_CREDENTIAL_TRANSPORT:
+        raise ContractError("task credential transport is not an allowed worker transport")
+    if detect_secrets(requirement, PrivacyPolicy()):
+        raise ContractError("task credential requirement contains a protected credential")
+
+
+def task_credential_channel_reference(
+    *, task_card_digest: str, recipient: str, purpose: str, scope: str,
+    transport: str,
+) -> str:
+    """Derive a value-free channel locator from its complete task-only binding."""
+
+    validate_task_credential_requirement({
+        "purpose": purpose, "scope": scope, "transport": transport,
+    })
+    authorize_recipient(recipient)
+    if not isinstance(task_card_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", task_card_digest):
+        raise ContractError("task credential channel task digest is invalid")
+    return "task-channel:" + sha256_hex({
+        "domain": "memory-task-credential-channel/v1",
+        "task_card_digest": task_card_digest, "recipient": recipient,
+        "purpose": purpose, "scope": scope, "transport": transport,
+    })
+
+
+def validate_task_credential_channel(
+    channel: Any, *, task_card_digest: str, recipient: str,
+    requirement: Mapping[str, Any] | None,
+) -> None:
+    """Validate a value-free reference to a task-scoped worker channel."""
+
+    if requirement is None:
+        if channel is not None:
+            raise ContractError("task credential channel has no task requirement")
+        return
+    validate_task_credential_requirement(requirement)
+    if channel is None:
+        raise ContractError("required task credential channel is missing")
+    if not isinstance(channel, Mapping):
+        raise ContractError("required task credential channel is ambiguous")
+    required = {"reference", "task_card_digest", "recipient", "purpose", "scope", "transport"}
+    if set(channel) != required:
+        raise ContractError("required task credential channel contains forbidden or missing fields")
+    reference = channel.get("reference")
+    if (not isinstance(reference, str) or len(reference) > 128
+            or not re.fullmatch(r"task-channel:[0-9a-f]{64}", reference)):
+        raise ContractError("required task credential channel reference is invalid")
+    if (channel.get("task_card_digest") != task_card_digest
+            or channel.get("recipient") != recipient
+            or any(channel.get(key) != requirement[key] for key in requirement)):
+        raise ContractError("required task credential channel does not match task, recipient, purpose, scope, or transport")
+    authorize_recipient(recipient)
+    if reference != task_credential_channel_reference(
+        task_card_digest=task_card_digest, recipient=recipient,
+        **{key: requirement[key] for key in ("purpose", "scope", "transport")},
+    ):
+        raise ContractError("required task credential channel reference does not match its binding")
+    if detect_secrets(channel, PrivacyPolicy()):
+        raise ContractError("required task credential channel contains a protected credential")
 
 
 def make_memory_handoff(
@@ -818,6 +901,8 @@ def make_envelope(
             "invocation_target", "recipient", "delivery_trace",
         ):
             record[field] = final_context[field]
+        if "task_credential_channel" in final_context:
+            record["task_credential_channel"] = final_context["task_credential_channel"]
         record["final_context_id"] = final_context["context_id"]
         record["final_context_integrity"] = final_context["integrity"]
     record["content_hash"] = content_hash(record)
@@ -848,6 +933,8 @@ def validate_envelope(
     schema = record.get("schema") if isinstance(record, Mapping) else None
     if schema not in (ENVELOPE_SCHEMA, FINAL_ENVELOPE_SCHEMA):
         raise ContractError("unknown envelope schema")
+    if schema == FINAL_ENVELOPE_SCHEMA and detect_secrets(record, PrivacyPolicy()):
+        raise ContractError("finalized envelope contains a prohibited credential")
     validate_record(record, schema)
     if require_final_context and schema != FINAL_ENVELOPE_SCHEMA:
         raise ContractError("a domain-finalized envelope is required")
@@ -876,11 +963,15 @@ def validate_envelope(
     for field, expected_value in expected.items():
         actual = record.get(field)
         if actual != expected_value:
+            if schema == FINAL_ENVELOPE_SCHEMA:
+                raise ContractError(f"finalized envelope {field.replace('_', ' ')} mismatch")
             raise ContractError(f"envelope {field.replace('_', ' ')} mismatch: expected {expected_value!r}, got {actual!r}")
     strategy = _require_nonempty_str(record.get("strategy"), "strategy")
     configuration = record.get("configuration")
     if not isinstance(configuration, Mapping):
         raise ContractError("envelope configuration must be an object")
+    if has_worker_authority(configuration):
+        raise ContractError("envelope contains prohibited control authority")
     if configuration.get("strategy") != strategy:
         raise ContractError("envelope strategy does not match its configuration")
     if record.get("configuration_digest") != sha256_hex(configuration):
@@ -910,6 +1001,14 @@ def validate_envelope(
             raise ContractError("finalized envelope context identity mismatch")
         for field in ("checkpoint", "execution_role", "invocation_target", "recipient"):
             _require_canonical_identity(record.get(field), field)
+        authorize_recipient(record.get("recipient"))
+        validate_task_credential_channel(
+            record.get("task_credential_channel"),
+            task_card_digest=task_card["content_hash"], recipient=record["recipient"],
+            requirement=task_card.get("task_credential_requirement"),
+        )
+        if ("task_credential_channel" in record) != ("task_credential_channel" in bound_context):
+            raise ContractError("finalized envelope task credential channel binding mismatch")
         for field in ("final_context_id", "final_context_integrity"):
             _require_nonempty_str(record.get(field), field)
         if record.get("task") != task_card["task"]:
@@ -933,6 +1032,8 @@ def validate_envelope(
         for field in bound_fields:
             if bound_context.get(field) != record.get(field):
                 raise ContractError(f"finalized envelope {field.replace('_', ' ')} context binding mismatch")
+        if "task_credential_channel" in record and bound_context["task_credential_channel"] != record["task_credential_channel"]:
+            raise ContractError("finalized envelope task credential channel binding mismatch")
         if bound_context.get("omitted") != delivery["omitted"]:
             raise ContractError("finalized envelope omitted context binding mismatch")
     elif any(field in record for field in ("final_context", "final_context_id", "final_context_integrity")):
@@ -3692,6 +3793,7 @@ def make_finalized_context(
     role_separation: Mapping[str, Any],
     freshness: Mapping[str, Any],
     context_limit: int,
+    task_credential_channel: Mapping[str, Any] | None = None,
     context_id: str | None = None,
     created_at: str | None = None,
 ) -> dict[str, Any]:
@@ -3763,6 +3865,8 @@ def make_finalized_context(
         "state": "ready",
         "created_at": created_at or utc_now(),
     }
+    if task_credential_channel is not None:
+        record["task_credential_channel"] = dict(task_credential_channel)
     record["integrity"] = _final_context_integrity(record)
     record["context_id"] = context_id or _final_context_id(record)
     record["content_hash"] = content_hash(record)
@@ -3787,7 +3891,11 @@ def _final_context_id(record: Mapping[str, Any]) -> str:
 
 
 def validate_finalized_context(record: Mapping[str, Any]) -> None:
+    if not isinstance(record, Mapping) or record.get("schema") != FINAL_CONTEXT_SCHEMA:
+        raise ContractError("finalized context schema mismatch")
     validate_record(record, FINAL_CONTEXT_SCHEMA)
+    if detect_secrets(record, PrivacyPolicy()):
+        raise ContractError("finalized context contains a prohibited credential")
     for field in (
         "context_id",
         "lane_id",
@@ -3814,6 +3922,16 @@ def validate_finalized_context(record: Mapping[str, Any]) -> None:
         _require_nonempty_str(record.get(field), field)
     for field in ("checkpoint", "execution_role", "invocation_target", "recipient"):
         _require_canonical_identity(record.get(field), field)
+    authorize_recipient(record.get("recipient"))
+    if "task_credential_channel" in record:
+        channel = record["task_credential_channel"]
+        if not isinstance(channel, Mapping):
+            raise ContractError("finalized task credential channel is invalid")
+        validate_task_credential_channel(
+            channel, task_card_digest=record["task_card_digest"],
+            recipient=record["recipient"],
+            requirement={key: channel.get(key) for key in ("purpose", "scope", "transport")},
+        )
     if record.get("execution_role") != FINAL_CONTEXT_SECURITY["execution_role"]:
         raise ContractError("finalized context execution role mismatch")
     if record.get("accepted_by") != "ROOT" or not isinstance(record.get("plan_revision"), int) or isinstance(record["plan_revision"], bool) or record["plan_revision"] < 1:
@@ -3823,6 +3941,8 @@ def validate_finalized_context(record: Mapping[str, Any]) -> None:
     configuration = record.get("configuration")
     if not isinstance(configuration, Mapping):
         raise ContractError("finalized context configuration must be an object")
+    if has_worker_authority(configuration):
+        raise ContractError("finalized context contains prohibited control authority")
     if record["configuration_digest"] != sha256_hex(configuration):
         raise ContractError("finalized context configuration digest mismatch")
     if configuration.get("strategy") != record["strategy"]:
@@ -4116,6 +4236,9 @@ __all__ = [
     "validate_plan_disposition",
     "make_finalized_context",
     "validate_finalized_context",
+    "task_credential_channel_reference",
+    "validate_task_credential_requirement",
+    "validate_task_credential_channel",
     "make_final_source_recheck",
     "validate_final_source_recheck",
     "make_apc_child_operation",
