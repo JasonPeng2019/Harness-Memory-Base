@@ -338,7 +338,18 @@ class TrustedProcedureService:
             payload_digest=stored["content_hash"],
             partition_id=stored["partition_id"],
         )
-        current = adapter.exact_current(stored["logical_id"], stored["partition_id"])
+        try:
+            current = adapter.exact_current(stored["logical_id"], stored["partition_id"])
+        except atlas.AtlasProcedureError as exc:
+            if operation["status"] == "intent":
+                self._update_remote_operation(
+                    operation, status="blocked", error="remote designation exact read failed"
+                )
+            if operation["status"] in {"ambiguous", "remote_committed"}:
+                raise ProcedureRemoteAmbiguityError(
+                    "remote designation remains uncertain until exact current can be read"
+                ) from exc
+            raise ProcedureError("remote designation exact read failed") from exc
         if operation["status"] in {"acknowledged", "remote_committed"}:
             if self._current_matches_designation(current, stored):
                 if operation["status"] == "remote_committed":
@@ -376,7 +387,6 @@ class TrustedProcedureService:
             raise ProcedureIneligibleError("designation remote operation is no longer publishable")
         try:
             remote = adapter.write_designation(stored)
-            current = adapter.exact_current(stored["logical_id"], stored["partition_id"])
         except atlas.AtlasProcedureFencedError as exc:
             self._update_remote_operation(operation, status="fenced", error="remote designation fenced")
             raise ProcedureIneligibleError("remote designation was fenced") from exc
@@ -388,6 +398,22 @@ class TrustedProcedureService:
         except atlas.AtlasProcedureError as exc:
             self._update_remote_operation(operation, status="blocked", error="remote designation failed")
             raise ProcedureError("remote designation failed") from exc
+        try:
+            current = adapter.exact_current(stored["logical_id"], stored["partition_id"])
+        except atlas.AtlasProcedureError as exc:
+            self._update_remote_operation(
+                operation, status="ambiguous", error="remote designation exact read after write failed"
+            )
+            raise ProcedureRemoteAmbiguityError(
+                "remote designation write lacks authoritative exact readback"
+            ) from exc
+        if current is None:
+            self._update_remote_operation(
+                operation, status="ambiguous", error="remote designation lacks exact current evidence"
+            )
+            raise ProcedureRemoteAmbiguityError(
+                "remote designation write lacks authoritative exact readback"
+            )
         if not self._current_matches_designation(current, stored):
             self._update_remote_operation(operation, status="fenced", error="remote current changed")
             raise ProcedureIneligibleError("remote designation did not become exact current")
@@ -479,8 +505,6 @@ class TrustedProcedureService:
                 status="ambiguous" if ambiguous else "blocked",
                 error=error,
             )
-        elif not ambiguous and operation["status"] == "ambiguous":
-            self._update_remote_operation(operation, status="blocked", error=error)
 
     def _reconcile_publication_state_operation(
         self,
@@ -657,7 +681,6 @@ class TrustedProcedureService:
             raise ProcedureIneligibleError("publication is no longer eligible for remote submission")
         try:
             remote = adapter.write_publication(publication)
-            snapshot = adapter.exact_read(publication["publication_id"])
         except atlas.AtlasProcedureFencedError as exc:
             self._update_publication(publication, status="fenced", error="remote publication fenced")
             self._update_remote_operation(operation, status="fenced", error="remote publication fenced")
@@ -672,7 +695,50 @@ class TrustedProcedureService:
             self._update_publication(publication, status="blocked", error="remote publication failed")
             self._update_remote_operation(operation, status="blocked", error="remote publication failed")
             raise ProcedureError("remote publication failed") from exc
+        try:
+            snapshot = adapter.exact_read(publication["publication_id"])
+        except atlas.AtlasProcedureError as exc:
+            self._update_publication(
+                publication, status="ambiguous", error="remote exact read after write failed"
+            )
+            self._update_remote_operation(
+                operation, status="ambiguous", error="remote exact read after write failed"
+            )
+            raise ProcedureRemoteAmbiguityError(
+                "remote publication write lacks authoritative exact readback"
+            ) from exc
         if not self._snapshot_matches_publication(snapshot, publication):
+            remote_publication = (
+                snapshot.document.get("publication") if snapshot is not None else None
+            )
+            incomplete_readback = snapshot is None or (
+                isinstance(remote_publication, Mapping)
+                and remote_publication.get("payload_digest") == publication["payload_digest"]
+                and snapshot.revocation is None
+                and (
+                    snapshot.current is None
+                    or self._current_matches_designation(
+                        snapshot.current, publication["designation"]
+                    )
+                )
+                and (
+                    snapshot.publication_state is None
+                    or self._snapshot_matches_publication_state(
+                        snapshot, publication, state="active"
+                    )
+                )
+                and (snapshot.current is None or snapshot.publication_state is None)
+            )
+            if incomplete_readback:
+                self._update_publication(
+                    publication, status="ambiguous", error="remote publication lacks exact readback"
+                )
+                self._update_remote_operation(
+                    operation, status="ambiguous", error="remote publication lacks exact readback"
+                )
+                raise ProcedureRemoteAmbiguityError(
+                    "remote publication write lacks authoritative exact readback"
+                )
             self._update_publication(publication, status="fenced", error="remote lifecycle changed")
             self._update_remote_operation(operation, status="fenced", error="remote lifecycle changed")
             raise ProcedureIneligibleError("remote publication failed exact lifecycle validation")
@@ -823,9 +889,20 @@ class TrustedProcedureService:
             payload_digest=withdrawal["content_hash"],
             partition_id=withdrawal["partition_id"],
         )
-        remote_current = adapter.exact_current(
-            withdrawal["logical_id"], withdrawal["partition_id"]
-        )
+        try:
+            remote_current = adapter.exact_current(
+                withdrawal["logical_id"], withdrawal["partition_id"]
+            )
+        except atlas.AtlasProcedureError as exc:
+            if operation["status"] == "intent":
+                self._update_remote_operation(
+                    operation, status="blocked", error="remote withdrawal exact read failed"
+                )
+            if operation["status"] in {"ambiguous", "remote_committed"}:
+                raise ProcedureRemoteAmbiguityError(
+                    "remote withdrawal remains uncertain until exact current can be read"
+                ) from exc
+            raise ProcedureError("remote withdrawal exact read failed") from exc
         if self._current_matches_withdrawal(remote_current, withdrawal):
             receipt = self._receipt(remote_current)
             if operation["status"] in {"intent", "ambiguous", "blocked"}:
@@ -839,14 +916,10 @@ class TrustedProcedureService:
         elif operation["status"] in {"intent", "blocked"}:
             try:
                 remote = adapter.write_withdrawal(withdrawal)
-                remote_current = adapter.exact_current(
-                    withdrawal["logical_id"], withdrawal["partition_id"]
-                )
             except atlas.AtlasProcedureAmbiguityError as exc:
-                if operation["status"] == "intent":
-                    self._update_remote_operation(
-                        operation, status="ambiguous", error="withdrawal acknowledgement lost"
-                    )
+                self._update_remote_operation(
+                    operation, status="ambiguous", error="withdrawal acknowledgement lost"
+                )
                 raise ProcedureRemoteAmbiguityError(
                     "remote withdrawal acknowledgement is ambiguous; exact reconciliation is required"
                 ) from exc
@@ -862,6 +935,24 @@ class TrustedProcedureService:
                         operation, status="blocked", error="remote withdrawal failed"
                     )
                 raise ProcedureError("remote withdrawal failed") from exc
+            try:
+                remote_current = adapter.exact_current(
+                    withdrawal["logical_id"], withdrawal["partition_id"]
+                )
+            except atlas.AtlasProcedureError as exc:
+                self._update_remote_operation(
+                    operation, status="ambiguous", error="remote withdrawal exact read after write failed"
+                )
+                raise ProcedureRemoteAmbiguityError(
+                    "remote withdrawal write lacks authoritative exact readback"
+                ) from exc
+            if remote_current is None:
+                self._update_remote_operation(
+                    operation, status="ambiguous", error="remote withdrawal lacks exact current evidence"
+                )
+                raise ProcedureRemoteAmbiguityError(
+                    "remote withdrawal write lacks authoritative exact readback"
+                )
             if not self._current_matches_withdrawal(remote_current, withdrawal):
                 self._update_remote_operation(
                     operation, status="fenced", error="remote current changed"
@@ -993,7 +1084,7 @@ class TrustedProcedureService:
                     operation, status="ambiguous", error="revocation acknowledgement lost"
                 )
         except atlas.AtlasProcedureError:
-            if operation["status"] in {"intent", "ambiguous"}:
+            if operation["status"] == "intent":
                 self._update_remote_operation(operation, status="blocked", error="remote revocation failed")
         if remote_ready:
             for publication in self.store.list_procedure_publications(
