@@ -10,7 +10,7 @@ from __future__ import annotations
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from . import memory_handoff, processes
 from .bootstrap import BootstrapError, _validate_provider_launch_config
@@ -50,6 +50,11 @@ RETIRE_ACCEPTANCE_INVALID = "RETIRE_ACCEPTANCE_INVALID"
 RETIRE_CLEANUP_UNPROVEN = "RETIRE_CLEANUP_UNPROVEN"
 RETIRE_LEASE_RELEASE_FAILED = "RETIRE_LEASE_RELEASE_FAILED"
 
+# The explicit worker-environment boundary a durable task card may
+# declare.  A "scrubbed" card starts its controller (and, through it,
+# its provider) without the product control credentials; legacy and
+# all-off cards declare nothing and keep the inherited environment.
+WORKER_ENVIRONMENT_SCRUBBED = "scrubbed"
 HANDSHAKE_TIMEOUT_SECONDS = 30.0
 RETIRE_CONTROLLER_EXIT_WAIT_SECONDS = 5.0
 RETIRE_CONTROLLER_EXIT_POLL_SECONDS = 0.1
@@ -161,6 +166,33 @@ def _reap_controller_and_prove_exit(
     except subprocess.TimeoutExpired:
         return False
     return not processes.identity_matches(pid, creation)
+
+
+def _declared_worker_environment(task_card: Mapping[str, Any] | None) -> str | None:
+    """Resolve one lane's explicit worker-environment boundary.
+
+    The durable task card is the only authority.  A card that declares
+    nothing keeps the harness's inherited environment, and an enhanced lane
+    with its own finalized dispatch envelope keeps the existing scrubbed
+    worker environment.  A card that declares the scrubbed boundary is
+    honored even without an enhanced memory handoff, so a restricted child
+    never starts with the product control credentials.  An unknown mode is
+    refused instead of silently degrading to inherited.
+    """
+
+    if not isinstance(task_card, Mapping):
+        return None
+    mode = task_card.get("worker_environment")
+    if mode is None:
+        return None
+    from memory_harness.contracts import WORKER_ENVIRONMENT_MODES
+
+    if not isinstance(mode, str) or mode not in WORKER_ENVIRONMENT_MODES:
+        raise LaunchError(
+            LAUNCH_INVOCATION_INVALID,
+            f"task card declares an unknown worker environment mode: {mode!r}",
+        )
+    return mode
 
 
 def run_launch(lane_id: str) -> dict[str, Any]:
@@ -289,8 +321,9 @@ def run_launch(lane_id: str) -> dict[str, Any]:
         if not binding_path.is_file():
             raise LaunchError(LAUNCH_BINDING_FAILED, f"binding missing: {binding_path}")
 
+        worker_environment = _declared_worker_environment(task_card)
         spawn_options: dict[str, Any] = {"cwd": str(harness_root)}
-        if memory_envelope is not None:
+        if memory_envelope is not None or worker_environment == WORKER_ENVIRONMENT_SCRUBBED:
             spawn_options["env"] = memory_handoff.worker_environment()
         child = processes.spawn_detached(
             processes.python_argv("orchestrator_harness.controller", lane_id),

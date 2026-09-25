@@ -188,30 +188,37 @@ def run_apc_child(
                 )
             )
         raise
-    if observed is None:
+    details = dict(observed) if isinstance(observed, Mapping) else {}
+    if not isinstance(observed, Mapping) or not observed.get("invocation_id"):
+        # The acknowledgement is ambiguous.  The exact identity the product
+        # harness did record (the lane, its run, and the phase that stopped
+        # answering) stays visible on the durable operation, so a retry must
+        # reconcile that exact child instead of blindly relaunching it.
+        launch_intent: dict[str, Any] = {
+            "acknowledgement": str(
+                details.get("acknowledgement")
+                or ("lost" if observed is None else "unreadable")
+            )
+        }
+        for key in ("phase", "lane_id", "run_id"):
+            value = details.get(key)
+            if isinstance(value, str) and value:
+                launch_intent[key] = value
         ambiguous = contracts.make_apc_child_operation(
             request=request,
             status="ambiguous",
-            launch_intent={"acknowledgement": "lost"},
+            launch_intent=launch_intent,
+            cleanup=(
+                dict(details["cleanup"])
+                if isinstance(details.get("cleanup"), Mapping)
+                else None
+            ),
             attempt=attempt_number,
         )
         if store is not None:
             store.record_apc_child_operation(ambiguous)
         raise ApcChildAmbiguityError(
-            "child launch acknowledgement is ambiguous; reconcile the exact child before retrying"
-        )
-    if not isinstance(observed, Mapping) or not observed.get("invocation_id"):
-        if store is not None:
-            store.record_apc_child_operation(
-                contracts.make_apc_child_operation(
-                    request=request,
-                    status="ambiguous",
-                    launch_intent={"acknowledgement": "unreadable"},
-                    attempt=attempt_number,
-                )
-            )
-        raise ApcChildAmbiguityError(
-            "observed child invocation identity is unreadable; "
+            "child launch acknowledgement is ambiguous; "
             "reconcile the exact child before retrying"
         )
 

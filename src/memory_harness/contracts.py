@@ -10,6 +10,11 @@ from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
+# The explicit worker-environment boundary a task card may declare.  A
+# "scrubbed" card runs its controller and provider without the product
+# control credentials; legacy and all-off cards declare nothing and keep the
+# harness's inherited environment.
+WORKER_ENVIRONMENT_MODES = frozenset({"scrubbed"})
 MEMORY_HANDOFF_SCHEMA = "memory-handoff/v1"
 PLAN_SCHEMA = "memory-plan/v1"
 DECISION_SCHEMA = "memory-decision/v1"
@@ -126,6 +131,7 @@ def make_task_card(
     base_commit: str,
     branch: str | None = None,
     memory_handoff: Mapping[str, Any] | None = None,
+    worker_environment: str | None = None,
 ) -> dict[str, Any]:
     task_text = _require_nonempty_str(task, "task")
     base = _require_nonempty_str(base_commit, "base_commit")
@@ -136,6 +142,13 @@ def make_task_card(
     }
     if branch is not None:
         record["branch"] = _require_nonempty_str(branch, "branch")
+    if worker_environment is not None:
+        mode = _require_nonempty_str(worker_environment, "worker_environment")
+        if mode not in WORKER_ENVIRONMENT_MODES:
+            raise ContractError(
+                f"unknown worker environment mode: {mode!r}"
+            )
+        record["worker_environment"] = mode
     if memory_handoff is not None:
         if not isinstance(memory_handoff, Mapping):
             raise ContractError("memory_handoff must be an object")
@@ -149,6 +162,10 @@ def validate_task_card(record: Mapping[str, Any]) -> None:
     validate_record(record, TASK_CARD_SCHEMA)
     _require_nonempty_str(record.get("task"), "task")
     _require_nonempty_str(record.get("base_commit"), "base_commit")
+    if "worker_environment" in record:
+        mode = _require_nonempty_str(record["worker_environment"], "worker_environment")
+        if mode not in WORKER_ENVIRONMENT_MODES:
+            raise ContractError(f"unknown worker environment mode: {mode!r}")
     if "memory_handoff" in record:
         validate_memory_handoff(record["memory_handoff"])
 
@@ -3536,6 +3553,7 @@ __all__ = [
     "PLAN_DISPOSITION_SCHEMA",
     "FINAL_CONTEXT_SCHEMA",
     "APC_CHILD_OPERATION_SCHEMA",
+    "WORKER_ENVIRONMENT_MODES",
     "CURRENT_PLAN_STATES",
     "HANDOFF_PLAN_STATES",
     "CANDIDATE_KINDS",

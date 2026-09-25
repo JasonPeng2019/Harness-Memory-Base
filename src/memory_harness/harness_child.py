@@ -25,6 +25,7 @@ Failure semantics are exact and never blind:
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -154,6 +155,77 @@ def _binding_launch_config(
     return options
 
 
+def _bounded_call(
+    call: Callable[[], Any],
+    *,
+    remaining: float,
+) -> tuple[bool, Any]:
+    """Run one blocking native call without outliving the shared allowance.
+
+    Queue, launch, and cancellation are the product harness's own synchronous
+    consumers, so each one runs on a short-lived daemon thread and the adapter
+    waits only inside the remaining enclosing deadline.  A call that has not
+    answered by then is reported as not completed; the adapter never blocks
+    past the allowance and never starts a later effectful phase for it.
+    """
+
+    if remaining <= 0:
+        return False, None
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            outcome["value"] = call()
+        except BaseException as exc:  # surfaced to the caller thread below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, name="apc-child-native", daemon=True)
+    worker.start()
+    worker.join(timeout=remaining)
+    if worker.is_alive():
+        return False, None
+    if "error" in outcome:
+        raise outcome["error"]
+    return True, outcome.get("value")
+
+
+def _selected_adapter_cli(
+    *, harness_root: Path, provider: str, model: str, launch_config: Mapping[str, Any]
+) -> str:
+    """Return the executable the selected provider adapter would start.
+
+    The adapter's own validated launch vector is the only authority for the
+    cli a lane will actually run, so the explicit binding is checked against
+    it before anything is queued.  No provider API is called and no process
+    is started: this only resolves the selected adapter's declared binding.
+    """
+
+    from orchestrator_harness.setup import _load_binding
+
+    binding_path = (
+        harness_root / "orchestrator_harness" / "provider_adapters" / provider / "launcher_binding.py"
+    )
+    if not binding_path.is_file():
+        raise ValueError(f"launcher binding missing for provider {provider}: {binding_path}")
+    binding = _load_binding(binding_path)
+    if getattr(binding, "PROVIDER_ID", None) != provider:
+        raise ValueError(f"launcher binding identity does not match provider {provider}")
+    build_argv = getattr(binding, "build_argv", None)
+    if not callable(build_argv):
+        raise ValueError(f"launcher binding lacks build_argv for provider {provider}")
+    argv = build_argv(
+        model=model,
+        launch_config=dict(launch_config),
+        worktree=str(harness_root),
+        prompt_path=str(harness_root / "worker-prompt.md"),
+        session_id=None,
+        resume=False,
+    )
+    if not isinstance(argv, (list, tuple)) or not argv or not isinstance(argv[0], str) or not argv[0].strip():
+        raise ValueError(f"launcher binding returned no executable for provider {provider}")
+    return argv[0].strip()
+
+
 def make_native_apc_launcher(
     *,
     session: DraftingChildSession,
@@ -222,10 +294,43 @@ def make_native_apc_launcher(
 
         lane_id = session.lane_prefix + str(request["content_hash"])[:12]
         launch_config = _binding_launch_config(session, binding)
+        cli = binding.get("cli")
+        if not isinstance(cli, str) or not cli.strip():
+            raise ApcChildUnavailableError(
+                "the run's explicit adaptation binding names no cli for the APC child"
+            )
+        try:
+            from orchestrator_harness import config as harness_config
+
+            harness_root = Path(harness_config.find_harness_root())
+            selected_cli = _selected_adapter_cli(
+                harness_root=harness_root,
+                provider=session.provider,
+                model=session.model,
+                launch_config=launch_config,
+            )
+        except ApcChildUnavailableError:
+            raise
+        except Exception as exc:
+            raise ApcChildUnavailableError(
+                f"the selected provider adapter cannot be resolved for cli "
+                f"{cli.strip()!r}: {exc}"
+            ) from exc
+        if not (
+            selected_cli == cli.strip()
+            or Path(selected_cli).name == cli.strip()
+            or Path(selected_cli).stem == cli.strip()
+        ):
+            raise ApcChildUnavailableError(
+                f"the run's explicit adaptation binding names cli {cli.strip()!r}, but "
+                f"the selected provider adapter starts {selected_cli!r}; the APC child "
+                "never silently substitutes another cli"
+            )
         card = contracts.make_task_card(
             task=_drafting_child_task(request, binding=binding),
             base_commit=session.base_commit,
             branch=f"lane/{lane_id}",
+            worker_environment="scrubbed",
         )
         task_card_path = Path(session.task_card_dir) / f"{lane_id}.task-card.json"
         task_card_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,14 +338,36 @@ def make_native_apc_launcher(
             json.dumps(card, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
 
-        queued = _bootstrap()(
-            lane_id=lane_id,
-            provider=session.provider,
-            model=session.model,
-            launch_config=launch_config,
-            exclusive_resources=list(session.exclusive_resources),
-            task_card_path=str(task_card_path),
+        queued_done, queued = _bounded_call(
+            lambda: _bootstrap()(
+                lane_id=lane_id,
+                provider=session.provider,
+                model=session.model,
+                launch_config=launch_config,
+                exclusive_resources=list(session.exclusive_resources),
+                task_card_path=str(task_card_path),
+            ),
+            remaining=deadline - now(),
         )
+        if not queued_done:
+            # The queue call has not acknowledged inside the allowance, so the
+            # lane may exist; its exact identity stays unresolved instead of
+            # being relaunched or hidden.
+            return _unresolved_phase("bootstrap", lane_id, binding=binding)
+        if not isinstance(queued, Mapping):
+            # A non-mapping queue acknowledgement proves nothing about whether
+            # the lane was created, so the exact deterministic lane identity
+            # stays visible as unresolved instead of being refused as a
+            # proven-not-launched failure.
+            return _unresolved_phase(
+                "bootstrap",
+                lane_id,
+                binding=binding,
+                acknowledgement=(
+                    "the product harness returned no readable queue "
+                    "acknowledgement for this exact lane"
+                ),
+            )
         if not queued.get("ok"):
             code = str(queued.get("code"))
             if code in ("BOOTSTRAP_LANE_ID_IN_USE", "BOOTSTRAP_WORKTREE_EXISTS"):
@@ -252,7 +379,27 @@ def make_native_apc_launcher(
                 f"{queued.get('summary')}"
             )
 
-        launched = _launch()(lane_id)
+        launched_done, launched = _bounded_call(
+            lambda: _launch()(lane_id), remaining=deadline - now()
+        )
+        if not launched_done:
+            # The launch acknowledgement is outside the allowance; the exact
+            # lane stays unresolved and nothing later is started for it.
+            return _unresolved_phase("launch", lane_id, binding=binding)
+        if not isinstance(launched, Mapping):
+            # The queue succeeded, so this exact lane may exist even though its
+            # launch acknowledgement is unreadable.  Its identity stays visible
+            # as unresolved instead of a bare error that would leave the
+            # durable operation with only the recorded intent.
+            return _unresolved_phase(
+                "launch",
+                lane_id,
+                binding=binding,
+                acknowledgement=(
+                    "the product harness returned no readable launch "
+                    "acknowledgement for this exact lane"
+                ),
+            )
         if not launched.get("ok"):
             lane: Mapping[str, Any] | None = None
             try:
@@ -263,30 +410,99 @@ def make_native_apc_launcher(
             if process.get("pid"):
                 # The harness recorded a live controller; the acknowledgement
                 # is ambiguous and must be reconciled exactly, not repeated.
-                return None
+                return _unresolved_phase(
+                    "launch",
+                    lane_id,
+                    binding=binding,
+                    lane=lane,
+                    acknowledgement=(
+                        "the product harness refused the launch "
+                        f"({launched.get('code')}) after recording a live controller "
+                        "for this exact lane"
+                    ),
+                )
+            # The queue succeeded, so a prepared lane exists.  It is retired
+            # before the refusal is recorded; an unproven retirement keeps the
+            # exact child unresolved instead of hiding it behind a refusal.
+            cleanup = _retire(lane_id)
+            if not cleanup.get("cleanup_proven"):
+                return _unresolved_phase(
+                    "launch",
+                    lane_id,
+                    binding=binding,
+                    lane=lane,
+                    cleanup=cleanup,
+                    acknowledgement=(
+                        "the product harness could not launch the child lane "
+                        f"({launched.get('code')}: {launched.get('summary')}) and its "
+                        "prepared lane could not be proven retired"
+                    ),
+                )
             raise ApcChildUnavailableError(
-                f"the product harness could not launch the child lane: "
-                f"{launched.get('code')}: {launched.get('summary')}"
+                "the product harness could not launch the child lane: "
+                f"{launched.get('code')}: {launched.get('summary')}; the prepared "
+                f"lane {lane_id} was retired ({cleanup.get('stop_code')}) before this "
+                "terminal refusal"
             )
 
-        lane = _lane(lane_id)
+        try:
+            lane = _lane(lane_id)
+        except Exception:
+            # The launch was acknowledged but its exact lane record cannot be
+            # read back, so its identity stays visible as unresolved instead of
+            # being lost behind a bare error.
+            return _unresolved_phase(
+                "launch",
+                lane_id,
+                binding=binding,
+                acknowledgement=(
+                    "the product harness acknowledged the launch of this exact "
+                    "lane but its recorded lane identity could not be read back"
+                ),
+            )
         recorded_launch = dict((lane.get("provider") or {}).get("launch_config") or {})
         if str(recorded_launch.get(session.effort_option)) != str(
             launch_config[session.effort_option]
         ):
-            _retire(lane_id)
-            raise HarnessBridgeError(
+            mismatch = (
                 "the product harness recorded a launch configuration that does not "
-                f"carry the explicit binding effort for lane {lane_id}; the exact "
-                "child was retired and its unresolved ownership must be reconciled"
+                f"carry the explicit binding effort for lane {lane_id}"
+            )
+            cleanup = _retire(lane_id)
+            if not cleanup.get("cleanup_proven"):
+                # The exact child may still be live; its identity and the
+                # unproven retirement stay visible instead of a claim that it
+                # was retired.
+                return _unresolved_phase(
+                    "launch",
+                    lane_id,
+                    binding=binding,
+                    lane=lane,
+                    cleanup=cleanup,
+                    acknowledgement=mismatch + " and it could not be proven retired",
+                )
+            raise HarnessBridgeError(
+                mismatch
+                + "; the exact child was retired "
+                + f"({cleanup.get('stop_code')}) and a fresh attempt must not "
+                "blindly relaunch it"
             )
         process = dict(lane.get("process") or {})
         pid = process.get("pid")
         creation_time = process.get("creation_time")
         if not isinstance(pid, int) or not isinstance(creation_time, str) or not creation_time:
-            raise HarnessBridgeError(
-                "the launched child lane has no recorded controller identity; "
-                "reconcile the exact child before any retry"
+            # The lane exists but its controller identity was never recorded,
+            # so the exact lane/run ownership stays visible as unresolved
+            # instead of being lost behind a bare error.
+            return _unresolved_phase(
+                "launch",
+                lane_id,
+                binding=binding,
+                lane=lane,
+                acknowledgement=(
+                    "this exact lane was acknowledged but the product harness "
+                    "recorded no controller identity for it"
+                ),
             )
         run_id = str(lane.get("run_id"))
         invocation_id = f"controller:{pid}:{creation_time}"
@@ -302,6 +518,18 @@ def make_native_apc_launcher(
             "artifact_path": str(artifact_path),
             "launch_config": dict(launch_config),
         }
+
+        if now() >= deadline:
+            # The launch itself consumed the one enclosing allowance.  Result
+            # collection and cancellation are later phases, so neither starts;
+            # the exact owned child stays visible as unresolved instead of
+            # being cancelled past its bound or silently relaunched.
+            observed["cleanup"] = {
+                "state": "cleanup not started: the enclosing allowance expired",
+                "lane_id": lane_id,
+                "cleanup_proven": False,
+            }
+            return observed
 
         artifact: Mapping[str, Any] | None = None
         expired = False
@@ -320,7 +548,17 @@ def make_native_apc_launcher(
                 break
             pause(poll_seconds)
 
-        cleanup = _retire(lane_id)
+        if not expired:
+            cleanup = _retire(lane_id)
+        else:
+            # The one enclosing allowance is already spent, so no further
+            # effectful native call may start; the exact owned lane stays
+            # visible as unresolved instead of being cancelled past its bound.
+            cleanup = {
+                "state": "cleanup not started: the enclosing allowance expired",
+                "lane_id": lane_id,
+                "cleanup_proven": False,
+            }
         observed["cleanup"] = cleanup
         if artifact is None:
             if not expired:
@@ -332,16 +570,71 @@ def make_native_apc_launcher(
         observed["result"] = artifact
         return observed
 
+    def _unresolved_phase(
+        phase: str,
+        lane_id: str,
+        *,
+        binding: Mapping[str, Any],
+        lane: Mapping[str, Any] | None = None,
+        cleanup: Mapping[str, Any] | None = None,
+        acknowledgement: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the exact unresolved observation for one expired phase.
+
+        The lane identity (and the run identity when the harness already
+        recorded it) is the ownership evidence the accepted reconciliation
+        path keeps visible; no retry may blindly relaunch it.
+        """
+
+        observation: dict[str, Any] = {
+            "phase": phase,
+            "lane_id": lane_id,
+            "binding": dict(binding),
+            "acknowledgement": acknowledgement
+            or f"the {phase} acknowledgement was not observed inside the enclosing allowance",
+        }
+        if lane is not None:
+            run_id = lane.get("run_id")
+            if run_id:
+                observation["run_id"] = str(run_id)
+        if cleanup is not None:
+            observation["cleanup"] = dict(cleanup)
+        return observation
+
     def _retire(lane_id: str) -> dict[str, Any]:
-        """Prove the exact child retired, within the harness's own bounds."""
+        """Prove the exact child retired inside the shared allowance.
+
+        Cancellation is itself a blocking native call, so it runs under the
+        same enclosing deadline as queue and launch.  A cancellation that has
+        not proven retirement by then stays unproven rather than outliving the
+        allowance.
+        """
 
         try:
-            stopped = _stop()(lane_id)
+            stopped_done, stopped = _bounded_call(
+                lambda: _stop()(lane_id), remaining=deadline - now()
+            )
         except Exception as exc:  # pragma: no cover - defensive
             return {
                 "state": "cleanup unproven on the product harness",
                 "lane_id": lane_id,
                 "reason": str(exc),
+                "cleanup_proven": False,
+            }
+        if not stopped_done:
+            return {
+                "state": "cleanup unproven on the product harness",
+                "lane_id": lane_id,
+                "reason": (
+                    "cancellation did not prove retirement inside the enclosing allowance"
+                ),
+                "cleanup_proven": False,
+            }
+        if not isinstance(stopped, Mapping):
+            return {
+                "state": "cleanup unproven on the product harness",
+                "lane_id": lane_id,
+                "reason": "the product harness returned no cancellation acknowledgement",
                 "cleanup_proven": False,
             }
         if stopped.get("ok"):

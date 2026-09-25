@@ -12,11 +12,15 @@ separate.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
+import os
 import re
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -30,9 +34,11 @@ from memory_harness import (
     config,
     contracts,
     experience,
+    harness_bridge,
     harness_child,
     local_adapters,
     preparation,
+    privacy,
     store,
     templates,
 )
@@ -42,7 +48,7 @@ from orchestrator_harness import bootstrap, core as harness_core, lanes, launch,
 BINDING = {
     "provider": "codex",
     "model": "test-model",
-    "cli": "test-cli",
+    "cli": "codex",
     "effort": "low",
     "source": "explicit",
 }
@@ -56,7 +62,11 @@ BINDING_SOURCE = (
     "PROVIDER_ID = 'codex'\n"
     "ADAPTER_VERSION = 'test-v1'\n"
     "def validate_launch_config(*, model, launch_config): return dict(launch_config)\n"
-    "def build_argv(**kwargs): return ['codex']\n"
+    "def build_argv(*, model, launch_config, **kwargs):\n"
+    "    configured = validate_launch_config(model=model, launch_config=launch_config)\n"
+    "    if configured.get('launcher') == 'ollama':\n"
+    "        return ['ollama', 'launch', 'codex', '--model', model, '--yes', '--', 'codex', 'exec']\n"
+    "    return ['codex', 'exec']\n"
     "def parse_line(line): return None\n"
 )
 
@@ -130,6 +140,8 @@ class NativeChildHarness:
         self.launch_options: dict[str, str] = {}
         self.bootstrap_calls: list[str] = []
         self.provider_spawns: list[str] = []
+        self.spawn_calls: list[dict] = []
+        self.stop_calls: list[str] = []
 
     def close(self) -> None:
         self.temporary.cleanup()
@@ -167,6 +179,14 @@ class NativeChildHarness:
     def launch_patches(self, *, provider_behavior):
         def spawn_side_effect(argv, **kwargs):
             lane_id = argv[-1]
+            self.spawn_calls.append(
+                {
+                    "argv": list(argv),
+                    "lane_id": lane_id,
+                    "env_present": "env" in kwargs,
+                    "env": kwargs.get("env"),
+                }
+            )
             provider_behavior(lane_id)
             return MagicMock(pid=41)
 
@@ -189,6 +209,26 @@ class NativeChildHarness:
             patch.object(launch.subprocess, "run"),
             patch.object(processes, "spawn_provider", side_effect=provider_spawn),
         ]
+
+    def idle_child(self):
+        """A deterministic lane body that only proves terminal cleanup."""
+
+        def behavior(lane_id: str) -> None:
+            lane = self.lane_lookup(lane_id)
+            self.write_json(
+                Path(lane["controller_status_path"]),
+                {
+                    "schema": "controller-status/v1",
+                    "lane_id": lane_id,
+                    "run_id": lane["run_id"],
+                    "controller_state": "exited",
+                    "provider_state": {"state": "exited", "exit_code": 0, "pid": 41},
+                    "cleanup_proven": True,
+                    "recorded_status": "review_pending",
+                },
+            )
+
+        return behavior
 
     def deterministic_child(self, *, artifact_name: str = "apc-result.json"):
         """The deterministic native child for this fixture.
@@ -317,7 +357,7 @@ class NativeApcChildTests(unittest.TestCase):
             sleep=lambda seconds: self.clock.advance(1.0),
         )
 
-    def _prepare(self, launcher):
+    def _prepare(self, launcher, binding=BINDING):
         return self.service.prepare(
             task_card=contracts.make_task_card(
                 task="Fix the regression failure in the parser test", base_commit="base-1"
@@ -327,7 +367,7 @@ class NativeApcChildTests(unittest.TestCase):
             route="ordinary",
             stores=list(self.stores),
             root_replan=ROOT_REPLAN,
-            apc_binding=BINDING,
+            apc_binding=binding,
             apc_launcher=launcher,
         )
 
@@ -339,8 +379,15 @@ class NativeApcChildTests(unittest.TestCase):
             stack.enter_context(item)
         for item in self.fixture.launch_patches(provider_behavior=provider_behavior):
             stack.enter_context(item)
-        if force_stop is not None:
-            stack.enter_context(patch.object(launch, "run_force_stop", return_value=force_stop))
+        real_force_stop = launch.run_force_stop
+
+        def stop_side_effect(lane_id):
+            self.fixture.stop_calls.append(lane_id)
+            if force_stop is not None:
+                return force_stop
+            return real_force_stop(lane_id)
+
+        stack.enter_context(patch.object(launch, "run_force_stop", side_effect=stop_side_effect))
         return stack
 
     def _operations(self, outcome):
@@ -486,6 +533,620 @@ class NativeApcChildTests(unittest.TestCase):
         # later attempt the way an unresolved live child would.
         self.assertEqual(["refused"], [operation["status"] for operation in operations])
         self.assertIn("refused", contracts.APC_CHILD_TERMINAL_STATUSES)
+
+    # -- the repaired native boundary defects -------------------------------
+
+    def test_apc_child_controller_environment_is_scrubbed_without_touching_legacy(self) -> None:
+        control = {
+            "MEMORY_HARNESS_CONTROL_TOKEN": "control-token",
+            "MEMORY_HARNESS_POLICY_TOKEN": "policy-token",
+            "APC_CHILD_INHERITED_SENTINEL": "kept",
+        }
+        with patch.dict(os.environ, control, clear=False):
+            with self._native_stack(provider_behavior=self.fixture.deterministic_child()):
+                outcome = self._prepare(self._launcher())
+            inherited_minus_control = privacy.worker_environment(os.environ)
+            self.assertIn("MEMORY_HARNESS_CONTROL_TOKEN", os.environ)
+
+        self.assertEqual("apc_proposal", outcome.disposition["branch"])
+        lane_id = self.fixture.bootstrap_calls[0]
+        spawns = [call for call in self.fixture.spawn_calls if call["lane_id"] == lane_id]
+        self.assertEqual(1, len(spawns))
+        self.assertTrue(
+            spawns[0]["env_present"],
+            "the APC child controller must not inherit the parent environment",
+        )
+        env = spawns[0]["env"]
+        self.assertIsInstance(env, dict)
+        for key in ("MEMORY_HARNESS_CONTROL_TOKEN", "MEMORY_HARNESS_POLICY_TOKEN"):
+            self.assertNotIn(key, env)
+        # The scrub keeps everything else, so this is a scrubbed inheritance
+        # rather than an unrelated empty environment.
+        self.assertEqual("kept", env["APC_CHILD_INHERITED_SENTINEL"])
+        self.assertEqual(inherited_minus_control, env)
+
+        # The provider only ever inherits the controller environment: the
+        # provider spawn has no environment parameter at all.
+        self.assertEqual(
+            {"argv", "cwd", "stdin", "stdout", "stderr"},
+            set(inspect.signature(processes.spawn_provider).parameters),
+        )
+
+        # The child card declares the scrubbed boundary explicitly and still
+        # carries no enhanced memory handoff.
+        lane = self.fixture.lane_lookup(lane_id)
+        card = json.loads(
+            (
+                Path(lane["worktree_path"]) / ".agent-workspace" / "task-card.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual("scrubbed", card["worker_environment"])
+        self.assertNotIn("memory_handoff", card)
+
+    def test_legacy_lane_keeps_the_inherited_controller_environment(self) -> None:
+        legacy_card = contracts.make_task_card(
+            task="legacy lane without optional memory", base_commit="base-1"
+        )
+        card_path = self.fixture.root / "legacy-cards" / "legacy-lane.task-card.json"
+        card_path.parent.mkdir(parents=True, exist_ok=True)
+        card_path.write_text(
+            json.dumps(legacy_card, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            queued = bootstrap.run_bootstrap(
+                lane_id="legacy-lane",
+                provider=BINDING["provider"],
+                model=BINDING["model"],
+                launch_config={"reasoning_effort": BINDING["effort"]},
+                exclusive_resources=[],
+                task_card_path=str(card_path),
+            )
+            self.assertTrue(queued.get("ok"), queued)
+            launched = launch.run_launch("legacy-lane")
+            self.assertTrue(launched.get("ok"), launched)
+
+        spawns = [call for call in self.fixture.spawn_calls if call["lane_id"] == "legacy-lane"]
+        self.assertEqual(1, len(spawns))
+        self.assertFalse(
+            spawns[0]["env_present"],
+            "a legacy or all-off lane keeps the inherited controller environment",
+        )
+        self.assertIsNone(spawns[0]["env"])
+
+    def test_binding_cli_must_match_the_selected_provider_adapter(self) -> None:
+        mismatched = {**BINDING, "cli": "test-cli"}
+
+        with self._native_stack(provider_behavior=self.fixture.deterministic_child()):
+            outcome = self._prepare(self._launcher(), binding=mismatched)
+
+        # Nothing was queued or launched: the cli the explicit binding names is
+        # not the cli the selected adapter actually starts.
+        self.assertEqual([], self.fixture.bootstrap_calls)
+        self.assertEqual([], self.fixture.spawn_calls)
+        self.assertEqual("fresh", outcome.disposition["branch"])
+        self.assertIsNone(outcome.proposal)
+        reason = outcome.disposition["reuse_attempts"][0]["reason"]
+        self.assertIn("ApcChildUnavailableError", reason)
+        self.assertIn("cli", reason)
+        operations = self._operations(outcome)
+        self.assertEqual(["refused"], [operation["status"] for operation in operations])
+
+    def test_two_explicit_binding_configurations_select_without_source_changes(self) -> None:
+        with self._native_stack(provider_behavior=self.fixture.deterministic_child()):
+            codex_outcome = self._prepare(self._launcher())
+            ollama_outcome = self._prepare(
+                self._launcher(launch_options={"launcher": "ollama"}),
+                binding={**BINDING, "cli": "ollama"},
+            )
+
+        self.assertEqual("apc_proposal", codex_outcome.disposition["branch"])
+        self.assertEqual("apc_proposal", ollama_outcome.disposition["branch"])
+        lane_ids = self.fixture.bootstrap_calls
+        self.assertEqual(2, len(lane_ids))
+        self.assertEqual(
+            {"reasoning_effort": BINDING["effort"]},
+            dict(self.fixture.lane_lookup(lane_ids[0])["provider"]["launch_config"]),
+        )
+        self.assertEqual(
+            {"launcher": "ollama", "reasoning_effort": BINDING["effort"]},
+            dict(self.fixture.lane_lookup(lane_ids[1])["provider"]["launch_config"]),
+        )
+
+    def test_launch_that_consumes_the_allowance_retains_exact_ownership(self) -> None:
+        def slow_child(lane_id: str) -> None:
+            # The launch handshake alone consumed the whole child allowance.
+            self.clock.advance(600.0)
+            self.fixture.deterministic_child()(lane_id)
+
+        with self._native_stack(provider_behavior=slow_child):
+            outcome = self._prepare(self._launcher())
+
+        self.assertEqual("fresh", outcome.disposition["branch"])
+        self.assertIsNone(outcome.proposal)
+        reason = outcome.disposition["reuse_attempts"][0]["reason"]
+        self.assertIn("ApcChildTimeoutError", reason)
+
+        lane_id = self.fixture.bootstrap_calls[0]
+        # Exactly one child was queued and launched, and nothing native was
+        # started after the deadline, not even cancellation.
+        self.assertEqual(1, len(self.fixture.bootstrap_calls))
+        self.assertEqual([], self.fixture.stop_calls)
+
+        operations = self._operations(outcome)
+        self.assertEqual(["cleanup_pending"], [operation["status"] for operation in operations])
+        pending = operations[-1]
+        self.assertIn("cleanup_pending", contracts.APC_CHILD_UNRESOLVED_STATUSES)
+        self.assertEqual("controller:41:ct-1", pending["observed_invocation"]["invocation_id"])
+        self.assertEqual(lane_id, pending["observed_invocation"]["lane_id"])
+        self.assertFalse(pending["cleanup"]["cleanup_proven"])
+        # The exact owned child stays visible instead of being relaunched.
+        self.assertEqual("running", self.fixture.lane_lookup(lane_id)["lifecycle"])
+
+    def test_blocking_native_launch_is_bounded_within_the_allowance(self) -> None:
+        """A launch that blocks past the allowance never outlives it.
+
+        The prepared lane really exists (the fixture's patched bootstrap
+        consumers queue it), but its launch acknowledgement only lands long
+        after the one shared deadline.  The adapter must answer inside the
+        allowance with the exact unresolved lane identity and must not start
+        result collection or cancellation for it.
+        """
+
+        gate = threading.Event()
+        late_effects_done = threading.Event()
+        holder: list[threading.Thread] = []
+        stop_probe = MagicMock(
+            return_value={
+                "ok": True,
+                "code": "FORCE_STOP_OK",
+                "summary": "lane force-stopped and retired",
+                "evidence_paths": [],
+                "next_action": "none",
+            }
+        )
+
+        def blocking_launch(lane_id: str):
+            holder.append(threading.current_thread())
+            gate.wait(timeout=10.0)
+            # The acknowledgement lands late, after the allowance expired; a
+            # real launch would have recorded the controller identity and its
+            # terminal cleanup by then.
+            lanes.update_lane(
+                self.fixture.runtime,
+                self.fixture.EPOCH,
+                lane_id,
+                lambda current: {
+                    **current,
+                    "process": {"pid": 41, "creation_time": "ct-1"},
+                },
+            )
+            self.fixture.deterministic_child()(lane_id)
+            late_effects_done.set()
+            return {
+                "ok": True,
+                "code": "LAUNCH_OK",
+                "summary": "late acknowledgement",
+                "evidence_paths": [],
+                "next_action": "none",
+            }
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            launcher = harness_child.make_native_apc_launcher(
+                session=harness_child.DraftingChildSession(
+                    runtime_root=self.fixture.runtime,
+                    task_card_dir=self.fixture.root / "apc-cards",
+                    base_commit="test-base",
+                    provider=BINDING["provider"],
+                    model=BINDING["model"],
+                ),
+                deadline=self.clock() + 1.5,
+                clock=self.clock,
+                launch_fn=blocking_launch,
+                stop_fn=stop_probe,
+                sleep=lambda seconds: None,
+            )
+            request = apc.make_apc_request(
+                template={"template_id": "template-1", "version": 1, "allowed_edits": ["bindings"]},
+                parent_decision_id="decision-1",
+                parent_objective_id="objective-1",
+                permitted_edits=["bindings"],
+                binding=BINDING,
+            )
+
+            with patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ):
+                started = time.monotonic()
+                try:
+                    observed = launcher(request)
+                finally:
+                    elapsed = time.monotonic() - started
+                    released = gate.is_set()
+                    gate.set()
+                    for thread in holder:
+                        if thread is not threading.current_thread():
+                            thread.join(timeout=5.0)
+                    late_effects_done.wait(timeout=5.0)
+
+        # The adapter answered inside its own allowance instead of blocking on
+        # the native call, and it started no later effectful phase.
+        self.assertFalse(released)
+        self.assertLess(elapsed, 2.0)
+        self.assertGreater(elapsed, 0.2)
+        self.assertEqual("launch", observed["phase"])
+        self.assertEqual(self.fixture.bootstrap_calls, [observed["lane_id"]])
+        self.assertNotIn("invocation_id", observed)
+        # No cancellation started for the lane the launch never acknowledged.
+        stop_probe.assert_not_called()
+
+    def test_launch_failure_retires_the_prepared_lane_before_refusal(self) -> None:
+        failed_launch = {
+            "ok": False,
+            "code": "LAUNCH_PROVIDER_START_FAILED",
+            "summary": "the provider process could not be started",
+            "evidence_paths": [],
+            "next_action": "resolve the error and re-launch",
+        }
+
+        with self._native_stack(provider_behavior=self.fixture.deterministic_child()):
+            with patch.object(launch, "run_launch", return_value=failed_launch):
+                outcome = self._prepare(self._launcher())
+
+        lane_id = self.fixture.bootstrap_calls[0]
+        # The prepared lane was retired before the refusal was recorded, so a
+        # later attempt cannot inherit a half-prepared lane.
+        self.assertEqual([lane_id], self.fixture.stop_calls)
+        self.assertEqual("retired", self.fixture.lane_lookup(lane_id)["lifecycle"])
+        self.assertEqual("fresh", outcome.disposition["branch"])
+        reason = outcome.disposition["reuse_attempts"][0]["reason"]
+        self.assertIn("ApcChildUnavailableError", reason)
+        operations = self._operations(outcome)
+        self.assertEqual(["refused"], [operation["status"] for operation in operations])
+        self.assertIn("refused", contracts.APC_CHILD_TERMINAL_STATUSES)
+
+    def test_unproven_retirement_after_launch_failure_stays_unresolved(self) -> None:
+        failed_launch = {
+            "ok": False,
+            "code": "LAUNCH_PROVIDER_START_FAILED",
+            "summary": "the provider process could not be started",
+            "evidence_paths": [],
+            "next_action": "resolve the error and re-launch",
+        }
+        survived = {
+            "ok": False,
+            "code": "FORCE_STOP_PROCESS_SURVIVED",
+            "summary": "a lane process could not be terminated even forcibly",
+            "evidence_paths": [],
+            "next_action": "escalate to the operator/host",
+        }
+
+        with self._native_stack(
+            provider_behavior=self.fixture.deterministic_child(), force_stop=survived
+        ):
+            with patch.object(launch, "run_launch", return_value=failed_launch):
+                outcome = self._prepare(self._launcher())
+            retry = self._prepare(self._launcher())
+
+        lane_id = self.fixture.bootstrap_calls[0]
+        # Exactly one queue and one bounded retirement attempt happened, and no
+        # retry relaunched anything while the exact child stays unresolved.
+        self.assertEqual([lane_id], self.fixture.bootstrap_calls)
+        self.assertEqual([lane_id], self.fixture.stop_calls)
+        self.assertEqual("fresh", retry.disposition["branch"])
+        retry_reason = retry.disposition["reuse_attempts"][0]["reason"]
+        self.assertIn("reconcile", retry_reason)
+
+        operations = self._operations(outcome)
+        self.assertEqual(["ambiguous"], [operation["status"] for operation in operations])
+        ambiguous = operations[-1]
+        self.assertIn("ambiguous", contracts.APC_CHILD_UNRESOLVED_STATUSES)
+        # The exact lane ownership stays visible instead of being hidden.
+        self.assertEqual(lane_id, ambiguous["launch_intent"]["lane_id"])
+        self.assertEqual("prepared", self.fixture.lane_lookup(lane_id)["lifecycle"])
+
+
+    def test_unreadable_native_acknowledgements_keep_the_exact_lane_ownership(self) -> None:
+        """ROOT's ownership check: an unreadable acknowledgement is unresolved.
+
+        The product harness really queued this exact deterministic lane, but its
+        queue or launch acknowledgement answered with something unreadable.  The
+        adapter and the accepted reconciliation path must keep that exact lane
+        identity visible as an unresolved child, and a later attempt must
+        reconcile it instead of blindly relaunching it.
+        """
+
+        request = apc.make_apc_request(
+            template={
+                "template_id": "template-1",
+                "version": 1,
+                "allowed_edits": ["bindings"],
+            },
+            parent_decision_id="decision-1",
+            parent_objective_id="objective-1",
+            permitted_edits=["bindings"],
+            binding=BINDING,
+        )
+
+        # (a) The queue acknowledgement itself is unreadable.
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            launcher = harness_child.make_native_apc_launcher(
+                session=harness_child.DraftingChildSession(
+                    runtime_root=self.fixture.runtime,
+                    task_card_dir=self.fixture.root / "apc-cards",
+                    base_commit="test-base",
+                    provider=BINDING["provider"],
+                    model=BINDING["model"],
+                ),
+                deadline=self.clock() + 240.0,
+                clock=self.clock,
+                lane_lookup=self.fixture.lane_lookup,
+                bootstrap_fn=lambda **kwargs: ["not-a-mapping-queue-ack"],
+                sleep=lambda seconds: None,
+            )
+            with patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ):
+                observed = launcher(request)
+
+        lane_id = observed["lane_id"]
+        self.assertTrue(lane_id.startswith("apc-child-"), lane_id)
+        self.assertEqual("bootstrap", observed["phase"])
+        self.assertNotIn("invocation_id", observed)
+
+        # The durable record keeps that exact lane identity instead of a bare
+        # refusal, and a retry must reconcile it rather than relaunch.
+        with self.assertRaises(harness_bridge.ApcChildAmbiguityError) as caught:
+            harness_bridge.run_apc_child(
+                request=request,
+                template_record={
+                    "template_id": "template-1",
+                    "fixed_steps": [],
+                    "verification_intent": "verify",
+                },
+                launcher=lambda _request: observed,
+                store=self.memory_store,
+                limits=self.limits,
+                clock=self.clock,
+                deadline=self.clock() + 240.0,
+            )
+        self.assertIn("reconcile the exact child", str(caught.exception))
+
+        operations = self.memory_store.list_apc_child_operations("decision-1")
+        self.assertEqual(["ambiguous"], [operation["status"] for operation in operations])
+        ambiguous = operations[-1]
+        self.assertIn("ambiguous", contracts.APC_CHILD_UNRESOLVED_STATUSES)
+        self.assertEqual(lane_id, ambiguous["launch_intent"]["lane_id"])
+        self.assertIsNone(ambiguous.get("observed_invocation"))
+
+        with self.assertRaises(harness_bridge.ApcChildAmbiguityError):
+            harness_bridge.run_apc_child(
+                request=request,
+                template_record={
+                    "template_id": "template-1",
+                    "fixed_steps": [],
+                    "verification_intent": "verify",
+                },
+                launcher=lambda _request: observed,
+                store=self.memory_store,
+                limits=self.limits,
+                clock=self.clock,
+                deadline=self.clock() + 240.0,
+            )
+
+        # (b) The launch acknowledgement is unreadable for an already-queued lane.
+        launch_request = apc.make_apc_request(
+            template={
+                "template_id": "template-2",
+                "version": 1,
+                "allowed_edits": ["bindings"],
+            },
+            parent_decision_id="decision-2",
+            parent_objective_id="objective-1",
+            permitted_edits=["bindings"],
+            binding=BINDING,
+        )
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            launcher = harness_child.make_native_apc_launcher(
+                session=harness_child.DraftingChildSession(
+                    runtime_root=self.fixture.runtime,
+                    task_card_dir=self.fixture.root / "apc-cards",
+                    base_commit="test-base",
+                    provider=BINDING["provider"],
+                    model=BINDING["model"],
+                ),
+                deadline=self.clock() + 240.0,
+                clock=self.clock,
+                lane_lookup=self.fixture.lane_lookup,
+                launch_fn=lambda lane_id: "not-a-mapping-launch-ack",
+                sleep=lambda seconds: None,
+            )
+            with patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ):
+                launched_observed = launcher(launch_request)
+
+        launched_lane_id = launched_observed["lane_id"]
+        self.assertEqual("launch", launched_observed["phase"])
+        self.assertNotIn("invocation_id", launched_observed)
+        self.assertEqual(
+            [launched_lane_id],
+            [lane for lane in self.fixture.bootstrap_calls if lane == launched_lane_id],
+        )
+
+        with self.assertRaises(harness_bridge.ApcChildAmbiguityError) as caught:
+            harness_bridge.run_apc_child(
+                request=launch_request,
+                template_record={
+                    "template_id": "template-2",
+                    "fixed_steps": [],
+                    "verification_intent": "verify",
+                },
+                launcher=lambda _request: launched_observed,
+                store=self.memory_store,
+                limits=self.limits,
+                clock=self.clock,
+                deadline=self.clock() + 240.0,
+            )
+        self.assertIn("reconcile the exact child", str(caught.exception))
+
+        launch_operations = self.memory_store.list_apc_child_operations("decision-2")
+        self.assertEqual(["ambiguous"], [operation["status"] for operation in launch_operations])
+        launched_ambiguous = launch_operations[-1]
+        self.assertEqual(launched_lane_id, launched_ambiguous["launch_intent"]["lane_id"])
+        self.assertIsNone(launched_ambiguous.get("observed_invocation"))
+
+    def test_unreadable_lane_record_after_launch_keeps_the_exact_lane_ownership(self) -> None:
+        """A launched lane whose record cannot be read back stays unresolved.
+
+        The launch really happened, so the exact lane identity must remain
+        visible on the durable operation even though its recorded lane identity
+        could not be read back; nothing may be relaunched blindly and no result
+        may be claimed for it.
+        """
+
+        request = apc.make_apc_request(
+            template={
+                "template_id": "template-3",
+                "version": 1,
+                "allowed_edits": ["bindings"],
+            },
+            parent_decision_id="decision-3",
+            parent_objective_id="objective-1",
+            permitted_edits=["bindings"],
+            binding=BINDING,
+        )
+
+        def unreadable_lane(lane_id: str):
+            raise lanes.LaneError("LANE_RECORD_INVALID", "lane record unreadable")
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            launcher = harness_child.make_native_apc_launcher(
+                session=harness_child.DraftingChildSession(
+                    runtime_root=self.fixture.runtime,
+                    task_card_dir=self.fixture.root / "apc-cards",
+                    base_commit="test-base",
+                    provider=BINDING["provider"],
+                    model=BINDING["model"],
+                ),
+                deadline=self.clock() + 240.0,
+                clock=self.clock,
+                lane_lookup=unreadable_lane,
+                sleep=lambda seconds: None,
+            )
+            with patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ):
+                observed = launcher(request)
+
+        lane_id = observed["lane_id"]
+        self.assertEqual("launch", observed["phase"])
+        self.assertNotIn("invocation_id", observed)
+        self.assertIn(lane_id, self.fixture.bootstrap_calls)
+
+        with self.assertRaises(harness_bridge.ApcChildAmbiguityError) as caught:
+            harness_bridge.run_apc_child(
+                request=request,
+                template_record={
+                    "template_id": "template-3",
+                    "fixed_steps": [],
+                    "verification_intent": "verify",
+                },
+                launcher=lambda _request: observed,
+                store=self.memory_store,
+                limits=self.limits,
+                clock=self.clock,
+                deadline=self.clock() + 240.0,
+            )
+        self.assertIn("reconcile the exact child", str(caught.exception))
+
+        operations = self.memory_store.list_apc_child_operations("decision-3")
+        self.assertEqual(["ambiguous"], [operation["status"] for operation in operations])
+        ambiguous = operations[-1]
+        self.assertIn("ambiguous", contracts.APC_CHILD_UNRESOLVED_STATUSES)
+        self.assertEqual(lane_id, ambiguous["launch_intent"]["lane_id"])
+        self.assertIsNone(ambiguous.get("observed_invocation"))
+
+    def test_launch_failure_without_controller_identity_stays_unresolved(self) -> None:
+        """A lane acknowledged without a recorded controller stays unresolved.
+
+        The harness recorded no pid or creation time for the exact lane, so its
+        identity must remain visible as unresolved instead of a bare error that
+        would hide the live ownership from reconciliation.
+        """
+
+        request = apc.make_apc_request(
+            template={
+                "template_id": "template-4",
+                "version": 1,
+                "allowed_edits": ["bindings"],
+            },
+            parent_decision_id="decision-4",
+            parent_objective_id="objective-1",
+            permitted_edits=["bindings"],
+            binding=BINDING,
+        )
+
+        identity_less = {
+            "ok": True,
+            "code": "LAUNCH_OK",
+            "summary": "launch acknowledged without a controller identity",
+            "evidence_paths": [],
+            "next_action": "none",
+        }
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            launcher = harness_child.make_native_apc_launcher(
+                session=harness_child.DraftingChildSession(
+                    runtime_root=self.fixture.runtime,
+                    task_card_dir=self.fixture.root / "apc-cards",
+                    base_commit="test-base",
+                    provider=BINDING["provider"],
+                    model=BINDING["model"],
+                ),
+                deadline=self.clock() + 240.0,
+                clock=self.clock,
+                lane_lookup=self.fixture.lane_lookup,
+                launch_fn=lambda lane_id: identity_less,
+                sleep=lambda seconds: None,
+            )
+            with patch(
+                "orchestrator_harness.config.find_harness_root",
+                return_value=self.fixture.harness,
+            ):
+                observed = launcher(request)
+
+        lane_id = observed["lane_id"]
+        self.assertEqual("launch", observed["phase"])
+        self.assertNotIn("invocation_id", observed)
+
+        with self.assertRaises(harness_bridge.ApcChildAmbiguityError) as caught:
+            harness_bridge.run_apc_child(
+                request=request,
+                template_record={
+                    "template_id": "template-4",
+                    "fixed_steps": [],
+                    "verification_intent": "verify",
+                },
+                launcher=lambda _request: observed,
+                store=self.memory_store,
+                limits=self.limits,
+                clock=self.clock,
+                deadline=self.clock() + 240.0,
+            )
+        self.assertIn("reconcile the exact child", str(caught.exception))
+
+        operations = self.memory_store.list_apc_child_operations("decision-4")
+        self.assertEqual(["ambiguous"], [operation["status"] for operation in operations])
+        ambiguous = operations[-1]
+        self.assertIn("ambiguous", contracts.APC_CHILD_UNRESOLVED_STATUSES)
+        self.assertEqual(lane_id, ambiguous["launch_intent"]["lane_id"])
+        self.assertIsNone(ambiguous.get("observed_invocation"))
 
 
 if __name__ == "__main__":
