@@ -51,6 +51,36 @@ class GetSurface:
                          "total_count": total}}
 
 
+class PaginatingGetSurface(GetSurface):
+    def __init__(self) -> None:
+        super().__init__()
+        self.later_fault: str | None = None
+
+    async def get(self, request: dict) -> dict:
+        self.get_calls.append(request)
+        page = request["page"]
+        page_size = request["page_size"]
+        start = (page - 1) * page_size
+        cases = list(self.cases[start:start + page_size])
+        total = len(self.cases)
+        if page == 2:
+            if self.later_fault == "failed":
+                raise ConnectionError("page 2 unavailable")
+            if self.later_fault == "missing":
+                cases = []
+            elif self.later_fault == "duplicate":
+                cases = [self.cases[0]]
+            elif self.later_fault == "foreign":
+                cases = [{**cases[0], "agent_id": "foreign-owner"}]
+            elif self.later_fault == "changed_total":
+                total += 1
+            elif self.later_fault == "malformed":
+                return {"data": {"agent_cases": "invalid", "count": 1,
+                                 "total_count": total}}
+        return {"data": {"agent_cases": cases, "count": len(cases),
+                         "total_count": total}}
+
+
 class EverOSExternalReconciliationTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -186,6 +216,76 @@ class EverOSExternalReconciliationTests(unittest.TestCase):
         self.assertEqual("confirmed", confirmed["status"])
         self.assertEqual(uncertain["ingestion_id"], confirmed["ingestion_id"])
         self.assertEqual(1, len(self.surface.memorize_calls))
+
+    def _paginating_surface(self) -> PaginatingGetSurface:
+        surface = PaginatingGetSurface()
+        self.surface = surface
+        memory_root = experience.EverOSAdapter.memory_root_for_scope(
+            self.root / "everos", self.scope
+        )
+        self.adapter = experience.EverOSAdapter(
+            scope=self.scope,
+            base_root=self.root / "everos",
+            surface=experience.EverOSPublicSurface.from_object(
+                surface,
+                memory_root=memory_root,
+                resolve_memory_root=lambda: memory_root,
+            ),
+        )
+        return surface
+
+    def _page_cases(self, session_id: str) -> list[dict]:
+        return [
+            {**self._case(session_id), "id": f"readback-case-{index:03d}"}
+            for index in range(101)
+        ]
+
+    def test_public_get_confirms_all_101_cases_across_two_exact_pages(self) -> None:
+        surface = self._paginating_surface()
+        pending = self._extract()
+        surface.cases = self._page_cases(pending["session_id"])
+        surface.get_calls.clear()
+
+        confirmed = self._extract()
+
+        self.assertEqual("confirmed", confirmed["status"])
+        self.assertEqual(101, len(confirmed["case_ids"]))
+        self.assertEqual({case["id"] for case in surface.cases}, set(confirmed["case_ids"]))
+        self.assertEqual([1, 2], [request["page"] for request in surface.get_calls])
+        for request in surface.get_calls:
+            self.assertEqual({
+                "agent_id": self.adapter.everos_owner_id,
+                "app_id": self.adapter.everos_application_id,
+                "project_id": self.adapter.everos_project_id,
+                "memory_type": "agent_case",
+                "filters": {"session_id": pending["session_id"]},
+                "page_size": 100,
+            }, {key: value for key, value in request.items() if key != "page"})
+        self.assertEqual(1, len(surface.memorize_calls))
+        for case_id in ("readback-case-000", "readback-case-100"):
+            receipt = self.state.get_case_receipt(self.scope.to_record(), case_id)
+            self.assertEqual(self.trajectory["review_receipt_id"], receipt["review_receipt_id"])
+
+    def test_later_page_faults_cannot_partially_confirm_uncertain_ingestion(self) -> None:
+        surface = self._paginating_surface()
+        surface.lose_ack = True
+        uncertain = self._extract()
+        self.assertEqual("uncertain", uncertain["status"])
+        surface.cases = self._page_cases(uncertain["session_id"])
+        for fault in ("missing", "malformed", "changed_total", "duplicate", "foreign", "failed"):
+            with self.subTest(fault=fault):
+                surface.later_fault = fault
+                surface.get_calls.clear()
+                replay = self._extract()
+                self.assertEqual("uncertain", replay["status"])
+                self.assertEqual(uncertain["ingestion_id"], replay["ingestion_id"])
+                self.assertEqual([1, 2], [request["page"] for request in surface.get_calls])
+                with self.assertRaises(store.StoreError):
+                    self.state.get_case_receipt(
+                        self.scope.to_record(), "readback-case-000"
+                    )
+                self.assertEqual(1, len(surface.memorize_calls))
+                self.assertEqual(1, len(self.service.search_recent_evidence(self.scope, "parser")))
 
 
 if __name__ == "__main__":

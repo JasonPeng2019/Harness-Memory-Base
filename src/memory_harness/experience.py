@@ -449,38 +449,52 @@ class EverOSAdapter:
         if self.surface.get is None or self.surface.make_get_request is None:
             result = await self.search_representation(session_id=session_id, query=query)
             return result["agent_cases"]
-        request = self.surface.make_get_request(
-            agent_id=self.everos_owner_id,
-            app_id=self.everos_application_id,
-            project_id=self.everos_project_id,
-            memory_type="agent_case",
-            filters={"session_id": session_id},
-            page=1,
-            page_size=100,
-        )
-        response = _model_mapping(await self.surface.get(request), "EverOS get response")
-        data = response.get("data")
-        if not isinstance(data, Mapping):
-            raise ExperienceError("EverOS get response has no data object")
-        items = data.get("agent_cases")
-        count = data.get("count")
-        total_count = data.get("total_count")
-        if (
-            not isinstance(items, list)
-            or isinstance(count, bool)
-            or not isinstance(count, int)
-            or isinstance(total_count, bool)
-            or not isinstance(total_count, int)
-            or count != len(items)
-            or total_count != count
-        ):
-            raise ExperienceError("EverOS get case listing is incomplete or malformed")
-        cases = [_model_mapping(item, "EverOS get case") for item in items]
-        for source_case in cases:
-            self.validate_case(source_case, session_id=session_id)
-        if len({source_case["id"] for source_case in cases}) != len(cases):
-            raise ExperienceError("EverOS get returned duplicate case identities")
-        return cases
+        cases: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        expected_total: int | None = None
+        page = 1
+        page_size = 100  # Vendored GetRequest's maximum page size.
+        while True:
+            self._assert_bound_memory_root()
+            request = self.surface.make_get_request(
+                agent_id=self.everos_owner_id,
+                app_id=self.everos_application_id,
+                project_id=self.everos_project_id,
+                memory_type="agent_case",
+                filters={"session_id": session_id},
+                page=page,
+                page_size=page_size,
+            )
+            response = _model_mapping(await self.surface.get(request), "EverOS get response")
+            data = response.get("data")
+            if not isinstance(data, Mapping):
+                raise ExperienceError("EverOS get response has no data object")
+            items = data.get("agent_cases")
+            count = data.get("count")
+            total_count = data.get("total_count")
+            if (
+                not isinstance(items, list)
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or isinstance(total_count, bool)
+                or not isinstance(total_count, int)
+                or total_count < 0
+                or (expected_total is not None and total_count != expected_total)
+                or count != len(items)
+                or count != min(page_size, total_count - len(cases))
+            ):
+                raise ExperienceError("EverOS get case listing is incomplete or malformed")
+            expected_total = total_count
+            for item in items:
+                source_case = _model_mapping(item, "EverOS get case")
+                self.validate_case(source_case, session_id=session_id)
+                if source_case["id"] in seen_ids:
+                    raise ExperienceError("EverOS get returned duplicate case identities")
+                seen_ids.add(source_case["id"])
+                cases.append(source_case)
+            if len(cases) == expected_total:
+                return cases
+            page += 1
 
     async def search_representation(
         self, *, session_id: str, query: str
