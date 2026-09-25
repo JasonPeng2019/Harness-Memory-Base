@@ -781,6 +781,8 @@ class ReviewedExperienceService:
         adapter.assert_scope(trajectory["scope"])
         existing = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
         if existing is not None:
+            if existing["status"] in {"pending", "uncertain"}:
+                return await self.reconcile_extraction(trajectory_id, adapter)
             return existing
         session_id = adapter.session_id_for(trajectory_id)
         payload = adapter.add_payload(trajectory, session_id=session_id)
