@@ -4,15 +4,15 @@ Creates the worktree + ``.agent-workspace``, applies the cache overlay, writes
 the worker prompt/result template and the controller invocation.  Opens a new
 epoch if none is active.  Does not start a provider or take a lease.
 
-Managed bootstrap copies the active ``workspace/`` base and only the selected
-provider payload, then generates the lane-specific queue/result/invocation/
-records.  Plain bootstrap gets no queue helpers, hook payload, or worker
-skills.  Source trees stay unchanged.
+Managed bootstrap validates and copies the one installed composed payload for
+the selected provider, then generates the lane-specific queue/result/invocation
+records. Plain bootstrap uses the active ``workspace/`` base without managed
+helpers or provider material. Source trees stay unchanged.
 """
 
 from __future__ import annotations
 
-import json
+import hashlib
 import json
 import shutil
 import subprocess
@@ -333,6 +333,14 @@ def _write_worker_prompt(
 ) -> Path:
     lines = [str(task_card["task"]).strip()]
     lines.extend(_render_memory_context(worktree))
+    if task_card.get("worker_task_credentials"):
+        lines.append(
+            "\n## Task credentials\n"
+            "The declared task credentials are withheld because their authority "
+            "has not been independently validated. Continue work that does not "
+            "need them. Stop the dependent action and request the required task "
+            "authority through the lane's escalation path."
+        )
     if rationale and rationale.strip():
         lines.append(f"\n## Resume rationale\n{rationale.strip()}")
     if managed:
@@ -375,6 +383,7 @@ def _write_invocation(
     model: str,
     launch_config: dict[str, str],
     exclusive_resources: list[str],
+    memory_envelope: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     agent_workspace = worktree / ".agent-workspace"
     invocation = {
@@ -406,6 +415,16 @@ def _write_invocation(
         },
         "created_at": iso_utc(),
     }
+    if memory_envelope is not None:
+        context = memory_handoff.load_final_context(
+            worktree_path=worktree, envelope=memory_envelope
+        )
+        invocation["dispatch_binding"] = memory_handoff.dispatch_binding(
+            envelope=memory_envelope, context=context
+        )
+        invocation["prompt_digest"] = hashlib.sha256(
+            (agent_workspace / "worker-prompt.md").read_bytes()
+        ).hexdigest()
     invocation["content_hash"] = content_hash(invocation)
     atomic_write_json(agent_workspace / "invocation.json", invocation)
     return invocation
@@ -437,14 +456,9 @@ def _install_managed_material(
     lane_id: str,
     run_id: str,
 ) -> None:
-    """Install the managed worker payload: provider payload + inbox/outbox."""
+    """Install the exact verified composition plus lane-specific inbox/outbox."""
     agent_workspace = worktree / ".agent-workspace"
-    payload = rt / "super-cache" / "adapter-payloads" / provider_id
-    if not payload.is_dir():
-        raise BootstrapError(
-            BOOTSTRAP_ADAPTER_MISSING,
-            f"adapter payload missing for provider {provider_id}: {payload}",
-        )
+    payload = _managed_payload(harness_root, rt, provider_id)
     payload_exclusions: list[str] = []
     if provider_id == "codex":
         config_relative = Path(".codex") / "config.toml"
@@ -466,6 +480,7 @@ def _install_managed_material(
     shared_hook_relative = {
         "codex": Path(".codex") / "hooks.json",
         "claude-code": Path(".claude") / "settings.json",
+        "qwen-code": Path(".qwen") / "settings.json",
     }.get(provider_id)
     if shared_hook_relative is not None:
         payload_hooks = payload / shared_hook_relative
@@ -507,6 +522,29 @@ def _install_managed_material(
     (agent_workspace / "manager-notifications").mkdir(parents=True, exist_ok=True)
     (agent_workspace / "processed-notifications").mkdir(parents=True, exist_ok=True)
     _write_worker_binding(worktree, rt, lane_id, run_id)
+
+
+def _managed_payload(harness_root: Path, rt: Path, provider_id: str) -> Path:
+    """Fail closed when the installed tree differs from setup's exact plan."""
+    from .setup import (
+        COMPOSED_PAYLOADS,
+        SETUP_CACHE_INVALID,
+        SetupError,
+        _require_plain_workspace_boundary,
+        _validated_worker_payload,
+    )
+
+    payload = rt / "super-cache" / COMPOSED_PAYLOADS / provider_id
+    try:
+        _require_plain_workspace_boundary(rt, code=SETUP_CACHE_INVALID)
+        if not payload.is_dir():
+            raise BootstrapError(BOOTSTRAP_CACHE_MISSING, f"installed worker composition missing: {payload}")
+        return _validated_worker_payload(harness_root, rt, provider_id)
+    except (SetupError, OSError) as exc:
+        raise BootstrapError(
+            BOOTSTRAP_CACHE_COLLISION,
+            str(exc),
+        ) from exc
 
 
 def _validate_provider_launch_config(
@@ -671,6 +709,30 @@ def run_bootstrap(
                 "evidence_paths": [],
                 "next_action": "fix the manifest (requires shutdown) or drop the resource",
             }
+    if config.profile == "managed":
+        try:
+            _managed_payload(harness_root, config.runtime_root, provider)
+        except BootstrapError as exc:
+            return {
+                "ok": False,
+                "code": exc.code,
+                "summary": str(exc),
+                "evidence_paths": [],
+                "next_action": "run harness setup and verify the installed worker composition",
+            }
+    else:
+        from .setup import SetupError, _validated_cache_for_dispatch
+
+        try:
+            _validated_cache_for_dispatch(harness_root, config.runtime_root)
+        except (SetupError, OSError) as exc:
+            return {
+                "ok": False,
+                "code": BOOTSTRAP_CACHE_COLLISION,
+                "summary": str(exc),
+                "evidence_paths": [],
+                "next_action": "run harness setup and verify the installed cache",
+            }
     def allowance_expired() -> bool:
         """Report one absolute expiry without touching any effectful phase."""
 
@@ -765,14 +827,7 @@ def run_bootstrap(
         agent_workspace.mkdir(parents=True, exist_ok=True)
 
         managed = config.profile == "managed"
-        base_overlay = rt / "super-cache" / "workspace"
-        if not base_overlay.is_dir():
-            raise BootstrapError(
-                BOOTSTRAP_CACHE_MISSING,
-                f"active workspace base missing: {base_overlay} (run harness setup first)",
-            )
         if managed:
-            _copy_overlay(base_overlay, worktree_path)
             _install_managed_material(
                 harness_root,
                 rt,
@@ -782,6 +837,12 @@ def run_bootstrap(
                 run_id=run_id,
             )
         else:
+            base_overlay = rt / "super-cache" / "workspace"
+            if not base_overlay.is_dir():
+                raise BootstrapError(
+                    BOOTSTRAP_CACHE_MISSING,
+                    f"active workspace base missing: {base_overlay} (run harness setup first)",
+                )
             _copy_overlay(
                 base_overlay,
                 worktree_path,
@@ -796,7 +857,7 @@ def run_bootstrap(
             "applied_at": iso_utc(),
         }
         if managed:
-            receipt["provider_payload"] = f"adapter-payloads/{provider}"
+            receipt["provider_payload"] = f"composed-payloads/{provider}"
         atomic_write_json(agent_workspace / "overlay-receipt.json", receipt)
         atomic_write_json(agent_workspace / "task-card.json", task_card)
         memory = memory_handoff.prepare_lane_memory(
@@ -904,6 +965,7 @@ def run_bootstrap(
             model=model,
             launch_config=configured_launch,
             exclusive_resources=list(exclusive_resources),
+            memory_envelope=memory.envelope,
         )
 
         lane = base_lane_record()

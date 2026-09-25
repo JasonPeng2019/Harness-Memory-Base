@@ -103,6 +103,7 @@ class MaterializationFixture:
         agent_workspace = self.harness / "super-cache" / "workspace" / ".agent-workspace"
         for name, contents in {
             "README.md": "base workspace\n",
+            "hook-dispatch.py": "# hook dispatch\n",
             "lane-queue.py": "# lane queue\n",
             "manager-notify.py": "# manager notify\n",
             "result-stop-check.py": "# result stop check\n",
@@ -169,6 +170,22 @@ class MaterializationFixture:
         self._write_text(
             adapter / "super-cache" / dotdir / "worker.txt", worker_contents
         )
+        self._write_json(
+            adapter / "super-cache" / dotdir / "orchestrator-harness-binding.json",
+            {
+                "schema": "harness-hook-binding/v1",
+                "role": "worker",
+                "provider_id": provider_id,
+            },
+        )
+        self._write_text(
+            adapter / "super-cache" / dotdir / "skills" / "lane-assignment" / "SKILL.md",
+            ".agent-workspace/lane-queue.py\n",
+        )
+        self._write_text(
+            adapter / "super-cache" / dotdir / "skills" / "manager-notify" / "SKILL.md",
+            ".agent-workspace/manager-notify.py\n",
+        )
 
     def _write_provider_to(self, harness: Path, provider_id: str, dotdir: str) -> None:
         """Install a disposable provider fixture next to a copied shipped tree."""
@@ -199,6 +216,15 @@ class MaterializationFixture:
         self._write_text(
             adapter / "super-cache" / dotdir / "worker.txt", "fixture\n"
         )
+        self._write_json(
+            adapter / "super-cache" / dotdir / "orchestrator-harness-binding.json",
+            {"schema": "harness-hook-binding/v1", "role": "worker", "provider_id": provider_id},
+        )
+        for name, helper in (("lane-assignment", "lane-queue.py"), ("manager-notify", "manager-notify.py")):
+            self._write_text(
+                adapter / "super-cache" / dotdir / "skills" / name / "SKILL.md",
+                f".agent-workspace/{helper}\n",
+            )
         self._write_text(
             harness
             / "orchestrator_harness"
@@ -556,6 +582,131 @@ class V2MaterializationTests(unittest.TestCase):
             (self.fixture.root_workspace / ".harness-runtime").exists()
         )
         self.assertEqual("existing\n", collision.read_text(encoding="utf-8"))
+
+    def test_composed_worker_destination_collision_precedes_all_setup_writes(self) -> None:
+        self.fixture._write_text(
+            self.fixture.harness
+            / "adapters"
+            / "codex"
+            / "super-cache"
+            / ".agent-workspace"
+            / "lane-queue.py",
+            "# competing provider owner\n",
+        )
+        with (
+            patch.object(setup, "find_harness_root", return_value=self.fixture.harness),
+            patch.object(setup, "_start_monitor") as start_monitor,
+        ):
+            result = setup.run_setup()
+        self.assertFalse(result["ok"])
+        self.assertEqual(setup.SETUP_ADAPTER_COLLISION, result["code"])
+        self.assertFalse((self.fixture.root_workspace / ".harness-runtime").exists())
+        self.assertFalse((self.fixture.root_workspace / ".codex").exists())
+        start_monitor.assert_not_called()
+
+    def test_unknown_or_duplicate_worker_hook_command_precedes_setup_writes(self) -> None:
+        payload = self.fixture.harness / "adapters" / "codex" / "super-cache" / ".codex"
+        self.fixture._write_text(payload / "hooks" / "known.py", "# known\n")
+        for commands in (
+            ["python .codex/hooks/missing.py"],
+            ["python .codex/hooks/known.py", "python .codex/hooks/known.py"],
+            ["python .codex/hooks/known.py extra"],
+            ["python .codex/hooks/../known.py"],
+        ):
+            with self.subTest(commands=commands):
+                self.fixture._write_json(
+                    payload / "hooks.json",
+                    {"hooks": {"Stop": [{"hooks": [{"command": command} for command in commands]}]}},
+                )
+                with (
+                    patch.object(setup, "find_harness_root", return_value=self.fixture.harness),
+                    patch.object(setup, "_start_monitor") as start_monitor,
+                ):
+                    result = setup.run_setup()
+                self.assertFalse(result["ok"])
+                self.assertEqual(setup.SETUP_ADAPTER_COLLISION, result["code"])
+                self.assertFalse((self.fixture.root_workspace / ".harness-runtime").exists())
+                self.assertFalse((self.fixture.root_workspace / ".codex").exists())
+                start_monitor.assert_not_called()
+
+    def test_equivalent_worker_hook_script_spellings_are_rejected_before_setup_writes(self) -> None:
+        for variant in (r"python .codex\hooks\known.py", "python .CODEX/Hooks/KNOWN.py"):
+            with self.subTest(variant=variant):
+                fixture = MaterializationFixture()
+                self.addCleanup(fixture.close)
+                payload = fixture.harness / "adapters" / "codex" / "super-cache" / ".codex"
+                fixture._write_text(payload / "hooks" / "known.py", "# known\n")
+                fixture._write_json(
+                    payload / "hooks.json",
+                    {"hooks": {"Stop": [{"hooks": [
+                        {"command": "python .codex/hooks/known.py"},
+                        {"command": variant},
+                    ]}]}},
+                )
+                with (
+                    patch.object(setup, "find_harness_root", return_value=fixture.harness),
+                    patch.object(setup, "_start_monitor") as start_monitor,
+                ):
+                    result = setup.run_setup()
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(setup.SETUP_ADAPTER_COLLISION, result["code"])
+                self.assertFalse((fixture.root_workspace / ".harness-runtime").exists())
+                self.assertFalse((fixture.root_workspace / ".codex").exists())
+                start_monitor.assert_not_called()
+
+    def test_distinct_owned_worker_hook_commands_remain_valid(self) -> None:
+        payload = self.fixture.harness / "adapters" / "codex" / "super-cache" / ".codex"
+        for name in ("first.py", "second.py"):
+            self.fixture._write_text(payload / "hooks" / name, "# known\n")
+        self.fixture._write_json(
+            payload / "hooks.json",
+            {"hooks": {"Stop": [{"hooks": [
+                {"command": "python .codex/hooks/first.py"},
+                {"command": r"python .CODEX\HOOKS\second.py"},
+            ]}]}},
+        )
+        plan = setup._plan_active_cache(self.fixture.harness)
+        self.assertIn(
+            Path("composed-payloads/codex/.codex/hooks/first.py"),
+            [relative for _, relative in plan],
+        )
+        self.assertIn(
+            Path("composed-payloads/codex/.codex/hooks/second.py"),
+            [relative for _, relative in plan],
+        )
+
+    def test_setup_installs_shared_and_provider_files_in_one_worker_tree(self) -> None:
+        child = MagicMock(pid=1701)
+        with (
+            patch.object(setup, "find_harness_root", return_value=self.fixture.harness),
+            patch.object(setup.processes, "python_argv", return_value=["python", "-m", "monitor"]),
+            patch.object(setup.processes, "spawn_detached", return_value=child),
+            patch.object(
+                setup.processes,
+                "process_identity",
+                return_value={"pid": 1701, "creation_time": "test-creation"},
+            ),
+        ):
+            result = setup.run_setup()
+        self.assertTrue(result["ok"], result)
+        composed = (
+            self.fixture.root_workspace
+            / ".harness-runtime"
+            / "super-cache"
+            / "composed-payloads"
+        )
+        for provider_id, dotdir in (("codex", ".codex"), ("disposable-custom", ".custom")):
+            payload = composed / provider_id
+            self.assertEqual(
+                (self.fixture.harness / "super-cache" / "workspace" / ".agent-workspace" / "lane-queue.py").read_bytes(),
+                (payload / ".agent-workspace" / "lane-queue.py").read_bytes(),
+            )
+            self.assertEqual(
+                (self.fixture.harness / "adapters" / provider_id / "super-cache" / dotdir / "worker.txt").read_bytes(),
+                (payload / dotdir / "worker.txt").read_bytes(),
+            )
+            self.assertFalse((payload / "AGENTS.md").exists())
+            self.assertTrue((payload / dotdir / "skills" / "lane-assignment" / "SKILL.md").is_file())
 
     def test_setup_materialization_keeps_shipped_sources_immutable(self) -> None:
         before = self.fixture.source_snapshot()
@@ -930,15 +1081,46 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertTrue(
             (worktree / ".agent-workspace" / "manager-notifications").is_dir()
         )
+        self.assertEqual(
+            "# lane queue\n",
+            (worktree / ".agent-workspace" / "lane-queue.py").read_text(encoding="utf-8"),
+        )
+        receipt = json.loads(
+            (worktree / ".agent-workspace" / "overlay-receipt.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual("composed-payloads/codex", receipt["provider_payload"])
+
+    def test_missing_or_changed_installed_composition_blocks_managed_bootstrap(self) -> None:
+        for failure in ("missing", "changed"):
+            with self.subTest(failure=failure):
+                self.fixture.active_cache()
+                installed = (
+                    self.fixture.root_workspace
+                    / ".harness-runtime"
+                    / "super-cache"
+                    / "composed-payloads"
+                    / "codex"
+                    / ".agent-workspace"
+                    / "lane-queue.py"
+                )
+                if failure == "missing":
+                    installed.unlink()
+                else:
+                    installed.write_text("# tampered\n", encoding="utf-8")
+                result, worktree = self._bootstrap(
+                    f"composition-{failure}", managed=True, provider="codex", prime_cache=False
+                )
+                self.assertFalse(result["ok"])
+                self.assertIn(result["code"], (bootstrap.BOOTSTRAP_CACHE_MISSING, bootstrap.BOOTSTRAP_CACHE_COLLISION))
+                self.assertFalse(worktree.exists())
 
     def test_managed_codex_payload_preserves_valid_existing_config(self) -> None:
         runtime = self.fixture.root_workspace / ".harness-runtime"
-        self.fixture.active_cache()
         payload_config = (
-            runtime
-            / "super-cache"
-            / "adapter-payloads"
+            self.fixture.harness
+            / "adapters"
             / "codex"
+            / "super-cache"
             / ".codex"
             / "config.toml"
         )
@@ -967,6 +1149,11 @@ class V2MaterializationTests(unittest.TestCase):
             }
         }
         self.fixture._write_json(payload_hooks, shipped_hook)
+        self.fixture._write_text(
+            payload_config.parent / "hooks" / "orchestrator_harness_stop.py",
+            "# worker stop hook\n",
+        )
+        self.fixture.active_cache()
         existing_hooks = worktree / ".codex" / "hooks.json"
         combined_hooks = {
             "description": "product hooks",
@@ -1196,7 +1383,7 @@ class V2MaterializationTests(unittest.TestCase):
         )
 
     def _bootstrap(
-        self, lane_id: str, *, managed: bool, provider: str
+        self, lane_id: str, *, managed: bool, provider: str, prime_cache: bool = True
     ) -> tuple[dict[str, object], Path]:
         self.fixture._write_json(
             self.fixture.harness / "harness-config.json",
@@ -1206,7 +1393,8 @@ class V2MaterializationTests(unittest.TestCase):
             },
         )
         runtime = self.fixture.root_workspace / ".harness-runtime"
-        self.fixture.active_cache()
+        if prime_cache:
+            self.fixture.active_cache()
         task_card = self.fixture.root / f"{lane_id}.json"
         self.fixture._write_json(
             task_card,
@@ -1249,7 +1437,10 @@ class V2MaterializationTests(unittest.TestCase):
                 exclusive_resources=[],
                 task_card_path=str(task_card),
             )
-        git_add.assert_called_once()
+        if result["ok"]:
+            git_add.assert_called_once()
+        else:
+            git_add.assert_not_called()
         provider_cli.assert_not_called()
         return result, worktree
 if __name__ == "__main__":

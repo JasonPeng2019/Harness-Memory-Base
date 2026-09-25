@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .core import read_json
+from .core import content_hash, read_json
 from .records import atomic_write_json
 
 
@@ -29,6 +31,32 @@ class PendingPlanError(MemoryHandoffError):
     condition from an invalid or copied envelope, and it is never resolved by
     silently falling back to the legacy path.
     """
+
+
+_FINAL_CONTEXT_FIELDS = (
+    "plan_revision",
+    "plan_integrity",
+    "execution_role",
+    "invocation_target",
+    "recipient",
+    "recipient_authorization",
+    "rendered_context",
+    "delivery_trace",
+)
+_HANDOFF_FIELDS = (
+    "task",
+    "plan_revision",
+    "plan_integrity",
+    "context_id",
+    "context_integrity",
+    "context_digest",
+    "execution_role",
+    "invocation_target",
+    "recipient",
+    "recipient_authorization",
+    "rendered_context",
+    "delivery_trace",
+)
 
 
 def _memory_module(name: str):
@@ -223,6 +251,175 @@ def _write_envelope(worktree: str | Path, envelope: Mapping[str, Any]) -> Path:
     return envelope_path
 
 
+def _final_context_handoff_fields(
+    context: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    task_card: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Project only domain-finalized, recipient-ready meaning into the lane envelope.
+
+    The cc5b4f2 domain finalizer predates these STEP-06 fields. Its existing
+    envelope keeps the inherited seam until lane 1 joins. A partially upgraded
+    finalized record is unsafe and never gets that compatibility path.
+    """
+
+    if not any(field in context for field in _FINAL_CONTEXT_FIELDS):
+        if any(field in envelope for field in _HANDOFF_FIELDS):
+            raise MemoryHandoffError(
+                "dispatch envelope claims final-context fields absent from the domain record"
+            )
+        return None
+    missing = [
+        field
+        for field in (*_FINAL_CONTEXT_FIELDS, "context_id", "integrity", "content_hash")
+        if field not in context
+    ]
+    if missing:
+        raise MemoryHandoffError(
+            f"finalized context is missing handoff fields: {', '.join(missing)}"
+        )
+    if context.get("content_hash") != content_hash(dict(context)):
+        raise MemoryHandoffError("finalized context payload integrity changed")
+    if context["plan_revision"] != plan["revision"]:
+        raise MemoryHandoffError("finalized context plan revision changed")
+    if context["plan_integrity"] != plan["content_hash"]:
+        raise MemoryHandoffError("finalized context plan integrity changed")
+    for field in ("execution_role", "invocation_target", "recipient"):
+        if not isinstance(context[field], str) or not context[field].strip():
+            raise MemoryHandoffError(f"finalized context {field} is missing")
+    if context["execution_role"] != "worker":
+        raise MemoryHandoffError("finalized context execution role is not the lane worker")
+    if context["invocation_target"] != "orchestrator_harness.controller":
+        raise MemoryHandoffError("finalized context invocation target changed")
+    if context["recipient"] != f"worker:{envelope['lane_id']}":
+        raise MemoryHandoffError("finalized context recipient does not match the lane")
+    authorization = context["recipient_authorization"]
+    if (
+        not isinstance(authorization, Mapping)
+        or authorization.get("recipient") != context["recipient"]
+        or authorization.get("authorized") is not True
+        or authorization.get("sanitized") is not True
+    ):
+        raise MemoryHandoffError(
+            "finalized context lacks sanitized recipient authorization"
+        )
+    if context.get("freshness", {}).get("state") != "current":
+        raise MemoryHandoffError("finalized context is stale or revoked")
+    if context.get("configuration") != envelope.get("configuration"):
+        raise MemoryHandoffError("finalized context captured configuration changed")
+
+    mandatory = envelope.get("mandatory_content")
+    optional = envelope.get("optional_content")
+    if not isinstance(mandatory, list) or not isinstance(optional, list):
+        raise MemoryHandoffError("finalized envelope has no rendered content lists")
+    content_ids = [item["id"] for item in mandatory + optional]
+    if len(content_ids) != len(set(content_ids)):
+        raise MemoryHandoffError("finalized context has duplicate rendered identities")
+    by_id = {item.get("id"): item.get("content") for item in mandatory if isinstance(item, Mapping)}
+    required = {
+        "task": task_card["task"],
+        "accepted-plan": plan["content"],
+        "base": task_card["base_commit"],
+        "route": plan["route"],
+    }
+    for identifier, value in required.items():
+        if by_id.get(identifier) != value:
+            raise MemoryHandoffError(
+                f"finalized context mandatory {identifier} meaning changed or is missing"
+            )
+    if not by_id.get("security"):
+        raise MemoryHandoffError("finalized context mandatory security meaning is missing")
+    rendered = context["rendered_context"]
+    if not isinstance(rendered, Mapping) or dict(rendered) != {
+        "mandatory": mandatory,
+        "optional": optional,
+    }:
+        raise MemoryHandoffError("finalized rendered context differs from the envelope")
+    trace = context["delivery_trace"]
+    if not isinstance(trace, Mapping):
+        raise MemoryHandoffError("finalized context delivery trace is missing")
+    if set(trace) != {"selected", "packed", "omitted", "delivered"}:
+        raise MemoryHandoffError("finalized context delivery trace is incomplete")
+    if any(
+        not isinstance(trace[field], list)
+        or any(not isinstance(item, str) or not item for item in trace[field])
+        for field in ("selected", "packed", "omitted", "delivered")
+    ):
+        raise MemoryHandoffError("finalized context delivery trace has invalid identities")
+    if any(
+        len(trace[field]) != len(set(trace[field]))
+        for field in ("selected", "packed", "omitted", "delivered")
+    ):
+        raise MemoryHandoffError("finalized context delivery trace has duplicate identities")
+    packed = [item["id"] for item in optional]
+    if trace["packed"] != packed or trace["omitted"] != envelope["delivery"]["omitted"]:
+        raise MemoryHandoffError("finalized context packed or omitted trace changed")
+    if context.get("omitted") != trace["omitted"]:
+        raise MemoryHandoffError("finalized context omission evidence changed")
+    if set(packed) & set(trace["omitted"]):
+        raise MemoryHandoffError("finalized context marks an item both packed and omitted")
+    if trace["delivered"] != packed:
+        raise MemoryHandoffError("finalized context delivered trace differs from rendered optional items")
+    if not set(packed).issubset(trace["selected"]):
+        raise MemoryHandoffError("finalized context packed trace was not selected")
+    return {
+        "task": task_card["task"],
+        "plan_revision": context["plan_revision"],
+        "plan_integrity": context["plan_integrity"],
+        "context_id": context["context_id"],
+        "context_integrity": context["integrity"],
+        "context_digest": context["content_hash"],
+        "execution_role": context["execution_role"],
+        "invocation_target": context["invocation_target"],
+        "recipient": context["recipient"],
+        "recipient_authorization": {
+            "recipient": context["recipient"],
+            "authorized": True,
+            "sanitized": True,
+        },
+        "rendered_context": dict(rendered),
+        "delivery_trace": dict(trace),
+    }
+
+
+def _bind_final_context(
+    envelope: Mapping[str, Any],
+    context: Mapping[str, Any],
+    task_card: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    bound = dict(envelope)
+    fields = _final_context_handoff_fields(context, bound, task_card, plan)
+    if fields is None:
+        return bound
+    for field, value in fields.items():
+        if field in bound and bound[field] != value:
+            raise MemoryHandoffError(f"dispatch envelope {field} differs from finalized context")
+    bound.update(fields)
+    bound["content_hash"] = content_hash(bound)
+    return bound
+
+
+def _record_bound_final_context(
+    worktree_path: str | Path,
+    context: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+) -> None:
+    """Link the durable final context to the envelope actually handed off."""
+
+    store = _memory_module("store")
+    store_path, _ = memory_paths(worktree_path)
+    memory_store = store.MemoryStore(store_path)
+    memory_store.initialize()
+    try:
+        memory_store.record_final_context(
+            context, envelope_digest=envelope["content_hash"]
+        )
+    finally:
+        memory_store.close()
+
+
 def _prepare_memory_outcome(
     *,
     task_card: Mapping[str, Any],
@@ -349,12 +546,48 @@ def prepare_lane_memory(
             base_commit=base_commit,
             finalize=accepted,
         )
-        if not accepted or outcome is None or outcome.envelope is None:
+        if not accepted:
             _, envelope_path = memory_paths(worktree_path)
             envelope_path.unlink(missing_ok=True)
             return LaneMemory(state=state, envelope=None, outcome=outcome)
-        _write_envelope(worktree_path, outcome.envelope)
-        return LaneMemory(state=state, envelope=outcome.envelope, outcome=outcome)
+        if outcome is None or not isinstance(outcome.envelope, Mapping):
+            raise MemoryHandoffError(
+                "the accepted plan has no finalized dispatch envelope"
+            )
+        if not isinstance(outcome.context, Mapping):
+            raise MemoryHandoffError(
+                "the accepted plan has no durable finalized context"
+            )
+        envelope = _bind_final_context(
+            outcome.envelope,
+            outcome.context,
+            task_card,
+            require_accepted_handoff(task_card),
+        )
+        validate_envelope_for_launch(
+            envelope=envelope,
+            task_card=task_card,
+            lane_id=lane_id,
+            run_id=run_id,
+            worktree_path=worktree_path,
+            base_commit=base_commit,
+        )
+        validate_final_context_for_launch(
+            context=outcome.context,
+            envelope=envelope,
+            task_card=task_card,
+            lane_id=lane_id,
+            run_id=run_id,
+            worktree_path=worktree_path,
+            base_commit=base_commit,
+        )
+        envelope_path = _write_envelope(worktree_path, envelope)
+        try:
+            _record_bound_final_context(worktree_path, outcome.context, envelope)
+        except Exception:
+            envelope_path.unlink(missing_ok=True)
+            raise
+        return LaneMemory(state=state, envelope=envelope, outcome=outcome)
     except MemoryHandoffError:
         raise
     except Exception as exc:
@@ -400,10 +633,60 @@ def prepare_resume_envelope(
     replenishing the objective's budget.
     """
 
+    validate_resume_handoff(
+        task_card=task_card,
+        lane_id=lane_id,
+        worktree_path=worktree_path,
+        base_commit=base_commit,
+    )
     return prepare_bootstrap_envelope(
         task_card=task_card,
         lane_id=lane_id,
         run_id=run_id,
+        worktree_path=worktree_path,
+        base_commit=base_commit,
+    )
+
+
+def validate_resume_handoff(
+    *,
+    task_card: Mapping[str, Any],
+    lane_id: str,
+    worktree_path: str | Path,
+    base_commit: str,
+    prior_run_id: str | None = None,
+) -> None:
+    """Check the prior accepted artifact before resume can replace it.
+
+    Resume is allowed to create a fresh run envelope only from the same exact
+    accepted task and plan. Reading the prior durable context first exposes a
+    stale or corrupted artifact instead of silently replacing it.
+    """
+
+    if enabled_handoff_state(task_card) != "execution_accepted":
+        if memory_paths(worktree_path)[1].exists():
+            raise MemoryHandoffError(
+                "resume task card changed an accepted lane into a non-dispatchable handoff"
+            )
+        return
+    envelope = load_envelope(worktree_path)
+    if envelope is None:
+        raise MemoryHandoffError("the accepted lane has no prior finalized handoff")
+    validate_envelope_for_launch(
+        envelope=envelope,
+        task_card=task_card,
+        lane_id=lane_id,
+        run_id=prior_run_id or str(envelope.get("run_id") or ""),
+        worktree_path=worktree_path,
+        base_commit=base_commit,
+    )
+    context = load_final_context(worktree_path=worktree_path, envelope=envelope)
+    validate_final_context_for_launch(
+        context=context,
+        envelope=envelope,
+        task_card=task_card,
+        lane_id=lane_id,
+        run_id=prior_run_id or str(envelope.get("run_id") or ""),
         worktree_path=worktree_path,
         base_commit=base_commit,
     )
@@ -467,10 +750,12 @@ def validate_final_context_for_launch(
 ) -> dict[str, Any]:
     """Validate a finalized context against the actual dispatch target."""
 
-    from memory_harness import context as memory_context
-
     plan = require_accepted_handoff(task_card)
     try:
+        if context.get("observed_invocation") is not None:
+            raise MemoryHandoffError("finalized context cannot claim an observed launch")
+        from memory_harness import context as memory_context
+
         memory_context.validate_final_context(
             context,
             envelope=envelope,
@@ -481,7 +766,16 @@ def validate_final_context_for_launch(
             base_commit=base_commit,
             worktree_path=str(worktree_path),
         )
+        fields = _final_context_handoff_fields(context, envelope, task_card, plan)
+        if fields is not None:
+            for field, value in fields.items():
+                if envelope.get(field) != value:
+                    raise MemoryHandoffError(
+                        f"dispatch envelope {field} differs from the durable finalized context"
+                    )
     except PendingPlanError:
+        raise
+    except MemoryHandoffError:
         raise
     except Exception as exc:
         raise MemoryHandoffError(f"invalid finalized context: {exc}") from exc
@@ -518,6 +812,8 @@ def validate_envelope_for_launch(
         from memory_harness import contracts
 
         plan = require_accepted_handoff(task_card)
+        if envelope.get("observed_invocation") is not None:
+            raise MemoryHandoffError("finalized envelope cannot claim an observed launch")
         contracts.validate_envelope(
             envelope,
             task_card=task_card,
@@ -527,6 +823,15 @@ def validate_envelope_for_launch(
             base_commit=base_commit,
             worktree_path=str(worktree_path),
         )
+        if any(field in envelope for field in _HANDOFF_FIELDS):
+            if any(field not in envelope for field in _HANDOFF_FIELDS):
+                raise MemoryHandoffError("dispatch envelope final-context identity is incomplete")
+            if envelope["task"] != task_card["task"]:
+                raise MemoryHandoffError("dispatch envelope task changed")
+            if envelope["plan_revision"] != plan["revision"]:
+                raise MemoryHandoffError("dispatch envelope plan revision changed")
+            if envelope["plan_integrity"] != plan["content_hash"]:
+                raise MemoryHandoffError("dispatch envelope plan integrity changed")
     except PendingPlanError:
         raise
     except MemoryHandoffError:
@@ -556,12 +861,15 @@ def load_final_context(
             "the enhanced dispatch has no durable memory state to validate"
         )
     store = _memory_module("store")
-    memory_store = store.MemoryStore(store_path)
-    memory_store.initialize()
     try:
-        context = memory_store.get_final_context_for_decision(decision_id)
-    finally:
-        memory_store.close()
+        memory_store = store.MemoryStore(store_path)
+        memory_store.initialize()
+        try:
+            context = memory_store.get_final_context_for_decision(decision_id)
+        finally:
+            memory_store.close()
+    except Exception as exc:
+        raise MemoryHandoffError(f"cannot read durable finalized context: {exc}") from exc
     if not isinstance(context, Mapping):
         raise MemoryHandoffError(
             "the enhanced dispatch has no durable finalized context for its decision"
@@ -578,12 +886,204 @@ def _open_runtime(worktree_path: str | Path):
     return memory_store, runtime.MemoryRuntime(memory_store)
 
 
-def worker_environment() -> dict[str, str]:
-    """Return the inherited environment without product control credentials."""
+_PROVIDER_CREDENTIAL_KEYS = {
+    "codex": frozenset({"OPENAI_API_KEY"}),
+    "claude-code": frozenset({"ANTHROPIC_API_KEY"}),
+    "qwen-code": frozenset({"QWEN_API_KEY", "DASHSCOPE_API_KEY", "GEMINI_API_KEY"}),
+}
+
+
+def _task_credential_keys(task_card: Mapping[str, Any] | None) -> frozenset[str]:
+    """Validate declared names; a name cannot prove a token's authority."""
+
+    declared = (task_card or {}).get("worker_task_credentials", [])
+    if not isinstance(declared, list) or any(not isinstance(key, str) for key in declared):
+        raise MemoryHandoffError("worker_task_credentials must list environment names")
+    if len(declared) != len(set(declared)):
+        raise MemoryHandoffError("worker_task_credentials contains duplicate names")
+    for key in declared:
+        if (
+            re.fullmatch(r"TASK_ONLY_[A-Z0-9_]+", key) is None
+            or not _credential_key(key)
+            or _control_credential_key(key)
+        ):
+            raise MemoryHandoffError("worker_task_credentials contains a non-task credential name")
+    return frozenset(declared)
+
+
+def worker_environment(
+    task_card: Mapping[str, Any] | None = None, *, provider_id: str = "codex"
+) -> dict[str, str]:
+    """Return a worker environment without product control credentials.
+
+    A task card supplies credential names but cannot attest the authority of
+    their values.  Withhold them until a separate validated channel exists;
+    actions that require them must stop. Provider model-auth keys are separate
+    from task authority.
+    """
 
     from memory_harness import privacy
 
-    return privacy.worker_environment(os.environ)
+    inherited = privacy.worker_environment(os.environ)
+    _task_credential_keys(task_card)
+    allowed_provider = _PROVIDER_CREDENTIAL_KEYS.get(provider_id, frozenset())
+    forbidden = {
+        key: value for key, value in os.environ.items()
+        if _control_credential_key(key) and isinstance(value, str) and value
+    }
+    return {
+        key: value for key, value in inherited.items()
+        if not _control_credential_key(key)
+        and value not in forbidden.values()
+        and (not _credential_key(key) or key in allowed_provider)
+    }
+
+
+_CONTROL_AUTHORITY_WORDS = frozenset({
+    "APPROVAL", "APPROVE", "PUBLICATION", "PUBLISH", "REVOCATION",
+    "REVOKE", "POLICY", "CONTROL",
+})
+_CREDENTIAL_WORDS = frozenset({
+    "TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "CREDENTIALS", "AUTH", "ASKPASS",
+})
+
+
+def _credential_key(key: str) -> bool:
+    return bool(set(re.split(r"[^A-Z0-9]+", key.upper())) & _CREDENTIAL_WORDS)
+
+
+def _control_credential_key(key: str) -> bool:
+    words = set(re.split(r"[^A-Z0-9]+", key.upper()))
+    if not _credential_key(key):
+        return False
+    if words & _CONTROL_AUTHORITY_WORDS:
+        return True
+    return key.upper().startswith("MEMORY_HARNESS_") and not key.upper().startswith(
+        "MEMORY_HARNESS_TASK_ONLY_"
+    )
+
+
+def redact_control_diagnostic(message: str) -> str:
+    """Never echo a ROOT control credential through launch diagnostics."""
+
+    values = sorted(
+        {
+            value for key, value in os.environ.items()
+            if _control_credential_key(key) and isinstance(value, str) and value
+        },
+        key=len,
+        reverse=True,
+    )
+    for value in values:
+        message = message.replace(value, "[REDACTED]")
+    return message
+
+
+def validate_worker_material(
+    *, worktree_path: str | Path, invocation: Mapping[str, Any],
+    environment: Mapping[str, str], task_card: Mapping[str, Any] | None = None,
+) -> None:
+    """Check the actual restricted worker inputs before recording an intent.
+
+    The prompt and provider tool configuration may not embed a product
+    control credential from the ROOT environment.  Report only the artifact
+    name: a refusal must not echo the credential into launch diagnostics.
+    """
+
+    worktree = Path(worktree_path)
+    workspace = worktree / ".agent-workspace"
+    prompt = workspace / "worker-prompt.md"
+    if not prompt.is_file():
+        raise MemoryHandoffError("restricted worker prompt is missing")
+    forbidden = {
+        key: value for key, value in os.environ.items()
+        if _control_credential_key(key) and isinstance(value, str) and value
+    }
+    if any(_control_credential_key(key) for key in environment):
+        raise MemoryHandoffError("restricted worker environment has product control authority")
+    if any(value in environment.values() for value in forbidden.values()):
+        raise MemoryHandoffError("restricted worker environment aliases product control authority")
+    _task_credential_keys(task_card)
+    provider_id = invocation.get("provider", {}).get("id")
+    allowed_provider = _PROVIDER_CREDENTIAL_KEYS.get(provider_id, frozenset())
+    if any(
+        _credential_key(key) and key not in allowed_provider
+        for key in environment
+    ):
+        raise MemoryHandoffError("restricted worker environment has an undeclared credential")
+    artifacts = [
+        prompt,
+        workspace / "invocation.json",
+        worktree / ".codex" / "config.toml",
+        worktree / ".codex" / "mcp.json",
+        worktree / ".claude" / "settings.json",
+        worktree / ".claude" / "settings.local.json",
+        worktree / ".qwen" / "settings.json",
+    ]
+    if provider_id == "codex":
+        artifacts.append(
+            Path(environment.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+        )
+    elif provider_id == "claude-code":
+        artifacts.append(
+            Path(environment.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+            / "settings.json"
+        )
+    elif provider_id == "qwen-code":
+        artifacts.append(Path.home() / ".qwen" / "settings.json")
+    for artifact in artifacts:
+        if not artifact.is_file():
+            continue
+        try:
+            contents = artifact.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise MemoryHandoffError(
+                f"restricted worker material is unreadable: {artifact.name}"
+            ) from exc
+        configured_control = any(
+            _control_credential_key(match.group(1))
+            for match in re.finditer(
+                r"(?im)[\"']?([A-Za-z][A-Za-z0-9_-]+)[\"']?\s*[:=]",
+                contents,
+            )
+        )
+        try:
+            config = (
+                tomllib.loads(contents)
+                if artifact.suffix == ".toml"
+                else json.loads(contents) if artifact.suffix == ".json" else None
+            )
+        except (ValueError, TypeError) as exc:
+            raise MemoryHandoffError(
+                f"restricted worker configuration is invalid: {artifact.name}"
+            ) from exc
+        tool_authority = _control_tool_config(config)
+        if (
+            any(key in contents or value in contents for key, value in forbidden.items())
+            or configured_control
+            or (artifact != prompt and tool_authority)
+        ):
+            raise MemoryHandoffError(
+                f"restricted worker material contains product control authority: {artifact.name}"
+            )
+    if invocation.get("env") != {}:
+        raise MemoryHandoffError("restricted invocation declares an unexpected environment")
+
+
+def _control_tool_config(config: Any) -> bool:
+    """Recognize control actions in a provider's external-tool settings."""
+
+    if not isinstance(config, Mapping):
+        return False
+    for key, value in config.items():
+        name = str(key).lower()
+        if "mcp" in name or name == "tools":
+            rendered = json.dumps(value, sort_keys=True).lower()
+            if any(word.lower() in rendered for word in _CONTROL_AUTHORITY_WORDS):
+                return True
+        if _control_tool_config(value):
+            return True
+    return False
 
 
 def dispatch(
@@ -609,11 +1109,141 @@ def record_dispatch_intent(
 
     memory_store, memory_runtime = _open_runtime(worktree_path)
     try:
-        return memory_runtime.record_dispatch_intent(envelope)
+        existing = _dispatch_operation(memory_store, envelope)
+        if existing is not None:
+            raise MemoryHandoffError(
+                f"{existing['status']} dispatch intent already exists; reconcile exact native ownership"
+            )
+        intent = memory_runtime.record_dispatch_intent(envelope)
+        confirmed = _dispatch_operation(memory_store, envelope)
+        if confirmed is None or confirmed["operation_id"] != intent["operation_id"] or confirmed["status"] != "pending":
+            raise MemoryHandoffError("dispatch intent was not durably confirmed")
+        return confirmed
+    except MemoryHandoffError:
+        raise
     except Exception as exc:
         raise MemoryHandoffError(f"cannot record dispatch intent: {exc}") from exc
     finally:
         memory_store.close()
+
+
+def _dispatch_operation(memory_store: Any, envelope: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Find the one intent for this run; reject changed decisions/envelopes.
+
+    Lane 1's current public selector is decision-scoped.  Read the existing
+    operation table for a run conflict until its joined run selector lands;
+    this creates no second receipt or state owner.
+    """
+
+    from memory_harness import contracts
+
+    expected = contracts.make_operation(kind="dispatch", envelope=envelope)
+    rows = memory_store._require_connection().execute(
+        "SELECT operation_id FROM operations WHERE kind = 'dispatch' AND run_id = ?",
+        (envelope["run_id"],),
+    ).fetchall()
+    if any(row["operation_id"] != expected["operation_id"] for row in rows):
+        raise MemoryHandoffError(
+            "conflicting dispatch ownership exists for this lane and run"
+        )
+    matches = [
+        operation for operation in memory_store.list_operations(envelope["decision_id"])
+        if operation["kind"] == "dispatch" and operation["run_id"] == envelope["run_id"]
+    ]
+    if any(operation["operation_id"] != expected["operation_id"] for operation in matches):
+        raise MemoryHandoffError(
+            "conflicting dispatch ownership exists for this decision and run"
+        )
+    return matches[0] if matches else None
+
+
+def get_dispatch_operation(
+    *, worktree_path: str | Path, envelope: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    memory_store, _ = _open_runtime(worktree_path)
+    try:
+        return _dispatch_operation(memory_store, envelope)
+    except MemoryHandoffError:
+        raise
+    except Exception as exc:
+        raise MemoryHandoffError(f"cannot read dispatch intent: {exc}") from exc
+    finally:
+        memory_store.close()
+
+
+def get_dispatch_decision(
+    *, worktree_path: str | Path, envelope: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Read the exact durable decision in the existing optional store.
+
+    The store exposes a SQL row without its contract schema. On same-decision
+    preparation replay it updates the hash and update time while keeping the
+    first insertion time. The latest canonical decision uses that update time.
+    """
+    from memory_harness import contracts
+
+    memory_store, _ = _open_runtime(worktree_path)
+    try:
+        row = memory_store.get_decision(str(envelope["decision_id"]))
+        decision = {
+            "schema": "memory-decision/v1",
+            **{field: row[field] for field in (
+                "decision_id", "task_card_digest", "objective_id", "route",
+                "plan_id", "plan_state", "plan_digest", "strategy",
+                "configuration", "configuration_digest", "state",
+                "content_hash",
+            )},
+            "created_at": row["updated_at"],
+        }
+        contracts.validate_decision(decision)
+        return decision
+    except Exception as exc:
+        raise MemoryHandoffError(f"cannot read exact dispatch decision: {exc}") from exc
+    finally:
+        memory_store.close()
+
+
+def native_observation(
+    *, envelope: Mapping[str, Any], context: Mapping[str, Any],
+    controller_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind one observed controller incarnation to the accepted dispatch."""
+
+    pid = controller_identity.get("pid")
+    creation = controller_identity.get("creation_time")
+    if not isinstance(pid, int) or pid <= 0 or not isinstance(creation, str) or not creation:
+        raise MemoryHandoffError("observed controller has no exact process identity")
+    return {
+        **dispatch_binding(envelope=envelope, context=context),
+        "invocation_id": f"controller:{pid}:{creation}",
+        "pid": pid,
+        "creation_time": creation,
+    }
+
+
+def dispatch_binding(
+    *, envelope: Mapping[str, Any], context: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Identity the controller invocation must carry before native spawn."""
+
+    context_id = context.get("context_id")
+    context_digest = context.get("content_hash")
+    if not isinstance(context_id, str) or not context_id or not isinstance(context_digest, str) or not context_digest:
+        raise MemoryHandoffError("dispatch has no exact final context")
+    return {
+        "task_card_digest": envelope["task_card_digest"],
+        "decision_id": envelope["decision_id"],
+        "plan_id": envelope["plan_id"],
+        "plan_digest": envelope["plan_digest"],
+        "context_id": context_id,
+        "context_digest": context_digest,
+        "envelope_digest": envelope["content_hash"],
+        "lane_id": envelope["lane_id"],
+        "run_id": envelope["run_id"],
+        "base_commit": envelope["base_commit"],
+        "route": envelope["route"],
+        "configuration_digest": envelope["configuration_digest"],
+    }
 
 
 def record_observed_invocation(
@@ -628,12 +1258,31 @@ def record_observed_invocation(
 
     memory_store, _ = _open_runtime(worktree_path)
     try:
+        context = load_final_context(worktree_path=worktree_path, envelope=envelope)
+        expected = native_observation(
+            envelope=envelope,
+            context=context,
+            controller_identity=observed_invocation,
+        )
+        if dict(observed_invocation) != expected:
+            raise MemoryHandoffError("observed native invocation does not match the exact dispatch")
+        existing = _dispatch_operation(memory_store, envelope)
+        if existing is None:
+            raise MemoryHandoffError("observed invocation has no durable dispatch intent")
+        if existing["status"] == "delivered":
+            if existing["observed_invocation"] != expected:
+                raise MemoryHandoffError("a conflicting native invocation already owns this dispatch")
+            return existing
         operation = contracts.make_operation(
             kind="dispatch",
             envelope=envelope,
             status="delivered",
             observed_invocation=observed_invocation,
         )
+        if existing["status"] == "ambiguous":
+            return _memory_module("runtime").MemoryRuntime(memory_store).reconcile_ambiguous_dispatch(
+                envelope, observed_invocation
+            )
         return memory_store.record_operation(operation)
     finally:
         memory_store.close()
@@ -661,7 +1310,16 @@ def record_ambiguous_dispatch(
 def omit_optional_content(
     *, worktree_path: str | Path, envelope: Mapping[str, Any], item_id: str
 ) -> dict[str, Any]:
-    """Omit one optional item and write the corrected delivery trace."""
+    """Omit legacy optional content; enriched finalization owns its own trace."""
+
+    persisted = load_envelope(worktree_path)
+    if any(field in envelope for field in _HANDOFF_FIELDS) or (
+        persisted is not None and any(field in persisted for field in _HANDOFF_FIELDS)
+    ):
+        raise MemoryHandoffError(
+            "final freshness omission for enriched context must run through the "
+            "domain finalizer before publishing a new handoff"
+        )
 
     memory_store, memory_runtime = _open_runtime(worktree_path)
     try:
@@ -677,16 +1335,19 @@ __all__ = [
     "MemoryHandoffError",
     "PendingPlanError",
     "dispatch",
+    "dispatch_binding",
     "enabled_handoff_state",
     "finalize_envelope",
     "handoff_from_task_card",
     "handoff_plan",
     "handoff_plan_state",
+    "get_dispatch_operation",
     "lane_handoff_state",
     "prepare_lane_memory",
     "load_envelope",
     "load_final_context",
     "memory_paths",
+    "native_observation",
     "omit_optional_content",
     "plan_state_summary",
     "prepare_bootstrap_envelope",
@@ -694,9 +1355,12 @@ __all__ = [
     "record_ambiguous_dispatch",
     "record_dispatch_intent",
     "record_observed_invocation",
+    "redact_control_diagnostic",
     "require_accepted_handoff",
     "validate_envelope_for_launch",
     "validate_final_context_for_launch",
+    "validate_resume_handoff",
     "validate_task_card",
+    "validate_worker_material",
     "worker_environment",
 ]
