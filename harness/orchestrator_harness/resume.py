@@ -293,6 +293,14 @@ def run_resume(
                 "evidence_paths": [],
                 "next_action": "supply a valid project-task-card/v1 resume card",
             }
+        declared_environment = task_card.get("worker_environment")
+        if (
+            lane.get("worker_environment") == "scrubbed"
+            and declared_environment != "scrubbed"
+        ):
+            raise memory_handoff.MemoryHandoffError(
+                "resume task card cannot weaken the lane's durable scrubbed worker environment"
+            )
 
         prior_run_id = str(lane.get("run_id") or "")
         recorded_memory_state = lane.get("memory_plan_state")
@@ -518,6 +526,13 @@ def run_resume(
                 raise memory_handoff.MemoryHandoffError(
                     "lane run or status changed before fresh run ownership"
                 )
+            if (
+                current.get("worker_environment") == "scrubbed"
+                and declared_environment != "scrubbed"
+            ):
+                raise memory_handoff.MemoryHandoffError(
+                    "resume task card cannot weaken the lane's durable scrubbed worker environment"
+                )
             return {
                 **current,
                 "run_id": run_id,
@@ -527,6 +542,11 @@ def run_resume(
                 "acceptance_advancement": None,
                 "last_reported_actionable_status": None,
                 "resume_from_run_id": prior_run_id,
+                **(
+                    {"worker_environment": declared_environment}
+                    if declared_environment is not None
+                    else {}
+                ),
                 **(
                     {
                         "memory_plan_state": memory.state,

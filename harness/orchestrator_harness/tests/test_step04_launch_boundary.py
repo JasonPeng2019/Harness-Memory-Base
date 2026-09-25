@@ -1712,6 +1712,85 @@ class Step04ResumeBoundaryTests(unittest.TestCase):
         self.assertFalse(envelope_path.exists())
         self.assertTrue((worktree / ".agent-workspace" / "invocation.json").is_file())
 
+    def test_resume_of_legacy_lane_durably_strengthens_scrubbed_boundary(self) -> None:
+        card = legacy_card()
+        prepared, worktree = self.fixture.run_bootstrap(
+            lane_id="resume-legacy-scrubbed", card=card
+        )
+        self.assertTrue(prepared["ok"], prepared)
+        self.assertNotIn("worker_environment", self.fixture.lane_record("resume-legacy-scrubbed"))
+        self.fixture.make_resumable("resume-legacy-scrubbed")
+        scrubbed_card = {**card, "worker_environment": "scrubbed"}
+        scrubbed_card["content_hash"] = contracts.content_hash(scrubbed_card)
+
+        resumed = self.fixture.run_resume(
+            lane_id="resume-legacy-scrubbed", card=scrubbed_card
+        )
+        self.assertTrue(resumed["ok"], resumed)
+        self.assertEqual("RESUME_OK", resumed["code"])
+        lane = self.fixture.lane_record("resume-legacy-scrubbed")
+        workspace = worktree / ".agent-workspace"
+        copied_card = json.loads((workspace / "task-card.json").read_text(encoding="utf-8"))
+        invocation = json.loads((workspace / "invocation.json").read_text(encoding="utf-8"))
+        self.assertEqual("scrubbed", lane.get("worker_environment"))
+        self.assertEqual("scrubbed", copied_card["worker_environment"])
+        self.assertEqual(scrubbed_card, copied_card)
+        self.assertEqual(lane["run_id"], invocation["run_id"])
+        self.assertIsNone(invocation.get("dispatch_binding"))
+        self.assertFalse(self.fixture.memory_paths(worktree)[0].exists())
+
+        launched, spawn = self.fixture.run_launch(lane_id="resume-legacy-scrubbed")
+        self.assertTrue(launched["ok"], launched)
+        spawn.assert_called_once()
+        self.assertIsInstance(spawn.call_args.kwargs.get("env"), dict)
+        self.fixture.write_text(
+            worktree / ".codex" / "config.toml",
+            '[mcp_servers.prod]\ncommand = "productctl"\nargs = ["approve"]\n',
+        )
+        with patch.dict(os.environ, spawn.call_args.kwargs["env"], clear=True):
+            with self.assertRaises(controller.ControllerError) as rejected:
+                controller._validate_enhanced_dispatch(
+                    self.fixture.lane_record("resume-legacy-scrubbed"), invocation
+                )
+        self.assertEqual(controller.LAUNCH_INVOCATION_INVALID, rejected.exception.code)
+
+    def test_resume_cannot_weaken_a_durable_scrubbed_boundary(self) -> None:
+        scrubbed_card = legacy_card()
+        scrubbed_card["worker_environment"] = "scrubbed"
+        scrubbed_card["content_hash"] = contracts.content_hash(scrubbed_card)
+        prepared, worktree = self.fixture.run_bootstrap(
+            lane_id="resume-scrubbed", card=scrubbed_card
+        )
+        self.assertTrue(prepared["ok"], prepared)
+        self.fixture.make_resumable("resume-scrubbed")
+        prior = self.fixture.lane_record("resume-scrubbed")
+
+        resumed = self.fixture.run_resume(
+            lane_id="resume-scrubbed", card=legacy_card()
+        )
+        self.assertFalse(resumed["ok"], resumed)
+        self.assertEqual(prior["run_id"], self.fixture.lane_record("resume-scrubbed")["run_id"])
+        self.assertEqual("scrubbed", self.fixture.lane_record("resume-scrubbed")["worker_environment"])
+        copied = json.loads(
+            (worktree / ".agent-workspace" / "task-card.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual("scrubbed", copied["worker_environment"])
+
+    def test_resume_of_all_off_lane_keeps_optional_memory_absent(self) -> None:
+        card, _ = accepted_card(configuration={"all_features": False})
+        prepared, worktree = self.fixture.run_bootstrap(
+            lane_id="resume-all-off", card=card
+        )
+        self.assertTrue(prepared["ok"], prepared)
+        self.fixture.make_resumable("resume-all-off")
+
+        resumed = self.fixture.run_resume(lane_id="resume-all-off", card=card)
+        self.assertTrue(resumed["ok"], resumed)
+        self.assertNotIn("worker_environment", self.fixture.lane_record("resume-all-off"))
+        store_path, envelope_path = self.fixture.memory_paths(worktree)
+        self.assertFalse(store_path.exists())
+        self.assertFalse(envelope_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
