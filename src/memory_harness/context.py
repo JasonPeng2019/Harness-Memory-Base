@@ -228,6 +228,10 @@ def finalize_context(
         recheck: Mapping[str, Any] | None = None
         if missing_identity:
             recheck = contracts.make_final_source_recheck(item=original, status="ineligible")
+        elif selected_item.get("freshness") == "frozen" and source_owner_recheck is None:
+            # A legacy generic callback can recheck live guidance, but cannot
+            # establish an immutable source-owner contract for frozen guidance.
+            recheck = contracts.make_final_source_recheck(item=original, status="unavailable")
         elif (source_owner_recheck is not None or source_recheck is not None) and selected_item.get("source_id"):
             try:
                 callback = source_owner_recheck or source_recheck
@@ -241,18 +245,33 @@ def finalize_context(
             else:
                 recheck = observed
             if not isinstance(recheck, Mapping):
-                raise OptionalItemError(f"final source recheck is invalid for {item_id}")
+                if selected_item.get("freshness") != "frozen":
+                    raise OptionalItemError(f"final source recheck is invalid for {item_id}")
+                recheck = contracts.make_final_source_recheck(item=original, status="ineligible")
             try:
                 contracts.validate_final_source_recheck(recheck, item=original)
             except (contracts.ContractError, TypeError, ValueError) as exc:
-                raise OptionalItemError(f"final source recheck is invalid for {item_id}: {exc}") from exc
-            if recheck["status"] == "frozen":
+                if selected_item.get("freshness") != "frozen":
+                    raise OptionalItemError(f"final source recheck is invalid for {item_id}: {exc}") from exc
+                recheck = contracts.make_final_source_recheck(item=original, status="ineligible")
+            if selected_item.get("freshness") == "frozen" and recheck["status"] == "frozen":
                 expected = {"source_id": original["source_id"],
                             "revision_id": original["revision_id"],
                             "content_digest": contracts.sha256_hex(original["content"])}
                 if not isinstance(owner_proof, Mapping) or owner_proof.get("frozen_contract") != expected:
-                    raise OptionalItemError(f"frozen source proof is invalid for {item_id}")
-                selected_item["frozen_contract"] = expected
+                    recheck = contracts.make_final_source_recheck(
+                        item=original, status="ineligible",
+                        observed_revision_id=recheck["observed_revision_id"],
+                        observed_content_digest=recheck["observed_content_digest"],
+                    )
+                else:
+                    selected_item["frozen_contract"] = expected
+            elif selected_item.get("freshness") == "frozen" and recheck["status"] == "eligible":
+                recheck = contracts.make_final_source_recheck(
+                    item=original, status="ineligible",
+                    observed_revision_id=recheck["observed_revision_id"],
+                    observed_content_digest=recheck["observed_content_digest"],
+                )
             if recheck["status"] in {"eligible", "frozen"} and isinstance(owner_proof, Mapping):
                 representation = owner_proof.get("compact_representation")
                 approval = owner_proof.get("compact_approval")

@@ -313,8 +313,9 @@ def _validate_delivery_trace(
                     and recheck["content_digest"] != item["content_digest"]):
                 raise ContractError("finalized delivery content differs from rechecked source")
             frozen = item["provenance"].get("frozen_contract")
-            if recheck["status"] == "frozen" and (
-                item["provenance"].get("freshness") != "frozen"
+            if (recheck["status"] == "frozen" or item["provenance"].get("freshness") == "frozen") and (
+                recheck["status"] != "frozen"
+                or item["provenance"].get("freshness") != "frozen"
                 or frozen != {
                     "source_id": recheck["source_id"],
                     "revision_id": recheck["revision_id"],
@@ -322,6 +323,8 @@ def _validate_delivery_trace(
                 }
             ):
                 raise ContractError("finalized frozen source lacks its explicit contract")
+        elif item["provenance"].get("freshness") == "frozen":
+            raise ContractError("finalized frozen source lacks its final owner recheck")
     for item in omitted:
         if not isinstance(item.get("reason"), str) or not item["reason"].strip():
             raise ContractError("finalized delivery omission requires a reason")

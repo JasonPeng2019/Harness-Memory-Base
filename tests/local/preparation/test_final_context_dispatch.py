@@ -694,14 +694,14 @@ class FinalContextDispatchTests(unittest.TestCase):
             "final recheck: unavailable",
             self._finalize(optional_items=[item]).omissions[0]["reason"],
         )
-        with self.assertRaises(context.OptionalItemError):
-            self._finalize(optional_items=[item], source_recheck=lambda selected: {
-                "recheck": contracts.make_final_source_recheck(
-                    item=selected, status="frozen", observed_revision_id="r1",
-                    observed_content_digest=proof["content_digest"],
-                ),
-                "owner_proof": {"frozen_contract": proof},
-            })
+        generic_claim = self._finalize(optional_items=[item], source_recheck=lambda selected: {
+            "recheck": contracts.make_final_source_recheck(
+                item=selected, status="frozen", observed_revision_id="r1",
+                observed_content_digest=proof["content_digest"],
+            ),
+            "owner_proof": {"frozen_contract": proof},
+        })
+        self.assertEqual("final recheck: unavailable", generic_claim.omissions[0]["reason"])
         candidate = contracts.make_candidate(
             kind="historical_evidence", logical_id="case", revision_id="r1",
             origin="cases", source_id="cases", payload=payload,
@@ -737,6 +737,69 @@ class FinalContextDispatchTests(unittest.TestCase):
                 self.assertEqual([], rejected.context["optional_content"])
                 self.assertEqual("final recheck: ineligible",
                                  rejected.context["delivery_trace"]["omitted"][0]["reason"])
+
+    def test_declared_frozen_rejects_generic_exact_eligible_recheck(self) -> None:
+        item = {"id": "frozen-case", "kind": "historical_evidence",
+                "source_id": "cases", "revision_id": "r1", "freshness": "frozen",
+                "content": {"summary": "immutable evidence"}}
+        eligible = lambda selected: contracts.make_final_source_recheck(
+            item=selected, status="eligible", observed_revision_id="r1",
+            observed_content_digest=contracts.sha256_hex(item["content"]),
+        )
+        result = self._finalize(optional_items=[item], source_recheck=eligible)
+        self.assertEqual([], result.context["optional_content"])
+        trace = result.context["delivery_trace"]
+        self.assertEqual([], trace["packed"])
+        self.assertEqual([], trace["context_delivered"])
+        self.assertEqual("final recheck: unavailable", trace["omitted"][0]["reason"])
+        self.assertEqual("unavailable", trace["selected"][0]["provenance"]["final_recheck"]["status"])
+        with self.assertRaisesRegex(context.PlanAffectingFreshnessError, "cases.*r1.*ROOT"):
+            self._finalize(optional_items=[item], source_recheck=eligible,
+                           selected_provenance={"frozen-case": {"plan_affecting": True}})
+        proof = {"source_id": "cases", "revision_id": "r1",
+                 "content_digest": contracts.sha256_hex(item["content"])}
+        owner_eligible = self._finalize(optional_items=[item], source_owner_recheck=lambda selected: {
+            "recheck": eligible(selected), "owner_proof": {"frozen_contract": proof},
+        })
+        self.assertEqual("final recheck: ineligible", owner_eligible.omissions[0]["reason"])
+        malformed = self._finalize(optional_items=[item], source_owner_recheck=lambda selected: {
+            "recheck": contracts.make_final_source_recheck(
+                item=selected, status="frozen", observed_revision_id="r1",
+                observed_content_digest=proof["content_digest"],
+            ),
+            "owner_proof": {"frozen_contract": {"source_id": "cases"}},
+        })
+        self.assertEqual("final recheck: ineligible", malformed.omissions[0]["reason"])
+        wrong_identity = self._finalize(optional_items=[item], source_owner_recheck=lambda selected: {
+            "recheck": contracts.make_final_source_recheck(
+                item={**selected, "id": "other-case"}, status="frozen",
+                observed_revision_id="r1", observed_content_digest=proof["content_digest"],
+            ),
+            "owner_proof": {"frozen_contract": proof},
+        })
+        self.assertEqual("final recheck: ineligible", wrong_identity.omissions[0]["reason"])
+        owner_frozen = self._finalize(optional_items=[item], source_owner_recheck=lambda selected: {
+            "recheck": contracts.make_final_source_recheck(
+                item=selected, status="frozen", observed_revision_id="r1",
+                observed_content_digest=proof["content_digest"],
+            ),
+            "owner_proof": {"frozen_contract": proof},
+        })
+        self.assertEqual(["frozen-case"], owner_frozen.context["optional_items"])
+        forged = deepcopy(owner_frozen.context)
+        for section in ("selected", "packed", "context_delivered"):
+            descriptor = forged["delivery_trace"][section][0]
+            recheck = descriptor["provenance"]["final_recheck"]
+            recheck["status"] = "eligible"
+            recheck["content_hash"] = contracts.content_hash(recheck)
+            descriptor["provenance_digest"] = contracts.sha256_hex(descriptor["provenance"])
+        forged["integrity"] = contracts._final_context_integrity(forged)
+        forged["context_id"] = contracts._final_context_id(forged)
+        forged["content_hash"] = contracts.content_hash(forged)
+        with self.assertRaisesRegex(contracts.ContractError, "frozen"):
+            contracts.validate_finalized_context(forged)
+        live = self._finalize(optional_items=[{**item, "freshness": "live"}], source_recheck=eligible)
+        self.assertEqual(["frozen-case"], live.context["optional_items"])
 
     def test_final_live_recheck_uses_full_search_eligibility_gate(self) -> None:
         payload = {"summary": "current case"}
