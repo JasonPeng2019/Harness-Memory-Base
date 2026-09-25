@@ -403,6 +403,30 @@ def make_native_apc_launcher(
                 # A child for this exact request may already exist; never
                 # blindly relaunch over it.
                 return None
+            effects = queued.get("attempt_effects")
+            if isinstance(effects, Mapping) and effects.get("rollback_proven") is not True:
+                owns_identity = bool(effects.get("worktree_created")) or bool(
+                    effects.get("lane_record_written")
+                )
+                if owns_identity:
+                    # The harness could not prove its attempt was rolled back,
+                    # so the exact lane or worktree may still exist: keep that
+                    # ownership visible instead of a terminal refusal.
+                    return _unresolved_phase(
+                        "bootstrap",
+                        lane_id,
+                        binding=binding,
+                        worktree=(
+                            str(effects.get("worktree_path"))
+                            if effects.get("worktree_path")
+                            else None
+                        ),
+                        acknowledgement=(
+                            "the product harness could not queue the child "
+                            f"lane ({code}: {queued.get('summary')}) and its "
+                            "attempt worktree could not be proven rolled back"
+                        ),
+                    )
             raise ApcChildUnavailableError(
                 f"the product harness could not queue the child lane: {code}: "
                 f"{queued.get('summary')}"
@@ -608,13 +632,15 @@ def make_native_apc_launcher(
         binding: Mapping[str, Any],
         lane: Mapping[str, Any] | None = None,
         cleanup: Mapping[str, Any] | None = None,
+        worktree: str | None = None,
         acknowledgement: str | None = None,
     ) -> dict[str, Any]:
         """Return the exact unresolved observation for one expired phase.
 
-        The lane identity (and the run identity when the harness already
-        recorded it) is the ownership evidence the accepted reconciliation
-        path keeps visible; no retry may blindly relaunch it.
+        The lane identity, the exact worktree path when the harness may still
+        own one, and the run identity already recorded by the harness are the
+        ownership evidence the accepted reconciliation path keeps visible; no
+        retry may blindly relaunch it.
         """
 
         observation: dict[str, Any] = {
@@ -630,6 +656,8 @@ def make_native_apc_launcher(
                 observation["run_id"] = str(run_id)
         if cleanup is not None:
             observation["cleanup"] = dict(cleanup)
+        if worktree:
+            observation["worktree_path"] = str(worktree)
         return observation
 
     def _retire(lane_id: str, *, attempt_deadline: float) -> dict[str, Any]:

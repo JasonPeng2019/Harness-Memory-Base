@@ -221,7 +221,7 @@ def run_apc_child(
                 or ("lost" if observed is None else "unreadable")
             )
         }
-        for key in ("phase", "lane_id", "run_id"):
+        for key in ("phase", "lane_id", "run_id", "worktree_path"):
             value = details.get(key)
             if isinstance(value, str) and value:
                 launch_intent[key] = value

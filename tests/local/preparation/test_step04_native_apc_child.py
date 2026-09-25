@@ -1505,5 +1505,155 @@ class NativeApcChildTests(unittest.TestCase):
             "prepared", self.fixture.lane_lookup("late-stop-lane")["lifecycle"]
         )
 
+    # -- the remaining reviewed bootstrap defects ---------------------------
+
+    def test_slow_bootstrap_preflight_cannot_renew_the_caller_cutoff(self) -> None:
+        """A slow provider validation cannot renew the caller's one cutoff.
+
+        The allowance is the enclosing attempt's remaining time, so it is
+        captured when the call enters.  Validating the provider launch config
+        afterwards may itself run long; that must leave the call expired
+        instead of minting a fresh allowance that starts a late worktree.
+        """
+
+        card = contracts.make_task_card(
+            task="restricted drafting child", base_commit="test-base"
+        )
+        card["worker_environment"] = "scrubbed"
+        card_path = (
+            self.fixture.root / "late-cards" / "slow-preflight-lane.task-card.json"
+        )
+        card_path.parent.mkdir(parents=True, exist_ok=True)
+        card_path.write_text(
+            json.dumps(card, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        worktree_add = MagicMock()
+        real_validate = bootstrap._validate_provider_launch_config
+
+        def slow_validate(*args, **kwargs):
+            time.sleep(0.2)
+            return real_validate(*args, **kwargs)
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            with patch.object(
+                bootstrap,
+                "_validate_provider_launch_config",
+                side_effect=slow_validate,
+            ):
+                with patch.object(bootstrap, "_git_worktree_add", worktree_add):
+                    queued = bootstrap.run_bootstrap(
+                        lane_id="slow-preflight-lane",
+                        provider=BINDING["provider"],
+                        model=BINDING["model"],
+                        launch_config={"reasoning_effort": BINDING["effort"]},
+                        exclusive_resources=[],
+                        task_card_path=str(card_path),
+                        allowance_seconds=0.05,
+                    )
+
+        self.assertFalse(queued.get("ok"), queued)
+        self.assertEqual("BOOTSTRAP_ALLOWANCE_EXPIRED", queued.get("code"))
+        self.assertIn("expired before the lane worktree", queued.get("summary", ""))
+        worktree_add.assert_not_called()
+        worktree = (
+            self.fixture.runtime
+            / "worktrees"
+            / self.fixture.EPOCH
+            / "slow-preflight-lane"
+        )
+        self.assertFalse(worktree.exists())
+        effects = queued.get("attempt_effects") or {}
+        self.assertIs(False, effects.get("worktree_created"))
+        self.assertIs(False, effects.get("lane_record_written"))
+        self.assertIs(True, effects.get("rollback_proven"))
+
+    def test_unproven_bootstrap_rollback_stays_unresolved_not_terminal(self) -> None:
+        """An unproven bootstrap rollback keeps exact ownership unresolved.
+
+        The queue really created the child worktree before its preparation
+        failed, and the attempt's rollback could not be proven; the exact lane
+        and worktree identity must stay visible on the durable operation as
+        unresolved, and a later attempt must reconcile it instead of a
+        terminal refusal or a blind relaunch.
+        """
+
+        request = apc.make_apc_request(
+            template={
+                "template_id": "template-6",
+                "version": 1,
+                "allowed_edits": ["bindings"],
+            },
+            parent_decision_id="decision-6",
+            parent_objective_id="objective-1",
+            permitted_edits=["bindings"],
+            binding=BINDING,
+        )
+        lane_id = "apc-child-" + str(request["content_hash"])[:12]
+        worktree = (
+            self.fixture.runtime / "worktrees" / self.fixture.EPOCH / lane_id
+        )
+
+        def failed_memory_prepare(*args, **kwargs):
+            raise RuntimeError(
+                "memory preparation failed after the worktree existed"
+            )
+
+        template_record = {
+            "template_id": "template-6",
+            "fixed_steps": [],
+            "verification_intent": "verify",
+        }
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            with patch.object(
+                bootstrap.memory_handoff,
+                "prepare_lane_memory",
+                side_effect=failed_memory_prepare,
+            ):
+                with self.assertRaises(
+                    harness_bridge.ApcChildAmbiguityError
+                ) as caught:
+                    harness_bridge.run_apc_child(
+                        request=request,
+                        template_record=template_record,
+                        launcher=self._launcher(),
+                        store=self.memory_store,
+                        limits=self.limits,
+                        clock=self.clock,
+                        deadline=self.clock() + 240.0,
+                    )
+                self.assertIn("reconcile the exact child", str(caught.exception))
+                self.assertEqual([lane_id], self.fixture.bootstrap_calls)
+
+                # The unproven child stays exact and unresolved: a later
+                # attempt must reconcile it, never relaunch it blindly.
+                with self.assertRaises(
+                    harness_bridge.ApcChildAmbiguityError
+                ) as retry_caught:
+                    harness_bridge.run_apc_child(
+                        request=request,
+                        template_record=template_record,
+                        launcher=self._launcher(),
+                        store=self.memory_store,
+                        limits=self.limits,
+                        clock=self.clock,
+                        deadline=self.clock() + 240.0,
+                    )
+                self.assertIn("already exists", str(retry_caught.exception))
+                self.assertEqual([lane_id], self.fixture.bootstrap_calls)
+
+        operations = self.memory_store.list_apc_child_operations("decision-6")
+        self.assertEqual(
+            ["ambiguous"], [operation["status"] for operation in operations]
+        )
+        ambiguous = operations[-1]
+        self.assertIn("ambiguous", contracts.APC_CHILD_UNRESOLVED_STATUSES)
+        self.assertIsNone(ambiguous.get("observed_invocation"))
+        # The exact unresolved ownership: the phase, lane, and worktree the
+        # product harness may still own stay visible for reconciliation.
+        self.assertEqual("bootstrap", ambiguous["launch_intent"]["phase"])
+        self.assertEqual(lane_id, ambiguous["launch_intent"]["lane_id"])
+        self.assertEqual(str(worktree), ambiguous["launch_intent"]["worktree_path"])
+
 if __name__ == "__main__":
     unittest.main()

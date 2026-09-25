@@ -549,13 +549,42 @@ def run_bootstrap(
     """Execute ``lane bootstrap`` and return the structured result.
 
     ``allowance_seconds`` is the caller's remaining share of one enclosing
-    absolute deadline.  A spent allowance refuses before any worktree, epoch,
-    or lane record exists, and the same absolute instant is re-checked
+    absolute deadline captured when the call enters, before any potentially
+    blocking configuration or provider validation, so a slow preflight cannot
+    renew the cutoff.  A spent allowance refuses before any worktree, epoch, or
+    lane record exists, and the same absolute instant is re-checked
     immediately before each effect of this call, so a call that started inside
     the allowance and then ran long can never create a lane the caller has
     already stopped waiting for.  ``None`` keeps the ordinary caller's
     unbounded behaviour.
     """
+    # Capture the caller's one absolute cutoff at function entry, before any
+    # potentially blocking preflight; a slow config/provider validation must
+    # not renew the allowance and start a lane the caller has stopped waiting
+    # for.
+    allowance_deadline: float | None = None
+    if allowance_seconds is not None:
+        allowance_deadline = time.monotonic() + float(allowance_seconds)
+        if allowance_seconds <= 0:
+            return {
+                "ok": False,
+                "code": BOOTSTRAP_ALLOWANCE_EXPIRED,
+                "summary": (
+                    "the enclosing allowance is spent; no lane was created and "
+                    "nothing may be queued after it"
+                ),
+                "evidence_paths": [],
+                "attempt_effects": {
+                    "worktree_created": False,
+                    "lane_record_written": False,
+                    "rollback_proven": True,
+                },
+                "next_action": (
+                    "reconcile the exact child of the enclosing attempt or "
+                    "prepare again inside the remaining decision time"
+                ),
+            }
+
     try:
         from .config import find_harness_root
 
@@ -611,24 +640,6 @@ def run_bootstrap(
                 "evidence_paths": [],
                 "next_action": "fix the manifest (requires shutdown) or drop the resource",
             }
-    allowance_deadline: float | None = None
-    if allowance_seconds is not None:
-        allowance_deadline = time.monotonic() + float(allowance_seconds)
-        if allowance_seconds <= 0:
-            return {
-                "ok": False,
-                "code": BOOTSTRAP_ALLOWANCE_EXPIRED,
-                "summary": (
-                    "the enclosing allowance is spent; no lane was created and "
-                    "nothing may be queued after it"
-                ),
-                "evidence_paths": [],
-                "next_action": (
-                    "reconcile the exact child of the enclosing attempt or "
-                    "prepare again inside the remaining decision time"
-                ),
-            }
-
     def allowance_expired() -> bool:
         """Report one absolute expiry without touching any effectful phase."""
 
@@ -644,26 +655,58 @@ def run_bootstrap(
     rt = config.runtime_root
     worktree_path: Path | None = None
     branch: str | None = None
+    epoch_id: str | None = None
     worktree_created = False
     lane_record_written = False
     memory: memory_handoff.LaneMemory | None = None
 
-    def rollback_failure_summary(summary: str) -> str:
+    def close_failed_attempt(summary: str) -> tuple[str, dict[str, Any]]:
+        """Roll back attempt-created identity and report exact ownership.
+
+        The returned effects tell a caller whether this attempt can still own
+        a worktree or lane record, so an unproven rollback stays an unresolved
+        child instead of a terminal proven-no-child refusal.
+        """
+
+        effects: dict[str, Any] = {
+            "worktree_created": worktree_created,
+            "lane_record_written": lane_record_written,
+        }
+        if worktree_path is not None:
+            effects["worktree_path"] = str(worktree_path)
+        if lane_record_written and epoch_id is not None:
+            effects["lane_record_path"] = str(
+                lane_record_dir(rt, epoch_id, lane_id) / "lane.json"
+            )
         if not worktree_created:
-            return summary
+            effects["rollback_proven"] = True
+            return summary, effects
         if lane_record_written:
-            return f"{summary}; rollback withheld because a lane record was published"
+            effects["rollback_proven"] = False
+            return (
+                f"{summary}; rollback withheld because a lane record was published",
+                effects,
+            )
         if worktree_path is None or branch is None:
-            return f"{summary}; rollback incomplete: attempt identity is unavailable"
+            effects["rollback_proven"] = False
+            return (
+                f"{summary}; rollback incomplete: attempt identity is unavailable",
+                effects,
+            )
         try:
             notes = _rollback_bootstrap_worktree(
                 config.root_workspace, branch, worktree_path
             )
         except Exception as rollback_exc:
-            return f"{summary}; rollback incomplete: {rollback_exc}"
+            effects["rollback_proven"] = False
+            effects["rollback_notes"] = [str(rollback_exc)]
+            return f"{summary}; rollback incomplete: {rollback_exc}", effects
         if notes:
-            return f"{summary}; rollback incomplete: {'; '.join(notes)}"
-        return f"{summary}; attempt worktree rolled back"
+            effects["rollback_proven"] = False
+            effects["rollback_notes"] = list(notes)
+            return f"{summary}; rollback incomplete: {'; '.join(notes)}", effects
+        effects["rollback_proven"] = True
+        return f"{summary}; attempt worktree rolled back", effects
 
     try:
         task_card = _read_task_card(Path(task_card_path))
@@ -838,19 +881,23 @@ def run_bootstrap(
             lane["dispatchable"] = memory.dispatchable
         publish_lane(lane)
     except BootstrapError as exc:
+        summary, effects = close_failed_attempt(str(exc))
         return {
             "ok": False,
             "code": exc.code,
-            "summary": rollback_failure_summary(str(exc)),
+            "summary": summary,
             "evidence_paths": [],
+            "attempt_effects": effects,
             "next_action": "resolve the named target and re-run bootstrap",
         }
     except Exception as exc:
+        summary, effects = close_failed_attempt(str(exc))
         return {
             "ok": False,
             "code": BOOTSTRAP_REQUEST_INVALID,
-            "summary": rollback_failure_summary(str(exc)),
+            "summary": summary,
             "evidence_paths": [],
+            "attempt_effects": effects,
             "next_action": "resolve the error and re-run bootstrap",
         }
 
