@@ -543,6 +543,10 @@ class PreparationService:
         run_id: str | None = None,
         worktree_path: str | None = None,
         base_commit: str | None = None,
+        checkpoint: str | None = None,
+        execution_role: str | None = None,
+        invocation_target: str | None = None,
+        recipient: str | None = None,
         finalize: bool = False,
     ) -> PreparationOutcome:
         contracts.validate_task_card(task_card)
@@ -606,11 +610,13 @@ class PreparationService:
                 run_id=run_id,
                 worktree_path=worktree_path,
                 base_commit=base_commit,
+                checkpoint=checkpoint,
+                execution_role=execution_role,
+                invocation_target=invocation_target,
+                recipient=recipient,
                 mandatory_content=mandatory_content,
                 optional_items=(),
-                omitted=["optional-memory-unavailable"] + [
-                    str(item["id"]) for item in supplied_optional
-                ],
+                omitted=["optional-memory-unavailable", *supplied_optional],
                 freshness_check=freshness_check,
             )
 
@@ -935,6 +941,10 @@ class PreparationService:
             run_id=run_id,
             worktree_path=worktree_path,
             base_commit=base_commit,
+            checkpoint=checkpoint,
+            execution_role=execution_role,
+            invocation_target=invocation_target,
+            recipient=recipient,
             mandatory_content=mandatory_content,
             optional_items=optional_items,
             freshness_check=freshness_check,
@@ -2015,15 +2025,24 @@ class PreparationService:
         run_id: str | None,
         worktree_path: str | None,
         base_commit: str | None,
+        checkpoint: str | None,
+        execution_role: str | None,
+        invocation_target: str | None,
+        recipient: str | None,
         mandatory_content: Iterable[Mapping[str, Any]],
         optional_items: Iterable[Mapping[str, Any]],
         freshness_check: Callable[[Mapping[str, Any]], bool] | None,
-        omitted: Iterable[str] = (),
+        omitted: Iterable[str | Mapping[str, Any]] = (),
     ) -> PreparationOutcome:
         if not all((lane_id, run_id, worktree_path, base_commit)):
             raise PreparationError(
                 "finalization requires the exact lane, run, worktree, and base identity"
             )
+        for field, value in (
+            ("checkpoint", checkpoint), ("execution_role", execution_role),
+            ("invocation_target", invocation_target), ("recipient", recipient),
+        ):
+            contracts._require_canonical_identity(value, field)
         selected = outcome.selected_candidates
         packed_optional: list[dict[str, Any]] = []
         for candidate in selected:
@@ -2048,6 +2067,10 @@ class PreparationService:
             base_commit=str(base_commit),
             strategy=(outcome.preparation or outcome.decision)["strategy"],
             configuration=(outcome.preparation or outcome.decision)["configuration"],
+            checkpoint=str(checkpoint),
+            execution_role=str(execution_role),
+            invocation_target=str(invocation_target),
+            recipient=str(recipient),
             mandatory_content=list(mandatory_content),
             optional_items=packed_optional,
             omitted=omitted,

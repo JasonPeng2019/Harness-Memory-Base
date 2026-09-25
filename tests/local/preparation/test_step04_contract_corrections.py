@@ -1166,6 +1166,10 @@ class Step04ContractCorrectionTests(unittest.TestCase):
         mandatory = [
             {"id": "task", "kind": "task", "content": card["task"]},
             {"id": "accepted-plan", "kind": "accepted-plan", "content": accepted["content"]},
+            {"id": "base", "kind": "base", "content": "base-1"},
+            {"id": "route", "kind": "route", "content": "ordinary"},
+            {"id": "checkpoint", "kind": "checkpoint", "content": "checkpoint-1"},
+            {"id": "security", "kind": "security", "content": contracts.FINAL_CONTEXT_SECURITY},
         ]
         return card, accepted, first, service, mandatory
 
@@ -1182,6 +1186,8 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             apc_launcher=lambda request: launched.append(request) or None,
             lane_id="lane-1", run_id="run-1", worktree_path=str(self.root),
             base_commit="base-1", finalize=True, mandatory_content=mandatory,
+            checkpoint="checkpoint-1", execution_role="worker",
+            invocation_target="harness:worker", recipient="worker:lane-1",
             optional_items=[{
                 "id": "independent-hint", "kind": "historical_evidence",
                 "origin": "everos", "revision_id": "r1",

@@ -3787,9 +3787,7 @@ class MemoryStore:
                     context_id, decision_id, plan_id, plan_digest,
                     envelope_digest, record, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(context_id) DO UPDATE SET
-                    envelope_digest=excluded.envelope_digest,
-                    record=excluded.record
+                ON CONFLICT(context_id) DO NOTHING
                 """,
                 (
                     context["context_id"],
@@ -3801,7 +3799,14 @@ class MemoryStore:
                     context["created_at"],
                 ),
             )
-        return self.get_final_context(str(context["context_id"]))
+        persisted = self.get_final_context(str(context["context_id"]))
+        row = connection.execute(
+            "SELECT envelope_digest FROM final_contexts WHERE context_id = ?",
+            (context["context_id"],),
+        ).fetchone()
+        if persisted != dict(context) or row["envelope_digest"] != envelope_digest:
+            raise StoreError("final context identity already belongs to a different immutable record or envelope")
+        return persisted
 
     def get_final_context(self, context_id: str) -> dict[str, Any]:
         connection = self._require_connection()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -75,9 +76,17 @@ class FinalContextDispatchTests(unittest.TestCase):
             "base_commit": "base-1",
             "strategy": "standard",
             "configuration": dict(self.configuration),
+            "checkpoint": "checkpoint-1",
+            "execution_role": "worker",
+            "invocation_target": "harness:worker",
+            "recipient": "worker:lane-1",
             "mandatory_content": [
                 {"id": "task", "kind": "task", "content": self.card["task"]},
                 {"id": "accepted-plan", "kind": "accepted-plan", "content": self.accepted["content"]},
+                {"id": "base", "kind": "base", "content": "base-1"},
+                {"id": "route", "kind": "route", "content": "ordinary"},
+                {"id": "checkpoint", "kind": "checkpoint", "content": "checkpoint-1"},
+                {"id": "security", "kind": "security", "content": context.ROLE_SEPARATION},
             ],
             "limits": self.limits,
         }
@@ -124,6 +133,12 @@ class FinalContextDispatchTests(unittest.TestCase):
         self.assertEqual("objective-1", finalized.context["objective_id"])
         self.assertEqual(self.accepted["content_hash"], finalized.context["plan_digest"])
         self.assertEqual("base-1", finalized.context["base_commit"])
+        self.assertEqual("checkpoint-1", finalized.context["checkpoint"])
+        self.assertEqual("worker", finalized.context["execution_role"])
+        self.assertEqual("harness:worker", finalized.envelope["invocation_target"])
+        self.assertEqual("worker:lane-1", finalized.envelope["recipient"])
+        self.assertEqual(self.accepted["revision"], finalized.context["plan_revision"])
+        self.assertEqual(finalized.context["context_id"], finalized.envelope["final_context_id"])
         self.assertEqual(
             context.ROLE_SEPARATION["control_plane"],
             finalized.context["role_separation"]["control_plane"],
@@ -131,15 +146,169 @@ class FinalContextDispatchTests(unittest.TestCase):
         self.assertFalse(finalized.context["role_separation"]["may_approve"])
         self.assertFalse(finalized.context["role_separation"]["may_execute_parent"])
         context.validate_final_context(
-            finalized.context,
-            envelope=finalized.envelope,
-            task_card=self.card,
-            plan=self.accepted,
-            lane_id="lane-1",
-            run_id="run-1",
-            base_commit="base-1",
-            worktree_path=str(self.worktree),
+            finalized.context, envelope=finalized.envelope, task_card=self.card,
+            plan=self.accepted, lane_id="lane-1", run_id="run-1",
+            base_commit="base-1", worktree_path=str(self.worktree),
         )
+
+    def test_exact_mandatory_state_and_canonical_destination_are_required(self) -> None:
+        mandatory = self._finalize().envelope["mandatory_content"]
+        for identifier in ("task", "accepted-plan", "base", "route", "checkpoint", "security"):
+            with self.subTest(missing=identifier):
+                with self.assertRaisesRegex(ValueError, identifier.replace("-", ".")):
+                    self._finalize(mandatory_content=[item for item in mandatory if item["id"] != identifier])
+            with self.subTest(substituted=identifier):
+                changed = deepcopy(mandatory)
+                next(item for item in changed if item["id"] == identifier)["content"] = "substituted"
+                with self.assertRaisesRegex(ValueError, identifier.replace("-", ".")):
+                    self._finalize(mandatory_content=changed)
+        for field in ("checkpoint", "execution_role", "invocation_target", "recipient"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field.replace("_", " ")):
+                    self._finalize(**{field: "  value  "})
+
+    def test_complete_optional_trace_binds_provenance_content_and_omission_reason(self) -> None:
+        finalized = self._finalize(optional_items=[
+            {"id": "packed", "kind": "memory", "origin": "everos", "revision_id": "r1", "content": "short"},
+            {"id": "omitted", "kind": "memory", "origin": "atlas", "revision_id": "r2", "content": "x" * 5000},
+        ])
+        trace = finalized.context["delivery_trace"]
+        self.assertEqual(["packed", "omitted"], [item["id"] for item in trace["selected"]])
+        self.assertEqual(["packed"], [item["id"] for item in trace["packed"]])
+        self.assertEqual(trace["packed"], trace["context_delivered"])
+        self.assertEqual("exceeds the optional allowance", trace["omitted"][0]["reason"])
+        self.assertEqual(trace, finalized.envelope["delivery_trace"])
+        for item in trace["selected"]:
+            self.assertEqual(64, len(item["provenance_digest"]))
+            self.assertEqual(64, len(item["content_digest"]))
+        changed = self._finalize(optional_items=[
+            {"id": "packed", "kind": "memory", "origin": "everos", "revision_id": "r2", "content": "short"},
+            {"id": "omitted", "kind": "memory", "origin": "atlas", "revision_id": "r2", "content": "x" * 5000},
+        ])
+        self.assertNotEqual(finalized.context["context_id"], changed.context["context_id"])
+        changed_content = self._finalize(optional_items=[
+            {"id": "packed", "kind": "memory", "origin": "everos", "revision_id": "r1", "content": "different"},
+            {"id": "omitted", "kind": "memory", "origin": "atlas", "revision_id": "r2", "content": "x" * 5000},
+        ])
+        self.assertNotEqual(finalized.context["integrity"], changed_content.context["integrity"])
+        changed_reason = self._finalize(optional_items=[
+            {"id": "packed", "kind": "memory", "origin": "everos", "revision_id": "r1", "content": "short"},
+            {"id": "omitted", "kind": "memory", "origin": "atlas", "revision_id": "r2", "content": "x" * 5000},
+        ], freshness_check=lambda item: item["id"] != "omitted")
+        self.assertNotEqual(finalized.context["context_id"], changed_reason.context["context_id"])
+
+    def test_destination_changes_create_distinct_ready_contexts(self) -> None:
+        original = self._finalize()
+        for field, value in (("invocation_target", "harness:other"), ("recipient", "worker:other")):
+            with self.subTest(field=field):
+                changed = self._finalize(**{field: value})
+                self.assertNotEqual(original.context["context_id"], changed.context["context_id"])
+        changed_mandatory = deepcopy(original.envelope["mandatory_content"])
+        next(item for item in changed_mandatory if item["id"] == "checkpoint")["content"] = "checkpoint-2"
+        changed_checkpoint = self._finalize(checkpoint="checkpoint-2", mandatory_content=changed_mandatory)
+        self.assertNotEqual(original.context["context_id"], changed_checkpoint.context["context_id"])
+
+    def test_plan_affecting_selection_flag_changes_trace_identity(self) -> None:
+        item = {"id": "memory-1", "origin": "everos", "content": "same content"}
+        ordinary = self._finalize(optional_items=[{**item, "plan_affecting": False}], freshness_check=lambda item: True)
+        affecting = self._finalize(optional_items=[{**item, "plan_affecting": True}], freshness_check=lambda item: True)
+        self.assertNotEqual(ordinary.context["context_id"], affecting.context["context_id"])
+
+    def test_secret_optional_provenance_never_enters_trace(self) -> None:
+        policy = privacy.PrivacyPolicy(known_secrets=("super-secret-value",))
+        with self.assertRaises(context.OptionalItemError):
+            self._finalize(optional_items=[{
+                "id": "memory-1", "origin": "super-secret-value", "content": "note",
+            }], privacy_policy=policy)
+
+    def test_finalized_envelope_cannot_downgrade_to_generic_validation(self) -> None:
+        finalized = self._finalize()
+        self.assertEqual(contracts.FINAL_ENVELOPE_SCHEMA, finalized.envelope["schema"])
+        stripped = deepcopy(finalized.envelope)
+        for field in (
+            "final_context", "final_context_id", "final_context_integrity", "task",
+            "plan_revision", "accepted_by", "checkpoint", "execution_role",
+            "invocation_target", "recipient", "delivery_trace",
+        ):
+            stripped.pop(field)
+        stripped["content_hash"] = contracts.content_hash(stripped)
+        with self.assertRaises(ValueError):
+            contracts.validate_envelope(
+                stripped, task_card=self.card, plan=self.accepted,
+                lane_id="lane-1", run_id="run-1", base_commit="base-1",
+                worktree_path=str(self.worktree),
+            )
+        stripped["schema"] = contracts.ENVELOPE_SCHEMA
+        stripped["content_hash"] = contracts.content_hash(stripped)
+        with self.assertRaises(ValueError):
+            contracts.validate_envelope(
+                stripped, task_card=self.card, plan=self.accepted,
+                lane_id="lane-1", run_id="run-1", base_commit="base-1",
+                worktree_path=str(self.worktree), require_final_context=True,
+            )
+
+    def test_rehashed_record_and_envelope_tampering_fails_validation(self) -> None:
+        finalized = self._finalize(optional_items=[{"id": "a", "content": "note"}])
+        for field, value in (
+            ("integrity", "0" * 64), ("context_id", "0" * 64),
+            ("recipient", "worker:other"), ("invocation_target", "harness:other"),
+        ):
+            changed = deepcopy(finalized.context)
+            changed[field] = value
+            changed["content_hash"] = contracts.content_hash(changed)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                contracts.validate_finalized_context(changed)
+        for field in ("mandatory_content", "optional_content", "delivery_trace"):
+            changed = deepcopy(finalized.envelope)
+            if field == "delivery_trace":
+                changed[field]["context_delivered"] = []
+            else:
+                changed[field][0]["content"] = "changed"
+            changed["content_hash"] = contracts.content_hash(changed)
+            with self.subTest(field=field), self.assertRaises((ValueError, context.ContextError)):
+                context.validate_final_context(
+                    finalized.context, envelope=changed, task_card=self.card,
+                    plan=self.accepted, lane_id="lane-1", run_id="run-1",
+                    base_commit="base-1", worktree_path=str(self.worktree),
+                )
+
+    def test_preparation_rejects_missing_security_before_final_context_persistence(self) -> None:
+        service = preparation.PreparationService(store=self.memory_store, limits=self.limits)
+        mandatory = [item for item in self._finalize().envelope["mandatory_content"] if item["id"] != "security"]
+        with self.assertRaisesRegex(ValueError, "security"):
+            service.prepare(
+                task_card=self.card, plan=self.accepted, objective_id="objective-1",
+                lane_id="lane-1", run_id="run-1", worktree_path=str(self.worktree),
+                base_commit="base-1", checkpoint="checkpoint-1",
+                execution_role="worker", invocation_target="harness:worker",
+                recipient="worker:lane-1", mandatory_content=mandatory, finalize=True,
+            )
+        self.assertIsNone(self.memory_store.get_final_context_for_decision(self.decision_id))
+
+    def test_envelope_rejects_rehashed_domain_binding_substitution(self) -> None:
+        finalized = self._finalize()
+        changed = deepcopy(finalized.envelope)
+        changed["recipient"] = "worker:other"
+        changed["content_hash"] = contracts.content_hash(changed)
+        with self.assertRaisesRegex(ValueError, "recipient"):
+            contracts.validate_envelope(
+                changed, task_card=self.card, plan=self.accepted,
+                lane_id="lane-1", run_id="run-1", base_commit="base-1",
+                worktree_path=str(self.worktree),
+            )
+
+    def test_persisted_context_id_never_overwrites_a_different_record(self) -> None:
+        finalized = self._finalize()
+        first = self.memory_store.record_final_context(
+            finalized.context, envelope_digest=finalized.envelope["content_hash"]
+        )
+        changed = deepcopy(finalized.context)
+        changed["created_at"] = "2030-01-01T00:00:00Z"
+        changed["content_hash"] = contracts.content_hash(changed)
+        self.assertEqual(first["context_id"], changed["context_id"])
+        with self.assertRaises(store.StoreError):
+            self.memory_store.record_final_context(changed, envelope_digest="different-envelope")
+        self.assertEqual(first, self.memory_store.get_final_context(first["context_id"]))
 
     def test_copied_context_fails_against_the_actual_task_card(self) -> None:
         finalized = self._finalize()
@@ -177,11 +346,10 @@ class FinalContextDispatchTests(unittest.TestCase):
     # -- bounded content ----------------------------------------------------
 
     def test_oversized_mandatory_state_blocks_instead_of_truncating(self) -> None:
+        mandatory = self._finalize().envelope["mandatory_content"]
         with self.assertRaises(context.MandatoryOverflowError):
             self._finalize(
-                mandatory_content=[
-                    {"id": "task", "kind": "task", "content": "x" * 8000},
-                ]
+                mandatory_content=[*mandatory, {"id": "required-constraints", "content": "x" * 8000}]
             )
 
     def test_optional_overflow_omits_whole_items(self) -> None:

@@ -1,10 +1,9 @@
 """Final context: bind mandatory state and eligible optional memory safely.
 
-The finalizer renders mandatory task/accepted-plan state first, packs or omits
-whole optional items inside the configured allowance, rechecks plan-affecting
-freshness immediately before finalization, and binds one exact integrity over
-the actual task, objective, repository base, accepted plan, rendered items, and
-role separation.
+The finalizer renders exact mandatory task/plan/base/route/checkpoint/security
+state first, packs or omits whole optional items inside the configured allowance,
+and binds the rendered content and delivery trace to a ready execution identity.
+Ready means context-delivered, not that a worker was invoked.
 """
 
 from __future__ import annotations
@@ -38,14 +37,7 @@ class OptionalItemError(ContextError):
     """An optional item is malformed and cannot be packed."""
 
 
-ROLE_SEPARATION = {
-    "execution_role": "worker",
-    "control_plane": "excluded",
-    "memory_authority": "none",
-    "may_approve": False,
-    "may_publish": False,
-    "may_execute_parent": False,
-}
+ROLE_SEPARATION = contracts.FINAL_CONTEXT_SECURITY
 
 
 @dataclass(frozen=True)
@@ -82,9 +74,13 @@ def finalize_context(
     base_commit: str,
     strategy: str,
     configuration: Mapping[str, Any],
+    checkpoint: str,
+    execution_role: str,
+    invocation_target: str,
+    recipient: str,
     mandatory_content: Iterable[Mapping[str, Any]],
     optional_items: Iterable[Mapping[str, Any]] = (),
-    omitted: Iterable[str] = (),
+    omitted: Iterable[str | Mapping[str, Any]] = (),
     privacy_policy: PrivacyPolicy | None = None,
     limits: PreparationLimits | None = None,
     freshness_check: Callable[[Mapping[str, Any]], bool] | None = None,
@@ -104,16 +100,35 @@ def finalize_context(
         identifier = item.get("id")
         if not isinstance(identifier, str) or not identifier:
             raise ContextError("mandatory content entries require a nonempty id")
+    contracts._validate_final_mandatory(
+        mandatory, task=task_card["task"], plan_content=plan["content"],
+        base_commit=base_commit, route=plan["route"], checkpoint=checkpoint,
+    )
     guard_mandatory(mandatory, policy)
 
-    omissions: list[dict[str, Any]] = [
-        {"id": str(item), "reason": "omitted before finalization"} for item in omitted
-    ]
+    selected: list[dict[str, Any]] = []
+    omissions: list[dict[str, Any]] = []
+    for raw in omitted:
+        item = _normalize_optional_item(raw) if isinstance(raw, Mapping) else {
+            "id": str(raw), "kind": "unavailable", "origin": "preparation", "content": None,
+        }
+        if detect_secrets({key: value for key, value in item.items() if key != "content"}, policy):
+            raise OptionalItemError("optional provenance contains prohibited secret")
+        descriptor = contracts._optional_descriptor(item)
+        selected.append(descriptor)
+        omissions.append({**descriptor, "reason": "omitted before finalization"})
     optional: list[dict[str, Any]] = []
+    selected_by_id: dict[str, dict[str, Any]] = {}
     for raw in optional_items:
         item = _normalize_optional_item(raw)
         item_id = item["id"]
-        affects_plan = bool(item.pop("plan_affecting", False))
+        if detect_secrets({key: value for key, value in item.items() if key != "content"}, policy):
+            raise OptionalItemError("optional provenance contains prohibited secret")
+        affects_plan = bool(item.get("plan_affecting", False))
+        descriptor = contracts._optional_descriptor(item)
+        selected_by_id[item_id] = descriptor
+        selected.append(descriptor)
+        item.pop("plan_affecting", None)
         fresh = True
         if freshness_check is not None:
             fresh = bool(freshness_check(item))
@@ -122,10 +137,10 @@ def finalize_context(
                 raise PlanAffectingFreshnessError(
                     f"plan-affecting optional item is no longer fresh: {item_id}"
                 )
-            omissions.append({"id": item_id, "reason": "not fresh"})
+            omissions.append({**descriptor, "reason": "not fresh"})
             continue
         if detect_secrets(item, policy):
-            omissions.append({"id": item_id, "reason": "prohibited secret"})
+            omissions.append({**descriptor, "reason": "prohibited secret"})
             continue
         optional.append(sanitize_payload(item, policy))
 
@@ -139,44 +154,58 @@ def finalize_context(
     for item in optional:
         size = _render_size([item])
         if size > remaining:
-            omissions.append({"id": item["id"], "reason": "exceeds the optional allowance"})
+            omissions.append({**selected_by_id[item["id"]], "reason": "exceeds the optional allowance"})
             continue
         remaining -= size
         packed.append(item)
 
-    envelope = contracts.make_envelope(
-        task_card=task_card,
-        plan=plan,
-        decision_id=decision_id,
-        lane_id=lane_id,
-        run_id=run_id,
-        worktree_path=str(worktree_path),
-        base_commit=base_commit,
-        mandatory_content=mandatory,
-        optional_content=packed,
-        omitted_content=[str(entry["id"]) for entry in omissions],
-        strategy=strategy,
-        configuration=configuration,
-    )
+    trace = {
+        "selected": selected,
+        "packed": [contracts._optional_descriptor(item) for item in packed],
+        "omitted": omissions,
+        "context_delivered": [contracts._optional_descriptor(item) for item in packed],
+    }
     context = contracts.make_finalized_context(
         lane_id=lane_id,
         run_id=run_id,
         decision_id=decision_id,
+        task=task_card["task"],
         task_card_digest=task_card["content_hash"],
         objective_id=plan["objective_id"],
         route=plan["route"],
         plan_id=plan["plan_id"],
+        plan_revision=plan["revision"],
+        accepted_by=plan["accepted_by"],
+        accepted_plan_content=plan["content"],
         plan_digest=plan["content_hash"],
         base_commit=base_commit,
         worktree_path=str(worktree_path),
+        checkpoint=checkpoint,
         strategy=strategy,
         configuration=configuration,
-        mandatory_items=mandatory,
-        optional_items=packed,
-        omitted=[str(entry["id"]) for entry in omissions],
+        execution_role=execution_role,
+        invocation_target=invocation_target,
+        recipient=recipient,
+        mandatory_content=mandatory,
+        optional_content=packed,
+        delivery_trace=trace,
         role_separation=ROLE_SEPARATION,
         freshness={"mode": "rechecked" if freshness_check is not None else "not-required"},
         context_limit=resolved.context_char_limit,
+    )
+    envelope = contracts.make_envelope(
+        task_card=task_card, plan=plan, decision_id=decision_id,
+        lane_id=lane_id, run_id=run_id, worktree_path=str(worktree_path),
+        base_commit=base_commit, mandatory_content=mandatory, optional_content=packed,
+        omitted_content=[entry["id"] for entry in omissions],
+        strategy=strategy, configuration=configuration, final_context=context,
+    )
+    validate_final_context(
+        context, envelope=envelope, task_card=task_card, plan=plan,
+        lane_id=lane_id, run_id=run_id, base_commit=base_commit,
+        worktree_path=str(worktree_path), checkpoint=checkpoint,
+        execution_role=execution_role, invocation_target=invocation_target,
+        recipient=recipient,
     )
     return FinalizedContext(envelope=envelope, context=context, omissions=omissions)
 
@@ -191,6 +220,10 @@ def validate_final_context(
     run_id: str,
     base_commit: str,
     worktree_path: str,
+    checkpoint: str | None = None,
+    execution_role: str | None = None,
+    invocation_target: str | None = None,
+    recipient: str | None = None,
 ) -> None:
     """Validate the finalized context against the actual dispatch target.
 
@@ -198,8 +231,8 @@ def validate_final_context(
     fails here as one explicit ``ContextError`` before any launch is attempted.
     """
 
-    contracts.validate_finalized_context(context)
     try:
+        contracts.validate_finalized_context(context)
         contracts.validate_envelope(
             envelope,
             task_card=task_card,
@@ -208,6 +241,7 @@ def validate_final_context(
             run_id=run_id,
             base_commit=base_commit,
             worktree_path=str(worktree_path),
+            require_final_context=True,
         )
     except contracts.ContractError as exc:
         raise ContextError(f"finalized envelope does not match the dispatch target: {exc}") from exc
@@ -215,17 +249,39 @@ def validate_final_context(
         "lane_id": lane_id,
         "run_id": run_id,
         "decision_id": envelope["decision_id"],
+        "task": task_card["task"],
         "task_card_digest": task_card["content_hash"],
         "objective_id": plan["objective_id"],
         "route": plan["route"],
         "plan_id": plan["plan_id"],
+        "plan_revision": plan["revision"],
+        "accepted_by": plan["accepted_by"],
+        "accepted_plan_content": plan["content"],
         "plan_digest": plan["content_hash"],
         "base_commit": base_commit,
         "worktree_path": str(worktree_path),
         "mandatory_digest": envelope["mandatory_digest"],
         "optional_digest": envelope["optional_digest"],
+        "mandatory_content": envelope["mandatory_content"],
+        "optional_content": envelope["optional_content"],
+        "delivery_trace": envelope.get("delivery_trace"),
+        "bound_record": envelope.get("final_context"),
+        "context_id": envelope.get("final_context_id"),
+        "integrity": envelope.get("final_context_integrity"),
     }
+    for field in ("checkpoint", "execution_role", "invocation_target", "recipient"):
+        expected[field] = envelope.get(field)
+    for field, value in (
+        ("checkpoint", checkpoint), ("execution_role", execution_role),
+        ("invocation_target", invocation_target), ("recipient", recipient),
+    ):
+        if value is not None and envelope.get(field) != value:
+            raise ContextError(f"finalized context {field.replace('_', ' ')} does not match the dispatch target")
     for field, value in expected.items():
+        if field == "bound_record":
+            if context != value:
+                raise ContextError("finalized context record does not match its envelope")
+            continue
         if context.get(field) != value:
             raise ContextError(
                 f"finalized context {field.replace('_', ' ')} does not match the dispatch target"

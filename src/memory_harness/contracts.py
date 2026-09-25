@@ -19,6 +19,15 @@ MEMORY_HANDOFF_SCHEMA = "memory-handoff/v1"
 PLAN_SCHEMA = "memory-plan/v1"
 DECISION_SCHEMA = "memory-decision/v1"
 ENVELOPE_SCHEMA = "memory-dispatch/v1"
+FINAL_ENVELOPE_SCHEMA = "memory-final-dispatch/v1"
+FINAL_CONTEXT_SECURITY = {
+    "execution_role": "worker",
+    "control_plane": "excluded",
+    "memory_authority": "none",
+    "may_approve": False,
+    "may_publish": False,
+    "may_execute_parent": False,
+}
 OPERATION_SCHEMA = "memory-operation/v1"
 OUTCOME_SCHEMA = "memory-outcome/v1"
 REVIEW_RECEIPT_SCHEMA = "memory-review-receipt/v1"
@@ -104,6 +113,100 @@ def _require_nonempty_str(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ContractError(f"{field} must be a nonempty string")
     return value
+
+
+def _require_canonical_identity(value: Any, field: str) -> str:
+    identity = _require_nonempty_str(value, field)
+    if identity != identity.strip() or any(ord(char) < 32 for char in identity):
+        raise ContractError(f"{field.replace('_', ' ')} must be canonical")
+    return identity
+
+
+def _validate_final_mandatory(
+    mandatory: list[dict[str, Any]], *, task: str, plan_content: Any,
+    base_commit: str, route: str, checkpoint: str,
+) -> None:
+    expected = {
+        "task": task,
+        "accepted-plan": plan_content,
+        "base": base_commit,
+        "route": route,
+        "checkpoint": checkpoint,
+        "security": FINAL_CONTEXT_SECURITY,
+    }
+    by_id = {item["id"]: item for item in mandatory}
+    if len(by_id) != len(mandatory):
+        raise ContractError("finalized mandatory content has duplicate ids")
+    for identifier, content in expected.items():
+        item = by_id.get(identifier)
+        if item is None or item.get("kind", identifier) != identifier or item.get("content") != content:
+            raise ContractError(f"finalized mandatory {identifier} content is missing or inconsistent")
+
+
+def _optional_descriptor(item: Mapping[str, Any]) -> dict[str, Any]:
+    provenance = {key: value for key, value in item.items() if key not in {"id", "content"}}
+    return {
+        "id": _require_canonical_identity(item.get("id"), "optional item id"),
+        "provenance": provenance,
+        "provenance_digest": sha256_hex(provenance),
+        "content_digest": sha256_hex(item.get("content")),
+    }
+
+
+def _validate_delivery_trace(
+    trace: Any, optional: list[dict[str, Any]], omitted_ids: list[str],
+) -> None:
+    if not isinstance(trace, Mapping) or set(trace) != {
+        "selected", "packed", "omitted", "context_delivered"
+    }:
+        raise ContractError("finalized delivery trace is incomplete")
+    for key in ("selected", "packed", "omitted", "context_delivered"):
+        if not isinstance(trace[key], list):
+            raise ContractError(f"finalized delivery trace {key} must be a list")
+    selected = trace["selected"]
+    packed = trace["packed"]
+    omitted = trace["omitted"]
+    entries = [(key, item) for key in ("selected", "packed", "context_delivered", "omitted") for item in trace[key]]
+    for key, item in entries:
+        if not isinstance(item, Mapping):
+            raise ContractError("finalized delivery trace entries must be objects")
+        required = {"id", "provenance", "provenance_digest", "content_digest"}
+        if set(item) != (required | ({"reason"} if key == "omitted" else set())):
+            raise ContractError("finalized delivery trace entry has unexpected fields")
+        provenance = item.get("provenance")
+        if not isinstance(provenance, Mapping) or item.get("provenance_digest") != sha256_hex(provenance):
+            raise ContractError("finalized delivery provenance digest mismatch")
+        _require_canonical_identity(item.get("id"), "optional item id")
+        digest = item.get("content_digest")
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ContractError("finalized delivery content digest is invalid")
+    selected_by_id = {item["id"]: item for item in selected}
+    if len(selected_by_id) != len(selected):
+        raise ContractError("finalized delivery selected ids are duplicated")
+    expected_packed = [_optional_descriptor(item) for item in optional]
+    if packed != expected_packed or trace["context_delivered"] != expected_packed:
+        raise ContractError("finalized delivery packed/context-delivered trace mismatch")
+    if [item.get("id") for item in omitted] != omitted_ids:
+        raise ContractError("finalized delivery omitted ids mismatch")
+    if set(selected_by_id) != {item["id"] for item in packed} | {item["id"] for item in omitted}:
+        raise ContractError("finalized delivery selected partition mismatch")
+    if len(packed) + len(omitted) != len(selected):
+        raise ContractError("finalized delivery selected partition is duplicated")
+    for item in packed:
+        selected_item = selected_by_id[item["id"]]
+        rendered_provenance = dict(selected_item["provenance"])
+        rendered_provenance.pop("plan_affecting", None)
+        if item != {
+            **selected_item,
+            "provenance": rendered_provenance,
+            "provenance_digest": sha256_hex(rendered_provenance),
+        }:
+            raise ContractError("finalized delivery selected/packed provenance mismatch")
+    for item in omitted:
+        if not isinstance(item.get("reason"), str) or not item["reason"].strip():
+            raise ContractError("finalized delivery omission requires a reason")
+        if selected_by_id[item["id"]] != {key: value for key, value in item.items() if key != "reason"}:
+            raise ContractError("finalized delivery selected/omitted provenance mismatch")
 
 
 def _validate_content(value: Any, field: str = "content") -> None:
@@ -522,6 +625,7 @@ def make_envelope(
     omitted_content: list[str] | None = None,
     strategy: str = "standard",
     configuration: Mapping[str, Any] | None = None,
+    final_context: Mapping[str, Any] | None = None,
     created_at: str | None = None,
 ) -> dict[str, Any]:
     validate_task_plan_binding(task_card, plan)
@@ -544,7 +648,7 @@ def make_envelope(
     if not isinstance(omitted, list) or any(not isinstance(item, str) or not item for item in omitted):
         raise ContractError("omitted_content must be a list of nonempty strings")
     record: dict[str, Any] = {
-        "schema": ENVELOPE_SCHEMA,
+        "schema": FINAL_ENVELOPE_SCHEMA if final_context is not None else ENVELOPE_SCHEMA,
         "lane_id": lane,
         "run_id": run,
         "decision_id": validate_decision_id,
@@ -571,6 +675,16 @@ def make_envelope(
         "dispatch_state": "finalized",
         "created_at": created_at or utc_now(),
     }
+    if final_context is not None:
+        validate_finalized_context(final_context)
+        record["final_context"] = dict(final_context)
+        for field in (
+            "task", "plan_revision", "accepted_by", "checkpoint", "execution_role",
+            "invocation_target", "recipient", "delivery_trace",
+        ):
+            record[field] = final_context[field]
+        record["final_context_id"] = final_context["context_id"]
+        record["final_context_integrity"] = final_context["integrity"]
     record["content_hash"] = content_hash(record)
     validate_envelope(
         record,
@@ -594,8 +708,14 @@ def validate_envelope(
     base_commit: str,
     worktree_path: str,
     decision_id: str | None = None,
+    require_final_context: bool = False,
 ) -> None:
-    validate_record(record, ENVELOPE_SCHEMA)
+    schema = record.get("schema") if isinstance(record, Mapping) else None
+    if schema not in (ENVELOPE_SCHEMA, FINAL_ENVELOPE_SCHEMA):
+        raise ContractError("unknown envelope schema")
+    validate_record(record, schema)
+    if require_final_context and schema != FINAL_ENVELOPE_SCHEMA:
+        raise ContractError("a domain-finalized envelope is required")
     validate_task_card(task_card)
     validate_task_plan_binding(task_card, plan)
     validate_plan(plan, expected_state="accepted")
@@ -648,6 +768,40 @@ def validate_envelope(
         raise ContractError("delivery trace does not match the rendered content")
     if record.get("dispatch_state") != "finalized":
         raise ContractError("envelope is not finalized")
+    if schema == FINAL_ENVELOPE_SCHEMA:
+        bound_context = record.get("final_context")
+        validate_finalized_context(bound_context)
+        if bound_context["context_id"] != record.get("final_context_id") or bound_context["integrity"] != record.get("final_context_integrity"):
+            raise ContractError("finalized envelope context identity mismatch")
+        for field in ("checkpoint", "execution_role", "invocation_target", "recipient"):
+            _require_canonical_identity(record.get(field), field)
+        for field in ("final_context_id", "final_context_integrity"):
+            _require_nonempty_str(record.get(field), field)
+        if record.get("task") != task_card["task"]:
+            raise ContractError("finalized envelope task mismatch")
+        if record.get("plan_revision") != plan["revision"] or record.get("accepted_by") != plan["accepted_by"]:
+            raise ContractError("finalized envelope accepted plan revision mismatch")
+        if record["execution_role"] != FINAL_CONTEXT_SECURITY["execution_role"]:
+            raise ContractError("finalized envelope execution role mismatch")
+        _validate_final_mandatory(
+            mandatory, task=task_card["task"], plan_content=plan["content"],
+            base_commit=base_commit, route=plan["route"], checkpoint=record["checkpoint"],
+        )
+        _validate_delivery_trace(record.get("delivery_trace"), optional, delivery["omitted"])
+        bound_fields = {
+            "lane_id", "run_id", "decision_id", "task", "task_card_digest", "objective_id",
+            "route", "plan_id", "plan_digest", "base_commit", "worktree_path", "strategy",
+            "configuration", "configuration_digest", "mandatory_content", "optional_content",
+            "mandatory_digest", "optional_digest", "checkpoint", "execution_role",
+            "invocation_target", "recipient", "plan_revision", "accepted_by", "delivery_trace",
+        }
+        for field in bound_fields:
+            if bound_context.get(field) != record.get(field):
+                raise ContractError(f"finalized envelope {field.replace('_', ' ')} context binding mismatch")
+        if bound_context.get("omitted") != delivery["omitted"]:
+            raise ContractError("finalized envelope omitted context binding mismatch")
+    elif any(field in record for field in ("final_context", "final_context_id", "final_context_integrity")):
+        raise ContractError("generic envelope cannot carry a finalized-context binding")
 
 
 def make_operation(
@@ -3229,32 +3383,39 @@ def make_finalized_context(
     lane_id: str,
     run_id: str,
     decision_id: str,
+    task: str,
     task_card_digest: str,
     objective_id: str,
     route: str,
     plan_id: str,
+    plan_revision: int,
+    accepted_by: str,
+    accepted_plan_content: Any,
     plan_digest: str,
     base_commit: str,
     worktree_path: str,
+    checkpoint: str,
     strategy: str,
     configuration: Mapping[str, Any],
-    mandatory_items: Iterable[Mapping[str, Any]],
-    optional_items: Iterable[Mapping[str, Any]],
-    omitted: Iterable[str],
+    execution_role: str,
+    invocation_target: str,
+    recipient: str,
+    mandatory_content: list[Mapping[str, Any]],
+    optional_content: list[Mapping[str, Any]],
+    delivery_trace: Mapping[str, Any],
     role_separation: Mapping[str, Any],
     freshness: Mapping[str, Any],
     context_limit: int,
     context_id: str | None = None,
     created_at: str | None = None,
 ) -> dict[str, Any]:
-    mandatory = [dict(item) for item in mandatory_items]
-    optional = [dict(item) for item in optional_items]
-    for item in mandatory + optional:
-        _require_nonempty_str(item.get("id"), "rendered item id")
+    mandatory = _normalize_content_list(mandatory_content, "mandatory_content")
+    optional = _normalize_content_list(optional_content, "optional_content")
     for field, value in (
         ("lane_id", lane_id),
         ("run_id", run_id),
         ("decision_id", decision_id),
+        ("task", task),
         ("task_card_digest", task_card_digest),
         ("objective_id", objective_id),
         ("plan_id", plan_id),
@@ -3264,67 +3425,79 @@ def make_finalized_context(
         ("strategy", strategy),
     ):
         _require_nonempty_str(value, field)
+    for field, value in (
+        ("checkpoint", checkpoint), ("execution_role", execution_role),
+        ("invocation_target", invocation_target), ("recipient", recipient),
+    ):
+        _require_canonical_identity(value, field)
     if route not in ROUTES:
         raise ContractError(f"unknown route: {route!r}")
+    if not isinstance(plan_revision, int) or isinstance(plan_revision, bool) or plan_revision < 1:
+        raise ContractError("finalized plan revision must be a positive integer")
+    if accepted_by != "ROOT":
+        raise ContractError("finalized plan must be ROOT accepted")
     resolved_configuration = _normalize_json_object(configuration, "configuration")
     if not isinstance(context_limit, int) or isinstance(context_limit, bool) or context_limit < 1:
         raise ContractError("context_limit must be a positive integer")
-    integrity = sha256_hex(
-        {
-            "domain": "memory-final-context/v1",
-            "task_card_digest": task_card_digest,
-            "objective_id": objective_id,
-            "route": route,
-            "plan_id": plan_id,
-            "plan_digest": plan_digest,
-            "base_commit": base_commit,
-            "worktree_path": worktree_path,
-            "strategy": strategy,
-            "configuration_digest": sha256_hex(resolved_configuration),
-            "mandatory": [item["id"] for item in mandatory],
-            "optional": [item["id"] for item in optional],
-            "omitted": sorted(str(item) for item in omitted),
-            "role_separation": dict(role_separation),
-            "context_limit": context_limit,
-        }
-    )
-    identity = context_id or sha256_hex(
-        {
-            "domain": "memory-final-context-identity/v1",
-            "decision_id": decision_id,
-            "integrity": integrity,
-        }
-    )
+    trace = dict(delivery_trace)
     record: dict[str, Any] = {
         "schema": FINAL_CONTEXT_SCHEMA,
-        "context_id": identity,
         "lane_id": lane_id,
         "run_id": run_id,
         "decision_id": decision_id,
+        "task": task,
         "task_card_digest": task_card_digest,
         "objective_id": objective_id,
         "route": route,
         "plan_id": plan_id,
+        "plan_revision": plan_revision,
+        "accepted_by": accepted_by,
+        "accepted_plan_content": accepted_plan_content,
         "plan_digest": plan_digest,
         "base_commit": base_commit,
         "worktree_path": worktree_path,
+        "checkpoint": checkpoint,
         "strategy": strategy,
         "configuration": resolved_configuration,
         "configuration_digest": sha256_hex(resolved_configuration),
+        "execution_role": execution_role,
+        "invocation_target": invocation_target,
+        "recipient": recipient,
+        "mandatory_content": mandatory,
         "mandatory_items": [item["id"] for item in mandatory],
         "mandatory_digest": sha256_hex(mandatory),
+        "optional_content": optional,
         "optional_items": [item["id"] for item in optional],
         "optional_digest": sha256_hex(optional),
-        "omitted": [str(item) for item in omitted],
+        "omitted": [item["id"] for item in trace["omitted"]],
+        "delivery_trace": trace,
         "role_separation": dict(role_separation),
         "freshness": dict(freshness),
         "context_limit": context_limit,
-        "integrity": integrity,
+        "state": "ready",
         "created_at": created_at or utc_now(),
     }
+    record["integrity"] = _final_context_integrity(record)
+    record["context_id"] = context_id or _final_context_id(record)
     record["content_hash"] = content_hash(record)
     validate_finalized_context(record)
     return record
+
+
+def _final_context_integrity(record: Mapping[str, Any]) -> str:
+    return sha256_hex({
+        "domain": "memory-final-context-integrity/v2",
+        "record": {key: value for key, value in record.items()
+                   if key not in {"context_id", "integrity", "content_hash", "created_at"}},
+    })
+
+
+def _final_context_id(record: Mapping[str, Any]) -> str:
+    return sha256_hex({
+        "domain": "memory-final-context-identity/v2",
+        "decision_id": record["decision_id"],
+        "integrity": record["integrity"],
+    })
 
 
 def validate_finalized_context(record: Mapping[str, Any]) -> None:
@@ -3334,19 +3507,31 @@ def validate_finalized_context(record: Mapping[str, Any]) -> None:
         "lane_id",
         "run_id",
         "decision_id",
+        "task",
         "task_card_digest",
         "objective_id",
         "plan_id",
+        "accepted_by",
         "plan_digest",
         "base_commit",
         "worktree_path",
+        "checkpoint",
         "strategy",
+        "execution_role",
+        "invocation_target",
+        "recipient",
         "configuration_digest",
         "mandatory_digest",
         "optional_digest",
         "integrity",
     ):
         _require_nonempty_str(record.get(field), field)
+    for field in ("checkpoint", "execution_role", "invocation_target", "recipient"):
+        _require_canonical_identity(record.get(field), field)
+    if record.get("execution_role") != FINAL_CONTEXT_SECURITY["execution_role"]:
+        raise ContractError("finalized context execution role mismatch")
+    if record.get("accepted_by") != "ROOT" or not isinstance(record.get("plan_revision"), int) or isinstance(record["plan_revision"], bool) or record["plan_revision"] < 1:
+        raise ContractError("finalized context accepted plan revision is invalid")
     if record["route"] not in ROUTES:
         raise ContractError("unknown finalized-context route")
     configuration = record.get("configuration")
@@ -3354,12 +3539,36 @@ def validate_finalized_context(record: Mapping[str, Any]) -> None:
         raise ContractError("finalized context configuration must be an object")
     if record["configuration_digest"] != sha256_hex(configuration):
         raise ContractError("finalized context configuration digest mismatch")
+    if configuration.get("strategy") != record["strategy"]:
+        raise ContractError("finalized context strategy mismatch")
     for field in ("mandatory_items", "optional_items", "omitted"):
         if not isinstance(record.get(field), list):
             raise ContractError(f"finalized context {field} must be a list")
     for field in ("role_separation", "freshness"):
         if not isinstance(record.get(field), Mapping):
             raise ContractError(f"finalized context {field} must be an object")
+    if dict(record["role_separation"]) != FINAL_CONTEXT_SECURITY:
+        raise ContractError("finalized context security boundary mismatch")
+    if record.get("state") != "ready":
+        raise ContractError("finalized context is not ready")
+    if not isinstance(record.get("context_limit"), int) or isinstance(record["context_limit"], bool) or record["context_limit"] < 1:
+        raise ContractError("finalized context limit must be a positive integer")
+    _validate_content(record.get("accepted_plan_content"), "accepted_plan_content")
+    mandatory = _normalize_content_list(record.get("mandatory_content"), "mandatory_content")
+    optional = _normalize_content_list(record.get("optional_content"), "optional_content")
+    _validate_final_mandatory(
+        mandatory, task=record["task"], plan_content=record.get("accepted_plan_content"),
+        base_commit=record["base_commit"], route=record["route"], checkpoint=record["checkpoint"],
+    )
+    if record["mandatory_items"] != [item["id"] for item in mandatory] or record["mandatory_digest"] != sha256_hex(mandatory):
+        raise ContractError("finalized context mandatory content mismatch")
+    if record["optional_items"] != [item["id"] for item in optional] or record["optional_digest"] != sha256_hex(optional):
+        raise ContractError("finalized context optional content mismatch")
+    _validate_delivery_trace(record.get("delivery_trace"), optional, record["omitted"])
+    if record["integrity"] != _final_context_integrity(record):
+        raise ContractError("finalized context integrity mismatch")
+    if record["context_id"] != _final_context_id(record):
+        raise ContractError("finalized context id mismatch")
 
 
 def make_apc_child_operation(
@@ -3474,6 +3683,7 @@ __all__ = [
     "PLAN_SCHEMA",
     "DECISION_SCHEMA",
     "ENVELOPE_SCHEMA",
+    "FINAL_ENVELOPE_SCHEMA",
     "OPERATION_SCHEMA",
     "OUTCOME_SCHEMA",
     "REVIEW_RECEIPT_SCHEMA",
@@ -3568,6 +3778,7 @@ __all__ = [
     "SEARCH_TRACE_SCHEMA",
     "PLAN_DISPOSITION_SCHEMA",
     "FINAL_CONTEXT_SCHEMA",
+    "FINAL_CONTEXT_SECURITY",
     "APC_CHILD_OPERATION_SCHEMA",
     "WORKER_ENVIRONMENT_MODES",
     "CURRENT_PLAN_STATES",
