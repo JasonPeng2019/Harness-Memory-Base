@@ -139,7 +139,7 @@ def resolve_launch(
     """
     if requested_profile is None:
         return argv, None
-    if requested_profile not in _PROFILES:
+    if not isinstance(requested_profile, str) or requested_profile not in _PROFILES:
         raise ValueError(f"unsupported requested network profile: {requested_profile}")
     launched = list(argv)
     sources: list[str] = []

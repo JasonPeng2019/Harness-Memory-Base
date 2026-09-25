@@ -320,25 +320,51 @@ class ProviderNetworkPayloadTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         provider_network_payload.install_soft_controls("qwen-code", self.worktree)
 
-    def test_invalid_explicit_profile_proves_no_provider_started(self):
+    def test_explicit_profile_validation_is_total_before_spawn(self):
+        original = self.argv("codex")
+        for profile in (
+            None, "soft_guardrail_network", "atlas_memory_only", "restricted_local",
+            "invalid", False, 7, 1.5, [], {},
+        ):
+            with self.subTest(profile=profile):
+                if profile in (None, "soft_guardrail_network", "atlas_memory_only", "restricted_local"):
+                    argv, facts = provider_network_payload.resolve_launch(
+                        "codex", self.worktree, original, profile,
+                    )
+                    if profile is None:
+                        self.assertIs(argv, original)
+                        self.assertIsNone(facts)
+                    else:
+                        self.assertIn('web_search="disabled"', argv)
+                        self.assertEqual(facts["requested_profile"], profile)
+                        self.assertEqual(facts["effective_profile"], "soft_guardrail_network")
+                else:
+                    with self.assertRaises(ValueError):
+                        provider_network_payload.resolve_launch(
+                            "codex", self.worktree, original, profile,
+                        )
+
         workspace = self.worktree / ".agent-workspace"
         workspace.mkdir()
         prompt = workspace / "worker-prompt.md"
         prompt.write_text("work")
-        lane = {
-            "worktree_path": str(self.worktree), "run_id": "run-1",
-            "controller_events_path": str(workspace / "controller.events.jsonl"),
-            "last_message_path": str(workspace / "last-message.txt"),
-        }
         invocation = {"provider": {"model": "test-model", "launch_config": CONFIGS["codex"]}}
-        with patch.object(controller.processes, "spawn_provider") as spawn:
-            with self.assertRaises(controller.ControllerError) as raised:
-                controller._run_provider(
-                    self.worktree, "epoch-1", lane, invocation, binding("codex"), prompt,
-                    requested_network_profile="invalid",
-                )
-        self.assertTrue(raised.exception.no_provider_started)
-        spawn.assert_not_called()
+        for profile in ("invalid", False, 7, 1.5, [], {}):
+            with self.subTest(controller_profile=profile):
+                lane = {
+                    "worktree_path": str(self.worktree), "run_id": "run-1",
+                    "controller_events_path": str(workspace / "controller.events.jsonl"),
+                    "last_message_path": str(workspace / "last-message.txt"),
+                }
+                with patch.object(controller.processes, "spawn_provider") as spawn:
+                    with self.assertRaises(controller.ControllerError) as raised:
+                        controller._run_provider(
+                            self.worktree, "epoch-1", lane, invocation, binding("codex"), prompt,
+                            requested_network_profile=profile,
+                        )
+                self.assertEqual(raised.exception.code, controller.LAUNCH_INVOCATION_INVALID)
+                self.assertTrue(raised.exception.no_provider_started)
+                spawn.assert_not_called()
 
 
 if __name__ == "__main__":
