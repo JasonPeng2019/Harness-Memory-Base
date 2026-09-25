@@ -174,7 +174,9 @@ class PreparationService:
             if key not in request:
                 continue
             value = (
-                resolved.requested_strategy if key == "strategy" else request[key]
+                resolved.requested_strategy if key == "strategy"
+                else getattr(resolved, key) if isinstance(requested[key], bool)
+                else request[key]
             )
             captured_value = (
                 captured.requested_strategy if key == "strategy" else requested[key]
@@ -320,11 +322,13 @@ class PreparationService:
             raise MandatoryStateFailure(
                 "captured logical decision preparations are unreadable; recover mandatory state"
             )
-        # A standalone accepted decision has not captured preparation policy.
-        # An all-off service with no per-call override still takes the inherited
-        # path, including when that older decision has a minimal configuration.
-        if not prior and requested.all_off and request is None:
-            return None, None, None, None
+        # A valid standalone decision has not captured preparation policy yet.
+        # The first preparation claims its resolved policy atomically. All-off
+        # still follows the inherited path while no policy has been claimed.
+        if not prior:
+            return (None, None, None, None) if requested.all_off else (
+                decision, None, None, None
+            )
         captured = self._decision_config(decision)
         self._check_explicit_policy(request, requested, captured)
         network_modes = set()
@@ -525,16 +529,19 @@ class PreparationService:
                     disposition=None, plan=dict(plan),
                     reason="all enhancements are off; the inherited harness path applies",
                 )
-            if durable is None:
+            if captured is None:
                 requested_config = self._effective_config(
                     supplied_config, failure_context=failure_context,
                     unknown_time=unknown_time,
                 )
-                ownership_decision = contracts.make_decision(
-                    task_card, plan_of_record, strategy=requested_config.strategy,
-                    configuration=asdict(requested_config),
-                )
-                if self.store is not None:
+                if durable is not None:
+                    ownership_decision = durable
+                else:
+                    ownership_decision = contracts.make_decision(
+                        task_card, plan_of_record, strategy=requested_config.strategy,
+                        configuration=asdict(requested_config),
+                    )
+                if self.store is not None and durable is None:
                     try:
                         id_taken = self.store.decision_id_exists(
                             ownership_decision["decision_id"]
@@ -593,16 +600,25 @@ class PreparationService:
             resolved_config, admitted, admission_reason = self._admit_config(
                 resolved_config, remaining=remaining, unknown_time=unknown_time
             )
+            if unknown_time and next_attempt > 1:
+                admitted = False
+                admission_reason = (
+                    "the logical decision already used its one unknown-time cheap pass"
+                )
             stage_allowance = self._stage_allowance(
                 resolved_config.strategy, remaining, unknown_time, admitted=admitted
             )
             decision = (
-                durable if durable is not None else contracts.make_decision(
+                durable if captured is not None else contracts.make_decision(
                     task_card, plan_of_record, strategy=resolved_config.strategy,
                     configuration=asdict(resolved_config),
                     decision_id=ownership_decision["decision_id"],
                 )
             )
+            if durable is not None and captured is None:
+                decision["created_at"] = durable["created_at"]
+                decision["content_hash"] = contracts.content_hash(decision)
+                contracts.validate_decision(decision)
             preparation = contracts.make_preparation(
                 task_card=task_card,
                 decision_id=decision["decision_id"],
@@ -628,12 +644,12 @@ class PreparationService:
                 break
             try:
                 preparation = self.store.record_preparation(
-                    preparation, first_decision=decision if durable is None else None
+                    preparation, first_decision=decision if captured is None else None
                 )
             except PreparationConflictError:
                 continue
             except StoreError as exc:
-                if durable is None:
+                if captured is None:
                     raise MandatoryStateFailure(
                         f"logical decision first-writer recovery failed: {exc}"
                     ) from exc
@@ -999,6 +1015,11 @@ class PreparationService:
             remaining=float(remaining_value or 0.0),
             unknown_time=unknown_time,
         )
+        if unknown_time and self.store is not None and next_attempt > 1:
+            admitted = False
+            admission_reason = (
+                "the logical decision already used its one unknown-time cheap pass"
+            )
         stage_allowance = self._stage_allowance(
             replacement_config.strategy,
             float(remaining_value or 0.0),
@@ -1180,13 +1201,13 @@ class PreparationService:
     def _stage_allowance(
         self, strategy: str, remaining: float, unknown_time: bool, *, admitted: bool = True
     ) -> float:
+        if not admitted:
+            return 0.0
         if unknown_time:
             return min(
                 self.limits.stage_seconds_for(strategy),
                 self.limits.unknown_time_budget_seconds,
             )
-        if not admitted:
-            return 0.0
         # An admitted recipe receives its full configured maximum.
         return self.limits.stage_seconds_for(strategy)
 

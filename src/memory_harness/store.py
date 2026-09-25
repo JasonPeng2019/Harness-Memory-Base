@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sqlite3
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -600,20 +601,18 @@ class MemoryStore:
             # Validate related rows before filtering to the exact identity.
             # A damaged identity column cannot make an existing owner look
             # absent and permit a second decision under drifted defaults.
+            related = tuple(combinations(keys, len(keys) - 2))
+            predicate = " OR ".join(
+                "(" + " AND ".join(f"{key}=?" for key in group) + ")"
+                for group in related
+            )
             rows = self._require_connection().execute(
-                """SELECT * FROM decisions WHERE task_card_digest=?
-                   OR (objective_id=? AND route=? AND plan_id=?)
-                   ORDER BY decision_id""",
-                (
-                    identity["task_card_digest"], identity["objective_id"],
-                    identity["route"], identity["plan_id"],
-                ),
+                f"SELECT * FROM decisions WHERE {predicate} ORDER BY decision_id",
+                tuple(identity[key] for group in related for key in group),
             ).fetchall()
             matches = []
             for stored in rows:
                 row = dict(stored)
-                if sum(row[key] == identity[key] for key in keys) < len(keys) - 1:
-                    continue
                 record = {
                     "schema": contracts.DECISION_SCHEMA,
                     **{key: row[key] for key in (
@@ -3242,32 +3241,55 @@ class MemoryStore:
                     "task_card_digest", "objective_id", "route", "plan_id",
                     "plan_state", "plan_digest",
                 )}
-                if self.find_logical_decision(identity) is not None:
-                    raise PreparationConflictError("another caller captured this logical decision")
-                try:
+                owner = self.find_logical_decision(identity)
+                if owner is not None:
+                    if owner["decision_id"] != first_decision["decision_id"]:
+                        raise PreparationConflictError(
+                            "another caller captured this logical decision"
+                        )
+                    if self.list_preparations(owner["decision_id"]):
+                        raise PreparationConflictError(
+                            "another caller claimed the first preparation"
+                        )
+                    if owner["created_at"] != first_decision["created_at"]:
+                        raise StoreError("standalone decision creation time changed")
                     connection.execute(
-                        """INSERT INTO decisions (
-                        decision_id, task_card_digest, objective_id, route, plan_id,
-                        plan_state, plan_digest, strategy, configuration,
-                        configuration_digest, state, content_hash, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        """UPDATE decisions SET strategy=?, configuration=?,
+                           configuration_digest=?, state=?, content_hash=?, updated_at=?
+                           WHERE decision_id=?""",
                         (
-                            first_decision["decision_id"], first_decision["task_card_digest"],
-                            first_decision["objective_id"], first_decision["route"],
-                            first_decision["plan_id"], first_decision["plan_state"],
-                            first_decision["plan_digest"], first_decision["strategy"],
+                            first_decision["strategy"],
                             json.dumps(first_decision["configuration"], sort_keys=True),
                             first_decision["configuration_digest"], first_decision["state"],
-                            first_decision["content_hash"], first_decision["created_at"],
-                            first_decision["created_at"],
+                            first_decision["content_hash"], contracts.utc_now(),
+                            first_decision["decision_id"],
                         ),
                     )
-                except sqlite3.IntegrityError as exc:
-                    if "decisions.decision_id" in str(exc):
-                        raise PreparationConflictError(
-                            "another exact plan claimed the accepted decision identifier"
-                        ) from exc
-                    raise
+                else:
+                    try:
+                        connection.execute(
+                            """INSERT INTO decisions (
+                            decision_id, task_card_digest, objective_id, route, plan_id,
+                            plan_state, plan_digest, strategy, configuration,
+                            configuration_digest, state, content_hash, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                first_decision["decision_id"], first_decision["task_card_digest"],
+                                first_decision["objective_id"], first_decision["route"],
+                                first_decision["plan_id"], first_decision["plan_state"],
+                                first_decision["plan_digest"], first_decision["strategy"],
+                                json.dumps(first_decision["configuration"], sort_keys=True),
+                                first_decision["configuration_digest"], first_decision["state"],
+                                first_decision["content_hash"], first_decision["created_at"],
+                                first_decision["created_at"],
+                            ),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        if "decisions.decision_id" in str(exc):
+                            raise PreparationConflictError(
+                                "another exact plan claimed the accepted decision identifier"
+                            ) from exc
+                        raise
             prior = self.list_preparations(str(preparation["decision_id"]))
             if prior and any(row["network_mode"] != preparation["network_mode"] for row in prior):
                 raise PreparationConflictError("captured preparation network mode changed")
@@ -3295,6 +3317,12 @@ class MemoryStore:
                     ),
                 )
             else:
+                if prior and preparation["budget_source"] == "unknown_time" and (
+                    preparation["stage_allowance_seconds"] > 0
+                ):
+                    raise PreparationConflictError(
+                        "unknown-time cheap pass is already claimed for this decision"
+                    )
                 attempts = [row.get("attempt") for row in prior]
                 if any(
                     isinstance(value, bool) or not isinstance(value, int) or value < 1

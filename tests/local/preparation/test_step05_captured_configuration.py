@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -201,6 +202,215 @@ class CapturedConfigurationTests(unittest.TestCase):
         self.assertEqual([first.preparation], self.state.list_preparations(
             first.decision["decision_id"]
         ))
+
+    def test_two_corrupt_identity_columns_fail_before_distance_filter(self) -> None:
+        first = self.first()
+        self.state.connection.execute(
+            "UPDATE decisions SET objective_id=?, plan_digest=? WHERE decision_id=?",
+            ("damaged-objective", "damaged-plan", first.decision["decision_id"]),
+        )
+        self.state.connection.commit()
+        calls: list[object] = []
+        with self.assertRaises(preparation.MandatoryStateFailure):
+            self.prepare(
+                self.service(strategy="deeper"),
+                stores=[search.SearchStore(
+                    store_id="everos", kind="historical_evidence",
+                    query=lambda query: calls.append(query) or [],
+                )],
+            )
+        self.assertEqual([], calls)
+        self.assertEqual(1, self.state.connection.execute(
+            "SELECT COUNT(*) FROM decisions"
+        ).fetchone()[0])
+        self.assertEqual([first.preparation], self.state.list_preparations(
+            first.decision["decision_id"]
+        ))
+
+    def test_explicit_dependent_gates_compare_normalized_policy(self) -> None:
+        first = self.prepare(self.service(template_memory=False, experience_write=False))
+        self.assertFalse(first.preparation["configuration"]["apc"])
+        self.assertFalse(first.preparation["configuration"]["generated_skill_creation"])
+        matching = self.prepare(
+            self.service(strategy="deeper"),
+            request={
+                "template_memory": False, "apc": True,
+                "experience_write": False, "generated_skill_creation": True,
+            },
+        )
+        self.assertEqual(first.decision["decision_id"], matching.decision["decision_id"])
+        self.assertEqual(first.preparation["configuration"], matching.preparation["configuration"])
+        with self.assertRaises(preparation.MandatoryStateFailure):
+            self.prepare(
+                self.service(), request={"template_memory": True, "apc": True}
+            )
+        self.assertEqual(1, self.state.connection.execute(
+            "SELECT COUNT(*) FROM decisions"
+        ).fetchone()[0])
+        self.assertEqual(2, len(self.state.list_preparations(first.decision["decision_id"])))
+
+    def test_standalone_decision_claims_first_policy_without_changing_id(self) -> None:
+        standalone = contracts.make_decision(
+            self.card, self.plan, strategy="standard",
+            configuration={"strategy": "standard"},
+        )
+        self.state.record_decision(standalone)
+        first = self.prepare(self.service(template_memory=False))
+        self.assertEqual(standalone["decision_id"], first.decision["decision_id"])
+        self.assertEqual(1, first.preparation["attempt"])
+        self.assertFalse(first.preparation["configuration"]["template_memory"])
+        captured = self.state.get_decision(standalone["decision_id"])
+        self.assertEqual(first.preparation["configuration"], captured["configuration"])
+        self.assertNotEqual(standalone["content_hash"], captured["content_hash"])
+        retry = self.prepare(self.service(strategy="deeper"))
+        self.assertEqual(first.decision["decision_id"], retry.decision["decision_id"])
+        self.assertFalse(retry.preparation["configuration"]["template_memory"])
+        self.assertEqual(2, retry.preparation["attempt"])
+
+    def test_standalone_claim_rolls_back_and_racing_caller_reuses_winner(self) -> None:
+        standalone = contracts.make_decision(
+            self.card, self.plan, strategy="standard",
+            configuration={"strategy": "standard"},
+        )
+        self.state.record_decision(standalone)
+        self.state.connection.execute(
+            """CREATE TRIGGER fail_first_prep BEFORE INSERT ON preparations
+               BEGIN SELECT RAISE(ABORT, 'synthetic preparation write failure'); END"""
+        )
+        with self.assertRaises(preparation.MandatoryStateFailure):
+            self.prepare(self.service(template_memory=False))
+        self.assertEqual(standalone["configuration"], self.state.get_decision(
+            standalone["decision_id"]
+        )["configuration"])
+        self.assertEqual([], self.state.list_preparations(standalone["decision_id"]))
+        self.state.connection.execute("DROP TRIGGER fail_first_prep")
+        self.state.connection.commit()
+
+        barrier = threading.Barrier(2)
+
+        class RacingStore:
+            def __init__(self, inner):
+                self.inner = inner
+                self.first = True
+
+            def list_captured_preparations(self, decision_id):
+                prior = self.inner.list_captured_preparations(decision_id)
+                if self.first:
+                    self.first = False
+                    barrier.wait(timeout=5)
+                return prior
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        def worker(template_memory: bool):
+            own_store = store.MemoryStore(self.path)
+            own_store.initialize()
+            try:
+                return self.prepare(self.service(
+                    state=RacingStore(own_store), template_memory=template_memory
+                ))
+            finally:
+                own_store.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(worker, value) for value in (False, True)]
+            results = [future.result(timeout=10) for future in futures]
+        self.assertEqual({standalone["decision_id"]}, {
+            item.decision["decision_id"] for item in results
+        })
+        self.assertEqual({1, 2}, {item.preparation["attempt"] for item in results})
+        self.assertEqual(1, len({
+            item.preparation["configuration"]["template_memory"] for item in results
+        }))
+        self.assertEqual(1, self.state.connection.execute(
+            "SELECT COUNT(*) FROM decisions"
+        ).fetchone()[0])
+
+    def test_standalone_identifier_collision_preserves_the_other_plan(self) -> None:
+        captured_config = asdict(config.resolve_config({}))
+        standalone = contracts.make_decision(
+            self.card, self.plan, strategy="standard",
+            configuration=captured_config,
+        )
+        self.state.record_decision(standalone)
+        revised_plan = contracts.make_plan(
+            plan_id=self.plan["plan_id"], objective_id="objective-1",
+            route="ordinary", state="candidate", content={"steps": ["revised"]},
+        )
+        self.assertEqual(standalone["decision_id"], contracts.make_decision(
+            self.card, revised_plan, strategy="standard",
+            configuration=captured_config,
+        )["decision_id"])
+        other = self.prepare(self.service(), plan=revised_plan)
+        self.assertNotEqual(standalone["decision_id"], other.decision["decision_id"])
+        self.assertEqual(standalone["configuration"], self.state.get_decision(
+            standalone["decision_id"]
+        )["configuration"])
+        self.assertEqual([], self.state.list_preparations(standalone["decision_id"]))
+        self.assertEqual(1, other.preparation["attempt"])
+
+    def test_unknown_time_restart_never_grants_a_second_cheap_pass(self) -> None:
+        calls: list[object] = []
+        launches: list[object] = []
+        candidate_store = search.SearchStore(
+            store_id="everos", kind="historical_evidence",
+            query=lambda query: calls.append(query) or [],
+        )
+        first = self.prepare(
+            self.service(), deadline=None, unknown_time=True,
+            stores=[candidate_store],
+        )
+        self.assertEqual(1, len(calls))
+        self.state.close()
+        self.state = store.MemoryStore(self.path)
+        self.state.initialize()
+        second = self.prepare(
+            self.service(strategy="deeper"), deadline=None, unknown_time=True,
+            stores=[candidate_store],
+            apc_launcher=lambda request: launches.append(request) or None,
+        )
+        self.assertEqual(first.decision["decision_id"], second.decision["decision_id"])
+        self.assertEqual(2, second.preparation["attempt"])
+        self.assertEqual("unknown_time", second.preparation["budget_source"])
+        self.assertIsNone(second.preparation["deadline_monotonic"])
+        self.assertIsNone(second.preparation["remaining_seconds"])
+        self.assertEqual(0.0, second.preparation["stage_allowance_seconds"])
+        self.assertEqual(1, len(calls))
+        self.assertEqual([], launches)
+        self.assertEqual("no_optional_memory", second.trace["outcome"])
+
+    def test_unknown_time_level_zero_does_not_reopen_optional_search(self) -> None:
+        calls: list[object] = []
+        candidate_store = search.SearchStore(
+            store_id="everos", kind="historical_evidence",
+            query=lambda query: calls.append(query) or [],
+        )
+        first = self.prepare(
+            self.service(), deadline=None, unknown_time=True,
+            stores=[candidate_store],
+        )
+        self.assertEqual(1, len(calls))
+        corrected = self.service().apply_level_zero(
+            preparation=first.preparation, decision=first.decision,
+            task_card=self.card, plan=first.plan, objective_id="objective-1",
+            stores=[candidate_store],
+        )
+        self.assertEqual(1, len(calls))
+        self.assertEqual(0.0, corrected.preparation["stage_allowance_seconds"])
+        self.assertEqual("unknown_time", corrected.preparation["budget_source"])
+        self.assertEqual("no_optional_memory", corrected.trace["outcome"])
+
+    def test_unknown_time_first_preparation_can_be_rewritten_without_new_pass(self) -> None:
+        first = self.prepare(self.service(), deadline=None, unknown_time=True)
+        preparation_id = first.preparation["preparation_id"]
+        self.assertEqual(first.preparation, self.state.record_preparation(first.preparation))
+        superseded = self.state.mark_preparation_superseded(
+            preparation_id, superseded_by="next-preparation"
+        )
+        self.assertEqual("superseded", superseded["status"])
+        self.assertEqual("next-preparation", superseded["superseded_by"])
+        self.assertEqual(1, len(self.state.list_preparations(first.decision["decision_id"])))
 
     def test_unrelated_corrupt_decision_does_not_block_exact_owner(self) -> None:
         first = self.first()
