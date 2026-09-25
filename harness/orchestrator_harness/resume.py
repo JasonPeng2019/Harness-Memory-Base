@@ -257,6 +257,19 @@ def run_resume(
             }
 
         prior_run_id = str(lane.get("run_id") or "")
+        recorded_memory_state = lane.get("memory_plan_state")
+        current_memory_state = memory_handoff.enabled_handoff_state(task_card)
+        if recorded_memory_state and current_memory_state != recorded_memory_state:
+            raise memory_handoff.MemoryHandoffError(
+                "resume task card changed the lane's accepted memory plan state"
+            )
+        memory_handoff.validate_resume_handoff(
+            task_card=task_card,
+            lane_id=lane_id,
+            prior_run_id=prior_run_id,
+            worktree_path=worktree,
+            base_commit=str(task_card.get("base_commit") or "HEAD"),
+        )
         run_id = new_id()
         managed = config.profile == "managed"
         # Resume is the same logical decision as the original bootstrap: it

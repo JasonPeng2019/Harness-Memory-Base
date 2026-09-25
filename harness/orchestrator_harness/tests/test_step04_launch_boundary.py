@@ -841,6 +841,52 @@ class Step04ResumeBoundaryTests(unittest.TestCase):
         finally:
             memory_store.close()
 
+    def test_native_resume_rejects_a_changed_accepted_revision(self) -> None:
+        card, plan = accepted_card()
+        result, worktree = self.fixture.run_bootstrap(
+            lane_id="revision-lane", card=card
+        )
+        self.assertTrue(result["ok"], result)
+        original = memory_handoff.load_envelope(worktree)
+        prior_run = self.fixture.lane_record("revision-lane")["run_id"]
+        self.fixture.make_resumable("revision-lane")
+        revised = contracts.revise_plan(
+            plan, new_plan_id="revised-plan", new_content={"steps": ["new revision"]}
+        )
+        changed_card = contracts.make_task_card(
+            task=card["task"],
+            base_commit=card["base_commit"],
+            branch=card["branch"],
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id=plan["objective_id"], route=plan["route"], plan=revised
+            ),
+        )
+        resumed = self.fixture.run_resume(
+            lane_id="revision-lane", card=changed_card
+        )
+        self.assertFalse(resumed["ok"], resumed)
+        self.assertIn("task card", resumed["summary"])
+        self.assertEqual(prior_run, self.fixture.lane_record("revision-lane")["run_id"])
+        self.assertEqual(original, memory_handoff.load_envelope(worktree))
+
+    def test_native_resume_rejects_an_unreadable_prior_handoff(self) -> None:
+        card, _ = accepted_card()
+        result, worktree = self.fixture.run_bootstrap(
+            lane_id="unreadable-lane", card=card
+        )
+        self.assertTrue(result["ok"], result)
+        prior_run = self.fixture.lane_record("unreadable-lane")["run_id"]
+        self.fixture.make_resumable("unreadable-lane")
+        _, envelope_path = memory_handoff.memory_paths(worktree)
+        envelope_path.write_text("{unreadable", encoding="utf-8")
+        resumed = self.fixture.run_resume(
+            lane_id="unreadable-lane", card=card
+        )
+        self.assertFalse(resumed["ok"], resumed)
+        self.assertIn("cannot read memory dispatch envelope", resumed["summary"])
+        self.assertEqual(prior_run, self.fixture.lane_record("unreadable-lane")["run_id"])
+        self.assertEqual("{unreadable", envelope_path.read_text(encoding="utf-8"))
+
     def test_resume_of_legacy_lane_keeps_the_ordinary_path(self) -> None:
         card = legacy_card()
         result, worktree = self.fixture.run_bootstrap(
