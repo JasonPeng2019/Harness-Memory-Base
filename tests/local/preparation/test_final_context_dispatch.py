@@ -254,10 +254,12 @@ class FinalContextDispatchTests(unittest.TestCase):
 
     def test_secret_optional_provenance_never_enters_trace(self) -> None:
         policy = privacy.PrivacyPolicy(known_secrets=("super-secret-value",))
-        with self.assertRaises(context.OptionalItemError):
-            self._finalize(optional_items=[{
-                "id": "memory-1", "origin": "super-secret-value", "content": "note",
-            }], privacy_policy=policy)
+        finalized = self._finalize(optional_items=[{
+            "id": "memory-1", "origin": "super-secret-value", "content": "note",
+        }], privacy_policy=policy)
+        self.assertEqual([], finalized.context["optional_content"])
+        self.assertEqual(["memory-1"], finalized.envelope["delivery"]["omitted"])
+        self.assertNotIn("super-secret-value", contracts.canonical_json(finalized.envelope).decode())
 
     def test_finalized_envelope_cannot_downgrade_to_generic_validation(self) -> None:
         finalized = self._finalize()
@@ -1112,6 +1114,49 @@ class FinalContextDispatchTests(unittest.TestCase):
                 ],
                 privacy_policy=policy,
             )
+
+    def test_worker_bound_mandatory_rejected_before_context_persistence(self) -> None:
+        mandatory = deepcopy(self._finalize().envelope["mandatory_content"])
+        checkpoint = 'API_\\u004bEY=credential-value'
+        next(item for item in mandatory if item["id"] == "checkpoint")["content"] = checkpoint
+        with self.assertRaises(privacy.MandatorySecretError) as error:
+            self._finalize(mandatory_content=mandatory, checkpoint=checkpoint)
+        self.assertNotIn("credential-value", str(error.exception))
+        self.assertIsNone(self.memory_store.get_final_context_for_decision(self.decision_id))
+
+    def test_worker_bound_optional_is_omitted_as_a_whole(self) -> None:
+        finalized = self._finalize(optional_items=[
+            {"id": "unsafe", "kind": "memory", "content": '{"api_\\u006bey":"credential-value"}'},
+            {"id": "safe", "kind": "memory", "content": "historical approval discussion"},
+        ])
+        self.assertEqual(["safe"], [item["id"] for item in finalized.context["optional_content"]])
+        self.assertEqual(["unsafe"], finalized.envelope["delivery"]["omitted"])
+        self.assertNotIn("credential-value", contracts.canonical_json(finalized.envelope).decode())
+
+    def test_plan_dependent_worker_bound_optional_returns_to_root(self) -> None:
+        plan = contracts.make_plan(
+            plan_id="accepted-plan", objective_id="objective-1", route="ordinary",
+            state="accepted", accepted_by="ROOT", content=self.accepted["content"],
+            source={"candidate_id": "unsafe"},
+        )
+        card = contracts.make_task_card(
+            task=self.card["task"], base_commit="base-1",
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id="objective-1", route="ordinary", plan=plan,
+            ),
+        )
+        decision = contracts.make_decision(card, plan, strategy="standard", configuration=self.configuration)
+        with self.assertRaisesRegex(context.PlanAffectingFreshnessError, "ROOT must replan"):
+            self._finalize(
+                task_card=card, plan=plan, decision_id=decision["decision_id"],
+                optional_items=[{"id": "unsafe", "kind": "memory", "content": {"publish_authority": True}}],
+            )
+        self.assertIsNone(self.memory_store.get_final_context_for_decision(decision["decision_id"]))
+
+    def test_worker_bound_recipient_rejected_before_final_context_persistence(self) -> None:
+        with self.assertRaises(privacy.MandatorySecretError):
+            self._finalize(recipient="worker:APIKEY=credential-value")
+        self.assertIsNone(self.memory_store.get_final_context_for_decision(self.decision_id))
 
     # -- durable, at-most-once dispatch ------------------------------------
 

@@ -10,7 +10,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from memory_harness import atlas, apc, experience, privacy
+from memory_harness import atlas, apc, contracts, experience, privacy
 
 
 class PrivacyBoundaryTests(unittest.TestCase):
@@ -22,14 +22,14 @@ class PrivacyBoundaryTests(unittest.TestCase):
 
     def test_mandatory_secret_blocks_without_rewriting_the_raw_source(self) -> None:
         raw_task = "Use synthetic-secret-alpha-1234567890 in the repository."
-        with self.assertRaisesRegex(privacy.MandatorySecretError, "synthetic-secret"):
+        with self.assertRaisesRegex(privacy.MandatorySecretError, "configured secret"):
             privacy.guard_mandatory(raw_task, self.policy)
         self.assertIn("synthetic-secret-alpha-1234567890", raw_task)
 
-    def test_optional_content_is_sanitized_and_raw_evidence_is_unchanged(self) -> None:
+    def test_optional_content_is_omitted_and_raw_evidence_is_unchanged(self) -> None:
         raw = "Historical note mentions synthetic-secret-alpha-1234567890."
         sanitized = privacy.sanitize_optional(raw, self.policy)
-        self.assertNotIn("synthetic-secret-alpha-1234567890", sanitized)
+        self.assertIsNone(sanitized)
         self.assertIn("synthetic-secret-alpha-1234567890", raw)
 
     def test_worker_environment_has_no_control_credentials(self) -> None:
@@ -58,7 +58,7 @@ class PrivacyBoundaryTests(unittest.TestCase):
 
     def test_mandatory_plan_secret_blocks_instead_of_being_rewritten(self) -> None:
         plan = {"steps": ["Use synthetic-secret-alpha-1234567890"]}
-        with self.assertRaisesRegex(privacy.MandatorySecretError, "synthetic-secret"):
+        with self.assertRaisesRegex(privacy.MandatorySecretError, "configured secret"):
             privacy.worker_prompt(
                 "Inspect the failing test.",
                 plan,
@@ -110,6 +110,102 @@ class PrivacyBoundaryTests(unittest.TestCase):
         serialized = json.dumps(request)
         self.assertNotIn("synthetic-secret-alpha-1234567890", serialized)
         self.assertNotIn("api_key", serialized)
+
+    def test_worker_bound_meaning_matrix(self) -> None:
+        unsafe = (
+            {"APIKEY": "synthetic-credential-value"},
+            "API_KEY=synthetic-credential-value",
+            '{"nested":{"api_key":"synthetic-credential-value"}}',
+            '{"nested":{"api_\\u006bey":"synthetic-credential-value"}}',
+            {"nested": [{"publish_authority": "enabled"}]},
+            {"authority": True},
+            "{\"nested\":{\"publish_\\u0061uthority\":true}}",
+            'credential=synthetic-secret-alpha-1234567890',
+            'credential=synthetic-secret-alpha-1234567890'.replace('secret', 'secr\\u0065t'),
+        )
+        for value in unsafe:
+            with self.subTest(value=value):
+                with self.assertRaises(privacy.MandatorySecretError) as error:
+                    privacy.guard_worker_bound(value, self.policy)
+                self.assertNotIn("synthetic-credential-value", str(error.exception))
+                self.assertNotIn("synthetic-secret-alpha-1234567890", str(error.exception))
+
+    def test_worker_bound_preserves_safe_meaning(self) -> None:
+        safe = (
+            {"role_label": "publisher"},
+            {"shared_publication": "historical example"},
+            {"publish_authority": False},
+            "publish_authority=false",
+            "The 2024 report discussed how approval worked.",
+            {"schema": "trusted-procedure-approval/v1", "authority_evidence": {"review": "ROOT approved"}},
+            {"schema": "trusted-procedure-revision/v1", "body": "Read the log"},
+            {"task_credential_channel": {"scope": "task_only", "validated": True, "channel_id": "task-secret"}},
+        )
+        for value in safe:
+            with self.subTest(value=value):
+                privacy.guard_worker_bound(value, self.policy)
+
+    def test_optional_and_remote_worker_bound_policy(self) -> None:
+        unsafe = {"content": {"nested": {"publish_authority": True}}}
+        self.assertIsNone(privacy.sanitize_optional(unsafe, self.policy))
+        with self.assertRaises(privacy.RemotePayloadPrivacyError):
+            privacy.guard_worker_bound_remote(unsafe, self.policy)
+        # Publication records retain their approved authority meaning; their
+        # credential values still fail the existing whole-publication scan.
+        privacy.guard_remote_payload({"authority": "ROOT approval"}, self.policy)
+        with self.assertRaises(privacy.RemotePayloadPrivacyError):
+            privacy.guard_remote_payload({"api_key": "synthetic-credential-value"}, self.policy)
+
+    def test_worker_prompt_omits_only_unsafe_optional_item(self) -> None:
+        prompt = privacy.worker_prompt("Inspect", {"steps": ["read"]}, optional_content=[
+            {"id": "safe", "content": "prior regression"},
+            {"id": "unsafe", "content": "APIKEY=credential-value"},
+        ], privacy_policy=self.policy)
+        self.assertIn("prior regression", prompt)
+        self.assertNotIn("credential-value", prompt)
+
+    def test_validated_procedure_approval_preserves_authority_evidence(self) -> None:
+        scope = {"application": "app", "namespace": "ns", "project": "p", "owner": "ROOT"}
+        procedure = contracts.make_procedure_revision(
+            logical_name="safe approval", origin="curated", origin_scope=scope,
+            body="Inspect the result", references=[],
+            predicates={"applicability": {}, "conflicts": {}, "capabilities": {}, "routes": {}},
+            source={"kind": "curated_authoring"},
+        )
+        approval = contracts.make_procedure_approval(
+            approval_id="approval-1", procedure=procedure, issuer="ROOT",
+            recipients=[scope], authority_evidence={"publish_authority": True},
+        )
+        privacy.guard_worker_bound({"procedure": procedure, "approval": approval}, self.policy)
+        compact = contracts.make_procedure_compact_representation(
+            procedure=procedure, content={"steps": ["Inspect"]},
+        )
+        compact_approval = contracts.make_procedure_compact_approval(
+            procedure=procedure, full_approval=approval, representation=compact,
+            approval_id="compact-approval-1", issuer="ROOT",
+            authority_evidence={"publish_authority": True},
+        )
+        privacy.guard_worker_bound({
+            "content": {"procedure": procedure, "approval": approval},
+            "compact_representation": compact, "compact_approval": compact_approval,
+        }, self.policy)
+        with self.assertRaises(privacy.MandatorySecretError):
+            privacy.guard_worker_bound({"procedure": procedure, "approval": {
+                **approval, "authority_evidence": {"api_key": "credential-value"},
+            }}, self.policy)
+        with self.assertRaises(privacy.MandatorySecretError):
+            privacy.guard_worker_bound({"authority_evidence": {"publish_authority": True}}, self.policy)
+
+    def test_worker_environment_filters_equivalent_control_keys(self) -> None:
+        environment = {
+            "PATH": "/usr/bin", "OPENAI_API_KEY": "provider-transport-secret",
+            "MEMORY_HARNESS_APIKEY": "control", "OTHER_PUBLISH_AUTHORITY": "yes",
+            "MEMORY_HARNESS_CONTROL_ENDPOINT": "local-control-socket",
+        }
+        self.assertEqual(
+            {"PATH": "/usr/bin", "OPENAI_API_KEY": "provider-transport-secret"},
+            privacy.worker_environment(environment, self.policy),
+        )
 
 
 if __name__ == "__main__":

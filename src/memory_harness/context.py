@@ -15,9 +15,8 @@ from . import contracts
 from .config import PreparationLimits
 from .privacy import (
     PrivacyPolicy,
-    detect_secrets,
     guard_mandatory,
-    sanitize_payload,
+    worker_bound_finding,
 )
 
 
@@ -61,6 +60,15 @@ def _normalize_optional_item(item: Mapping[str, Any]) -> dict[str, Any]:
     normalized.setdefault("kind", "memory")
     normalized.setdefault("origin", "optional")
     return normalized
+
+
+def _privacy_omission(item: Mapping[str, Any], policy: PrivacyPolicy) -> dict[str, Any]:
+    identifier = str(item["id"])
+    if worker_bound_finding(identifier, policy):
+        identifier = "privacy-" + contracts.sha256_hex(identifier)
+    return contracts._optional_descriptor({
+        "id": identifier, "kind": "omitted", "origin": "privacy", "content": None,
+    })
 
 
 def _compact_variant(item: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -168,7 +176,7 @@ def finalize_context(
         mandatory, task=task_card["task"], plan_content=plan["content"],
         base_commit=base_commit, route=plan["route"], checkpoint=checkpoint,
     )
-    guard_mandatory(mandatory, policy)
+    guard_mandatory({"mandatory": mandatory, "configuration": configuration}, policy)
 
     selected: list[dict[str, Any] | None] = []
     omissions: list[dict[str, Any]] = []
@@ -183,8 +191,11 @@ def finalize_context(
             )
         for claim in ("plan_affecting", "frozen_contract", "compact_representation", "compact_approval"):
             item.pop(claim, None)
-        if detect_secrets({key: value for key, value in item.items() if key != "content"}, policy):
-            raise OptionalItemError("optional provenance contains prohibited secret")
+        if worker_bound_finding({key: value for key, value in item.items() if key != "content"}, policy):
+            descriptor = _privacy_omission(item, policy)
+            selected.append(descriptor)
+            omissions.append({**descriptor, "reason": "prohibited optional provenance"})
+            continue
         descriptor = contracts._optional_descriptor(item)
         selected.append(descriptor)
         omissions.append({**descriptor, "reason": "omitted before finalization"})
@@ -215,11 +226,16 @@ def finalize_context(
         )
         if missing_identity:
             selected_item["revision_id"] = "unversioned"
-        if detect_secrets({key: value for key, value in selected_item.items() if key != "content"}, policy):
-            raise OptionalItemError("optional provenance contains prohibited secret")
         affects_plan = _plan_depends_on(
             plan, selected_item, trusted_dependency=source.get("plan_affecting") is True,
         )
+        if worker_bound_finding({key: value for key, value in selected_item.items() if key != "content"}, policy):
+            if affects_plan:
+                raise PlanAffectingFreshnessError("plan-dependent optional provenance contains prohibited worker-bound meaning; ROOT must replan")
+            descriptor = _privacy_omission(selected_item, policy)
+            selected.append(descriptor)
+            omissions.append({**descriptor, "reason": "prohibited optional provenance"})
+            continue
         if affects_plan:
             selected_item["plan_affecting"] = True
         # A live source must return one exact observation. The Boolean legacy
@@ -304,13 +320,15 @@ def finalize_context(
                 )
             omissions.append({**descriptor, "reason": f"final recheck: {status}" if recheck is not None else "not fresh"})
             continue
-        if detect_secrets(item, policy):
-            omissions.append({**descriptor, "reason": "prohibited secret"})
+        if worker_bound_finding(item, policy):
+            if affects_plan:
+                raise PlanAffectingFreshnessError("plan-dependent optional content contains prohibited worker-bound meaning; ROOT must replan")
+            omissions.append({**descriptor, "reason": "prohibited worker-bound meaning"})
             continue
         for claim in ("plan_affecting", "frozen_contract", "compact_representation", "compact_approval"):
             if claim not in {"compact_representation", "compact_approval"} or claim not in selected_item:
                 item.pop(claim, None)
-        optional.append((sanitize_payload(item, policy), selected_item, affects_plan, slot))
+        optional.append((item, selected_item, affects_plan, slot))
 
     mandatory_render = _render_size(mandatory)
     if mandatory_render > resolved.context_char_limit:
@@ -390,12 +408,14 @@ def finalize_context(
         freshness={"mode": "rechecked" if any((freshness_check, source_recheck, source_owner_recheck)) else "not-required"},
         context_limit=resolved.context_char_limit,
     )
+    guard_mandatory(context, policy)
     envelope = contracts.make_envelope(
         task_card=task_card, plan=plan, decision_id=decision_id,
         lane_id=lane_id, run_id=run_id, worktree_path=str(worktree_path),
         base_commit=base_commit, mandatory_content=mandatory, optional_content=packed,
         omitted_content=[entry["id"] for entry in omissions],
         strategy=strategy, configuration=configuration, final_context=context,
+        privacy_policy=policy,
     )
     validate_final_context(
         context, envelope=envelope, task_card=task_card, plan=plan,

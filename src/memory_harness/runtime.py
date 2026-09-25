@@ -7,7 +7,7 @@ from typing import Any, Callable, Mapping
 
 from . import contracts
 from .config import MemoryConfig, resolve_config
-from .privacy import PrivacyPolicy, guard_mandatory, sanitize_payload
+from .privacy import PrivacyPolicy, guard_mandatory, sanitize_optional, worker_bound_finding
 from .store import MemoryStore
 
 
@@ -59,6 +59,11 @@ class MemoryRuntime:
         contracts.validate_plan(plan)
         if task_card["base_commit"] != base_commit:
             raise RuntimeError("task card base does not match the preparation base")
+        mandatory = list(mandatory_content or [])
+        optional = list(optional_content or [])
+        if plan["state"] == "accepted":
+            guard_mandatory({"task": task_card["task"], "plan": plan["content"],
+                             "mandatory": mandatory, "configuration": asdict(self.config)}, self.privacy_policy)
         decision = contracts.make_decision(
             task_card,
             plan,
@@ -70,11 +75,17 @@ class MemoryRuntime:
         if plan["state"] != "accepted":
             return PreparedMemory(decision=decision, envelope=None)
 
-        mandatory = list(mandatory_content or [])
-        guard_mandatory(mandatory, self.privacy_policy)
-        sanitized_optional = sanitize_payload(list(optional_content or []), self.privacy_policy)
-        if not isinstance(sanitized_optional, list):
-            raise RuntimeError("sanitized optional content must remain a list")
+        safe_optional = []
+        omitted = []
+        for item in optional:
+            if sanitize_optional(item, self.privacy_policy) is None:
+                identifier = item["id"]
+                omitted.append(
+                    "privacy-" + contracts.sha256_hex(identifier)
+                    if worker_bound_finding(identifier, self.privacy_policy) else identifier
+                )
+            else:
+                safe_optional.append(item)
         envelope = contracts.make_envelope(
             task_card=task_card,
             plan=plan,
@@ -84,9 +95,11 @@ class MemoryRuntime:
             worktree_path=str(worktree_path),
             base_commit=base_commit,
             mandatory_content=mandatory,
-            optional_content=sanitized_optional,
+            optional_content=safe_optional,
+            omitted_content=omitted,
             strategy=self.config.strategy,
             configuration=asdict(self.config),
+            privacy_policy=self.privacy_policy,
         )
         return PreparedMemory(decision=decision, envelope=envelope)
 
@@ -99,6 +112,7 @@ class MemoryRuntime:
             raise RuntimeError("dispatch envelope must be an object")
         if envelope.get("plan_state") != "accepted":
             raise PlanNotAcceptedError("only a ROOT-accepted plan may dispatch")
+        guard_mandatory(envelope, self.privacy_policy)
         operation = contracts.make_operation(
             kind="dispatch",
             envelope=envelope,
@@ -138,6 +152,8 @@ class MemoryRuntime:
 
     def record_dispatch_intent(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
         """Persist one launch intent for callers that use the existing launcher."""
+
+        guard_mandatory(envelope, self.privacy_policy)
 
         operation = contracts.make_operation(
             kind="dispatch",

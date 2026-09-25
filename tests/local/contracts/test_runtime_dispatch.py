@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from memory_harness import contracts, runtime, store
+from memory_harness import contracts, privacy, runtime, store
 
 
 class RuntimeDispatchTests(unittest.TestCase):
@@ -96,6 +96,35 @@ class RuntimeDispatchTests(unittest.TestCase):
         replay = self.runtime.dispatch(self.envelope, lambda envelope: self.fail("duplicate launcher call"))
         self.assertEqual(result["operation_id"], replay["operation_id"])
         self.assertEqual("delivered", replay["status"])
+
+    def test_generic_dispatch_rejects_worker_bound_authority_before_intent_or_launch(self) -> None:
+        envelope = dict(self.envelope)
+        envelope["optional_content"] = [{"id": "unsafe", "kind": "memory", "content": '{"publish_\\u0061uthority":true}'}]
+        envelope["optional_digest"] = contracts.sha256_hex(envelope["optional_content"])
+        envelope["delivery"] = {**envelope["delivery"], "optional": ["unsafe"]}
+        envelope["content_hash"] = contracts.content_hash(envelope)
+        calls = []
+        with self.assertRaises(privacy.MandatorySecretError):
+            self.runtime.dispatch(envelope, lambda value: calls.append(value))
+        self.assertEqual([], calls)
+        self.assertEqual(0, self.memory_store.connection.execute("SELECT COUNT(*) FROM operations").fetchone()[0])
+
+    def test_generic_prepare_rejects_before_decision_persistence(self) -> None:
+        with self.assertRaises(privacy.MandatorySecretError) as error:
+            self.runtime.prepare(
+                plan=self.plan, task_card=self.card, lane_id="lane-unsafe", run_id="run-unsafe",
+                worktree_path=self.root / "worktree", base_commit="base-1",
+                mandatory_content=[{"id": "task", "kind": "task", "content": "APIKEY=credential-value"}],
+            )
+        self.assertNotIn("credential-value", str(error.exception))
+        self.assertEqual(1, self.memory_store.connection.execute("SELECT COUNT(*) FROM decisions").fetchone()[0])
+
+    def test_record_dispatch_intent_rejects_unsafe_envelope_before_persistence(self) -> None:
+        envelope = dict(self.envelope)
+        envelope["recipient"] = "worker:APIKEY=credential-value"
+        with self.assertRaises(privacy.MandatorySecretError):
+            self.runtime.record_dispatch_intent(envelope)
+        self.assertEqual(0, self.memory_store.connection.execute("SELECT COUNT(*) FROM operations").fetchone()[0])
 
     def test_lost_ack_is_reconciled_and_blocks_duplicate_dispatch(self) -> None:
         calls: list[object] = []

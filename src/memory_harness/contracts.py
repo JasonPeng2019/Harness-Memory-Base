@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
+from .privacy import PrivacyPolicy, guard_mandatory
+
 TASK_CARD_SCHEMA = "project-task-card/v1"
 # The explicit worker-environment boundary a task card may declare.  A
 # "scrubbed" card runs its controller and provider without the product
@@ -762,6 +764,7 @@ def make_envelope(
     configuration: Mapping[str, Any] | None = None,
     final_context: Mapping[str, Any] | None = None,
     created_at: str | None = None,
+    privacy_policy: PrivacyPolicy | None = None,
 ) -> dict[str, Any]:
     validate_task_plan_binding(task_card, plan)
     validate_plan(plan, expected_state="accepted")
@@ -779,6 +782,9 @@ def make_envelope(
         )
     mandatory = _normalize_content_list(mandatory_content, "mandatory_content")
     optional = _normalize_content_list(optional_content, "optional_content")
+    guard_mandatory({"task": task_card["task"], "plan": plan["content"],
+                     "mandatory": mandatory, "optional": optional,
+                     "configuration": resolved_configuration}, privacy_policy or PrivacyPolicy())
     omitted = omitted_content or []
     if not isinstance(omitted, list) or any(not isinstance(item, str) or not item for item in omitted):
         raise ContractError("omitted_content must be a list of nonempty strings")
@@ -812,6 +818,7 @@ def make_envelope(
     }
     if final_context is not None:
         validate_finalized_context(final_context)
+        guard_mandatory(final_context, privacy_policy or PrivacyPolicy())
         record["final_context"] = dict(final_context)
         for field in (
             "task", "plan_revision", "accepted_by", "checkpoint", "execution_role",
