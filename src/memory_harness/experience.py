@@ -768,21 +768,31 @@ class ReviewedExperienceService:
         return self.store.record_reviewed_trajectory(trajectory)
 
     async def extract_trajectory(
-        self, trajectory_id: str, adapter: EverOSAdapter
-    ) -> dict[str, Any]:
+        self,
+        trajectory_id: str,
+        adapter: EverOSAdapter,
+        *,
+        experience_write: bool = True,
+    ) -> dict[str, Any] | None:
         """Submit one optional EverOS extraction without unsafe replay.
 
         The local intent exists before the networked call. Any existing intent,
         including one left uncertain by a lost response, is reconciled only by
         exact receipt lookup and is never sent to EverOS a second time here.
+        When the captured operation disables experience writing, return the
+        existing local intent unchanged (or ``None``) without contacting EverOS.
         """
 
         trajectory = self.get_trajectory(trajectory_id)
-        adapter.assert_scope(trajectory["scope"])
         existing = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
+        if not experience_write:
+            return existing
+        adapter.assert_scope(trajectory["scope"])
         if existing is not None:
             if existing["status"] in {"pending", "uncertain"}:
-                return await self.reconcile_extraction(trajectory_id, adapter)
+                return await self.reconcile_extraction(
+                    trajectory_id, adapter, experience_write=experience_write
+                )
             return existing
         session_id = adapter.session_id_for(trajectory_id)
         payload = adapter.add_payload(trajectory, session_id=session_id)
@@ -812,16 +822,24 @@ class ReviewedExperienceService:
                 if latest["version"] != ingestion["version"]:
                     return latest
                 raise update_error from exc
-        return await self.reconcile_extraction(trajectory_id, adapter)
+        return await self.reconcile_extraction(
+            trajectory_id, adapter, experience_write=experience_write
+        )
 
     async def reconcile_extraction(
-        self, trajectory_id: str, adapter: EverOSAdapter
-    ) -> dict[str, Any]:
-        """Confirm representation only from exact scoped EverOS case receipts."""
+        self,
+        trajectory_id: str,
+        adapter: EverOSAdapter,
+        *,
+        experience_write: bool = True,
+    ) -> dict[str, Any] | None:
+        """Confirm exact case receipts, or pause reconciliation while writing is off."""
 
         trajectory = self.get_trajectory(trajectory_id)
-        adapter.assert_scope(trajectory["scope"])
         ingestion = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
+        if not experience_write:
+            return ingestion
+        adapter.assert_scope(trajectory["scope"])
         if ingestion is None:
             raise ExperienceError("no reviewed-experience ingestion exists to reconcile")
         if ingestion["status"] == "confirmed":
@@ -865,14 +883,19 @@ class ReviewedExperienceService:
         self,
         source_skill: Mapping[str, Any],
         adapter: EverOSAdapter,
-    ) -> dict[str, Any]:
+        *,
+        generated_skill_creation: bool = True,
+    ) -> dict[str, Any] | None:
         """Resolve a returned EverOS skill to exact reviewed source receipts.
 
         The result remains a generated, non-authoritative candidate. This
         operation neither approves the candidate nor executes any text/script it
-        contains.
+        contains. Disabling creation suppresses local candidate persistence;
+        EverOS's public memorize call has no per-call skill-only extraction gate.
         """
 
+        if not generated_skill_creation:
+            return None
         adapter.validate_skill(source_skill)
         source_case_ids = source_skill.get("source_case_ids")
         if not isinstance(source_case_ids, list) or not source_case_ids:
