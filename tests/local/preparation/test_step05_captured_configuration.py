@@ -255,6 +255,92 @@ class CapturedConfigurationTests(unittest.TestCase):
             first.decision["decision_id"]
         ))
 
+    def test_corrupt_preparation_index_fails_before_optional_call_or_write(self) -> None:
+        first = self.prepare(self.service())
+        self.state.connection.execute(
+            "UPDATE preparations SET task_card_digest=? WHERE preparation_id=?",
+            ("damaged-index", first.preparation["preparation_id"]),
+        )
+        self.state.connection.commit()
+        decision_row = tuple(self.state.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (first.decision["decision_id"],)
+        ).fetchone())
+        preparation_row = tuple(self.state.connection.execute(
+            "SELECT * FROM preparations WHERE preparation_id=?",
+            (first.preparation["preparation_id"],),
+        ).fetchone())
+        writes_before = self.state.connection.total_changes
+        calls: list[object] = []
+        with self.assertRaises(preparation.MandatoryStateFailure):
+            self.prepare(
+                self.service(strategy="deeper"),
+                stores=[search.SearchStore(
+                    store_id="everos", kind="historical_evidence",
+                    query=lambda query: calls.append(query) or [],
+                )],
+            )
+        self.assertEqual([], calls)
+        self.assertEqual(writes_before, self.state.connection.total_changes)
+        self.assertEqual(1, self.state.connection.execute(
+            "SELECT COUNT(*) FROM decisions"
+        ).fetchone()[0])
+        self.assertEqual(1, self.state.connection.execute(
+            "SELECT COUNT(*) FROM preparations"
+        ).fetchone()[0])
+        self.assertEqual(decision_row, tuple(self.state.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (first.decision["decision_id"],)
+        ).fetchone()))
+        self.assertEqual(preparation_row, tuple(self.state.connection.execute(
+            "SELECT * FROM preparations WHERE preparation_id=?",
+            (first.preparation["preparation_id"],),
+        ).fetchone()))
+
+    def test_corrupt_preparation_index_and_decision_cannot_mint_budget(self) -> None:
+        first = self.prepare(self.service())
+        self.state.connection.execute(
+            "UPDATE preparations SET task_card_digest=? WHERE preparation_id=?",
+            ("damaged-index", first.preparation["preparation_id"]),
+        )
+        self.state.connection.execute(
+            """UPDATE decisions SET task_card_digest=?, objective_id=?, plan_digest=?
+               WHERE decision_id=?""",
+            ("damaged-task", "damaged-objective", "damaged-plan",
+             first.decision["decision_id"]),
+        )
+        self.state.connection.commit()
+        decision_row = tuple(self.state.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (first.decision["decision_id"],)
+        ).fetchone())
+        preparation_row = tuple(self.state.connection.execute(
+            "SELECT * FROM preparations WHERE preparation_id=?",
+            (first.preparation["preparation_id"],),
+        ).fetchone())
+        writes_before = self.state.connection.total_changes
+        calls: list[object] = []
+        with self.assertRaises(preparation.MandatoryStateFailure):
+            self.prepare(
+                self.service(strategy="deeper"),
+                stores=[search.SearchStore(
+                    store_id="everos", kind="historical_evidence",
+                    query=lambda query: calls.append(query) or [],
+                )],
+            )
+        self.assertEqual([], calls)
+        self.assertEqual(writes_before, self.state.connection.total_changes)
+        self.assertEqual(1, self.state.connection.execute(
+            "SELECT COUNT(*) FROM decisions"
+        ).fetchone()[0])
+        self.assertEqual(1, self.state.connection.execute(
+            "SELECT COUNT(*) FROM preparations"
+        ).fetchone()[0])
+        self.assertEqual(decision_row, tuple(self.state.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (first.decision["decision_id"],)
+        ).fetchone()))
+        self.assertEqual(preparation_row, tuple(self.state.connection.execute(
+            "SELECT * FROM preparations WHERE preparation_id=?",
+            (first.preparation["preparation_id"],),
+        ).fetchone()))
+
     def test_malformed_related_preparation_identity_blocks_corrupt_owner_recovery(self) -> None:
         first = self.first()
         packet = dict(first.preparation)

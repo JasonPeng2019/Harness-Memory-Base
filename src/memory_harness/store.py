@@ -626,9 +626,7 @@ class MemoryStore:
             # decision columns. Consult this durable owner before deciding that
             # a damaged decision row is absent.
             prepared_rows = connection.execute(
-                """SELECT * FROM preparations WHERE task_card_digest=?
-                   AND objective_id=? AND route=? ORDER BY preparation_id""",
-                (identity["task_card_digest"], identity["objective_id"], identity["route"]),
+                "SELECT * FROM preparations ORDER BY preparation_id"
             ).fetchall()
             prepared_owners = set()
             indexed_fields = (
@@ -637,6 +635,20 @@ class MemoryStore:
                 "superseded_by",
             )
             for stored in prepared_rows:
+                if any(stored[key] != identity[key] for key in (
+                    "task_card_digest", "objective_id", "route"
+                )):
+                    # The serialized exact identity can reveal an owner hidden
+                    # by an indexed-column error. Do not recover via a partial
+                    # column match or validate unrelated malformed records.
+                    try:
+                        serialized = json.loads(str(stored["record"]))
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(serialized, Mapping) or any(
+                        serialized.get(key) != identity[key] for key in keys
+                    ):
+                        continue
                 try:
                     packet = self._stored_record(stored, contracts.validate_preparation)
                 except StoreError as exc:
