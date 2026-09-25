@@ -304,8 +304,6 @@ def _final_context_handoff_fields(
         )
     if context.get("freshness", {}).get("state") != "current":
         raise MemoryHandoffError("finalized context is stale or revoked")
-    if context.get("observed_invocation") is not None:
-        raise MemoryHandoffError("finalized context cannot claim an observed launch")
     if context.get("configuration") != envelope.get("configuration"):
         raise MemoryHandoffError("finalized context captured configuration changed")
 
@@ -399,6 +397,25 @@ def _bind_final_context(
     bound.update(fields)
     bound["content_hash"] = content_hash(bound)
     return bound
+
+
+def _record_bound_final_context(
+    worktree_path: str | Path,
+    context: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+) -> None:
+    """Link the durable final context to the envelope actually handed off."""
+
+    store = _memory_module("store")
+    store_path, _ = memory_paths(worktree_path)
+    memory_store = store.MemoryStore(store_path)
+    memory_store.initialize()
+    try:
+        memory_store.record_final_context(
+            context, envelope_digest=envelope["content_hash"]
+        )
+    finally:
+        memory_store.close()
 
 
 def _prepare_memory_outcome(
@@ -562,7 +579,12 @@ def prepare_lane_memory(
             worktree_path=worktree_path,
             base_commit=base_commit,
         )
-        _write_envelope(worktree_path, envelope)
+        envelope_path = _write_envelope(worktree_path, envelope)
+        try:
+            _record_bound_final_context(worktree_path, outcome.context, envelope)
+        except Exception:
+            envelope_path.unlink(missing_ok=True)
+            raise
         return LaneMemory(state=state, envelope=envelope, outcome=outcome)
     except MemoryHandoffError:
         raise
@@ -728,6 +750,8 @@ def validate_final_context_for_launch(
 
     plan = require_accepted_handoff(task_card)
     try:
+        if context.get("observed_invocation") is not None:
+            raise MemoryHandoffError("finalized context cannot claim an observed launch")
         from memory_harness import context as memory_context
 
         memory_context.validate_final_context(
@@ -786,6 +810,8 @@ def validate_envelope_for_launch(
         from memory_harness import contracts
 
         plan = require_accepted_handoff(task_card)
+        if envelope.get("observed_invocation") is not None:
+            raise MemoryHandoffError("finalized envelope cannot claim an observed launch")
         contracts.validate_envelope(
             envelope,
             task_card=task_card,
@@ -804,8 +830,6 @@ def validate_envelope_for_launch(
                 raise MemoryHandoffError("dispatch envelope plan revision changed")
             if envelope["plan_integrity"] != plan["content_hash"]:
                 raise MemoryHandoffError("dispatch envelope plan integrity changed")
-            if envelope.get("observed_invocation") is not None:
-                raise MemoryHandoffError("finalized envelope cannot claim an observed launch")
     except PendingPlanError:
         raise
     except MemoryHandoffError:
@@ -943,7 +967,16 @@ def record_ambiguous_dispatch(
 def omit_optional_content(
     *, worktree_path: str | Path, envelope: Mapping[str, Any], item_id: str
 ) -> dict[str, Any]:
-    """Omit one optional item and write the corrected delivery trace."""
+    """Omit legacy optional content; enriched finalization owns its own trace."""
+
+    persisted = load_envelope(worktree_path)
+    if any(field in envelope for field in _HANDOFF_FIELDS) or (
+        persisted is not None and any(field in persisted for field in _HANDOFF_FIELDS)
+    ):
+        raise MemoryHandoffError(
+            "final freshness omission for enriched context must run through the "
+            "domain finalizer before publishing a new handoff"
+        )
 
     memory_store, memory_runtime = _open_runtime(worktree_path)
     try:

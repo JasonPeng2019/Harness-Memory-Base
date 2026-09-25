@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -117,6 +118,34 @@ def _finalized_lane1_fixture(card: dict, plan: dict, worktree: Path) -> SimpleNa
     )
     context["content_hash"] = contracts.content_hash(context)
     return SimpleNamespace(envelope=envelope, context=context)
+
+
+def _record_domain_fixture(worktree: Path, outcome: SimpleNamespace) -> None:
+    """Model the domain write before the harness binds its final envelope."""
+
+    store_path, _ = memory_handoff.memory_paths(worktree)
+    memory_store = store.MemoryStore(store_path)
+    memory_store.initialize()
+    try:
+        memory_store.record_final_context(
+            outcome.context, envelope_digest=outcome.envelope["content_hash"]
+        )
+    finally:
+        memory_store.close()
+
+
+def _stored_final_context(worktree: Path, context_id: str) -> tuple[str, dict]:
+    store_path, _ = memory_handoff.memory_paths(worktree)
+    connection = sqlite3.connect(store_path)
+    try:
+        row = connection.execute(
+            "SELECT envelope_digest, record FROM final_contexts WHERE context_id = ?",
+            (context_id,),
+        ).fetchone()
+        assert row is not None
+        return row[0], json.loads(row[1])
+    finally:
+        connection.close()
 
 
 class MemoryHandoffSeamTests(unittest.TestCase):
@@ -388,6 +417,79 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         self.assertIn("scrubbed", prompt_context)
         self.assertIn("prior failure", prompt_context)
 
+    def test_bound_envelope_relinks_the_durable_final_context_digest(self) -> None:
+        outcome = _finalized_lane1_fixture(self.card, self.plan, self.worktree)
+        _record_domain_fixture(self.worktree, outcome)
+        with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=outcome):
+            envelope = memory_handoff.prepare_bootstrap_envelope(
+                task_card=self.card,
+                lane_id="lane-1",
+                run_id="run-1",
+                worktree_path=self.worktree,
+                base_commit="base-1",
+            )
+        written = memory_handoff.load_envelope(self.worktree)
+        stored_digest, stored_context = _stored_final_context(
+            self.worktree, outcome.context["context_id"]
+        )
+        self.assertNotEqual(outcome.envelope["content_hash"], written["content_hash"])
+        self.assertEqual(envelope["content_hash"], written["content_hash"])
+        self.assertEqual(written["content_hash"], stored_digest)
+        self.assertEqual(outcome.context, stored_context)
+
+    def test_finalized_envelope_rejects_observed_claim_in_both_shapes(self) -> None:
+        for enriched in (False, True):
+            with self.subTest(enriched=enriched):
+                if enriched:
+                    outcome = _finalized_lane1_fixture(self.card, self.plan, self.worktree)
+                    with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=outcome):
+                        envelope = memory_handoff.prepare_bootstrap_envelope(
+                            task_card=self.card, lane_id="lane-1", run_id="run-1",
+                            worktree_path=self.worktree, base_commit="base-1",
+                        )
+                else:
+                    envelope = memory_handoff.prepare_bootstrap_envelope(
+                        task_card=self.card, lane_id="lane-1", run_id="run-1",
+                        worktree_path=self.worktree, base_commit="base-1",
+                    )
+                claimed = dict(envelope)
+                claimed["observed_invocation"] = {"invocation_id": "fictional"}
+                claimed["content_hash"] = contracts.content_hash(claimed)
+                with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "observed launch"):
+                    memory_handoff.validate_envelope_for_launch(
+                        envelope=claimed, task_card=self.card, lane_id="lane-1",
+                        run_id="run-1", worktree_path=self.worktree, base_commit="base-1",
+                    )
+
+    def test_finalized_context_rejects_observed_claim_in_both_shapes(self) -> None:
+        for enriched in (False, True):
+            with self.subTest(enriched=enriched):
+                if enriched:
+                    outcome = _finalized_lane1_fixture(self.card, self.plan, self.worktree)
+                    context = outcome.context
+                    with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=outcome):
+                        envelope = memory_handoff.prepare_bootstrap_envelope(
+                            task_card=self.card, lane_id="lane-1", run_id="run-1",
+                            worktree_path=self.worktree, base_commit="base-1",
+                        )
+                else:
+                    envelope = memory_handoff.prepare_bootstrap_envelope(
+                        task_card=self.card, lane_id="lane-1", run_id="run-1",
+                        worktree_path=self.worktree, base_commit="base-1",
+                    )
+                    context = memory_handoff.load_final_context(
+                        worktree_path=self.worktree, envelope=envelope
+                    )
+                claimed = dict(context)
+                claimed["observed_invocation"] = {"invocation_id": "fictional"}
+                claimed["content_hash"] = contracts.content_hash(claimed)
+                with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "observed launch"):
+                    memory_handoff.validate_final_context_for_launch(
+                        context=claimed, envelope=envelope, task_card=self.card,
+                        lane_id="lane-1", run_id="run-1", worktree_path=self.worktree,
+                        base_commit="base-1",
+                    )
+
     def test_resume_rejects_an_unreadable_prior_handoff(self) -> None:
         memory_handoff.prepare_bootstrap_envelope(
             task_card=self.card,
@@ -573,6 +675,7 @@ class MemoryHandoffSeamTests(unittest.TestCase):
 
     def test_resume_checks_the_durable_enriched_context_fixture(self) -> None:
         outcome = _finalized_lane1_fixture(self.card, self.plan, self.worktree)
+        _record_domain_fixture(self.worktree, outcome)
         with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=outcome):
             envelope = memory_handoff.prepare_bootstrap_envelope(
                 task_card=self.card,
@@ -582,14 +685,10 @@ class MemoryHandoffSeamTests(unittest.TestCase):
                 base_commit="base-1",
             )
         store_path, _ = memory_handoff.memory_paths(self.worktree)
-        memory_store = store.MemoryStore(store_path)
-        memory_store.initialize()
-        try:
-            memory_store.record_final_context(
-                outcome.context, envelope_digest=envelope["content_hash"]
-            )
-        finally:
-            memory_store.close()
+        self.assertEqual(
+            envelope["content_hash"],
+            _stored_final_context(self.worktree, outcome.context["context_id"])[0],
+        )
         memory_handoff.validate_resume_handoff(
             task_card=self.card,
             lane_id="lane-1",
@@ -784,6 +883,31 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         self.assertIn("history", revised["delivery"]["omitted"])
         self.assertEqual(envelope["plan_id"], revised["plan_id"])
         self.assertEqual(envelope["plan_digest"], revised["plan_digest"])
+
+    def test_enriched_optional_omission_fails_before_file_or_store_mutation(self) -> None:
+        outcome = _finalized_lane1_fixture(self.card, self.plan, self.worktree)
+        _record_domain_fixture(self.worktree, outcome)
+        with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=outcome):
+            envelope = memory_handoff.prepare_bootstrap_envelope(
+                task_card=self.card, lane_id="lane-1", run_id="run-1",
+                worktree_path=self.worktree, base_commit="base-1",
+            )
+        store_path, envelope_path = memory_handoff.memory_paths(self.worktree)
+        before_file = envelope_path.read_bytes()
+        before_context = _stored_final_context(self.worktree, outcome.context["context_id"])
+        before_store = store_path.read_bytes()
+        for candidate in (envelope, outcome.envelope):
+            with self.subTest(candidate_is_bound=candidate is envelope):
+                with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "domain finalizer"):
+                    memory_handoff.omit_optional_content(
+                        worktree_path=self.worktree, envelope=candidate, item_id="case-1"
+                    )
+                self.assertEqual(before_file, envelope_path.read_bytes())
+                self.assertEqual(before_store, store_path.read_bytes())
+                self.assertEqual(
+                    before_context,
+                    _stored_final_context(self.worktree, outcome.context["context_id"]),
+                )
 
 
 if __name__ == "__main__":
