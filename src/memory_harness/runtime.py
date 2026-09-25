@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable, Mapping
 
 from . import contracts
 from .config import MemoryConfig, resolve_config
 from .privacy import PrivacyPolicy, guard_mandatory, sanitize_optional, worker_bound_finding
-from .store import MemoryStore
+from .store import MemoryStore, StoreError
 
 
 class RuntimeError(ValueError):
@@ -112,7 +112,7 @@ class MemoryRuntime:
             raise RuntimeError("dispatch envelope must be an object")
         if envelope.get("plan_state") != "accepted":
             raise PlanNotAcceptedError("only a ROOT-accepted plan may dispatch")
-        guard_mandatory(envelope, self.privacy_policy)
+        guard_mandatory(envelope, self._dispatch_privacy_policy(envelope))
         operation = contracts.make_operation(
             kind="dispatch",
             envelope=envelope,
@@ -153,7 +153,7 @@ class MemoryRuntime:
     def record_dispatch_intent(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
         """Persist one launch intent for callers that use the existing launcher."""
 
-        guard_mandatory(envelope, self.privacy_policy)
+        guard_mandatory(envelope, self._dispatch_privacy_policy(envelope))
 
         operation = contracts.make_operation(
             kind="dispatch",
@@ -167,6 +167,31 @@ class MemoryRuntime:
                 "reconcile it before any new launch"
             )
         return existing
+
+    def _dispatch_privacy_policy(self, envelope: Mapping[str, Any]) -> PrivacyPolicy:
+        """Use only provenance already persisted by the trusted finalizer."""
+        context = envelope.get("final_context")
+        if envelope.get("schema") != contracts.FINAL_ENVELOPE_SCHEMA or not isinstance(context, Mapping):
+            return self.privacy_policy
+        context_id = context.get("context_id")
+        if not isinstance(context_id, str):
+            return self.privacy_policy
+        try:
+            persisted = self.store.get_final_context(context_id)
+        except (StoreError, ValueError):
+            return self.privacy_policy
+        if persisted != context or envelope.get("final_context_integrity") != persisted.get("integrity"):
+            return self.privacy_policy
+        hashes = set(self.privacy_policy.trusted_approval_hashes)
+        trace = persisted.get("delivery_trace")
+        if isinstance(trace, Mapping):
+            for selected in trace.get("packed", []):
+                if isinstance(selected, Mapping) and isinstance(selected.get("provenance"), Mapping):
+                    for key in ("source_owner_approval_digest", "source_owner_compact_approval_digest"):
+                        digest = selected["provenance"].get(key)
+                        if isinstance(digest, str):
+                            hashes.add(digest)
+        return replace(self.privacy_policy, trusted_approval_hashes=tuple(sorted(hashes)))
 
     def reconcile_ambiguous_dispatch(
         self,

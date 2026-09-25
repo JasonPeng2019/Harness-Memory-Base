@@ -174,7 +174,8 @@ def _packed_descriptor(item: Mapping[str, Any], selected: Mapping[str, Any]) -> 
     """Bind source observations in the trace without altering rendered content."""
 
     descriptor = _optional_descriptor(item)
-    for field in ("final_recheck", "frozen_contract", "freshness", "source_id"):
+    for field in ("final_recheck", "frozen_contract", "freshness", "source_id",
+                  "source_owner_approval_digest", "source_owner_compact_approval_digest"):
         if field in selected["provenance"]:
             descriptor["provenance"].setdefault(field, selected["provenance"][field])
     descriptor["provenance_digest"] = sha256_hex(descriptor["provenance"])

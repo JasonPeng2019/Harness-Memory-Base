@@ -14,13 +14,12 @@ from typing import Any, Mapping
 
 REDACTION_MARKER = "[REDACTED]"
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
-_ASSIGNMENT = re.compile(r"(?<![\w.-])([A-Za-z][\w.-]{2,})\s*[:=]", re.MULTILINE)
-_CREDENTIAL_KEYS = ("apikey", "apitoken", "accesstoken", "refreshtoken", "password",
-                    "passwd", "secret", "credential", "authorization", "bearertoken",
-                    "controltoken", "policytoken", "privatekey")
-_AUTHORITY_KEYS = ("publishauthority", "publicationauthority", "mutationauthority", "memoryauthority",
-                   "controlplaneauthority", "maypublish", "mayapprove", "mayrevoke",
-                   "maymutate", "mayexecuteparent")
+_ASSIGNMENT = re.compile(r"(?<![\w.-])([A-Za-z][\w.-]{2,})[\"']?\s*[:=]", re.MULTILINE)
+_CAMEL = re.compile(r"([a-z0-9])([A-Z])")
+_CREDENTIAL_WORDS = {"password", "passwd", "secret", "credential", "authorization", "bearer", "privatekey"}
+_AUTHORITY_ACTIONS = {"approve", "approval", "publish", "publication", "revoke", "revocation",
+                      "mutate", "mutation", "policy", "control"}
+_AUTHORITY_GRANTS = {"allow", "enabled", "enable", "may", "can", "grant", "write", "authority", "permission"}
 _SAFE_AUTHORITY = {"none", "excluded", "historical_evidence_only", "evidence_only", "false"}
 
 
@@ -43,6 +42,9 @@ class PrivacyPolicy:
         "MEMORY_HARNESS_CONTROL_TOKEN",
         "MEMORY_HARNESS_POLICY_TOKEN",
     )
+    # Populated only from an authenticated coordinator/source-owner boundary.
+    # A record's self-asserted issuer, schema, or hash never populates this set.
+    trusted_approval_hashes: tuple[str, ...] = ()
 
     def detect(self, value: Any) -> list[str]:
         return _find_known_secrets(value, self.known_secrets)
@@ -70,13 +72,45 @@ def _decode_unicode(value: str) -> str:
     return _UNICODE_ESCAPE.sub(lambda match: chr(int(match.group(1), 16)), value)
 
 
+def _json_fragments(value: str) -> list[Any]:
+    """Read bounded JSON objects/arrays even when quoted inside ordinary prose."""
+    views = (value, re.sub(r'\\(["\\])', r'\1', value))
+    decoder = json.JSONDecoder()
+    fragments: list[Any] = []
+    for view in views:
+        for index, char in enumerate(view):
+            if char not in "{[":
+                continue
+            try:
+                parsed, _end = decoder.raw_decode(view[index:])
+            except ValueError:
+                continue
+            if isinstance(parsed, (dict, list)):
+                fragments.append(parsed)
+    return fragments
+
+
 def _key_kind(key: str) -> str | None:
-    normalized = re.sub(r"[^a-z0-9]", "", _decode_unicode(key).lower())
+    expanded = _CAMEL.sub(r"\1_\2", _decode_unicode(key))
+    words = re.findall(r"[a-z0-9]+", expanded.lower())
+    normalized = "".join(words)
     if normalized in {"taskcredentialchannel", "rolelabel", "sharedpublication"}:
         return None
-    if any(normalized.endswith(suffix) for suffix in _CREDENTIAL_KEYS):
+    if normalized.endswith(("apikey", "apitoken", "accesstoken", "refreshtoken",
+                            "controltoken", "policytoken", "privatekey")) or any(
+        word in _CREDENTIAL_WORDS for word in words
+    ):
         return "credential"
-    if any(normalized.endswith(suffix) for suffix in _AUTHORITY_KEYS):
+    if "token" in words and ({"api", "access", "refresh", "root", "approval", "approve",
+                              "control", "policy", "publish", "manager", "admin"} & set(words)):
+        return "credential"
+    if "role" in words and "enabled" in words and ({"root", "manager", "admin", "control"} & set(words)):
+        return "authority"
+    if set(words) & _AUTHORITY_ACTIONS and set(words) & _AUTHORITY_GRANTS:
+        return "authority"
+    if normalized in {"publishauthority", "publicationauthority", "mutationauthority",
+                      "memoryauthority", "controlplaneauthority", "maypublish", "mayapprove",
+                      "mayrevoke", "maymutate", "mayexecuteparent"}:
         return "authority"
     if normalized == "authority":
         return "authority_value"
@@ -102,6 +136,17 @@ def worker_bound_finding(value: Any, policy: PrivacyPolicy | None = None) -> str
         if isinstance(item, Mapping):
             if "task_credential_channel" in item and not _task_channel(item["task_credential_channel"]):
                 return "invalid task credential channel"
+            if item.get("content_hash") in selected.trusted_approval_hashes:
+                try:
+                    from . import contracts
+                    if item.get("schema") == contracts.PROCEDURE_APPROVAL_SCHEMA:
+                        contracts.validate_procedure_approval(item)
+                        coordinator_approval = True
+                    elif item.get("schema") == contracts.PROCEDURE_COMPACT_APPROVAL_SCHEMA:
+                        contracts.validate_procedure_compact_approval(item)
+                        coordinator_approval = True
+                except (ValueError, TypeError, KeyError):
+                    pass
             approved_pair = False
             approved_compact = False
             pair = item.get("content") if isinstance(item.get("content"), Mapping) else item
@@ -109,13 +154,13 @@ def worker_bound_finding(value: Any, policy: PrivacyPolicy | None = None) -> str
                 try:
                     from . import contracts
                     contracts.validate_procedure_approval(pair["approval"], procedure=pair["procedure"])
-                    approved_pair = True
+                    approved_pair = pair["approval"]["content_hash"] in selected.trusted_approval_hashes
                     if isinstance(item.get("compact_representation"), Mapping) and isinstance(item.get("compact_approval"), Mapping):
                         contracts.validate_procedure_compact_approval(
                             item["compact_approval"], procedure=pair["procedure"],
                             full_approval=pair["approval"], representation=item["compact_representation"],
                         )
-                        approved_compact = True
+                        approved_compact = item["compact_approval"]["content_hash"] in selected.trusted_approval_hashes
                 except (ValueError, TypeError, KeyError):
                     pass
             for key, child in item.items():
@@ -147,16 +192,14 @@ def worker_bound_finding(value: Any, policy: PrivacyPolicy | None = None) -> str
             return None
         if isinstance(item, str):
             decoded = _decode_unicode(item)
+            if len(decoded) > 65536 or decoded.count("{") + decoded.count("[") > 64:
+                return "scan limit"
             if _find_known_secrets(decoded, selected.known_secrets):
                 return "configured secret"
-            stripped = decoded.strip()
-            if stripped.startswith(("{", "[")):
-                try:
-                    parsed = json.loads(stripped)
-                except (ValueError, TypeError):
-                    parsed = None
-                if isinstance(parsed, (dict, list)):
-                    return visit(parsed, depth + 1)
+            for fragment in _json_fragments(decoded):
+                finding = visit(fragment, depth + 1)
+                if finding:
+                    return finding
             for match in _ASSIGNMENT.finditer(decoded):
                 kind = _key_kind(match.group(1))
                 assigned = decoded[match.end():].splitlines()[0].split(",", 1)[0].split(";", 1)[0].strip().strip("\"' ")

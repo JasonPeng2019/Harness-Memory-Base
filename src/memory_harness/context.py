@@ -8,7 +8,7 @@ Ready means context-delivered, not that a worker was invoked.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import contracts
@@ -160,6 +160,7 @@ def finalize_context(
     """Render one exact, safe, dispatch-ready execution context."""
 
     policy = privacy_policy or PrivacyPolicy()
+    trusted_approval_hashes = set(policy.trusted_approval_hashes)
     resolved = limits or PreparationLimits()
     contracts.validate_task_card(task_card)
     contracts.validate_plan(plan, expected_state="accepted")
@@ -189,7 +190,7 @@ def finalize_context(
                 f"selected source {item.get('source_id', item['id'])} revision "
                 f"{item.get('revision_id', 'unknown')} was omitted before final recheck; ROOT must replan"
             )
-        for claim in ("plan_affecting", "frozen_contract", "compact_representation", "compact_approval"):
+        for claim in ("plan_affecting", "frozen_contract", "compact_representation", "compact_approval", "source_owner_approval_digest", "source_owner_compact_approval_digest"):
             item.pop(claim, None)
         if worker_bound_finding({key: value for key, value in item.items() if key != "content"}, policy):
             descriptor = _privacy_omission(item, policy)
@@ -213,7 +214,7 @@ def finalize_context(
         selected_item = {**item, **source}
         # These raw fields can identify a candidate, but cannot authorize a
         # frozen readback, compact approval, or plan dependency.
-        for claim in ("frozen_contract", "compact_representation", "compact_approval", "plan_affecting"):
+        for claim in ("frozen_contract", "compact_representation", "compact_approval", "plan_affecting", "source_owner_approval_digest", "source_owner_compact_approval_digest"):
             selected_item.pop(claim, None)
         requires_source = selected_item.get("kind") == "procedure" or selected_item.get("freshness") == "frozen"
         missing_identity = requires_source and not selected_item.get("source_id")
@@ -242,6 +243,7 @@ def finalize_context(
         # checker remains a freshness-only fallback for caller-owned items.
         original = dict(selected_item)
         recheck: Mapping[str, Any] | None = None
+        owner_proof: Mapping[str, Any] = {}
         if missing_identity:
             recheck = contracts.make_final_source_recheck(item=original, status="ineligible")
         elif selected_item.get("freshness") == "frozen" and source_owner_recheck is None:
@@ -254,7 +256,6 @@ def finalize_context(
                 observed = callback(dict(original))
             except Exception:
                 observed = contracts.make_final_source_recheck(item=original, status="unavailable")
-            owner_proof: Mapping[str, Any] = {}
             if source_owner_recheck is not None and isinstance(observed, Mapping) and "recheck" in observed:
                 owner_proof = observed.get("owner_proof", {})
                 recheck = observed["recheck"]
@@ -308,6 +309,39 @@ def finalize_context(
             item["content"] = historical
         fresh = bool(freshness_check(original)) if recheck is None and freshness_check is not None else True
         status = recheck["status"] if recheck is not None else ("eligible" if fresh else "stale")
+        item_trusted_hashes: set[str] = set()
+        content = item.get("content")
+        if (source_owner_recheck is not None and selected_item.get("kind") == "procedure"
+                and status in {"eligible", "frozen"}
+                and isinstance(content, Mapping) and isinstance(content.get("procedure"), Mapping)
+                and isinstance(content.get("approval"), Mapping)
+                and owner_proof.get("approval_digest") == content["approval"].get("content_hash")):
+            try:
+                contracts.validate_procedure_approval(content["approval"], procedure=content["procedure"])
+            except contracts.ContractError:
+                pass
+            else:
+                digest = content["approval"]["content_hash"]
+                item_trusted_hashes.add(digest)
+                selected_item["source_owner_approval_digest"] = digest
+                if (isinstance(item.get("compact_representation"), Mapping)
+                        and isinstance(item.get("compact_approval"), Mapping)
+                        and owner_proof.get("compact_approval") == item["compact_approval"]):
+                    try:
+                        contracts.validate_procedure_compact_approval(
+                            item["compact_approval"], procedure=content["procedure"],
+                            full_approval=content["approval"],
+                            representation=item["compact_representation"],
+                        )
+                    except contracts.ContractError:
+                        pass
+                    else:
+                        compact_digest = item["compact_approval"]["content_hash"]
+                        item_trusted_hashes.add(compact_digest)
+                        selected_item["source_owner_compact_approval_digest"] = compact_digest
+        item_policy = replace(policy, trusted_approval_hashes=tuple(
+            sorted(trusted_approval_hashes | item_trusted_hashes)
+        ))
         descriptor = contracts._optional_descriptor(selected_item)
         slot = len(selected)
         selected.append(descriptor)
@@ -320,12 +354,15 @@ def finalize_context(
                 )
             omissions.append({**descriptor, "reason": f"final recheck: {status}" if recheck is not None else "not fresh"})
             continue
-        if worker_bound_finding(item, policy):
+        if worker_bound_finding(item, item_policy):
             if affects_plan:
                 raise PlanAffectingFreshnessError("plan-dependent optional content contains prohibited worker-bound meaning; ROOT must replan")
             omissions.append({**descriptor, "reason": "prohibited worker-bound meaning"})
             continue
-        for claim in ("plan_affecting", "frozen_contract", "compact_representation", "compact_approval"):
+        trusted_approval_hashes.update(item_trusted_hashes)
+        item.pop("source_owner_approval_digest", None)
+        item.pop("source_owner_compact_approval_digest", None)
+        for claim in ("plan_affecting", "frozen_contract", "compact_representation", "compact_approval", "source_owner_approval_digest", "source_owner_compact_approval_digest"):
             if claim not in {"compact_representation", "compact_approval"} or claim not in selected_item:
                 item.pop(claim, None)
         optional.append((item, selected_item, affects_plan, slot))
@@ -408,14 +445,15 @@ def finalize_context(
         freshness={"mode": "rechecked" if any((freshness_check, source_recheck, source_owner_recheck)) else "not-required"},
         context_limit=resolved.context_char_limit,
     )
-    guard_mandatory(context, policy)
+    context_policy = replace(policy, trusted_approval_hashes=tuple(sorted(trusted_approval_hashes)))
+    guard_mandatory(context, context_policy)
     envelope = contracts.make_envelope(
         task_card=task_card, plan=plan, decision_id=decision_id,
         lane_id=lane_id, run_id=run_id, worktree_path=str(worktree_path),
         base_commit=base_commit, mandatory_content=mandatory, optional_content=packed,
         omitted_content=[entry["id"] for entry in omissions],
         strategy=strategy, configuration=configuration, final_context=context,
-        privacy_policy=policy,
+        privacy_policy=context_policy,
     )
     validate_final_context(
         context, envelope=envelope, task_card=task_card, plan=plan,

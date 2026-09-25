@@ -2274,6 +2274,19 @@ class PreparationService:
                 verified = {key: value for key, value in owner_proof.items() if key == "frozen_contract"}
                 if (isinstance(content, Mapping) and isinstance(content.get("procedure"), Mapping)
                         and isinstance(content.get("approval"), Mapping)
+                        and owner_proof.get("approval_digest") == content["approval"].get("content_hash")):
+                    try:
+                        contracts.validate_procedure_approval(
+                            content["approval"], procedure=content["procedure"],
+                        )
+                    except contracts.ContractError:
+                        pass
+                    else:
+                        # A separate source-owner readback, not the query row or
+                        # candidate's approval flag, supplies this provenance.
+                        verified["approval_digest"] = content["approval"]["content_hash"]
+                if (isinstance(content, Mapping) and isinstance(content.get("procedure"), Mapping)
+                        and isinstance(content.get("approval"), Mapping)
                         and isinstance(representation, Mapping) and isinstance(approval, Mapping)):
                     try:
                         contracts.validate_procedure_approval(content["approval"], procedure=content["procedure"])
@@ -2287,6 +2300,7 @@ class PreparationService:
                     except contracts.ContractError:
                         pass
                     else:
+                        verified["approval_digest"] = content["approval"]["content_hash"]
                         verified["compact_representation"] = representation
                         verified["compact_approval"] = approval
                 owner_proof = verified
