@@ -1,5 +1,5 @@
-"""``resume-lane``: re-run a stopped, unaccepted lane in its same worktree and
-provider session with a fresh ``run_id``.
+"""``resume-lane``: re-run a stopped, unaccepted lane in its same worktree
+with a fresh ``run_id``. A proven pre-provider failure has no session to reuse.
 
 Resume is a short program, not an agent.  It re-does work: it clears the prior
 run's obsolete current state, writes a fresh invocation for the new run, and
@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from . import memory_handoff
+from . import memory_handoff, processes
 from .bootstrap import (
     _write_invocation,
     _write_result_template,
@@ -44,6 +44,56 @@ RESUME_PLAN_PENDING = "RESUME_PLAN_PENDING"
 _RESUMABLE_LIFECYCLES = frozenset(
     {"review_pending", "result_invalid", "blocked", "abandoned", "resuming"}
 )
+
+
+def _live_controller(lane: dict[str, Any]) -> bool:
+    """Check both the lane process and the controller's exact attestation."""
+    identities = [lane.get("process") or {}]
+    status_path = Path(lane["controller_status_path"])
+    if status_path.is_file():
+        try:
+            status = read_json(status_path)
+            require_schema(status, "controller-status/v1", status_path)
+        except (OSError, ValueError) as exc:
+            raise memory_handoff.MemoryHandoffError(
+                "controller status is unreadable; resume cannot prove prior ownership"
+            ) from exc
+        if status.get("lane_id") == lane["lane_id"] and status.get("run_id") == lane["run_id"]:
+            identities.append(status.get("controller_identity") or {})
+    return any(
+        isinstance(identity, dict)
+        and processes.identity_matches(identity.get("pid"), identity.get("creation_time"))
+        for identity in identities
+    )
+
+
+def _recheck_resume_owner(
+    rt: Path, epoch_id: str, lane: dict[str, Any], *, lifecycle: str
+) -> dict[str, Any]:
+    current = read_lane(rt, epoch_id, lane["lane_id"])
+    if any(
+        current.get(field) != lane.get(field)
+        for field in ("lane_id", "run_id", "worktree_path", "provider")
+    ) or current.get("lifecycle") != lifecycle:
+        raise memory_handoff.MemoryHandoffError(
+            "lane run or status changed before resume could replace it"
+        )
+    if _live_controller(current):
+        raise memory_handoff.MemoryHandoffError(
+            "an exact native controller is still live; resume cannot replace its run"
+        )
+    return current
+
+
+def _exact_controller_exited(identity: dict[str, Any]) -> bool:
+    pid = identity.get("pid")
+    creation = identity.get("creation_time")
+    if not isinstance(pid, int) or not isinstance(creation, str) or not creation:
+        return False
+    if not processes.process_alive(pid):
+        return True
+    current = processes.process_identity(pid)
+    return current is not None and current["creation_time"] != creation
 
 
 def _consume_resume_signal(rt: Path, lane_id: str, prior_run_id: str) -> None:
@@ -203,12 +253,7 @@ def run_resume(
                 "evidence_paths": [],
                 "next_action": "bootstrap a fresh lane",
             }
-        process = lane.get("process") or {}
-        from . import processes
-
-        if lifecycle == "running" and processes.identity_matches(
-            process.get("pid"), process.get("creation_time")
-        ):
+        if _live_controller(lane):
             return {
                 "ok": False,
                 "code": LANE_RUNNING,
@@ -216,7 +261,7 @@ def run_resume(
                 "evidence_paths": [],
                 "next_action": "wait for the lane to stop, or force-stop it first",
             }
-        if lifecycle not in _RESUMABLE_LIFECYCLES and lifecycle != "running":
+        if lifecycle not in _RESUMABLE_LIFECYCLES and lifecycle not in ("running", "prepared"):
             return {
                 "ok": False,
                 "code": RESUME_LANE_WRITE_FAILED,
@@ -236,14 +281,6 @@ def run_resume(
             }
         session = lane.get("session") or {}
         session_id = session.get("session_id")
-        if not isinstance(session_id, str) or not session_id:
-            return {
-                "ok": False,
-                "code": NO_SAVED_SESSION_ID,
-                "summary": f"lane {lane_id} has no saved provider session to resume",
-                "evidence_paths": [],
-                "next_action": "bootstrap a fresh lane (resume requires a native session)",
-            }
 
         try:
             task_card = _read_task_card(Path(resume_task_card))
@@ -270,22 +307,7 @@ def run_resume(
             # after resume has checked its operation.
             dispatch_lock = RecordLock(memory_handoff.memory_paths(worktree)[1])
             dispatch_lock.__enter__()
-            locked_lane = read_lane(rt, epoch_id, lane_id)
-            if any(
-                locked_lane.get(field) != lane.get(field)
-                for field in ("lane_id", "run_id", "worktree_path", "provider")
-            ) or locked_lane.get("lifecycle") == "accepted":
-                raise memory_handoff.MemoryHandoffError(
-                    "lane ownership changed before resume could reconcile dispatch"
-                )
-            locked_process = locked_lane.get("process") or {}
-            if locked_lane.get("lifecycle") == "running" and processes.identity_matches(
-                locked_process.get("pid"), locked_process.get("creation_time")
-            ):
-                raise memory_handoff.MemoryHandoffError(
-                    "a native controller started before resume acquired dispatch ownership"
-                )
-            lane = locked_lane
+            lane = _recheck_resume_owner(rt, epoch_id, lane, lifecycle=lifecycle)
         memory_handoff.validate_resume_handoff(
             task_card=task_card,
             lane_id=lane_id,
@@ -332,6 +354,56 @@ def run_resume(
                 raise memory_handoff.MemoryHandoffError(
                     "prior dispatch was reconciled; review its native lifecycle before resume"
                 )
+            if not isinstance(session_id, str) or not session_id:
+                from . import launch
+
+                observed = (prior_operation or {}).get("observed_invocation")
+                if prior_operation is None or prior_operation["status"] != "delivered" or not isinstance(observed, dict):
+                    raise memory_handoff.MemoryHandoffError(
+                        "no saved provider session or delivered no-provider failure permits a fresh run"
+                    )
+                context = memory_handoff.load_final_context(
+                    worktree_path=worktree, envelope=prior_envelope
+                )
+                expected = memory_handoff.native_observation(
+                    envelope=prior_envelope,
+                    context=context,
+                    controller_identity=observed,
+                )
+                if observed != expected:
+                    raise memory_handoff.MemoryHandoffError(
+                        "prior native controller observation conflicts with this run"
+                    )
+                current_process = lane.get("process") or {}
+                if current_process and current_process != {
+                    "pid": observed["pid"], "creation_time": observed["creation_time"]
+                }:
+                    raise memory_handoff.MemoryHandoffError(
+                        "a different native controller owns the prior run"
+                    )
+                outcome = launch._delivered_provider_outcome(
+                    lane, observed,
+                    memory_handoff.dispatch_binding(envelope=prior_envelope, context=context),
+                )
+                if (
+                    outcome is None or outcome[0] == "LAUNCH_OK"
+                    or not _exact_controller_exited(observed)
+                ):
+                    raise memory_handoff.MemoryHandoffError(
+                        "no-provider cleanup and exact controller exit are not proven; resume cannot replace the run"
+                    )
+        elif not isinstance(session_id, str) or not session_id:
+            return {
+                "ok": False,
+                "code": NO_SAVED_SESSION_ID,
+                "summary": f"lane {lane_id} has no saved provider session to resume",
+                "evidence_paths": [],
+                "next_action": "bootstrap a fresh lane (resume requires a native session)",
+            }
+        if lifecycle == "prepared" and (not current_memory_state or session_id):
+            raise memory_handoff.MemoryHandoffError(
+                "prepared lane has no proven pre-provider failure to resume"
+            )
         run_id = new_id()
         managed = config.profile == "managed"
         # Resume is the same logical decision as the original bootstrap: it
@@ -377,17 +449,28 @@ def run_resume(
                     "resume the lane again; no worker was created or launched"
                 ),
             }
-        update_lane(
-            rt,
-            epoch_id,
-            lane_id,
-            lambda current: {
+        if dispatch_lock is not None:
+            lane = _recheck_resume_owner(rt, epoch_id, lane, lifecycle=lifecycle)
+        def mark_resuming(current: dict[str, Any]) -> dict[str, Any]:
+            if current.get("run_id") != prior_run_id or current.get("lifecycle") != lifecycle:
+                raise memory_handoff.MemoryHandoffError(
+                    "lane run or status changed before resume mutation"
+                )
+            return {
                 **current,
                 "lifecycle": "resuming",
                 "resume_started_at": iso_utc(),
                 "resume_from_run_id": prior_run_id,
-            },
+            }
+
+        update_lane(
+            rt,
+            epoch_id,
+            lane_id,
+            mark_resuming,
         )
+        if dispatch_lock is not None:
+            _recheck_resume_owner(rt, epoch_id, lane, lifecycle="resuming")
         _clear_prior_run(rt, epoch_id, lane)
         if managed:
             _reset_worker_inbox(worktree, lane_id, run_id)
@@ -430,13 +513,14 @@ def run_resume(
         # The resume task card is a per-lane input; keep the current copy.
         atomic_write_json(worktree / ".agent-workspace" / "task-card.json", task_card)
 
-        update_lane(
-            rt,
-            epoch_id,
-            lane_id,
-            lambda current, value=run_id, pending=memory: {
+        def replace_run(current: dict[str, Any]) -> dict[str, Any]:
+            if current.get("run_id") != prior_run_id or current.get("lifecycle") != "resuming":
+                raise memory_handoff.MemoryHandoffError(
+                    "lane run or status changed before fresh run ownership"
+                )
+            return {
                 **current,
-                "run_id": value,
+                "run_id": run_id,
                 "lifecycle": "running",
                 "process": {},
                 "launch_pending": True,
@@ -445,14 +529,15 @@ def run_resume(
                 "resume_from_run_id": prior_run_id,
                 **(
                     {
-                        "memory_plan_state": pending.state,
-                        "dispatchable": pending.dispatchable,
+                        "memory_plan_state": memory.state,
+                        "dispatchable": memory.dispatchable,
                     }
-                    if pending.state is not None
+                    if memory.state is not None
                     else {}
                 ),
-            },
-        )
+            }
+
+        update_lane(rt, epoch_id, lane_id, replace_run)
         if managed:
             _consume_resume_signal(rt, lane_id, prior_run_id)
     except Exception as exc:

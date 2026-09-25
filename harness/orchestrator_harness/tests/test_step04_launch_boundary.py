@@ -15,8 +15,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import asdict
 from pathlib import Path
@@ -27,7 +29,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from orchestrator_harness import bootstrap, controller, launch, lanes, memory_handoff, resume, setup
+from orchestrator_harness import bootstrap, controller, launch, lanes, memory_handoff, processes, resume, setup
 from memory_harness import config, contracts, store
 
 
@@ -646,6 +648,7 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
             result, spawn = self.fixture.run_launch(lane_id="launch-lane", status={
                 "lane_id": "launch-lane", "run_id": self.envelope["run_id"],
                 "controller_state": "running", "cleanup_proven": False,
+                "provider_state": {"state": "running"},
                 "controller_identity": {"pid": 57, "creation_time": "native-57"},
                 "dispatch_binding": memory_handoff.dispatch_binding(
                     envelope=self.envelope,
@@ -696,6 +699,8 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
             result, spawn = self.fixture.run_launch(lane_id="launch-lane", status={
                 "lane_id": "launch-lane", "run_id": self.envelope["run_id"],
                 "controller_state": "exited", "cleanup_proven": True,
+                "provider_state": {"state": "exited", "exit_code": 0},
+                "recorded_status": "review_pending",
                 "controller_identity": {"pid": 57, "creation_time": "native-57"},
                 "dispatch_binding": memory_handoff.dispatch_binding(
                     envelope=self.envelope,
@@ -899,6 +904,63 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
             )
         self.assertEqual(invocation["dispatch_binding"], binding)
 
+    def test_native_controller_attests_its_real_pid_and_creation_before_provider(self) -> None:
+        binding_path = (
+            self.fixture.harness / "orchestrator_harness" / "provider_adapters"
+            / "codex" / "launcher_binding.py"
+        )
+        self.fixture.write_text(
+            binding_path,
+            'import time\ntime.sleep(2.0)\nraise RuntimeError("test pre-provider stop")\n',
+        )
+        self.fixture.write_json(
+            self.fixture.runtime / "CURRENT_EPOCH.json",
+            {"schema": "current-epoch/v1", "epoch_id": self.fixture.EPOCH},
+        )
+        env = memory_handoff.worker_environment(self.card, provider_id="codex")
+        env["PYTHONPATH"] = os.pathsep.join((str(ROOT / "harness"), str(SRC)))
+        child = processes.spawn_detached(
+            processes.python_argv("orchestrator_harness.controller", "launch-lane"),
+            cwd=self.fixture.harness, env=env, stderr=subprocess.PIPE,
+        )
+        attested = None
+        try:
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                lane = self.fixture.lane_record("launch-lane")
+                status = launch._read_controller_status(lane)
+                if status and status.get("controller_identity"):
+                    attested = status
+                    break
+                if child.poll() is not None:
+                    break
+                time.sleep(0.05)
+            if attested is None:
+                child.wait(timeout=6.0)
+                self.fail(
+                    "native controller never attested its PID: "
+                    + child.stderr.read().decode("utf-8", errors="replace")
+                )
+            identity = processes.process_identity(child.pid)
+            self.assertEqual(identity, attested["controller_identity"])
+            self.assertTrue(processes.identity_matches(child.pid, identity["creation_time"]))
+            self.assertEqual(
+                identity,
+                launch._lookup_native_invocation(
+                    self.fixture.runtime, self.fixture.EPOCH,
+                    self.fixture.lane_record("launch-lane"),
+                    expected_binding=attested["dispatch_binding"],
+                    expected_pid=child.pid,
+                ),
+            )
+        finally:
+            try:
+                child.wait(timeout=6.0)
+            except subprocess.TimeoutExpired:
+                child.terminate()
+                child.wait(timeout=6.0)
+            child.stderr.close()
+
     def test_changed_prompt_refuses_dispatch_before_intent(self) -> None:
         prompt = self.worktree / ".agent-workspace" / "worker-prompt.md"
         prompt.write_text(prompt.read_text(encoding="utf-8") + "\nNew instructions\n", encoding="utf-8")
@@ -1079,6 +1141,108 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
         finally:
             memory_store.close()
 
+    def test_allowance_crossing_durable_intent_cannot_strand_a_zero_spawn_retry(self) -> None:
+        clock = [0.0]
+        record_intent = memory_handoff.record_dispatch_intent
+
+        def cross_deadline(**kwargs: object) -> dict:
+            intent = record_intent(**kwargs)
+            clock[0] = 2.0
+            return intent
+
+        with (
+            patch.object(launch.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(memory_handoff, "record_dispatch_intent", side_effect=cross_deadline),
+        ):
+            first, spawn = self.fixture.run_launch(
+                lane_id="launch-lane", allowance_seconds=1.0
+            )
+        operation = memory_handoff.get_dispatch_operation(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        self.assertFalse(
+            spawn.call_count == 0 and operation is not None,
+            (first, operation),
+        )
+        if spawn.call_count:
+            retry, second_spawn = self.fixture.run_launch(lane_id="launch-lane")
+            self.assertTrue(retry["ok"], retry)
+            second_spawn.assert_not_called()
+
+    def test_delivered_observation_survives_later_lane_write_failure(self) -> None:
+        with patch.object(launch, "update_lane", side_effect=OSError("lane write failed")):
+            first, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(first["ok"], first)
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, first["code"])
+        spawn.assert_called_once()
+        spawn.return_value.terminate.assert_not_called()
+        operation = memory_handoff.get_dispatch_operation(
+            worktree_path=self.worktree, envelope=self.envelope
+        )
+        self.assertEqual("delivered", operation["status"])
+        retry, second_spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertTrue(retry["ok"], retry)
+        second_spawn.assert_not_called()
+
+    def test_attested_pre_provider_failure_is_preserved_on_exact_retry(self) -> None:
+        lane = self.fixture.lane_record("launch-lane")
+        controller._append_event(lane, "lease_busy", "resource is held")
+        status = {
+            "schema": "controller-status/v1",
+            "lane_id": "launch-lane",
+            "run_id": self.envelope["run_id"],
+            "controller_state": "exited",
+            "provider_state": {"state": "not_started"},
+            "cleanup_proven": True,
+            "controller_identity": {"pid": 41, "creation_time": "ct-1"},
+            "dispatch_binding": memory_handoff.dispatch_binding(
+                envelope=self.envelope,
+                context=memory_handoff.load_final_context(
+                    worktree_path=self.worktree, envelope=self.envelope
+                ),
+            ),
+        }
+        self.fixture.write_json(Path(lane["controller_status_path"]), status)
+        first, spawn = self.fixture.run_launch(lane_id="launch-lane", status=status)
+        self.assertFalse(first["ok"], first)
+        self.assertEqual(launch.LAUNCH_LEASE_BUSY, first["code"])
+        spawn.assert_called_once()
+        retry, second_spawn = self.fixture.run_launch(lane_id="launch-lane", status=status)
+        self.assertFalse(retry["ok"], retry)
+        self.assertEqual(launch.LAUNCH_LEASE_BUSY, retry["code"])
+        second_spawn.assert_not_called()
+        with patch.object(processes, "identity_matches", return_value=True):
+            blocked = self.fixture.run_resume(lane_id="launch-lane", card=self.card)
+        self.assertFalse(blocked["ok"], blocked)
+        self.assertEqual(self.envelope["run_id"], self.fixture.lane_record("launch-lane")["run_id"])
+        with patch.object(processes, "identity_matches", return_value=False):
+            recovered = self.fixture.run_resume(lane_id="launch-lane", card=self.card)
+        self.assertTrue(recovered["ok"], recovered)
+        self.assertNotEqual(self.envelope["run_id"], self.fixture.lane_record("launch-lane")["run_id"])
+
+    def test_delivered_controller_without_provider_outcome_stays_ambiguous(self) -> None:
+        status = {
+            "lane_id": "launch-lane",
+            "run_id": self.envelope["run_id"],
+            "controller_state": "starting",
+            "provider_state": {"state": "starting"},
+            "controller_identity": {"pid": 41, "creation_time": "ct-1"},
+            "dispatch_binding": memory_handoff.dispatch_binding(
+                envelope=self.envelope,
+                context=memory_handoff.load_final_context(
+                    worktree_path=self.worktree, envelope=self.envelope
+                ),
+            ),
+        }
+        first, spawn = self.fixture.run_launch(lane_id="launch-lane", status=status)
+        self.assertFalse(first["ok"], first)
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, first["code"])
+        spawn.assert_called_once()
+        retry, second_spawn = self.fixture.run_launch(lane_id="launch-lane", status=status)
+        self.assertFalse(retry["ok"], retry)
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, retry["code"])
+        second_spawn.assert_not_called()
+
     def test_removed_envelope_is_pending_plan_and_never_spawns(self) -> None:
         store_path, envelope_path = self.fixture.memory_paths(self.worktree)
         decision_id = self.envelope["decision_id"]
@@ -1241,6 +1405,72 @@ class Step04ScrubbedWorkerEnvironmentTests(unittest.TestCase):
         self.assertIsInstance(env, dict)
         for key in ("MEMORY_HARNESS_CONTROL_TOKEN", "MEMORY_HARNESS_POLICY_TOKEN"):
             self.assertNotIn(key, env)
+
+    def test_scrubbed_ordinary_launch_excludes_every_product_control_credential(self) -> None:
+        control = {
+            "MEMORY_HARNESS_APPROVAL_TOKEN": "approval-secret",
+            "MEMORY_HARNESS_PUBLICATION_KEY": "publication-secret",
+            "MEMORY_HARNESS_REVOCATION_TOKEN": "revocation-secret",
+            "MEMORY_HARNESS_POLICY_MUTATION_CREDENTIAL": "policy-secret",
+        }
+        with patch.dict(os.environ, control):
+            result, spawn = self.fixture.run_launch(lane_id="scrubbed-lane")
+        self.assertTrue(result["ok"], result)
+        env = spawn.call_args.kwargs["env"]
+        self.assertFalse(set(control) & set(env))
+        self.assertFalse(set(control.values()) & set(env.values()))
+        store_path, _ = self.fixture.memory_paths(self.worktree)
+        self.assertFalse(store_path.exists(), "ordinary scrubbed launch initialized optional memory")
+
+    def test_scrubbed_ordinary_launch_rejects_control_tool_and_prompt(self) -> None:
+        config_path = self.worktree / ".codex" / "config.toml"
+        self.fixture.write_text(
+            config_path,
+            '[mcp_servers.prod]\ncommand = "productctl"\nargs = ["approve"]\n',
+        )
+        result, spawn = self.fixture.run_launch(lane_id="scrubbed-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        spawn.assert_not_called()
+        config_path.unlink()
+        prompt = self.worktree / ".agent-workspace" / "worker-prompt.md"
+        prompt.write_text(
+            prompt.read_text(encoding="utf-8") + "\nMEMORY_HARNESS_APPROVAL_TOKEN=approval-secret\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"MEMORY_HARNESS_APPROVAL_TOKEN": "approval-secret"}):
+            result, spawn = self.fixture.run_launch(lane_id="scrubbed-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        self.assertNotIn("approval-secret", result["summary"])
+        spawn.assert_not_called()
+
+    def test_scrubbed_all_off_launch_excludes_product_control_credentials(self) -> None:
+        card, _ = accepted_card(configuration={"all_features": False})
+        card["worker_environment"] = "scrubbed"
+        card["content_hash"] = contracts.content_hash(card)
+        prepared, worktree = self.fixture.run_bootstrap(lane_id="scrubbed-all-off", card=card)
+        self.assertTrue(prepared["ok"], prepared)
+        with patch.dict(os.environ, {"MEMORY_HARNESS_APPROVAL_TOKEN": "approval-secret"}):
+            result, spawn = self.fixture.run_launch(lane_id="scrubbed-all-off")
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("MEMORY_HARNESS_APPROVAL_TOKEN", spawn.call_args.kwargs["env"])
+        self.assertFalse(self.fixture.memory_paths(worktree)[0].exists())
+
+    def test_scrubbed_ordinary_controller_rechecks_tools_before_provider(self) -> None:
+        lane = self.fixture.lane_record("scrubbed-lane")
+        invocation = json.loads(
+            (self.worktree / ".agent-workspace" / "invocation.json").read_text(encoding="utf-8")
+        )
+        self.fixture.write_text(
+            self.worktree / ".codex" / "config.toml",
+            '[mcp_servers.prod]\ncommand = "productctl"\nargs = ["approve"]\n',
+        )
+        with patch.dict(
+            os.environ, memory_handoff.worker_environment(self.card, provider_id="codex"), clear=True
+        ):
+            with self.assertRaises(controller.ControllerError):
+                controller._validate_enhanced_dispatch(lane, invocation)
 
 
 class Step04ResumeBoundaryTests(unittest.TestCase):
@@ -1413,6 +1643,58 @@ class Step04ResumeBoundaryTests(unittest.TestCase):
         self.assertIn("dispatch", resumed["summary"])
         self.assertEqual(prior_run, self.fixture.lane_record("unresolved-resume")["run_id"])
         self.assertEqual(envelope, memory_handoff.load_envelope(worktree))
+
+    def test_review_pending_live_exact_controller_cannot_be_replaced(self) -> None:
+        card, _ = accepted_card()
+        result, _ = self.fixture.run_bootstrap(lane_id="live-review", card=card)
+        self.assertTrue(result["ok"], result)
+        self.fixture.make_resumable("live-review")
+        lane = self.fixture.lane_record("live-review")
+        self.fixture.write_json(
+            Path(lane["controller_status_path"]),
+            {
+                "schema": "controller-status/v1",
+                "lane_id": "live-review",
+                "run_id": lane["run_id"],
+                "controller_identity": {"pid": 73, "creation_time": "native-73"},
+                "controller_state": "running",
+            },
+        )
+        old_run = self.fixture.lane_record("live-review")["run_id"]
+        with patch.object(processes, "identity_matches", return_value=True):
+            resumed = self.fixture.run_resume(lane_id="live-review", card=card)
+        self.assertFalse(resumed["ok"], resumed)
+        self.assertEqual(old_run, self.fixture.lane_record("live-review")["run_id"])
+
+    def test_resume_rechecks_live_controller_and_run_under_dispatch_lock(self) -> None:
+        card, _ = accepted_card()
+        result, _ = self.fixture.run_bootstrap(lane_id="late-controller", card=card)
+        self.assertTrue(result["ok"], result)
+        self.fixture.make_resumable("late-controller")
+        old_run = self.fixture.lane_record("late-controller")["run_id"]
+        real_lock = resume.RecordLock
+
+        class LateControllerLock:
+            def __init__(inner, path: Path) -> None:
+                inner.lock = real_lock(path)
+
+            def __enter__(inner):
+                inner.lock.__enter__()
+                self.fixture.write_lane_fields(
+                    "late-controller", process={"pid": 74, "creation_time": "native-74"}
+                )
+                return inner
+
+            def __exit__(inner, exc_type, exc, traceback):
+                return inner.lock.__exit__(exc_type, exc, traceback)
+
+        with (
+            patch.object(resume, "RecordLock", side_effect=LateControllerLock),
+            patch.object(processes, "identity_matches", return_value=True),
+        ):
+            resumed = self.fixture.run_resume(lane_id="late-controller", card=card)
+        self.assertFalse(resumed["ok"], resumed)
+        self.assertEqual(old_run, self.fixture.lane_record("late-controller")["run_id"])
 
     def test_resume_of_legacy_lane_keeps_the_ordinary_path(self) -> None:
         card = legacy_card()

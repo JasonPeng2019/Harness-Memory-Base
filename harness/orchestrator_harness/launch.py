@@ -8,7 +8,7 @@ lane hard stop.  Retire is the graceful end of an accepted lane.
 from __future__ import annotations
 
 import hashlib
-import os
+import json
 import subprocess
 import time
 from pathlib import Path
@@ -308,16 +308,79 @@ def _wait_for_spawn_attestation(
         time.sleep(0.1)
 
 
+def _delivered_provider_outcome(
+    lane: Mapping[str, Any], identity: Mapping[str, Any],
+    expected_binding: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Read the exact controller's provider outcome, not just its delivery.
+
+    ``None`` means the provider outcome is still unresolved. A controller can
+    attest its PID and then fail while acquiring a lease or starting a provider.
+    The existing status and run-scoped events retain that failure without a
+    second dispatch receipt.
+    """
+    status = _read_controller_status(dict(lane))
+    if (
+        status is None
+        or status.get("dispatch_binding") != expected_binding
+        or status.get("controller_identity") != {
+            "pid": identity.get("pid"), "creation_time": identity.get("creation_time")
+        }
+    ):
+        return None
+    provider = status.get("provider_state") or {}
+    if not isinstance(provider, Mapping):
+        return None
+    if status.get("controller_state") == "running" and provider.get("state") == "running":
+        return "LAUNCH_OK", "the provider started"
+    if (
+        provider.get("state") == "exited"
+        and status.get("cleanup_proven") is True
+        and status.get("recorded_status") in ("review_pending", "result_invalid")
+    ):
+        return "LAUNCH_OK", f"the provider reached {status['recorded_status']}"
+    if not (
+        status.get("controller_state") == "exited"
+        and provider.get("state") == "not_started"
+        and status.get("cleanup_proven") is True
+        and not any(provider.get(key) for key in ("pid", "creation_time", "provider_session_id"))
+        and not status.get("process_boundary")
+        and not (lane.get("session") or {}).get("session_id")
+    ):
+        return None
+    failure = status.get("recorded_status")
+    if failure not in ("lease_busy", "binding_failed", "provider_start_failed"):
+        events_path = Path(lane["controller_events_path"])
+        try:
+            lines = events_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("run_id") == lane["run_id"] and event.get("event_type") in (
+                "lease_busy", "binding_failed", "provider_start_failed"
+            ):
+                failure = event["event_type"]
+    return {
+        "lease_busy": (LAUNCH_LEASE_BUSY, "a declared resource is held; no provider started"),
+        "binding_failed": (LAUNCH_BINDING_FAILED, "the provider binding failed before start"),
+        "provider_start_failed": (LAUNCH_PROVIDER_START_FAILED, "the provider could not be started"),
+    }.get(failure)
+
+
 def run_launch(
     lane_id: str, *, allowance_seconds: float | None = None
 ) -> dict[str, Any]:
     """Execute ``lane launch`` and return the structured result.
 
     ``allowance_seconds`` is the caller's remaining share of one enclosing
-    absolute deadline.  A spent allowance refuses before any controller or
-    handshake effect, so a timed-out native call cannot create a late
-    unbounded effect after that deadline.  ``None`` keeps the ordinary
-    caller's unbounded behaviour.
+    absolute deadline. A spent allowance refuses before durable intent. Once
+    intent commits, the native spawn is attempted so the operation cannot be
+    stranded as a proven zero-spawn pending intent. The following handshake
+    remains bounded. ``None`` keeps the ordinary caller's unbounded behaviour.
     """
     if allowance_seconds is not None and allowance_seconds <= 0:
         return {
@@ -338,6 +401,7 @@ def run_launch(
         if allowance_seconds is None
         else time.monotonic() + float(allowance_seconds)
     )
+    memory_envelope: dict[str, Any] | None = None
     try:
         harness_root = find_harness_root()
         config = load_config(harness_root)
@@ -431,7 +495,6 @@ def run_launch(
             raise LaunchError(LAUNCH_PLAN_PENDING, str(exc)) from exc
         except memory_handoff.MemoryHandoffError as exc:
             raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
-        memory_envelope: dict[str, Any] | None = None
         final_context: dict[str, Any] | None = None
         if memory_state is not None:
             memory_envelope = memory_handoff.load_envelope(lane["worktree_path"])
@@ -518,9 +581,18 @@ def run_launch(
             except memory_handoff.MemoryHandoffError as exc:
                 raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
         elif worker_environment == WORKER_ENVIRONMENT_SCRUBBED:
-            from memory_harness import privacy
-
-            spawn_options["env"] = privacy.worker_environment(os.environ)
+            try:
+                spawn_options["env"] = memory_handoff.worker_environment(
+                    task_card, provider_id=provider_id
+                )
+                memory_handoff.validate_worker_material(
+                    worktree_path=lane["worktree_path"],
+                    invocation=invocation,
+                    environment=spawn_options["env"],
+                    task_card=task_card,
+                )
+            except memory_handoff.MemoryHandoffError as exc:
+                raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
         argv = processes.python_argv("orchestrator_harness.controller", lane_id)
         if memory_envelope is not None:
             assert final_context is not None
@@ -634,16 +706,53 @@ def run_launch(
                             envelope=memory_envelope,
                             observed_invocation=observed,
                         )
-                    update_lane(
-                        rt, epoch_id, lane_id,
-                        lambda current: {**current, "launch_pending": False},
+                    current_lane = read_lane(rt, epoch_id, lane_id)
+                    outcome = _delivered_provider_outcome(
+                        current_lane, observed, invocation["dispatch_binding"]
                     )
+                    def clear_pending(current: dict[str, Any]) -> dict[str, Any]:
+                        if current.get("run_id") != lane["run_id"]:
+                            raise LaunchError(
+                                LAUNCH_DISPATCH_AMBIGUOUS,
+                                "lane run changed during exact dispatch reconciliation",
+                            )
+                        current_process = current.get("process") or {}
+                        if current_process and current_process != {
+                            "pid": observed["pid"], "creation_time": observed["creation_time"]
+                        }:
+                            raise LaunchError(
+                                LAUNCH_DISPATCH_AMBIGUOUS,
+                                "native controller changed during exact dispatch reconciliation",
+                            )
+                        return {**current, "launch_pending": False}
+
+                    try:
+                        update_lane(rt, epoch_id, lane_id, clear_pending)
+                    except LaunchError:
+                        raise
+                    except Exception as exc:
+                        raise LaunchError(
+                            LAUNCH_DISPATCH_AMBIGUOUS,
+                            "native invocation is delivered but lane persistence is unresolved; reconcile this exact run",
+                        ) from exc
+                    evidence = [str(memory_handoff.memory_paths(lane["worktree_path"])[0])]
+                    if outcome is None:
+                        raise LaunchError(
+                            LAUNCH_DISPATCH_AMBIGUOUS,
+                            "native controller is delivered but provider-start outcome is unresolved; retry exact reconciliation",
+                            evidence_paths=evidence,
+                        )
+                    code, detail = outcome
                     return {
-                        "ok": True,
-                        "code": "LAUNCH_OK",
-                        "summary": f"lane {lane_id} has one reconciled native invocation",
-                        "evidence_paths": [str(memory_handoff.memory_paths(lane["worktree_path"])[0])],
-                        "next_action": "continue the existing harness review and cleanup lifecycle",
+                        "ok": code == "LAUNCH_OK",
+                        "code": code,
+                        "summary": f"lane {lane_id}: {detail}",
+                        "evidence_paths": evidence + [str(current_lane["controller_status_path"])],
+                        "next_action": (
+                            "continue the existing harness review and cleanup lifecycle"
+                            if code == "LAUNCH_OK" else
+                            "after exact controller exit and no-provider proof, use resume-lane for a fresh run"
+                        ),
                     }
                 if launch_deadline is not None and time.monotonic() >= launch_deadline:
                     raise LaunchError(
@@ -656,11 +765,10 @@ def run_launch(
                     )
                 except memory_handoff.MemoryHandoffError as exc:
                     raise LaunchError(LAUNCH_DISPATCH_AMBIGUOUS, str(exc)) from exc
-                if launch_deadline is not None and time.monotonic() >= launch_deadline:
-                    raise LaunchError(
-                        LAUNCH_ALLOWANCE_EXPIRED,
-                        "the enclosing allowance expired after intent; native ownership remains unresolved",
-                    )
+                # The allowance is checked immediately before durable intent.
+                # Once intent commits, attempt the native spawn even if that
+                # commit crossed the deadline: a zero-spawn pending intent has
+                # no durable fact from which an exact retry can recover.
                 try:
                     child = processes.spawn_detached(argv, **spawn_options)
                 except Exception as exc:
@@ -752,6 +860,12 @@ def run_launch(
         except LaunchError:
             raise
         except Exception as exc:
+            if memory_envelope is not None:
+                raise LaunchError(
+                    LAUNCH_DISPATCH_AMBIGUOUS,
+                    "native invocation is delivered but lane persistence is unresolved; reconcile this exact run",
+                    evidence_paths=[str(memory_handoff.memory_paths(lane["worktree_path"])[0])],
+                ) from exc
             child.terminate()
             child.wait(timeout=10.0)
             raise LaunchError(
@@ -763,7 +877,7 @@ def run_launch(
             # The handshake is a blocking native phase, so it may not outlive
             # the caller's one enclosing allowance.
             deadline = min(deadline, launch_deadline)
-        while time.monotonic() < deadline:
+        while True:
             status = _read_controller_status(lane)
             provider_state = (status or {}).get("provider_state") or {}
             running = (
@@ -792,9 +906,42 @@ def run_launch(
                     "evidence_paths": [str(Path(lane["worktree_path"]) / ".agent-workspace" / "controller.status.json")],
                     "next_action": "wait for the worker result; the monitor reports actionable status",
                 }
-            if child.poll() is not None:
+            if child.poll() is not None or time.monotonic() >= deadline:
                 break
             time.sleep(0.2)
+        if memory_envelope is not None and child.poll() is None:
+            raise LaunchError(
+                LAUNCH_DISPATCH_AMBIGUOUS,
+                "native controller was delivered but its provider outcome is still pending; reconcile this exact run",
+                evidence_paths=[str(memory_handoff.memory_paths(lane["worktree_path"])[0])],
+            )
+        if memory_envelope is not None:
+            outcome = _delivered_provider_outcome(
+                read_lane(rt, epoch_id, lane_id),
+                controller_identity,
+                invocation["dispatch_binding"],
+            )
+            evidence = [str(Path(lane["controller_status_path"]))]
+            if outcome is None:
+                raise LaunchError(
+                    LAUNCH_DISPATCH_AMBIGUOUS,
+                    "native controller was delivered but provider-start outcome is unresolved; reconcile this exact run",
+                    evidence_paths=evidence,
+                )
+            code, summary = outcome
+            if code == "LAUNCH_OK":
+                return {
+                    "ok": True,
+                    "code": code,
+                    "summary": f"lane {lane_id}: {summary}",
+                    "evidence_paths": evidence,
+                    "next_action": "continue the existing harness review and cleanup lifecycle",
+                }
+            if code == LAUNCH_PROVIDER_START_FAILED and _reap_controller_and_prove_exit(
+                child, controller_identity
+            ):
+                _clear_exited_controller_identity(rt, epoch_id, lane_id, controller_identity)
+            raise LaunchError(code, summary, evidence_paths=evidence)
         # The controller exited before the handshake: map its last event to a code.
         events_path = Path(lane["controller_events_path"])
         code = LAUNCH_CONTROLLER_START_FAILED
@@ -838,7 +985,11 @@ def run_launch(
             "code": exc.code,
             "summary": memory_handoff.redact_control_diagnostic(str(exc)),
             "evidence_paths": exc.evidence_paths,
-            "next_action": "on LAUNCH_LEASE_BUSY, wait for the holder to finish and re-launch",
+            "next_action": (
+                "reconcile this exact dispatch; after proven no-provider exit, use resume-lane for a fresh run"
+                if memory_envelope is not None else
+                "on LAUNCH_LEASE_BUSY, wait for the holder to finish and re-launch"
+            ),
         }
     except Exception as exc:
         return {

@@ -131,6 +131,23 @@ def _validate_enhanced_dispatch(
     if state is None:
         if invocation.get("dispatch_binding") is not None:
             raise ControllerError(LAUNCH_INVOCATION_INVALID, "unexpected enhanced dispatch binding")
+        if lane.get("worker_environment") == "scrubbed":
+            try:
+                worktree = Path(lane["worktree_path"])
+                card = read_json(worktree / ".agent-workspace" / "task-card.json")
+                if card.get("worker_environment") != "scrubbed":
+                    raise ValueError("scrubbed task card changed")
+                memory_handoff.validate_worker_material(
+                    worktree_path=worktree,
+                    invocation=invocation,
+                    environment=os.environ,
+                    task_card=card,
+                )
+            except Exception as exc:
+                raise ControllerError(
+                    LAUNCH_INVOCATION_INVALID,
+                    "scrubbed controller worker material is invalid",
+                ) from exc
         return None
     if state != "execution_accepted":
         raise ControllerError(LAUNCH_INVOCATION_INVALID, "enhanced lane has no accepted plan")
@@ -574,6 +591,7 @@ def run_controller(lane_id: str) -> int:
                 "provider_state": {"state": "not_started"},
                 "cleanup_proven": True,
                 "cleanup_error": None,
+                "recorded_status": "binding_failed",
             },
         )
         _append_event(lane, "binding_failed", str(exc))
@@ -604,6 +622,7 @@ def run_controller(lane_id: str) -> int:
                 "provider_state": {"state": "not_started"},
                 "cleanup_proven": True,
                 "cleanup_error": None,
+                "recorded_status": "lease_busy",
             },
         )
         _append_event(lane, "lease_busy", str(exc))
