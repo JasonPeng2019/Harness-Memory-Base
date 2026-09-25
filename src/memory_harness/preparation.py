@@ -9,6 +9,7 @@ packet and permits at most one bounded ordinary re-prepare.
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from dataclasses import asdict, dataclass, fields, replace
@@ -24,7 +25,7 @@ from .config import (
     resolve_config,
     resolve_limits,
 )
-from .privacy import PrivacyPolicy, sanitize_text
+from .privacy import PrivacyPolicy, safe_query_payload, sanitize_text
 from .search import BoundedSearch, SearchStore
 from .store import PreparationConflictError, StoreError
 
@@ -594,10 +595,19 @@ class PreparationService:
             if not finalize or current_plan_state != "execution_accepted":
                 return outcome
             supplied_optional = [dict(item) for item in optional_items]
-            if any(item.get("plan_affecting", False) for item in supplied_optional):
+            dependent = next((
+                item for item in supplied_optional
+                if context_module._plan_depends_on(plan_of_record, item)
+            ), None)
+            if dependent is not None:
                 return replace(
                     outcome,
-                    reason=outcome.reason + "; plan-affecting optional guidance blocks finalization",
+                    reason=(
+                        outcome.reason + "; plan-affecting optional guidance "
+                        f"{dependent.get('source_id', dependent.get('id', 'unknown'))} revision "
+                        f"{dependent.get('revision_id', 'unknown')} blocks finalization; "
+                        "ROOT must replan"
+                    ),
                 )
             # The accepted plan and caller-supplied mandatory state can still
             # be finalized. Record every omitted optional item and the failed
@@ -948,6 +958,8 @@ class PreparationService:
             mandatory_content=mandatory_content,
             optional_items=optional_items,
             freshness_check=freshness_check,
+            stores=stores,
+            objective=objective,
         )
 
 
@@ -2033,6 +2045,8 @@ class PreparationService:
         optional_items: Iterable[Mapping[str, Any]],
         freshness_check: Callable[[Mapping[str, Any]], bool] | None,
         omitted: Iterable[str | Mapping[str, Any]] = (),
+        stores: Sequence[SearchStore] = (),
+        objective: Mapping[str, Any] | None = None,
     ) -> PreparationOutcome:
         if not all((lane_id, run_id, worktree_path, base_commit)):
             raise PreparationError(
@@ -2054,17 +2068,40 @@ class PreparationService:
                     "score", "comparable", "disposition", "reasons", "id", "content",
                 }
             }
-            packed_optional.append(
-                {
-                    "id": candidate["candidate_id"],
-                    "kind": candidate["kind"],
-                    "origin": candidate["origin"],
-                    "content": candidate["payload"],
+            packed_item = {
+                "id": candidate["candidate_id"],
+                "kind": candidate["kind"],
+                "origin": candidate["origin"],
+                "content": candidate["payload"],
+                "revision_id": candidate["revision_id"],
+            }
+            if candidate["kind"] == "procedure":
+                for field in ("compact_representation", "compact_approval"):
+                    if field in candidate["payload"]:
+                        packed_item[field] = candidate["payload"][field]
+            if candidate.get("freshness") == "frozen":
+                expected_contract = {
+                    "source_id": candidate["source_id"],
                     "revision_id": candidate["revision_id"],
+                    "content_digest": candidate["payload_digest"],
                 }
-            )
+                sightings = candidate.get("provenance")
+                selected_store_id = (
+                    sightings[0].get("store_id")
+                    if isinstance(sightings, list) and sightings else None
+                )
+                source_store = next((store for store in stores if store.store_id == selected_store_id), None)
+                if source_store is not None and source_store.freshness == "frozen":
+                    selected_provenance[candidate["candidate_id"]]["frozen_contract"] = expected_contract
+                elif isinstance(candidate.get("frozen_contract"), Mapping):
+                    selected_provenance[candidate["candidate_id"]]["frozen_contract"] = dict(candidate["frozen_contract"])
+            packed_optional.append(packed_item)
         for item in optional_items:
             packed_optional.append(dict(item))
+        source_recheck = self._source_rechecker(
+            selected=selected, stores=stores, objective=objective,
+            preparation=outcome.preparation, route=plan["route"],
+        ) if selected else None
         finalized = context_module.finalize_context(
             task_card=task_card,
             plan=plan,
@@ -2086,6 +2123,7 @@ class PreparationService:
             privacy_policy=self.privacy_policy,
             limits=self.limits,
             freshness_check=freshness_check,
+            source_recheck=source_recheck,
         )
         if self.store is not None:
             self.store.record_final_context(
@@ -2108,6 +2146,120 @@ class PreparationService:
                 else "the exact accepted plan was finalized into a dispatchable context"
             ),
         )
+
+    def _source_rechecker(
+        self, *, selected: Sequence[Mapping[str, Any]], stores: Sequence[SearchStore],
+        objective: Mapping[str, Any] | None, preparation: Mapping[str, Any] | None,
+        route: str,
+    ) -> Callable[[Mapping[str, Any]], Mapping[str, Any]]:
+        """Read selected sources again inside the decision's remaining allowance.
+
+        SearchStore queries are the accepted source adapters: procedure adapters
+        repeat exact approval, designation, predicate, and revocation checks.
+        The finalizer consumes only a finite observation of that fresh read.
+        """
+
+        by_store = {store.store_id: store for store in stores}
+        selected_by_id = {candidate["candidate_id"]: candidate for candidate in selected}
+        cache: dict[str, list[Mapping[str, Any]] | None] = {}
+        if preparation is not None and preparation.get("budget_source") == "trusted_deadline":
+            cutoff = preparation.get("deadline_monotonic")
+            reserve = preparation.get("execution_reserve_seconds")
+            if self.store is not None and preparation.get("preparation_id"):
+                try:
+                    recovered, _ = self._recover_budget(str(preparation["decision_id"]))
+                    cutoff = min(float(cutoff), recovered[0]) if recovered is not None else None
+                except (PreparationError, TypeError, ValueError):
+                    cutoff = None
+            if isinstance(cutoff, (int, float)) and isinstance(reserve, (int, float)):
+                logical_remaining = max(0.0, float(cutoff) - float(reserve) - self.clock())
+            else:
+                logical_remaining = 0.0
+        elif preparation is not None and preparation.get("budget_source") == "unknown_time":
+            # There is no trusted remaining cutoff to spend a second optional
+            # slice against. Never replenish the one cheap unknown-time pass.
+            logical_remaining = 0.0
+        else:
+            logical_remaining = 0.0
+        real_deadline = time.monotonic() + logical_remaining
+        if objective is not None:
+            query = safe_query_payload({
+                "representation": {key: objective[key] for key in (
+                    "model", "dimensions", "metric", "sanitizer_version"
+                )},
+                "tokens": templates.bounded_token_projection(objective.get("tokens", [])),
+                "route": route,
+            }, self.privacy_policy)
+        else:
+            query = None
+
+        def read_store(store: SearchStore) -> list[Mapping[str, Any]]:
+            # Materialize and freeze the complete observation inside the
+            # bounded worker; a late or subsequently mutated source result
+            # cannot change a finalized trace.
+            query_copy = json.loads(contracts.canonical_json(query))
+            return json.loads(contracts.canonical_json(list(store.query(query_copy) or ())))
+
+        def recheck(item: Mapping[str, Any]) -> Mapping[str, Any]:
+            candidate = selected_by_id.get(item["id"])
+            provenance = candidate.get("provenance") if candidate else None
+            store_id = provenance[0].get("store_id") if isinstance(provenance, list) and provenance else None
+            store = by_store.get(store_id)
+            status = "unavailable"
+            observed_revision = None
+            observed_digest = None
+            if store is not None and query is not None and time.monotonic() < real_deadline:
+                if store_id not in cache:
+                    deadline = min(real_deadline, time.monotonic() + self.limits.store_seconds)
+                    try:
+                        produced, bounded = self.search._call_bounded(
+                            lambda: read_store(store),
+                            deadline=deadline, label=f"final-recheck:{store_id}",
+                        )
+                        cache[store_id] = produced if bounded is None else None
+                    except Exception:
+                        cache[store_id] = None
+                readings = cache[store_id]
+                if readings is not None:
+                    status = "ineligible"
+                    for raw in readings:
+                        if not isinstance(raw, Mapping) or raw.get("logical_id") != candidate.get("logical_id"):
+                            continue
+                        observed_revision = raw.get("revision_id") if isinstance(raw.get("revision_id"), str) else None
+                        payload = raw.get("payload")
+                        observed_digest = contracts.sha256_hex(payload) if isinstance(payload, Mapping) else None
+                        if observed_revision != item["revision_id"] or observed_digest != contracts.sha256_hex(item["content"]):
+                            status = "stale"
+                            continue
+                        if raw.get("revoked") is True or raw.get("withdrawn") is True:
+                            status = "revoked"
+                        elif (raw.get("kind") != candidate.get("kind")
+                              or raw.get("source_id", store.store_id) != candidate.get("source_id")
+                              or raw.get("payload_digest", observed_digest) != observed_digest
+                              or raw.get("freshness", store.freshness) != candidate.get("freshness")
+                              or raw.get("scope") != candidate.get("scope")
+                              or (raw.get("routes") is not None and (
+                                  not isinstance(raw["routes"], (str, list, tuple, set, frozenset))
+                                  or route not in raw["routes"]
+                              ))
+                              or raw.get("approval_status", "approved") != "approved"
+                              or raw.get("designation", "current") != "current"
+                              or raw.get("predicates_ok") is False
+                              or (candidate.get("kind") == "procedure"
+                                  and (raw.get("approval_status") != "approved"
+                                       or raw.get("designation") != "current"
+                                       or raw.get("predicates_ok") is not True))):
+                            status = "ineligible"
+                        else:
+                            status = "eligible"
+                        break
+            return contracts.make_final_source_recheck(
+                item=item, status=status,
+                observed_revision_id=observed_revision,
+                observed_content_digest=observed_digest,
+            )
+
+        return recheck
 
 
 __all__ = [

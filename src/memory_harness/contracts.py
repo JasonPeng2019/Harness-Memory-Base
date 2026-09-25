@@ -39,6 +39,9 @@ SKILL_APPROVAL_SCHEMA = "generated-skill-approval/v1"
 PROCEDURE_REVISION_SCHEMA = "trusted-procedure-revision/v1"
 PROCEDURE_APPROVAL_SCHEMA = "trusted-procedure-approval/v1"
 PROCEDURE_REPRESENTATION_SCHEMA = "trusted-procedure-representation/v1"
+PROCEDURE_COMPACT_REPRESENTATION_SCHEMA = "trusted-procedure-compact-representation/v1"
+PROCEDURE_COMPACT_APPROVAL_SCHEMA = "trusted-procedure-compact-approval/v1"
+FINAL_SOURCE_RECHECK_SCHEMA = "memory-final-source-recheck/v1"
 PROCEDURE_DESIGNATION_SCHEMA = "trusted-procedure-designation/v1"
 PROCEDURE_WITHDRAWAL_SCHEMA = "trusted-procedure-withdrawal/v1"
 PROCEDURE_PUBLICATION_SCHEMA = "trusted-procedure-publication/v1"
@@ -144,15 +147,108 @@ def _validate_final_mandatory(
 
 
 def _optional_descriptor(item: Mapping[str, Any]) -> dict[str, Any]:
-    provenance = json.loads(canonical_json({
+    provenance_source = {
         key: value for key, value in item.items() if key not in {"id", "content"}
-    }))
+    }
+    # The compact body is optional context, not provenance. Keep only its
+    # exact identifiers and digests in the trace, including when omitted.
+    for field, keys in (
+        ("compact_representation", ("representation_id", "revision_id", "procedure_digest", "content_digest", "content_hash")),
+        ("compact_approval", ("approval_id", "revision_id", "procedure_digest", "representation_id", "content_digest", "content_hash")),
+    ):
+        record = provenance_source.get(field)
+        if isinstance(record, Mapping):
+            provenance_source[field] = {key: record.get(key) for key in keys}
+    provenance = json.loads(canonical_json(provenance_source))
     return {
         "id": _require_canonical_identity(item.get("id"), "optional item id"),
         "provenance": provenance,
         "provenance_digest": sha256_hex(provenance),
         "content_digest": sha256_hex(item.get("content")),
     }
+
+
+def _packed_descriptor(item: Mapping[str, Any], selected: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind source observations in the trace without altering rendered content."""
+
+    descriptor = _optional_descriptor(item)
+    for field in ("final_recheck", "frozen_contract", "freshness", "source_id"):
+        if field in selected["provenance"]:
+            descriptor["provenance"].setdefault(field, selected["provenance"][field])
+    descriptor["provenance_digest"] = sha256_hex(descriptor["provenance"])
+    return descriptor
+
+
+FINAL_RECHECK_STATUSES = frozenset({
+    "eligible", "frozen", "stale", "revoked", "ineligible", "unavailable",
+})
+
+
+def make_final_source_recheck(
+    *, item: Mapping[str, Any], status: str,
+    observed_revision_id: str | None = None,
+    observed_content_digest: str | None = None,
+) -> dict[str, Any]:
+    """Bind one finite source observation to the selected, original item."""
+
+    record = {
+        "schema": FINAL_SOURCE_RECHECK_SCHEMA,
+        "item_id": _require_canonical_identity(item.get("id"), "recheck item id"),
+        "source_id": _require_nonempty_str(item.get("source_id"), "recheck source id"),
+        "revision_id": _require_nonempty_str(item.get("revision_id"), "recheck revision id"),
+        "content_digest": sha256_hex(item.get("content")),
+        "status": status,
+        "observed_revision_id": observed_revision_id,
+        "observed_content_digest": observed_content_digest,
+    }
+    record["content_hash"] = content_hash(record)
+    validate_final_source_recheck(record, item=item)
+    return record
+
+
+def validate_final_source_recheck(
+    record: Mapping[str, Any], *, item: Mapping[str, Any] | None = None,
+) -> None:
+    validate_record(record, FINAL_SOURCE_RECHECK_SCHEMA)
+    if set(record) != {
+        "schema", "item_id", "source_id", "revision_id", "content_digest",
+        "status", "observed_revision_id", "observed_content_digest", "content_hash",
+    }:
+        raise ContractError("final source recheck has unexpected fields")
+    for field in ("item_id", "source_id", "revision_id"):
+        _require_nonempty_str(record.get(field), f"recheck {field}")
+    for field in ("content_digest", "observed_content_digest"):
+        value = record.get(field)
+        if value is None and field == "observed_content_digest":
+            continue
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise ContractError(f"final source recheck {field} is invalid")
+    if record.get("status") not in FINAL_RECHECK_STATUSES:
+        raise ContractError("final source recheck status is invalid")
+    observed = record.get("observed_revision_id")
+    if observed is not None:
+        _require_nonempty_str(observed, "observed_revision_id")
+    if record["status"] in {"eligible", "frozen"} and (
+        observed != record["revision_id"]
+        or record["observed_content_digest"] != record["content_digest"]
+    ):
+        raise ContractError("eligible final recheck does not match the selected source")
+    if record["status"] == "stale" and (
+        observed == record["revision_id"]
+        and record["observed_content_digest"] == record["content_digest"]
+    ):
+        raise ContractError("stale final recheck reports unchanged source content")
+    if record["status"] == "unavailable" and (
+        observed is not None or record["observed_content_digest"] is not None
+    ):
+        raise ContractError("unavailable final recheck cannot claim an observation")
+    if item is not None and any((
+        record["item_id"] != item.get("id"),
+        record["source_id"] != item.get("source_id"),
+        record["revision_id"] != item.get("revision_id"),
+        record["content_digest"] != sha256_hex(item.get("content")),
+    )):
+        raise ContractError("final source recheck does not bind the selected item")
 
 
 def _validate_delivery_trace(
@@ -185,7 +281,10 @@ def _validate_delivery_trace(
     selected_by_id = {item["id"]: item for item in selected}
     if len(selected_by_id) != len(selected):
         raise ContractError("finalized delivery selected ids are duplicated")
-    expected_packed = [_optional_descriptor(item) for item in optional]
+    expected_packed = [
+        _packed_descriptor(item, selected_by_id[item["id"]])
+        for item in optional if item["id"] in selected_by_id
+    ]
     if packed != expected_packed or trace["context_delivered"] != expected_packed:
         raise ContractError("finalized delivery packed/context-delivered trace mismatch")
     if [item.get("id") for item in omitted] != omitted_ids:
@@ -201,11 +300,45 @@ def _validate_delivery_trace(
             for key, value in item["provenance"].items()
         ):
             raise ContractError("finalized delivery selected/packed provenance mismatch")
+        recheck = item["provenance"].get("final_recheck")
+        if recheck is not None:
+            validate_final_source_recheck(recheck)
+            if recheck["item_id"] != item["id"] or recheck["status"] not in {"eligible", "frozen"}:
+                raise ContractError("finalized delivery packed source recheck is not eligible")
+            if (recheck["source_id"] != item["provenance"].get("source_id")
+                    or recheck["revision_id"] != item["provenance"].get("revision_id")):
+                raise ContractError("finalized delivery recheck source identity mismatch")
+            if (item["provenance"].get("kind") != "historical_evidence"
+                    and item["provenance"].get("delivery_representation") != "compact"
+                    and recheck["content_digest"] != item["content_digest"]):
+                raise ContractError("finalized delivery content differs from rechecked source")
+            frozen = item["provenance"].get("frozen_contract")
+            if recheck["status"] == "frozen" and (
+                item["provenance"].get("freshness") != "frozen"
+                or frozen != {
+                    "source_id": recheck["source_id"],
+                    "revision_id": recheck["revision_id"],
+                    "content_digest": recheck["content_digest"],
+                }
+            ):
+                raise ContractError("finalized frozen source lacks its explicit contract")
     for item in omitted:
         if not isinstance(item.get("reason"), str) or not item["reason"].strip():
             raise ContractError("finalized delivery omission requires a reason")
         if selected_by_id[item["id"]] != {key: value for key, value in item.items() if key != "reason"}:
             raise ContractError("finalized delivery selected/omitted provenance mismatch")
+        recheck = item["provenance"].get("final_recheck")
+        if recheck is not None:
+            validate_final_source_recheck(recheck)
+            if recheck["item_id"] != item["id"]:
+                raise ContractError("finalized delivery omitted recheck item mismatch")
+            if (recheck["source_id"] != item["provenance"].get("source_id")
+                    or recheck["revision_id"] != item["provenance"].get("revision_id")):
+                raise ContractError("finalized delivery omitted recheck source mismatch")
+            if recheck["status"] not in {"eligible", "frozen"} and item["reason"] != f"final recheck: {recheck['status']}":
+                raise ContractError("finalized delivery omission contradicts source recheck")
+        elif item["reason"].startswith("final recheck:"):
+            raise ContractError("finalized delivery recheck omission lacks evidence")
 
 
 def _validate_content(value: Any, field: str = "content") -> None:
@@ -2124,6 +2257,157 @@ def validate_procedure_approval(
                 )
 
 
+def make_procedure_compact_representation(
+    *, procedure: Mapping[str, Any], content: Any,
+) -> dict[str, Any]:
+    """Create a distinct immutable compact body for one approved revision."""
+
+    validate_procedure_revision(procedure)
+    normalized = _normalize_json_value(content, "compact procedure content")
+    if not isinstance(normalized, (str, dict, list)) or not normalized:
+        raise ContractError("compact procedure content must be nonempty")
+    digest = sha256_hex(normalized)
+    record = {
+        "schema": PROCEDURE_COMPACT_REPRESENTATION_SCHEMA,
+        "logical_id": procedure["logical_id"],
+        "revision_id": procedure["revision_id"],
+        "procedure_digest": procedure["content_hash"],
+        "content": normalized,
+        "content_digest": digest,
+        "representation_id": sha256_hex({
+            "domain": PROCEDURE_COMPACT_REPRESENTATION_SCHEMA,
+            "revision_id": procedure["revision_id"],
+            "procedure_digest": procedure["content_hash"],
+            "content_digest": digest,
+        }),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_procedure_compact_representation(record, procedure=procedure)
+    return record
+
+
+def validate_procedure_compact_representation(
+    record: Mapping[str, Any], *, procedure: Mapping[str, Any] | None = None,
+) -> None:
+    validate_record(record, PROCEDURE_COMPACT_REPRESENTATION_SCHEMA)
+    if set(record) != {
+        "schema", "logical_id", "revision_id", "procedure_digest", "content",
+        "content_digest", "representation_id", "content_hash",
+    }:
+        raise ContractError("compact procedure representation has unexpected fields")
+    for field in ("logical_id", "revision_id", "procedure_digest", "representation_id"):
+        _require_nonempty_str(record.get(field), f"compact {field}")
+    content = _normalize_json_value(record.get("content"), "compact procedure content")
+    if not isinstance(content, (str, dict, list)) or not content:
+        raise ContractError("compact procedure content must be nonempty")
+    if record["content_digest"] != sha256_hex(content):
+        raise ContractError("compact procedure content digest mismatch")
+    if record["representation_id"] != sha256_hex({
+        "domain": PROCEDURE_COMPACT_REPRESENTATION_SCHEMA,
+        "revision_id": record["revision_id"],
+        "procedure_digest": record["procedure_digest"],
+        "content_digest": record["content_digest"],
+    }):
+        raise ContractError("compact procedure representation identity mismatch")
+    if procedure is not None:
+        validate_procedure_revision(procedure)
+        for field, value in (
+            ("logical_id", procedure["logical_id"]),
+            ("revision_id", procedure["revision_id"]),
+            ("procedure_digest", procedure["content_hash"]),
+        ):
+            if record[field] != value:
+                raise ContractError(f"compact representation does not bind procedure {field}")
+
+
+def make_procedure_compact_approval(
+    *, procedure: Mapping[str, Any], full_approval: Mapping[str, Any],
+    representation: Mapping[str, Any], approval_id: str, issuer: str,
+    authority_evidence: Mapping[str, Any], approved_at: str | None = None,
+) -> dict[str, Any]:
+    """Approve exact compact bytes independently of the full-body approval."""
+
+    validate_procedure_approval(full_approval, procedure=procedure)
+    validate_procedure_compact_representation(representation, procedure=procedure)
+    selected_id = _require_nonempty_str(approval_id, "compact approval_id")
+    selected_issuer = _require_nonempty_str(issuer, "compact issuer")
+    if selected_id == full_approval["approval_id"] or selected_issuer != full_approval["issuer"]:
+        raise ContractError("compact procedure needs separate approval by the trusted issuer")
+    record = {
+        "schema": PROCEDURE_COMPACT_APPROVAL_SCHEMA,
+        "approval_id": selected_id,
+        "issuer": selected_issuer,
+        "logical_id": procedure["logical_id"],
+        "revision_id": procedure["revision_id"],
+        "procedure_digest": procedure["content_hash"],
+        "full_approval_id": full_approval["approval_id"],
+        "full_approval_digest": full_approval["content_hash"],
+        "representation_id": representation["representation_id"],
+        "content_digest": representation["content_digest"],
+        "authority_evidence": _normalize_json_object(authority_evidence, "compact authority_evidence"),
+        "approved_at": approved_at or utc_now(),
+    }
+    record["content_hash"] = content_hash(record)
+    validate_procedure_compact_approval(
+        record, procedure=procedure, full_approval=full_approval,
+        representation=representation,
+    )
+    return record
+
+
+def validate_procedure_compact_approval(
+    record: Mapping[str, Any], *, procedure: Mapping[str, Any] | None = None,
+    full_approval: Mapping[str, Any] | None = None,
+    representation: Mapping[str, Any] | None = None,
+) -> None:
+    validate_record(record, PROCEDURE_COMPACT_APPROVAL_SCHEMA)
+    if set(record) != {
+        "schema", "approval_id", "issuer", "logical_id", "revision_id",
+        "procedure_digest", "full_approval_id", "full_approval_digest",
+        "representation_id", "content_digest", "authority_evidence",
+        "approved_at", "content_hash",
+    }:
+        raise ContractError("compact procedure approval has unexpected fields")
+    for field in (
+        "approval_id", "issuer", "logical_id", "revision_id", "procedure_digest",
+        "full_approval_id", "full_approval_digest", "representation_id",
+        "content_digest", "approved_at",
+    ):
+        _require_nonempty_str(record.get(field), f"compact {field}")
+    _normalize_json_object(record.get("authority_evidence"), "compact authority_evidence")
+    if record["approval_id"] == record["full_approval_id"]:
+        raise ContractError("compact procedure approval must be separate")
+    if procedure is not None:
+        validate_procedure_revision(procedure)
+        for field, value in (
+            ("logical_id", procedure["logical_id"]),
+            ("revision_id", procedure["revision_id"]),
+            ("procedure_digest", procedure["content_hash"]),
+        ):
+            if record[field] != value:
+                raise ContractError(f"compact approval does not bind procedure {field}")
+    if full_approval is not None:
+        validate_procedure_approval(full_approval, procedure=procedure)
+        for field, value in (
+            ("full_approval_id", full_approval["approval_id"]),
+            ("full_approval_digest", full_approval["content_hash"]),
+            ("issuer", full_approval["issuer"]),
+        ):
+            if record[field] != value:
+                raise ContractError(f"compact approval does not bind full approval {field}")
+    if representation is not None:
+        validate_procedure_compact_representation(representation, procedure=procedure)
+        for field, value in (
+            ("logical_id", representation["logical_id"]),
+            ("revision_id", representation["revision_id"]),
+            ("procedure_digest", representation["procedure_digest"]),
+            ("representation_id", representation["representation_id"]),
+            ("content_digest", representation["content_digest"]),
+        ):
+            if record[field] != value:
+                raise ContractError(f"compact approval does not bind representation {field}")
+
+
 def partition_is_authorized(
     approval: Mapping[str, Any], partition: Mapping[str, Any]
 ) -> bool:
@@ -3564,6 +3848,29 @@ def validate_finalized_context(record: Mapping[str, Any]) -> None:
     if record["optional_items"] != [item["id"] for item in optional] or record["optional_digest"] != sha256_hex(optional):
         raise ContractError("finalized context optional content mismatch")
     _validate_delivery_trace(record.get("delivery_trace"), optional, record["omitted"])
+    selected_by_id = {item["id"]: item for item in record["delivery_trace"]["selected"]}
+    for item in optional:
+        selected_provenance = selected_by_id[item["id"]]["provenance"]
+        if item.get("kind") == "historical_evidence":
+            if item.get("authority") != "historical_evidence_only" or not isinstance(item.get("content"), Mapping) or item["content"].get("procedural_authority") is not False or "evidence" not in item["content"]:
+                raise ContractError("historical evidence must have no procedural authority")
+            recheck = selected_provenance.get("final_recheck")
+            if recheck is not None and recheck["content_digest"] != sha256_hex(item["content"]["evidence"]):
+                raise ContractError("historical evidence differs from its rechecked source")
+        if item.get("delivery_representation") == "compact":
+            representation = item.get("compact_representation")
+            approval = item.get("compact_approval")
+            if not isinstance(representation, Mapping) or not isinstance(approval, Mapping):
+                raise ContractError("compact procedure requires exact representation and approval")
+            validate_procedure_compact_representation(representation)
+            validate_procedure_compact_approval(approval, representation=representation)
+            if item.get("kind") != "procedure" or item.get("content") != representation["content"] or item.get("revision_id") != representation["revision_id"]:
+                raise ContractError("compact procedure delivery does not match approved representation")
+            if item.get("full_content_digest") != selected_provenance.get("final_recheck", {}).get("content_digest"):
+                raise ContractError("compact procedure lacks rechecked full content binding")
+            if (item.get("full_procedure_digest") != representation["procedure_digest"]
+                    or item.get("full_approval_digest") != approval["full_approval_digest"]):
+                raise ContractError("compact procedure approval does not bind the full revision")
     if record["integrity"] != _final_context_integrity(record):
         raise ContractError("finalized context integrity mismatch")
     if record["context_id"] != _final_context_id(record):
@@ -3755,6 +4062,10 @@ __all__ = [
     "validate_procedure_revision",
     "make_procedure_approval",
     "validate_procedure_approval",
+    "make_procedure_compact_representation",
+    "validate_procedure_compact_representation",
+    "make_procedure_compact_approval",
+    "validate_procedure_compact_approval",
     "partition_is_authorized",
     "make_procedure_representation",
     "validate_procedure_representation",
@@ -3802,6 +4113,8 @@ __all__ = [
     "validate_plan_disposition",
     "make_finalized_context",
     "validate_finalized_context",
+    "make_final_source_recheck",
+    "validate_final_source_recheck",
     "make_apc_child_operation",
     "validate_apc_child_operation",
     "accept_plan",

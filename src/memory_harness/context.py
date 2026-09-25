@@ -30,7 +30,7 @@ class MandatoryOverflowError(ContextError):
 
 
 class PlanAffectingFreshnessError(ContextError):
-    """A plan-affecting optional item is no longer fresh; ROOT must decide."""
+    """A dependent source or approved representation changed; ROOT must replan."""
 
 
 class OptionalItemError(ContextError):
@@ -63,6 +63,77 @@ def _normalize_optional_item(item: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _frozen_recheck(item: Mapping[str, Any]) -> dict[str, Any]:
+    contract = item.get("frozen_contract")
+    if contract is None:
+        return contracts.make_final_source_recheck(item=item, status="unavailable")
+    expected = {
+        "source_id": item.get("source_id"),
+        "revision_id": item.get("revision_id"),
+        "content_digest": contracts.sha256_hex(item.get("content")),
+    }
+    if not isinstance(contract, Mapping) or dict(contract) != expected:
+        return contracts.make_final_source_recheck(item=item, status="ineligible")
+    return contracts.make_final_source_recheck(
+        item=item, status="frozen", observed_revision_id=item["revision_id"],
+        observed_content_digest=expected["content_digest"],
+    )
+
+
+def _compact_variant(item: Mapping[str, Any]) -> dict[str, Any] | None:
+    representation = item.get("compact_representation")
+    approval = item.get("compact_approval")
+    if representation is None and approval is None:
+        return None
+    content = item.get("content")
+    if not isinstance(content, Mapping) or not all(
+        isinstance(content.get(field), Mapping) for field in ("procedure", "approval")
+    ) or not isinstance(representation, Mapping) or not isinstance(approval, Mapping):
+        return None
+    procedure = content["procedure"]
+    full_approval = content["approval"]
+    try:
+        contracts.validate_procedure_approval(full_approval, procedure=procedure)
+        contracts.validate_procedure_compact_representation(representation, procedure=procedure)
+        contracts.validate_procedure_compact_approval(
+            approval, procedure=procedure, full_approval=full_approval,
+            representation=representation,
+        )
+    except contracts.ContractError:
+        return None
+    if item.get("revision_id") != procedure["revision_id"]:
+        return None
+    compact = {key: value for key, value in item.items()
+               if key not in {"compact_representation", "compact_approval"}}
+    compact.update({
+        "content": representation["content"],
+        "delivery_representation": "compact",
+        "full_content_digest": contracts.sha256_hex(content),
+        "full_procedure_digest": procedure["content_hash"],
+        "full_approval_digest": full_approval["content_hash"],
+        "compact_representation": dict(representation),
+        "compact_approval": dict(approval),
+    })
+    return compact
+
+
+def _plan_depends_on(plan: Mapping[str, Any], item: Mapping[str, Any]) -> bool:
+    if item.get("plan_affecting") is True:
+        return True
+    source = plan.get("source")
+    if not isinstance(source, Mapping):
+        return False
+    if source.get("candidate_id") == item.get("id"):
+        return True
+    logical_id = item.get("logical_id")
+    revision_id = item.get("revision_id")
+    return bool(logical_id and revision_id and (
+        (source.get("logical_id") == logical_id and source.get("revision_id") == revision_id)
+        or (source.get("template_id") == logical_id and source.get("template_version") == revision_id)
+        or (source.get("procedure_id") == logical_id and source.get("procedure_revision_id") == revision_id)
+    ))
+
+
 def finalize_context(
     *,
     task_card: Mapping[str, Any],
@@ -85,6 +156,7 @@ def finalize_context(
     privacy_policy: PrivacyPolicy | None = None,
     limits: PreparationLimits | None = None,
     freshness_check: Callable[[Mapping[str, Any]], bool] | None = None,
+    source_recheck: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
 ) -> FinalizedContext:
     """Render one exact, safe, dispatch-ready execution context."""
 
@@ -107,18 +179,23 @@ def finalize_context(
     )
     guard_mandatory(mandatory, policy)
 
-    selected: list[dict[str, Any]] = []
+    selected: list[dict[str, Any] | None] = []
     omissions: list[dict[str, Any]] = []
     for raw in omitted:
         item = _normalize_optional_item(raw) if isinstance(raw, Mapping) else {
             "id": str(raw), "kind": "unavailable", "origin": "preparation", "content": None,
         }
+        if _plan_depends_on(plan, item):
+            raise PlanAffectingFreshnessError(
+                f"selected source {item.get('source_id', item['id'])} revision "
+                f"{item.get('revision_id', 'unknown')} was omitted before final recheck; ROOT must replan"
+            )
         if detect_secrets({key: value for key, value in item.items() if key != "content"}, policy):
             raise OptionalItemError("optional provenance contains prohibited secret")
         descriptor = contracts._optional_descriptor(item)
         selected.append(descriptor)
         omissions.append({**descriptor, "reason": "omitted before finalization"})
-    optional: list[dict[str, Any]] = []
+    optional: list[tuple[dict[str, Any], dict[str, Any], bool, int]] = []
     selected_by_id: dict[str, dict[str, Any]] = {}
     for raw in optional_items:
         item = _normalize_optional_item(raw)
@@ -130,27 +207,71 @@ def finalize_context(
         ):
             raise OptionalItemError("selected provenance conflicts with rendered optional content")
         selected_item = {**item, **source}
+        requires_source = selected_item.get("kind") == "procedure" or selected_item.get("freshness") == "frozen"
+        missing_identity = requires_source and not selected_item.get("source_id")
+        if requires_source:
+            selected_item.setdefault("source_id", item_id)
+        missing_identity = missing_identity or (
+            bool(selected_item.get("source_id"))
+            and (not isinstance(selected_item.get("revision_id"), str)
+                 or not selected_item.get("revision_id"))
+        )
+        if missing_identity:
+            selected_item["revision_id"] = "unversioned"
         if detect_secrets({key: value for key, value in selected_item.items() if key != "content"}, policy):
             raise OptionalItemError("optional provenance contains prohibited secret")
-        affects_plan = bool(item.get("plan_affecting", False))
+        affects_plan = _plan_depends_on(plan, selected_item)
+        if affects_plan:
+            selected_item["plan_affecting"] = True
+        # A live source must return one exact observation. The Boolean legacy
+        # checker remains a freshness-only fallback for caller-owned items.
+        original = dict(selected_item)
+        recheck: Mapping[str, Any] | None = None
+        if missing_identity:
+            recheck = contracts.make_final_source_recheck(item=original, status="ineligible")
+        elif selected_item.get("freshness") == "frozen" and selected_item.get("source_id"):
+            recheck = _frozen_recheck(original)
+        elif source_recheck is not None and selected_item.get("source_id"):
+            try:
+                recheck = source_recheck(dict(original))
+            except Exception:
+                recheck = contracts.make_final_source_recheck(item=original, status="unavailable")
+            if not isinstance(recheck, Mapping):
+                raise OptionalItemError(f"final source recheck is invalid for {item_id}")
+            try:
+                contracts.validate_final_source_recheck(recheck, item=original)
+            except (contracts.ContractError, TypeError, ValueError) as exc:
+                raise OptionalItemError(f"final source recheck is invalid for {item_id}: {exc}") from exc
+        elif selected_item.get("source_id"):
+            recheck = contracts.make_final_source_recheck(item=original, status="unavailable")
+        if recheck is not None:
+            selected_item["final_recheck"] = dict(recheck)
+        if selected_item.get("kind") == "historical_evidence":
+            selected_item["authority"] = "historical_evidence_only"
+            item["authority"] = "historical_evidence_only"
+            historical = {"procedural_authority": False, "evidence": item.get("content")}
+            selected_item["content"] = historical
+            item["content"] = historical
+        fresh = bool(freshness_check(original)) if recheck is None and freshness_check is not None else True
+        status = recheck["status"] if recheck is not None else ("eligible" if fresh else "stale")
         descriptor = contracts._optional_descriptor(selected_item)
-        selected_by_id[item_id] = descriptor
+        slot = len(selected)
         selected.append(descriptor)
-        item.pop("plan_affecting", None)
-        fresh = True
-        if freshness_check is not None:
-            fresh = bool(freshness_check(item))
-        if not fresh:
+        selected_by_id[item_id] = descriptor
+        if status not in {"eligible", "frozen"}:
             if affects_plan:
                 raise PlanAffectingFreshnessError(
-                    f"plan-affecting optional item is no longer fresh: {item_id}"
+                    f"selected source {selected_item.get('source_id', item_id)} "
+                    f"revision {selected_item.get('revision_id', 'unknown')} changed ({status}); ROOT must replan"
                 )
-            omissions.append({**descriptor, "reason": "not fresh"})
+            omissions.append({**descriptor, "reason": f"final recheck: {status}" if recheck is not None else "not fresh"})
             continue
         if detect_secrets(item, policy):
             omissions.append({**descriptor, "reason": "prohibited secret"})
             continue
-        optional.append(sanitize_payload(item, policy))
+        item.pop("plan_affecting", None)
+        item.pop("frozen_contract", None)
+        optional.append((sanitize_payload(item, policy), selected_item, affects_plan, slot))
 
     mandatory_render = _render_size(mandatory)
     if mandatory_render > resolved.context_char_limit:
@@ -159,19 +280,48 @@ def finalize_context(
         )
     remaining = resolved.context_char_limit - mandatory_render
     packed: list[dict[str, Any]] = []
-    for item in optional:
-        size = _render_size([item])
+    for item, selected_item, affects_plan, slot in optional:
+        compact = None
+        if item.get("kind") == "procedure":
+            # Compact evidence is retained only if the full body cannot fit.
+            full = {key: value for key, value in item.items()
+                    if key not in {"compact_representation", "compact_approval"}}
+        else:
+            full = item
+        size = _render_size([full])
         if size > remaining:
-            omissions.append({**selected_by_id[item["id"]], "reason": "exceeds the optional allowance"})
-            continue
+            if item.get("kind") == "procedure":
+                compact = _compact_variant(item)
+            if compact is not None and _render_size([compact]) <= remaining:
+                full = compact
+                size = _render_size([full])
+                selected_item = {**selected_item, **compact}
+                if affects_plan:
+                    selected_item["plan_affecting"] = True
+                descriptor = contracts._optional_descriptor(selected_item)
+                selected[slot] = descriptor
+                selected_by_id[item["id"]] = descriptor
+            else:
+                if affects_plan:
+                    raise PlanAffectingFreshnessError(
+                        f"selected source {item.get('source_id', item['id'])} revision "
+                        f"{item.get('revision_id', 'unknown')} cannot fit as approved guidance; ROOT must replan"
+                    )
+                reason = (
+                    "no approved procedure representation fits the optional allowance"
+                    if item.get("kind") == "procedure"
+                    else "exceeds the optional allowance"
+                )
+                omissions.append({**selected_by_id[item["id"]], "reason": reason})
+                continue
         remaining -= size
-        packed.append(item)
+        packed.append(full)
 
     trace = {
         "selected": selected,
-        "packed": [contracts._optional_descriptor(item) for item in packed],
+        "packed": [contracts._packed_descriptor(item, selected_by_id[item["id"]]) for item in packed],
         "omitted": omissions,
-        "context_delivered": [contracts._optional_descriptor(item) for item in packed],
+        "context_delivered": [contracts._packed_descriptor(item, selected_by_id[item["id"]]) for item in packed],
     }
     context = contracts.make_finalized_context(
         lane_id=lane_id,
@@ -198,7 +348,7 @@ def finalize_context(
         optional_content=packed,
         delivery_trace=trace,
         role_separation=ROLE_SEPARATION,
-        freshness={"mode": "rechecked" if freshness_check is not None else "not-required"},
+        freshness={"mode": "rechecked" if freshness_check is not None or source_recheck is not None else "not-required"},
         context_limit=resolved.context_char_limit,
     )
     envelope = contracts.make_envelope(
