@@ -190,6 +190,8 @@ class EverOSPublicSurface:
     make_search_request: Callable[..., Any]
     memory_root: Path
     resolve_memory_root: Callable[[], str | Path]
+    get: Callable[[Any], Awaitable[Any]] | None = None
+    make_get_request: Callable[..., Any] | None = None
 
     @classmethod
     def from_object(
@@ -202,8 +204,12 @@ class EverOSPublicSurface:
         memorize = getattr(value, "memorize", None)
         search = getattr(value, "search", None)
         make_search_request = getattr(value, "make_search_request", None)
+        get = getattr(value, "get", None)
+        make_get_request = getattr(value, "make_get_request", None)
         if not callable(memorize) or not callable(search) or not callable(make_search_request):
             raise TypeError("EverOS public surface requires memorize, search, and SearchRequest")
+        if callable(get) != callable(make_get_request):
+            raise TypeError("EverOS public get requires both get and GetRequest")
         if not callable(resolve_memory_root):
             raise TypeError("EverOS public surface requires a MemoryRoot resolver")
         return cls(
@@ -212,6 +218,8 @@ class EverOSPublicSurface:
             make_search_request=make_search_request,
             memory_root=_normalize_memory_root(memory_root, "captured EverOS root"),
             resolve_memory_root=resolve_memory_root,
+            get=get,
+            make_get_request=make_get_request,
         )
 
 
@@ -224,7 +232,7 @@ def _normalize_memory_root(value: str | Path, label: str) -> Path:
 def load_vendored_everos_public_surface(
     *, memory_root: str | Path
 ) -> EverOSPublicSurface:
-    """Load vendored EverOS through its public service and search DTO exports.
+    """Load vendored EverOS through its public service and request DTO exports.
 
     The product package keeps this import lazy so ordinary all-off installs do
     not acquire EverOS's optional runtime dependency set.  The caller must
@@ -258,8 +266,9 @@ def load_vendored_everos_public_surface(
             )
         try:
             from everos.core.persistence import MemoryRoot
+            from everos.memory.get import GetRequest
             from everos.memory.search import SearchRequest
-            from everos.service import memorize, search
+            from everos.service import get, memorize, search
         except ModuleNotFoundError as exc:
             raise EverOSUnavailableError(
                 "EverOS is unavailable; install the vendored EverOS runtime before "
@@ -283,6 +292,8 @@ def load_vendored_everos_public_surface(
             make_search_request=SearchRequest,
             memory_root=captured_root,
             resolve_memory_root=resolve_memory_root,
+            get=get,
+            make_get_request=GetRequest,
         )
 
 
@@ -422,6 +433,54 @@ class EverOSAdapter:
         self._assert_bound_memory_root()
         result = await self.surface.memorize(dict(payload), is_final=True)
         return _model_mapping(result, "EverOS memorize result")
+
+    async def readback_cases(
+        self, *, session_id: str, query: str
+    ) -> list[dict[str, Any]]:
+        """Read one original session through public get when available.
+
+        Older public-surface doubles retain the accepted scoped search path.
+        A failed or incomplete get never falls through to ranked search.
+        """
+
+        self._assert_bound_memory_root()
+        if not isinstance(session_id, str) or not session_id:
+            raise ExperienceError("EverOS readback requires the original session_id")
+        if self.surface.get is None or self.surface.make_get_request is None:
+            result = await self.search_representation(session_id=session_id, query=query)
+            return result["agent_cases"]
+        request = self.surface.make_get_request(
+            agent_id=self.everos_owner_id,
+            app_id=self.everos_application_id,
+            project_id=self.everos_project_id,
+            memory_type="agent_case",
+            filters={"session_id": session_id},
+            page=1,
+            page_size=100,
+        )
+        response = _model_mapping(await self.surface.get(request), "EverOS get response")
+        data = response.get("data")
+        if not isinstance(data, Mapping):
+            raise ExperienceError("EverOS get response has no data object")
+        items = data.get("agent_cases")
+        count = data.get("count")
+        total_count = data.get("total_count")
+        if (
+            not isinstance(items, list)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or isinstance(total_count, bool)
+            or not isinstance(total_count, int)
+            or count != len(items)
+            or total_count != count
+        ):
+            raise ExperienceError("EverOS get case listing is incomplete or malformed")
+        cases = [_model_mapping(item, "EverOS get case") for item in items]
+        for source_case in cases:
+            self.validate_case(source_case, session_id=session_id)
+        if len({source_case["id"] for source_case in cases}) != len(cases):
+            raise ExperienceError("EverOS get returned duplicate case identities")
+        return cases
 
     async def search_representation(
         self, *, session_id: str, query: str
@@ -845,15 +904,15 @@ class ReviewedExperienceService:
         if ingestion["status"] == "confirmed":
             return ingestion
         try:
-            result = await adapter.search_representation(
+            source_cases = await adapter.readback_cases(
                 session_id=ingestion["session_id"], query=trajectory["task_text"]
             )
         except Exception:
-            # A search retry is read-only. Leave local state truthful and retain
+            # Readback is read-only. Leave local state truthful and retain
             # the recent evidence rather than relabeling unknown remote state.
             return ingestion
         receipts: list[dict[str, Any]] = []
-        for source_case in result["agent_cases"]:
+        for source_case in source_cases:
             adapter.validate_case(source_case, session_id=ingestion["session_id"])
             sanitized_case = privacy_module.sanitize_payload(source_case, self.privacy_policy)
             if not isinstance(sanitized_case, Mapping):
