@@ -9,6 +9,7 @@ own process cleanup, and copies a valid ACCEPTED advancement into its status.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from .core import content_hash, iso_utc, read_json, require_schema
 from .epochs import lane_record_dir
 from .lanes import find_active_lane, update_lane
 from .leases import acquire_leases, release_leases
+from .provider_adapters import usage_observation
 from .records import (
     RecordLock,
     append_jsonl,
@@ -68,6 +70,7 @@ class ProviderExecution:
     session_id: str | None = None
     argv: tuple[str, ...] = ()
     non_retryable_failure: bool = False
+    transcript_start_byte: int = 0
 
 
 def _load_binding(harness_root: Path, provider_id: str) -> Any:
@@ -297,24 +300,94 @@ def _append_attempt(
     result_state: str,
     cleanup_proven: bool,
     validation_error: str | None = None,
+    binding: Any = None,
+    transcript_start_byte: int = 0,
+    dispatch_binding: dict[str, Any] | None = None,
+    provider_started: bool | None = None,
 ) -> None:
-    """Append immutable provider-attempt evidence."""
+    """Append immutable source facts, not a derived usage or quality verdict.
+
+    The controller-attempts/v1 row binds lane_id/run_id/attempt, provider,
+    argv/session, and optional dispatch_binding to the exact transcript byte
+    range [transcript_start_byte, transcript_end_byte). Its ordered
+    native_usage_observations keep native counter names, event identities and
+    byte offsets. Observations may be replayed, intermediate, cumulative, or
+    terminal; native_usage_state=observed only means at least one numeric
+    counter was seen. Missing counters remain absent and state=incomplete when
+    none were seen. Lane 1's future usage store must reconcile these source
+    facts; this row does not assert attributed totals or outcome authority.
+    """
+    observations: list[dict[str, Any]] = []
+    native_session_id = session_id
+    transcript = paths["transcript"]
+    capture_error: str | None = None
+    try:
+        transcript_end_byte = transcript.stat().st_size
+    except OSError:
+        transcript_end_byte = transcript_start_byte
+    parser = getattr(binding, "parse_line", None)
+    if callable(parser) and transcript.is_file():
+        try:
+            with transcript.open("rb") as handle:
+                handle.seek(transcript_start_byte)
+                byte_offset = transcript_start_byte
+                for line_number, raw_line in enumerate(handle, start=1):
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    try:
+                        parsed = parser(line)
+                    except Exception as exc:
+                        parsed = None
+                        capture_error = f"provider parser failed at line {line_number}: {exc}"
+                    if isinstance(parsed, dict) and parsed.get("session_id"):
+                        native_session_id = str(parsed["session_id"])
+                    try:
+                        native_event = json.loads(raw_line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        native_event = None
+                    receipt = (
+                        usage_observation(native_event, lane.get("provider", {}).get("id", ""))
+                        if isinstance(native_event, dict) else None
+                    )
+                    if receipt is not None:
+                        observations.append({
+                            "line_number": line_number,
+                            "byte_offset": byte_offset,
+                            **receipt,
+                        })
+                    byte_offset += len(raw_line)
+        except OSError as exc:
+            capture_error = f"transcript read failed: {exc}"
     append_jsonl(
         Path(
             lane.get("attempts_path")
             or Path(lane["worktree_path"]) / ".agent-workspace" / "controller.attempts.jsonl"
         ),
         {
+            "lane_id": lane["lane_id"],
+            "run_id": lane["run_id"],
             "attempt": attempt_number,
             "provider": lane.get("provider", {}),
             "argv": list(argv or []),
-            "session_id": session_id,
+            "session_id": native_session_id,
             "prompt_path": str(prompt_path),
             "transcript_path": str(paths["transcript"]),
+            "transcript_start_byte": transcript_start_byte,
+            "transcript_end_byte": transcript_end_byte,
             "stderr_path": str(paths["stderr"]),
+            "provider_started": bool(argv) if provider_started is None else provider_started,
             "exit_code": exit_code,
             "result_state": result_state,
             "validation_error": validation_error,
+            "native_usage_state": (
+                "observed"
+                if any(
+                    isinstance(value, (int, float)) and not isinstance(value, bool)
+                    for item in observations for value in item["usage"].values()
+                ) else "incomplete"
+            ),
+            "native_usage_observations": observations,
+            "native_usage_capture_error": capture_error,
+            **({"dispatch_binding": dispatch_binding} if dispatch_binding is not None else {}),
             "cleanup_proven": cleanup_proven,
             "at": iso_utc(),
         },
@@ -376,6 +449,11 @@ def _run_provider(
     session_id = (lane.get("session") or {}).get("session_id")
     if resume is None:
         resume = bool(session_id)
+    lane["_attempt_argv"] = None
+    lane["_attempt_transcript_start_byte"] = (
+        transcript_path.stat().st_size if transcript_path.is_file() else 0
+    )
+    lane["_attempt_started"] = False
     argv = binding.build_argv(
         model=invocation["provider"]["model"],
         launch_config=invocation["provider"]["launch_config"],
@@ -384,12 +462,14 @@ def _run_provider(
         session_id=session_id,
         resume=resume,
     )
+    lane["_attempt_argv"] = list(argv)
     _append_event(lane, "provider_started", " ".join(argv))
     pre_spawn_offset: int = 0
     with prompt_path.open("r", encoding="utf-8") as prompt_handle, \
          transcript_path.open("a", encoding="utf-8") as transcript_handle, \
          stderr_path.open("a", encoding="utf-8") as stderr_handle:
         pre_spawn_offset = transcript_handle.tell()
+        lane["_attempt_transcript_start_byte"] = pre_spawn_offset
         try:
             child = processes.spawn_provider(
                 argv,
@@ -398,6 +478,7 @@ def _run_provider(
                 stdout=transcript_handle,
                 stderr=stderr_handle,
             )
+            lane["_attempt_started"] = True
         except Exception as exc:
             raise ControllerError(
                 LAUNCH_PROVIDER_START_FAILED,
@@ -545,6 +626,7 @@ def _run_provider(
         provider_session_id,
         tuple(argv),
         non_retryable_failure or exit_code != 0,
+        pre_spawn_offset,
     )
 
 
@@ -684,7 +766,7 @@ def run_controller(lane_id: str) -> int:
                 _append_attempt(
                     lane,
                     attempt_number=attempt_number,
-                    argv=None,
+                    argv=lane.get("_attempt_argv"),
                     session_id=(lane.get("session") or {}).get("session_id"),
                     prompt_path=prompt_path,
                     paths=attempt_paths,
@@ -692,6 +774,10 @@ def run_controller(lane_id: str) -> int:
                     result_state="invalid",
                     cleanup_proven=cleanup_proven,
                     validation_error=f"native resume unavailable: {exc}",
+                    binding=binding,
+                    transcript_start_byte=lane.get("_attempt_transcript_start_byte", 0),
+                    dispatch_binding=dispatch_binding,
+                    provider_started=bool(lane.get("_attempt_started")),
                 )
                 _write_status(
                     lane,
@@ -725,7 +811,7 @@ def run_controller(lane_id: str) -> int:
             _append_attempt(
                 lane,
                 attempt_number=attempt_number,
-                argv=None,
+                argv=lane.get("_attempt_argv"),
                 session_id=(lane.get("session") or {}).get("session_id"),
                 prompt_path=prompt_path,
                 paths=attempt_paths,
@@ -733,6 +819,10 @@ def run_controller(lane_id: str) -> int:
                 result_state="invalid",
                 cleanup_proven=cleanup_proven,
                 validation_error=str(exc),
+                binding=binding,
+                transcript_start_byte=lane.get("_attempt_transcript_start_byte", 0),
+                dispatch_binding=dispatch_binding,
+                provider_started=bool(lane.get("_attempt_started")),
             )
             _write_status(
                 lane,
@@ -791,6 +881,10 @@ def run_controller(lane_id: str) -> int:
                 result_state=effective_result_state,
                 cleanup_proven=False,
                 validation_error="provider/helper process boundary remains unknown or live",
+                binding=binding,
+                transcript_start_byte=execution.transcript_start_byte,
+                dispatch_binding=dispatch_binding,
+                provider_started=True,
             )
             _write_status(
                 lane,
@@ -828,6 +922,10 @@ def run_controller(lane_id: str) -> int:
                     else "missing or invalid RESULT.json"
                 )
             ),
+            binding=binding,
+            transcript_start_byte=execution.transcript_start_byte,
+            dispatch_binding=dispatch_binding,
+            provider_started=True,
         )
         if execution.session_id:
             lane = {**lane, "session": {"session_id": execution.session_id}}
