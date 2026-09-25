@@ -9,6 +9,7 @@ packet and permits at most one bounded ordinary re-prepare.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -142,32 +143,75 @@ class PreparationService:
         )
 
     def _recover_budget(
-        self, decision_id: str, budget_source: str
-    ) -> tuple[float, str, float] | None:
-        """Reuse the durable absolute deadline and granted budget once.
+        self, decision_id: str
+    ) -> tuple[tuple[float, float] | None, int]:
+        """Read the durable cutoff, current grant, and next attempt once.
 
         Restart, resume, and route correction all share one logical decision, so
-        they must not hand out a fresh deadline.  The granted budget is the
-        remaining time that decision originally recorded plus whatever it had
-        already spent; elapsed cost is then recomputed against the current
-        clock instead of being reset to zero.
+        they must not hand out a fresh deadline.  The tightest recorded cutoff
+        and its remaining-plus-spent grant retain elapsed cost without counting
+        time removed by a shorter trusted cutoff as time already spent.
         """
 
-        if budget_source == "unknown_time" or self.store is None:
-            return None
+        if self.store is None:
+            return None, 1
         try:
             prior = self.store.list_preparations(decision_id)
-        except Exception:
-            return None
-        for record in reversed(prior):
-            deadline = record.get("deadline_monotonic")
-            if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
-                continue
-            remaining = float(record.get("remaining_seconds") or 0.0)
-            spent = float(record.get("spent_seconds") or 0.0)
+        except Exception as exc:
+            raise PreparationError(
+                f"durable preparation budget lookup failed for {decision_id}: {exc}"
+            ) from exc
+        unreadable = f"durable preparation budget is unreadable for {decision_id}"
+        if not isinstance(prior, list):
+            raise PreparationError(unreadable)
+        trusted: list[tuple[int, float, float]] = []
+        attempts: list[int] = []
+        for record in prior:
+            if not isinstance(record, Mapping) or record.get("decision_id") != decision_id:
+                raise PreparationError(unreadable)
+            attempt = record.get("attempt")
             source = record.get("budget_source")
-            return float(deadline), str(source or "trusted_deadline"), remaining + spent
-        return None
+            spent = record.get("spent_seconds")
+            if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+                raise PreparationError(unreadable)
+            if (
+                isinstance(spent, bool)
+                or not isinstance(spent, (int, float))
+                or not math.isfinite(spent)
+                or spent < 0
+            ):
+                raise PreparationError(unreadable)
+            attempts.append(attempt)
+            if source == "unknown_time":
+                if (
+                    record.get("deadline_monotonic") is not None
+                    or record.get("remaining_seconds") is not None
+                ):
+                    raise PreparationError(unreadable)
+                continue
+            deadline = record.get("deadline_monotonic")
+            remaining = record.get("remaining_seconds")
+            if (
+                source != "trusted_deadline"
+                or isinstance(deadline, bool)
+                or not isinstance(deadline, (int, float))
+                or not math.isfinite(deadline)
+                or isinstance(remaining, bool)
+                or not isinstance(remaining, (int, float))
+                or not math.isfinite(remaining)
+                or remaining < 0
+            ):
+                raise PreparationError(unreadable)
+            grant = float(remaining + spent)
+            if not math.isfinite(grant):
+                raise PreparationError(unreadable)
+            trusted.append((attempt, float(deadline), grant))
+        if not trusted:
+            return None, max(attempts, default=0) + 1
+        _, tightest_deadline, granted_budget = min(
+            trusted, key=lambda item: (item[1], item[0])
+        )
+        return (tightest_deadline, granted_budget), max(attempts) + 1
 
     def _next_attempt(self, decision_id: str) -> int:
         if self.store is None:
@@ -293,24 +337,23 @@ class PreparationService:
             strategy=resolved_config.strategy,
             configuration=asdict(resolved_config),
         )
-        # One decision owns one deadline.  A restart, resume, or route
-        # correction reuses the durable absolute deadline, the budget that was
-        # originally granted, and the cost already paid, instead of
-        # replenishing the objective's budget.  An explicitly injected
-        # deadline is trusted input for this call and is honoured as given.
-        recovered = (
-            None
-            if explicit_deadline
-            else self._recover_budget(provisional["decision_id"], budget_source)
-        )
+        # One decision owns one deadline.  A later trusted cutoff may tighten
+        # the durable bound, but an explicit or default cutoff cannot extend it.
+        recovered, next_attempt = self._recover_budget(provisional["decision_id"])
         if recovered is not None:
-            absolute_deadline, budget_source, granted_budget = recovered
+            durable_deadline, granted_budget = recovered
+            durable_remaining = max(0.0, durable_deadline - now)
+            spent_seconds = max(0.0, granted_budget - durable_remaining)
+            absolute_deadline = (
+                min(absolute_deadline, durable_deadline)
+                if explicit_deadline
+                else durable_deadline
+            )
+            budget_source = "trusted_deadline"
+            unknown_time = False
         else:
-            granted_budget = None
+            spent_seconds = 0.0
         remaining = max(0.0, absolute_deadline - now) if not unknown_time else 0.0
-        if granted_budget is None:
-            granted_budget = remaining
-        spent_seconds = max(0.0, granted_budget - remaining)
         # One logical decision owns one captured configuration.  Stage
         # admission only demotes the *packet*; it must not mint a fresh
         # decision identity, because a later call with less remaining time
@@ -356,7 +399,7 @@ class PreparationService:
             execution_reserve_seconds=self.limits.execution_reserve_seconds,
             stage_allowance_seconds=stage_allowance,
             spent_seconds=spent_seconds,
-            attempt=self._next_attempt(decision["decision_id"]),
+            attempt=next_attempt,
         )
         if self.store is not None:
             self.store.record_preparation(preparation)

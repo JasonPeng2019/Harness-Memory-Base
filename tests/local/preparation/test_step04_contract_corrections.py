@@ -667,9 +667,9 @@ class Step04ContractCorrectionTests(unittest.TestCase):
         self.assertIn(
             "cleanup_pending", contracts.APC_CHILD_UNRESOLVED_STATUSES
         )
-        # The retry receives trusted time so the optional stage is admitted and
-        # the near-match handoff is genuinely reachable: the unresolved child,
-        # not the budget, must be what refuses a second launch.
+        # A later supplied deadline cannot renew the decision after its
+        # original cutoff.  The unresolved child remains owned, and no second
+        # optional stage or child launch is admitted.
         second = service.prepare(
             task_card=self.card,
             plan=self.candidate,
@@ -686,7 +686,13 @@ class Step04ContractCorrectionTests(unittest.TestCase):
         )
         self.assertEqual(1, len(calls), "an unresolved child must not relaunch")
         self.assertEqual("fresh", second.disposition["branch"])
-        self.assertIn("reconcile", second.disposition["reuse_attempts"][0]["reason"])
+        self.assertEqual(0.0, second.preparation["remaining_seconds"])
+        self.assertEqual(0, second.trace["rounds"])
+        self.assertEqual([], second.disposition["reuse_attempts"])
+        self.assertEqual(
+            ["cleanup_pending"],
+            [operation["status"] for operation in self.memory_store.list_apc_child_operations(first.decision["decision_id"])],
+        )
 
     def test_apc_reconciliation_clears_cleanup_pending_before_retry(self) -> None:
         def lost_ack(request):
@@ -749,6 +755,150 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             reopened.close()
         self.memory_store = store.MemoryStore(self.store_path)
         self.memory_store.initialize()
+
+    def test_later_explicit_deadline_recovers_one_durable_cutoff(self) -> None:
+        first = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            deadline=self.clock() + 240.0,
+        )
+        self.clock.advance(40.0)
+        restarted = preparation.PreparationService(
+            store=self.memory_store, limits=self.limits, clock=self.clock
+        )
+        later = restarted.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            deadline=self.clock() + 600.0,
+        )
+        self.assertEqual(first.decision["decision_id"], later.decision["decision_id"])
+        self.assertEqual(first.preparation["deadline_monotonic"], later.preparation["deadline_monotonic"])
+        self.assertEqual(200.0, later.preparation["remaining_seconds"])
+        self.assertEqual(40.0, later.preparation["spent_seconds"])
+        self.assertEqual(2, later.preparation["attempt"])
+
+    def test_omitted_deadline_recovers_original_cutoff_and_spent_cost(self) -> None:
+        first = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            deadline=self.clock() + 240.0,
+        )
+        self.clock.advance(35.0)
+        second = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            deadline=self.clock() + 500.0,
+        )
+        self.clock.advance(25.0)
+        omitted = self.service.prepare(
+            task_card=self.card, plan=self.candidate, objective_id="objective-1"
+        )
+        self.assertEqual(first.decision["decision_id"], omitted.decision["decision_id"])
+        self.assertEqual(first.preparation["deadline_monotonic"], omitted.preparation["deadline_monotonic"])
+        self.assertEqual(180.0, omitted.preparation["remaining_seconds"])
+        self.assertEqual(60.0, omitted.preparation["spent_seconds"])
+        self.assertEqual(3, omitted.preparation["attempt"])
+        self.assertEqual(omitted.preparation["deadline_monotonic"], second.preparation["deadline_monotonic"])
+
+    def test_shorter_trusted_cutoff_tightens_and_stays_tight(self) -> None:
+        first = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            deadline=self.clock() + 300.0,
+        )
+        self.clock.advance(30.0)
+        shorter = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            deadline=self.clock() + 90.0,
+        )
+        self.assertEqual(1120.0, shorter.preparation["deadline_monotonic"])
+        self.assertEqual(90.0, shorter.preparation["remaining_seconds"])
+        self.assertEqual(30.0, shorter.preparation["spent_seconds"])
+        self.clock.advance(20.0)
+        later = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            deadline=self.clock() + 600.0,
+        )
+        self.assertEqual(first.decision["decision_id"], later.decision["decision_id"])
+        self.assertEqual(1120.0, later.preparation["deadline_monotonic"])
+        self.assertEqual(70.0, later.preparation["remaining_seconds"])
+        self.assertEqual(50.0, later.preparation["spent_seconds"])
+
+    def test_failed_or_unreadable_budget_lookup_fails_before_optional_work(self) -> None:
+        first = self.service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            deadline=self.clock() + 240.0,
+        )
+        original = self.memory_store.get_preparation(first.preparation["preparation_id"])
+        queried: list[object] = []
+        launched: list[object] = []
+
+        class BudgetReadStore:
+            def __init__(self, inner, invalid):
+                self.inner = inner
+                self.invalid = invalid
+
+            def list_preparations(self, decision_id):
+                if self.invalid == "failure":
+                    raise OSError("durable budget read failed")
+                record = dict(original)
+                record[self.invalid] = "unreadable"
+                return [record]
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        for invalid in ("failure", "deadline_monotonic", "remaining_seconds", "spent_seconds"):
+            for supplied_deadline in (None, self.clock() + 600.0):
+                with self.subTest(invalid=invalid, deadline=supplied_deadline):
+                    service = preparation.PreparationService(
+                        store=BudgetReadStore(self.memory_store, invalid),
+                        limits=self.limits,
+                        clock=self.clock,
+                    )
+                    with self.assertRaisesRegex(preparation.PreparationError, "durable.*budget"):
+                        service.prepare(
+                            task_card=self.card,
+                            plan=self.candidate,
+                            objective_id="objective-1",
+                            deadline=supplied_deadline,
+                            root_replan={"requested_by": "ROOT", "reason": "retry"},
+                            stores=[search.SearchStore(
+                                store_id="everos",
+                                kind="historical_evidence",
+                                query=lambda query: queried.append(query) or [],
+                            )],
+                            apc_launcher=lambda request: launched.append(request) or None,
+                        )
+                    self.assertEqual([], queried)
+                    self.assertEqual([], launched)
+                    self.assertEqual(
+                        [original],
+                        self.memory_store.list_preparations(first.decision["decision_id"]),
+                    )
+
+    def test_no_store_first_call_keeps_its_supplied_deadline(self) -> None:
+        service = preparation.PreparationService(limits=self.limits, clock=self.clock)
+        first = service.prepare(
+            task_card=self.card,
+            plan=self.candidate,
+            objective_id="objective-1",
+            deadline=self.clock() + 240.0,
+        )
+        self.assertEqual(1240.0, first.preparation["deadline_monotonic"])
+        self.assertEqual(240.0, first.preparation["remaining_seconds"])
+        self.assertEqual(0.0, first.preparation["spent_seconds"])
 
     def test_expired_durable_deadline_makes_no_optional_call_after_restart(self) -> None:
         queried: list[object] = []
