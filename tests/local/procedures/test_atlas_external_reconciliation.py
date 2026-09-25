@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[3]
 SRC = ROOT / "src"
@@ -20,6 +21,7 @@ class _Collection:
         self.documents: dict[str, dict] = {}
         self.events: list[tuple[str, str]] = []
         self.fail_next_read_for: str | None = None
+        self.fail_read_after_replace_for: str | None = None
         self.lose_insert_ack_for: str | None = None
 
     def find_one(self, query: dict) -> dict | None:
@@ -41,6 +43,18 @@ class _Collection:
             self.lose_insert_ack_for = None
             raise RuntimeError("synthetic insert acknowledgement loss")
         return object()
+
+    def replace_one(self, query: dict, document: dict, *, upsert: bool) -> object:
+        identifier = query["_id"]
+        self.events.append(("replace", identifier))
+        existing = self.documents.get(identifier)
+        if existing is None or any(existing.get(key) != value for key, value in query.items()):
+            return SimpleNamespace(matched_count=0)
+        self.documents[identifier] = dict(document)
+        if self.fail_read_after_replace_for == identifier:
+            self.fail_read_after_replace_for = None
+            self.fail_next_read_for = identifier
+        return SimpleNamespace(matched_count=1)
 
 
 class _FaultAdapter(atlas.AtlasProcedureAdapter):
@@ -176,6 +190,41 @@ class AtlasExternalReconciliationTests(unittest.TestCase):
         ]
         self.assertEqual(1, len(operations))
         return publication, operations[0]
+
+    def _operation(self, *, kind: str, payload_id: str) -> dict:
+        operations = [
+            operation
+            for operation in self.memory_store.list_procedure_remote_operations(payload_id=payload_id)
+            if operation["kind"] == kind
+        ]
+        self.assertEqual(1, len(operations))
+        return operations[0]
+
+    def _successor_designation(self) -> dict:
+        successor = contracts.make_procedure_revision(
+            logical_name=self.procedure["logical_name"],
+            origin="curated",
+            origin_scope=self.scope,
+            body="Inspect the lock and its owner before recovery.",
+            references=self.procedure["behavior"]["references"],
+            predicates=self.procedure["behavior"]["predicates"],
+            source={"kind": "curated_authoring", "provenance_ref": "curation://root/2"},
+            created_at="2026-09-21T00:00:03Z",
+        )
+        approval = contracts.make_procedure_approval(
+            approval_id="approval-successor",
+            procedure=successor,
+            issuer="ROOT",
+            recipients=[self.scope],
+            authority_evidence={"policy_id": "trusted-root/v1", "subject": "root"},
+            approved_at="2026-09-21T00:00:04Z",
+        )
+        return self.service.designate(
+            procedure=successor,
+            approval=approval,
+            partition=self.partition,
+            issuer="ROOT",
+        )
 
     def test_success_uses_stable_remote_ids_and_exact_readback(self) -> None:
         publication = self._publish()
@@ -368,6 +417,210 @@ class AtlasExternalReconciliationTests(unittest.TestCase):
             self._publish()
         self.assertEqual("ambiguous", self._publication_and_operation()[0]["status"])
         self.assertEqual(1, self.adapter.publication_writes)
+
+    def test_designation_post_write_exact_current_outage_is_ambiguous(self) -> None:
+        successor = self._successor_designation()
+        current_id = atlas.current_document_id(successor["logical_id"], successor["partition_id"])
+        original_write = self.adapter.write_designation
+
+        def write_then_lose_read(designation: dict) -> dict:
+            remote = original_write(designation)
+            self.collection.fail_next_read_for = current_id
+            return remote
+
+        self.adapter.write_designation = write_then_lose_read  # type: ignore[method-assign]
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self.service.publish_designation(successor, self.adapter)
+        operation = self._operation(kind="designation", payload_id=successor["designation_id"])
+        self.assertEqual("ambiguous", operation["status"])
+        self.assertEqual(successor["designation_id"], self.collection.documents[current_id]["designation_id"])
+        self.assertEqual(1, self.collection.events.count(("replace", current_id)))
+
+        self.service.publish_designation(successor, self.adapter)
+        recovered = self._operation(kind="designation", payload_id=successor["designation_id"])
+        self.assertEqual(operation["operation_id"], recovered["operation_id"])
+        self.assertEqual("acknowledged", recovered["status"])
+        self.assertEqual(1, self.collection.events.count(("replace", current_id)))
+
+    def test_designation_pre_write_exact_current_outage_is_blocked(self) -> None:
+        successor = self._successor_designation()
+        current_id = atlas.current_document_id(successor["logical_id"], successor["partition_id"])
+        self.collection.fail_next_read_for = current_id
+
+        with self.assertRaises(procedures.ProcedureError):
+            self.service.publish_designation(successor, self.adapter)
+        operation = self._operation(kind="designation", payload_id=successor["designation_id"])
+        self.assertEqual("blocked", operation["status"])
+        self.assertEqual(0, self.collection.events.count(("replace", current_id)))
+        self.assertEqual(self.designation["designation_id"], self.collection.documents[current_id]["designation_id"])
+
+    def test_withdrawal_post_replace_read_outage_is_ambiguous(self) -> None:
+        current_id = atlas.current_document_id(self.designation["logical_id"], self.designation["partition_id"])
+        self.collection.fail_read_after_replace_for = current_id
+
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self.service.withdraw_partition(
+                logical_id=self.designation["logical_id"],
+                partition=self.partition,
+                issuer="ROOT",
+                adapter=self.adapter,
+            )
+        withdrawal = self.memory_store.get_current_procedure_designation(
+            self.designation["logical_id"], self.partition
+        )["record"]
+        operation = self._operation(kind="withdrawal", payload_id=withdrawal["withdrawal_id"])
+        self.assertEqual("ambiguous", operation["status"])
+        self.assertEqual("withdrawn", self.collection.documents[current_id]["state"])
+        self.assertEqual(1, self.collection.events.count(("replace", current_id)))
+
+        self.service.reconcile_withdrawal(
+            logical_id=self.designation["logical_id"],
+            partition=self.partition,
+            adapter=self.adapter,
+        )
+        recovered = self._operation(kind="withdrawal", payload_id=withdrawal["withdrawal_id"])
+        self.assertEqual(operation["operation_id"], recovered["operation_id"])
+        self.assertEqual("acknowledged", recovered["status"])
+        self.assertEqual(1, self.collection.events.count(("replace", current_id)))
+
+    def test_collection_local_insert_typeerror_is_definite_and_creates_no_document(self) -> None:
+        publication = contracts.make_procedure_publication(
+            procedure=self.procedure,
+            approval=self.approval,
+            representation=self.representation,
+            designation=self.designation,
+        )
+        def reject_before_submission(document: dict, required_driver_option: object) -> object:
+            raise AssertionError("collection body must not run")
+
+        # Python rejects the collection call before entering its body.
+        self.collection.insert_one = reject_before_submission  # type: ignore[method-assign]
+
+        with self.assertRaises(procedures.ProcedureError) as caught:
+            self._publish()
+        self.assertIs(type(caught.exception), procedures.ProcedureError)
+        pending, operation = self._publication_and_operation()
+        self.assertEqual("blocked", pending["status"])
+        self.assertEqual("blocked", operation["status"])
+        self.assertNotIn(publication["publication_id"], self.collection.documents)
+        self.assertNotIn(("insert", publication["publication_id"]), self.collection.events)
+        self.assertIsNone(operation["remote_receipt"])
+
+    def test_collection_typeerror_after_insert_and_read_outage_stays_ambiguous(self) -> None:
+        publication = contracts.make_procedure_publication(
+            procedure=self.procedure,
+            approval=self.approval,
+            representation=self.representation,
+            designation=self.designation,
+        )
+        publication_id = publication["publication_id"]
+        original_insert = self.collection.insert_one
+
+        def insert_then_fail_response(document: dict) -> object:
+            result = original_insert(document)
+            if document["_id"] == publication_id:
+                self.collection.fail_next_read_for = publication_id
+                raise TypeError("synthetic post-submit response failure")
+            return result
+
+        self.collection.insert_one = insert_then_fail_response  # type: ignore[method-assign]
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._publish()
+        pending, operation = self._publication_and_operation()
+        self.assertEqual("ambiguous", pending["status"])
+        self.assertEqual("ambiguous", operation["status"])
+        self.assertIn(publication_id, self.collection.documents)
+
+    def test_revocation_ambiguity_survives_later_exact_read_outage(self) -> None:
+        original_write = self.adapter.write_revocation
+        lose_ack = True
+
+        def write_then_lose_ack(revocation: dict) -> dict:
+            nonlocal lose_ack
+            remote = original_write(revocation)
+            if lose_ack:
+                lose_ack = False
+                raise atlas.AtlasProcedureAmbiguityError("synthetic revocation acknowledgement loss")
+            return remote
+
+        self.adapter.write_revocation = write_then_lose_ack  # type: ignore[method-assign]
+        first = self.service.revoke(
+            procedure=self.procedure, issuer="ROOT", reason="unsafe", adapter=self.adapter
+        )
+        revocation = first["revocation"]
+        operation = self._operation(kind="revocation", payload_id=revocation["revocation_id"])
+        self.assertEqual("ambiguous", operation["status"])
+
+        remote_id = atlas.revocation_document_id(revocation["revision_id"])
+        self.collection.fail_next_read_for = remote_id
+        second = self.service.revoke(
+            procedure=self.procedure, issuer="ROOT", reason="unsafe", adapter=self.adapter
+        )
+        retained = self._operation(kind="revocation", payload_id=revocation["revocation_id"])
+        self.assertFalse(second["managed_complete"])
+        self.assertEqual(operation["operation_id"], retained["operation_id"])
+        self.assertEqual("ambiguous", retained["status"])
+        self.assertEqual(1, self.collection.events.count(("insert", remote_id)))
+
+        recovered = self.service.revoke(
+            procedure=self.procedure, issuer="ROOT", reason="unsafe", adapter=self.adapter
+        )
+        acknowledged = self._operation(kind="revocation", payload_id=revocation["revocation_id"])
+        self.assertTrue(recovered["managed_complete"])
+        self.assertEqual(operation["operation_id"], acknowledged["operation_id"])
+        self.assertEqual("acknowledged", acknowledged["status"])
+        self.assertEqual(1, self.collection.events.count(("insert", remote_id)))
+
+    def test_publication_state_ambiguity_survives_read_and_definite_attempt_faults(self) -> None:
+        publication = self._publish()
+        original_write = self.adapter.write_publication_state
+        attempts = 0
+
+        def fail_state_attempt(pending: dict, *, state: str) -> dict:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise atlas.AtlasProcedureAmbiguityError("synthetic state acknowledgement loss")
+            if attempts == 2:
+                raise atlas.AtlasProcedureError("synthetic definite state attempt failure")
+            return original_write(pending, state=state)
+
+        self.adapter.write_publication_state = fail_state_attempt  # type: ignore[method-assign]
+        first = self.service.withdraw_partition(
+            logical_id=self.designation["logical_id"],
+            partition=self.partition,
+            issuer="ROOT",
+            adapter=self.adapter,
+        )
+        operation = self._operation(kind="withdraw_publication", payload_id=publication["publication_id"])
+        self.assertFalse(first["managed_complete"])
+        self.assertEqual("ambiguous", operation["status"])
+
+        self.adapter.fail_exact_read = True
+        self.service.reconcile_withdrawal(
+            logical_id=self.designation["logical_id"], partition=self.partition, adapter=self.adapter
+        )
+        self.assertEqual(
+            "ambiguous",
+            self._operation(kind="withdraw_publication", payload_id=publication["publication_id"])["status"],
+        )
+        self.service.reconcile_withdrawal(
+            logical_id=self.designation["logical_id"], partition=self.partition, adapter=self.adapter
+        )
+        retained = self._operation(kind="withdraw_publication", payload_id=publication["publication_id"])
+        self.assertEqual(operation["operation_id"], retained["operation_id"])
+        self.assertEqual("ambiguous", retained["status"])
+        self.assertEqual(2, attempts)
+
+        original_write(publication, state="withdrawn")
+        completed = self.service.reconcile_withdrawal(
+            logical_id=self.designation["logical_id"], partition=self.partition, adapter=self.adapter
+        )
+        acknowledged = self._operation(kind="withdraw_publication", payload_id=publication["publication_id"])
+        self.assertTrue(completed["managed_complete"])
+        self.assertEqual(operation["operation_id"], acknowledged["operation_id"])
+        self.assertEqual("acknowledged", acknowledged["status"])
+        self.assertEqual(2, attempts)
 
 
 if __name__ == "__main__":

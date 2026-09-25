@@ -535,6 +535,23 @@ class AtlasProcedureAdapter:
             return None
         return self._as_mapping(result, "Atlas exact-read result")
 
+    @staticmethod
+    def _local_insert_typeerror(exc: TypeError) -> bool:
+        trace = exc.__traceback__
+        if trace is not None and trace.tb_next is None and "required positional argument" in str(exc):
+            # Python rejected the collection call before entering insert_one.
+            return True
+        while trace is not None:
+            frame = trace.tb_frame
+            if (
+                frame.f_globals.get("__name__") == "pymongo.common"
+                and frame.f_code.co_name == "validate_is_document_type"
+            ):
+                # PyMongo invokes this validator before its insert command.
+                return True
+            trace = trace.tb_next
+        return False
+
     def _insert_exact(self, document: Mapping[str, Any], *, description: str) -> dict[str, Any]:
         identifier = document.get("_id")
         if not isinstance(identifier, str) or not identifier:
@@ -550,6 +567,8 @@ class AtlasProcedureAdapter:
         try:
             self.collection.insert_one(dict(document))
         except Exception as exc:
+            if isinstance(exc, TypeError) and self._local_insert_typeerror(exc):
+                raise AtlasProcedureError(f"{description} local insert validation failed") from exc
             # A lost response may have committed. Exact-read only the same id;
             # never generate a replacement operation identity on retry.
             try:
@@ -578,7 +597,12 @@ class AtlasProcedureAdapter:
     def _write_ordered_current(self, document: Mapping[str, Any]) -> dict[str, Any]:
         validate_atlas_current_document(document)
         identifier = str(document["_id"])
-        existing = self._find_one(identifier)
+        try:
+            existing = self._find_one(identifier)
+        except AtlasProcedureError:
+            raise
+        except Exception as exc:
+            raise AtlasProcedureError("Atlas current exact read before write failed") from exc
         if existing is None:
             persisted = self._insert_exact(document, description="Atlas current designation")
             validate_atlas_current_document(persisted)
@@ -592,46 +616,39 @@ class AtlasProcedureAdapter:
             if existing.get("content_hash") == document.get("content_hash"):
                 return existing
             raise AtlasProcedureFencedError("Atlas current generation already has another operation")
+        write_error: Exception | None = None
+        result: Any = None
         try:
             result = self.collection.replace_one(
                 {"_id": identifier, "generation": existing_generation},
                 dict(document),
                 upsert=False,
             )
-            matched = getattr(result, "matched_count", None)
-            if matched not in (None, 1):
-                reconciled = self._find_one(identifier)
-                if reconciled is not None:
-                    validate_atlas_current_document(reconciled)
-                    if reconciled.get("content_hash") == document.get("content_hash"):
-                        return reconciled
-                    if int(reconciled["generation"]) >= desired_generation:
-                        raise AtlasProcedureFencedError(
-                            "Atlas current designation advanced during update"
-                        )
-                raise AtlasProcedureAmbiguityError(
-                    "Atlas current conditional update was not matched"
-                )
         except AtlasProcedureError:
             raise
         except Exception as exc:
+            write_error = exc
+        try:
             reconciled = self._find_one(identifier)
             if reconciled is not None:
                 validate_atlas_current_document(reconciled)
-                if reconciled.get("content_hash") == document.get("content_hash"):
-                    return reconciled
-                if int(reconciled["generation"]) >= desired_generation:
-                    raise AtlasProcedureFencedError("Atlas current designation advanced during update") from exc
+        except Exception as exc:
+            raise AtlasProcedureAmbiguityError(
+                "Atlas current designation did not exact-read after update"
+            ) from exc
+        if reconciled is not None and reconciled.get("content_hash") == document.get("content_hash"):
+            return reconciled
+        if reconciled is not None and int(reconciled["generation"]) >= desired_generation:
+            raise AtlasProcedureFencedError("Atlas current designation advanced during update")
+        if write_error is not None:
             raise AtlasProcedureAmbiguityError(
                 "Atlas current designation acknowledgement is ambiguous"
-            ) from exc
-        reconciled = self._find_one(identifier)
+            ) from write_error
+        if getattr(result, "matched_count", None) not in (None, 1):
+            raise AtlasProcedureAmbiguityError("Atlas current conditional update was not matched")
         if reconciled is None:
             raise AtlasProcedureAmbiguityError("Atlas current designation disappeared after update")
-        validate_atlas_current_document(reconciled)
-        if reconciled.get("content_hash") != document.get("content_hash"):
-            raise AtlasProcedureFencedError("Atlas current designation advanced during update")
-        return reconciled
+        raise AtlasProcedureFencedError("Atlas current designation advanced during update")
 
     def write_designation(self, designation: Mapping[str, Any]) -> dict[str, Any]:
         contracts.validate_procedure_designation(designation)
@@ -836,7 +853,12 @@ class AtlasProcedureAdapter:
     ) -> dict[str, Any] | None:
         """Read one current-designation control document by exact identity."""
 
-        current = self._find_one(current_document_id(logical_id, partition_id))
+        try:
+            current = self._find_one(current_document_id(logical_id, partition_id))
+        except AtlasProcedureError:
+            raise
+        except Exception as exc:
+            raise AtlasProcedureError("Atlas exact current read failed") from exc
         if current is not None:
             validate_atlas_current_document(current)
         return current
