@@ -355,6 +355,42 @@ class PreparationService:
             strategy=resolved_config.strategy,
             configuration=asdict(resolved_config),
         )
+
+        def blocked_budget(
+            reason: str, *, decision: Mapping[str, Any] = provisional,
+            preparation: Mapping[str, Any] | None = None,
+        ) -> PreparationOutcome:
+            outcome = self._blocked_budget_outcome(
+                decision=decision, plan=plan_of_record,
+                preparation=preparation, reason=reason,
+            )
+            if not finalize or current_plan_state != "execution_accepted":
+                return outcome
+            supplied_optional = [dict(item) for item in optional_items]
+            if any(item.get("plan_affecting", False) for item in supplied_optional):
+                return replace(
+                    outcome,
+                    reason=outcome.reason + "; plan-affecting optional guidance blocks finalization",
+                )
+            # The accepted plan and caller-supplied mandatory state can still
+            # be finalized. Record every omitted optional item and the failed
+            # memory stage in the existing delivery trace.
+            return self._finalize(
+                outcome=outcome,
+                task_card=task_card,
+                plan=plan_of_record,
+                lane_id=lane_id,
+                run_id=run_id,
+                worktree_path=worktree_path,
+                base_commit=base_commit,
+                mandatory_content=mandatory_content,
+                optional_items=(),
+                omitted=["optional-memory-unavailable"] + [
+                    str(item["id"]) for item in supplied_optional
+                ],
+                freshness_check=freshness_check,
+            )
+
         requested_config = resolved_config
         proposed_deadline = absolute_deadline
         proposed_budget_source = budget_source
@@ -365,9 +401,7 @@ class PreparationService:
                 # tighten it, while a conflict retries against the new minimum.
                 recovered, next_attempt = self._recover_budget(provisional["decision_id"])
             except PreparationError as exc:
-                return self._blocked_budget_outcome(
-                    decision=provisional, plan=plan_of_record, reason=str(exc)
-                )
+                return blocked_budget(str(exc))
             now = self.clock()  # The durable read itself spends trusted time.
             absolute_deadline = proposed_deadline
             budget_source = proposed_budget_source
@@ -465,6 +499,10 @@ class PreparationService:
             network_mode=network_mode,
             budget_reason=admission_reason,
         )
+        if "budget_error" in search:
+            return blocked_budget(
+                search["budget_error"], decision=decision, preparation=preparation,
+            )
 
         if accepted_precedence:
             disposition = contracts.make_plan_disposition(
@@ -553,7 +591,10 @@ class PreparationService:
                 apc_binding=apc_binding,
                 apc_launcher=apc_launcher,
                 apc_cleanup=apc_cleanup,
-                deadline=absolute_deadline,
+                deadline=(
+                    min(absolute_deadline, search["cutoff"])
+                    if search["cutoff"] is not None else absolute_deadline
+                ),
                 unknown_time=unknown_time,
                 root_replan=replan,
             )
@@ -843,6 +884,11 @@ class PreparationService:
             network_mode=replacement["network_mode"],
             budget_reason=admission_reason,
         )
+        if "budget_error" in search:
+            return self._blocked_budget_outcome(
+                decision=decision, plan=plan, preparation=replacement,
+                reason=search["budget_error"],
+            )
         disposition = contracts.make_plan_disposition(
             decision_id=decision["decision_id"],
             objective_id=objective_id,
@@ -1064,14 +1110,29 @@ class PreparationService:
             enabled.append(store)
         unknown_time = preparation["budget_source"] == "unknown_time"
         rounds = 1 if unknown_time else self.limits.rounds_for(strategy)
+        if enabled and stage_allowance > 0 and self.store is not None:
+            # Another connection can tighten the decision's durable minimum
+            # after this packet is written. Recheck at the actual optional
+            # admission boundary, then charge the read against that minimum.
+            try:
+                recovered, _ = self._recover_budget(preparation["decision_id"])
+            except PreparationError as exc:
+                return {"budget_error": str(exc)}
+            if recovered is None and not unknown_time:
+                return {"budget_error": "the exact decision has no readable durable cutoff"}
+        else:
+            recovered = None
         if unknown_time:
             stage_allowance = min(
                 stage_allowance, self.limits.unknown_time_budget_seconds
             )
         elif stage_allowance > 0:
-            # Admission is checked again immediately before the optional
-            # stage: durable writes and objective construction also spend time.
-            remaining = max(0.0, float(preparation["deadline_monotonic"]) - self.clock())
+            # The read itself, durable writes, and objective construction all
+            # spend trusted time before any optional store call.
+            cutoff = float(preparation["deadline_monotonic"])
+            if recovered is not None:
+                cutoff = min(cutoff, recovered[0])
+            remaining = max(0.0, cutoff - self.clock())
             if remaining < stage_allowance + preparation["execution_reserve_seconds"]:
                 stage_allowance = 0.0
                 budget_reason = (
@@ -1127,7 +1188,11 @@ class PreparationService:
                 self.store.record_search_candidate(
                     preparation["preparation_id"], candidate
                 )
-        return {"trace": trace, "selected": list(result.delivered)}
+        return {
+            "trace": trace,
+            "selected": list(result.delivered),
+            "cutoff": cutoff if not unknown_time and stage_allowance > 0 else None,
+        }
 
     def _unresolved_child_operation(self, decision_id: str) -> dict[str, Any] | None:
         """Return one exact child of this decision that is still unresolved.
@@ -1643,6 +1708,7 @@ class PreparationService:
         mandatory_content: Iterable[Mapping[str, Any]],
         optional_items: Iterable[Mapping[str, Any]],
         freshness_check: Callable[[Mapping[str, Any]], bool] | None,
+        omitted: Iterable[str] = (),
     ) -> PreparationOutcome:
         if not all((lane_id, run_id, worktree_path, base_commit)):
             raise PreparationError(
@@ -1670,10 +1736,11 @@ class PreparationService:
             run_id=str(run_id),
             worktree_path=str(worktree_path),
             base_commit=str(base_commit),
-            strategy=outcome.preparation["strategy"],
-            configuration=outcome.preparation["configuration"],
+            strategy=(outcome.preparation or outcome.decision)["strategy"],
+            configuration=(outcome.preparation or outcome.decision)["configuration"],
             mandatory_content=list(mandatory_content),
             optional_items=packed_optional,
+            omitted=omitted,
             privacy_policy=self.privacy_policy,
             limits=self.limits,
             freshness_check=freshness_check,
@@ -1693,7 +1760,11 @@ class PreparationService:
             context=finalized.context,
             envelope=finalized.envelope,
             superseded=outcome.superseded,
-            reason="the exact accepted plan was finalized into a dispatchable context",
+            reason=(
+                outcome.reason + "; mandatory-only context finalized with optional memory omitted"
+                if outcome.mode == "no_memory_continuation"
+                else "the exact accepted plan was finalized into a dispatchable context"
+            ),
         )
 
 

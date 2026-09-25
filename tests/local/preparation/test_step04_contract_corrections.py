@@ -1001,6 +1001,12 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             lane_id="lane-1", run_id="run-1", worktree_path=str(self.root),
             base_commit="base-1", finalize=True,
             mandatory_content=[{"id": "task", "content": self.card["task"]}],
+            optional_items=[{
+                "id": "plan-guidance", "kind": "historical_evidence",
+                "origin": "everos", "revision_id": "r1",
+                "content": {"summary": "required by the accepted plan"},
+                "plan_affecting": True,
+            }],
             freshness_check=lambda item: checked.append(item) or True,
         )
         self.assertEqual("no_memory_continuation", outcome.mode)
@@ -1015,6 +1021,221 @@ class Step04ContractCorrectionTests(unittest.TestCase):
         self.assertEqual([], checked)
         self.assertEqual([first.preparation], self.memory_store.list_preparations(first.decision["decision_id"]))
         self.assertEqual(completed_trace, self.memory_store.get_search_trace(first.preparation["preparation_id"]))
+        self.assertIsNone(self.memory_store.get_final_context_for_decision(first.decision["decision_id"]))
+
+    def test_remaining_post_persistence_tightening_and_read_latency_block_search(self) -> None:
+        first = self.service.prepare(
+            task_card=self.card, plan=self.candidate, objective_id="objective-1",
+            deadline=self.clock() + 300.0,
+        )
+        self.clock.advance(30.0)
+        other_store = store.MemoryStore(self.store_path)
+        other_store.initialize()
+        other_service = preparation.PreparationService(
+            store=other_store, limits=self.limits, clock=self.clock,
+        )
+        interleaved: list[preparation.PreparationOutcome] = []
+
+        class SlowAdmissionReadStore:
+            def __init__(self, inner, clock):
+                self.inner, self.clock = inner, clock
+                self.reads = 0
+
+            def list_preparations(self, decision_id):
+                self.reads += 1
+                prior = self.inner.list_preparations(decision_id)
+                if self.reads == 2:
+                    self.clock.advance(10.0)
+                return prior
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        queried: list[object] = []
+        launched: list[object] = []
+        wrapped = SlowAdmissionReadStore(self.memory_store, self.clock)
+        service = preparation.PreparationService(
+            store=wrapped, limits=self.limits, clock=self.clock,
+        )
+        canonical = service._canonical_objective
+
+        def after_persistence(*args):
+            if not interleaved:
+                interleaved.append(other_service.prepare(
+                    task_card=self.card, plan=self.candidate, objective_id="objective-1",
+                    deadline=self.clock() + 35.0,
+                ))
+            return canonical(*args)
+
+        service._canonical_objective = after_persistence
+        try:
+            outcome = service.prepare(
+                task_card=self.card, plan=self.candidate, objective_id="objective-1",
+                deadline=self.clock() + 600.0,
+                stores=[search.SearchStore(
+                    store_id="everos", kind="historical_evidence",
+                    query=lambda query: queried.append(query) or [],
+                )],
+                apc_launcher=lambda request: launched.append(request) or None,
+            )
+            durable = self.memory_store.list_preparations(first.decision["decision_id"])
+            self.assertEqual(3, len(durable))
+            self.assertEqual(1065.0, interleaved[0].preparation["deadline_monotonic"])
+            self.assertEqual(1065.0, min(item["deadline_monotonic"] for item in durable))
+            self.assertEqual(1300.0, outcome.preparation["deadline_monotonic"])
+            self.assertEqual(2, wrapped.reads)
+            self.assertEqual(1040.0, self.clock())
+            self.assertEqual([], queried)
+            self.assertEqual([], launched)
+            self.assertEqual(0, outcome.trace["rounds"])
+            self.assertEqual("unattempted-by-budget", outcome.trace["attempts"][0]["status"])
+        finally:
+            other_store.close()
+
+    def test_remaining_unavailable_or_unreadable_admission_reread_blocks_optional_work(self) -> None:
+        class UnreadableAdmissionStore:
+            def __init__(self, inner, invalid):
+                self.inner, self.invalid = inner, invalid
+                self.reads = 0
+
+            def list_preparations(self, decision_id):
+                self.reads += 1
+                if self.reads == 2:
+                    if self.invalid == "failure":
+                        raise OSError("admission budget unavailable")
+                    record = dict(self.inner.list_preparations(decision_id)[0])
+                    record["deadline_monotonic"] = "unreadable"
+                    return [record]
+                return self.inner.list_preparations(decision_id)
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        queried: list[object] = []
+        for before, invalid in enumerate(("failure", "unreadable")):
+            with self.subTest(invalid=invalid):
+                wrapped = UnreadableAdmissionStore(self.memory_store, invalid)
+                service = preparation.PreparationService(
+                    store=wrapped, limits=self.limits, clock=self.clock,
+                )
+                outcome = service.prepare(
+                    task_card=self.card, plan=self.candidate, objective_id="objective-1",
+                    stores=[search.SearchStore(
+                        store_id="everos", kind="historical_evidence",
+                        query=lambda query: queried.append(query) or [],
+                    )],
+                )
+                self.assertEqual(2, wrapped.reads)
+                self.assertEqual("no_memory_continuation", outcome.mode)
+                self.assertEqual(self.candidate, outcome.plan)
+                self.assertIn("durable", outcome.reason)
+                self.assertEqual([], queried)
+                self.assertEqual(before + 1, len(self.memory_store.list_preparations(
+                    outcome.decision["decision_id"]
+                )))
+
+    def _accepted_budget_finalization_state(self):
+        accepted = contracts.make_plan(
+            plan_id="accepted-plan", objective_id="objective-1", route="ordinary",
+            state="accepted", accepted_by="ROOT", content={"steps": ["execute"]},
+        )
+        card = contracts.make_task_card(
+            task=self.card["task"], base_commit="base-1",
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id="objective-1", route="ordinary", plan=accepted,
+            ),
+        )
+        first = self.service.prepare(
+            task_card=card, plan=accepted, objective_id="objective-1",
+        )
+
+        class UnreadableBudgetStore:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def list_preparations(self, decision_id):
+                raise OSError("budget state unavailable")
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        service = preparation.PreparationService(
+            store=UnreadableBudgetStore(self.memory_store),
+            limits=self.limits, clock=self.clock,
+        )
+        mandatory = [
+            {"id": "task", "kind": "task", "content": card["task"]},
+            {"id": "accepted-plan", "kind": "accepted-plan", "content": accepted["content"]},
+        ]
+        return card, accepted, first, service, mandatory
+
+    def test_remaining_failed_budget_finalizes_independent_mandatory_context(self) -> None:
+        card, accepted, first, service, mandatory = self._accepted_budget_finalization_state()
+        queried: list[object] = []
+        launched: list[object] = []
+        outcome = service.prepare(
+            task_card=card, plan=accepted, objective_id="objective-1",
+            stores=[search.SearchStore(
+                store_id="everos", kind="historical_evidence",
+                query=lambda query: queried.append(query) or [],
+            )],
+            apc_launcher=lambda request: launched.append(request) or None,
+            lane_id="lane-1", run_id="run-1", worktree_path=str(self.root),
+            base_commit="base-1", finalize=True, mandatory_content=mandatory,
+            optional_items=[{
+                "id": "independent-hint", "kind": "historical_evidence",
+                "origin": "everos", "revision_id": "r1",
+                "content": {"summary": "optional hint"},
+                "plan_affecting": False,
+            }],
+        )
+        self.assertTrue(outcome.dispatchable)
+        self.assertEqual(accepted, outcome.plan)
+        self.assertEqual(first.decision["decision_id"], outcome.decision["decision_id"])
+        self.assertEqual(mandatory, outcome.envelope["mandatory_content"])
+        self.assertEqual(card["content_hash"], outcome.envelope["task_card_digest"])
+        self.assertEqual(accepted["plan_id"], outcome.envelope["plan_id"])
+        self.assertEqual(accepted["content_hash"], outcome.envelope["plan_digest"])
+        self.assertEqual("base-1", outcome.envelope["base_commit"])
+        self.assertEqual("ordinary", outcome.envelope["route"])
+        self.assertEqual([], outcome.envelope["optional_content"])
+        self.assertIn("optional-memory-unavailable", outcome.envelope["delivery"]["omitted"])
+        self.assertIn("independent-hint", outcome.envelope["delivery"]["omitted"])
+        self.assertIn("budget state unavailable", outcome.reason)
+        self.assertEqual(first.preparation["configuration"], outcome.envelope["configuration"])
+        self.assertEqual([], queried)
+        self.assertEqual([], launched)
+        self.assertEqual([first.preparation], self.memory_store.list_preparations(first.decision["decision_id"]))
+        self.assertEqual(outcome.context, self.memory_store.get_final_context_for_decision(first.decision["decision_id"]))
+
+    def test_remaining_failed_budget_blocks_plan_affecting_finalization(self) -> None:
+        card, accepted, first, service, mandatory = self._accepted_budget_finalization_state()
+        queried: list[object] = []
+        launched: list[object] = []
+        outcome = service.prepare(
+            task_card=card, plan=accepted, objective_id="objective-1",
+            stores=[search.SearchStore(
+                store_id="everos", kind="historical_evidence",
+                query=lambda query: queried.append(query) or [],
+            )],
+            apc_launcher=lambda request: launched.append(request) or None,
+            lane_id="lane-1", run_id="run-1", worktree_path=str(self.root),
+            base_commit="base-1", finalize=True, mandatory_content=mandatory,
+            optional_items=[{
+                "id": "required-guidance", "kind": "historical_evidence",
+                "origin": "everos", "revision_id": "r1",
+                "content": {"summary": "plan depends on this"},
+                "plan_affecting": True,
+            }],
+        )
+        self.assertEqual("no_memory_continuation", outcome.mode)
+        self.assertEqual(accepted, outcome.plan)
+        self.assertIn("plan-affecting", outcome.reason)
+        self.assertIsNone(outcome.context)
+        self.assertIsNone(outcome.envelope)
+        self.assertEqual([], queried)
+        self.assertEqual([], launched)
+        self.assertEqual([first.preparation], self.memory_store.list_preparations(first.decision["decision_id"]))
         self.assertIsNone(self.memory_store.get_final_context_for_decision(first.decision["decision_id"]))
 
     def test_failed_or_unreadable_budget_lookup_fails_before_optional_work(self) -> None:
