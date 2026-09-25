@@ -598,20 +598,9 @@ class MemoryStore:
         if any(not isinstance(identity.get(key), str) or not identity[key] for key in keys):
             raise StoreError("logical decision identity is incomplete")
         try:
-            # Validate related rows before filtering to the exact identity.
-            # A damaged identity column cannot make an existing owner look
-            # absent and permit a second decision under drifted defaults.
-            related = tuple(combinations(keys, len(keys) - 2))
-            predicate = " OR ".join(
-                "(" + " AND ".join(f"{key}=?" for key in group) + ")"
-                for group in related
-            )
-            rows = self._require_connection().execute(
-                f"SELECT * FROM decisions WHERE {predicate} ORDER BY decision_id",
-                tuple(identity[key] for group in related for key in group),
-            ).fetchall()
-            matches = []
-            for stored in rows:
+            connection = self._require_connection()
+
+            def validated_decision(stored: sqlite3.Row) -> dict[str, Any]:
                 row = dict(stored)
                 record = {
                     "schema": contracts.DECISION_SCHEMA,
@@ -631,11 +620,108 @@ class MemoryStore:
                 )
                 if record["state"] != expected_state:
                     raise StoreError("logical decision state conflicts with its plan state")
-                if all(record[key] == identity[key] for key in keys):
-                    matches.append(record)
+                return record
+
+            # Preparations retain the exact plan identity independently of the
+            # decision columns. Consult this durable owner before deciding that
+            # a damaged decision row is absent.
+            prepared_rows = connection.execute(
+                """SELECT * FROM preparations WHERE task_card_digest=?
+                   AND objective_id=? AND route=? ORDER BY preparation_id""",
+                (identity["task_card_digest"], identity["objective_id"], identity["route"]),
+            ).fetchall()
+            prepared_owners = set()
+            indexed_fields = (
+                "preparation_id", "decision_id", "task_card_digest", "objective_id",
+                "route", "strategy", "current_plan_state", "status", "supersedes",
+                "superseded_by",
+            )
+            for stored in prepared_rows:
+                try:
+                    packet = self._stored_record(stored, contracts.validate_preparation)
+                except StoreError as exc:
+                    # A malformed preparation cannot hide an exact owner. A
+                    # valid distinct decision can, however, prove that this
+                    # row belongs to another plan under the same task/route.
+                    other = connection.execute(
+                        "SELECT * FROM decisions WHERE decision_id=?",
+                        (stored["decision_id"],),
+                    ).fetchone()
+                    if other is not None:
+                        try:
+                            distinct = validated_decision(other)
+                        except (StoreError, ValueError, TypeError, KeyError,
+                                contracts.ContractError):
+                            pass
+                        else:
+                            if any(distinct[key] != identity[key] for key in keys):
+                                continue
+                    raise StoreError(f"related logical preparation is unreadable: {exc}") from exc
+                inconsistent = [key for key in indexed_fields if packet[key] != stored[key]]
+                if any(packet[key] != identity[key] for key in keys):
+                    if not inconsistent:
+                        continue
+                    if packet["decision_id"] != stored["decision_id"]:
+                        raise StoreError("distinct logical preparation owner is inconsistent")
+                    other = connection.execute(
+                        "SELECT * FROM decisions WHERE decision_id=?",
+                        (packet["decision_id"],),
+                    ).fetchone()
+                    if other is None:
+                        raise StoreError("distinct logical preparation decision is missing")
+                    distinct = validated_decision(other)
+                    if any(distinct[key] != packet[key] for key in keys):
+                        raise StoreError("distinct logical preparation identity is inconsistent")
+                    continue
+                if inconsistent:
+                    raise StoreError(
+                        f"related logical preparation {inconsistent[0]} is inconsistent"
+                    )
+                prepared_owners.add(packet["decision_id"])
+            if len(prepared_owners) > 1:
+                raise StoreError("ambiguous logical decision: multiple prepared owners")
+
+            exact_predicate = " AND ".join(f"{key}=?" for key in keys)
+            exact_rows = connection.execute(
+                f"SELECT * FROM decisions WHERE {exact_predicate} ORDER BY decision_id",
+                tuple(identity[key] for key in keys),
+            ).fetchall()
+            matches = [validated_decision(stored) for stored in exact_rows]
             if len(matches) > 1:
                 raise StoreError("ambiguous logical decision: multiple durable owners")
-            return matches[0] if matches else None
+            if prepared_owners:
+                prepared_id = next(iter(prepared_owners))
+                if matches and matches[0]["decision_id"] != prepared_id:
+                    raise StoreError("prepared logical decision conflicts with a second owner")
+                if matches:
+                    return matches[0]
+                stored = connection.execute(
+                    "SELECT * FROM decisions WHERE decision_id=?", (prepared_id,)
+                ).fetchone()
+                if stored is None:
+                    raise StoreError("prepared logical decision row is missing")
+                record = validated_decision(stored)
+                if any(record[key] != identity[key] for key in keys):
+                    raise StoreError("prepared logical decision identity is inconsistent")
+                return record
+            if matches:
+                return matches[0]
+
+            # Only when no exact owner exists, inspect nearby standalone rows.
+            # One or two damaged identity columns cannot silently mint a new
+            # decision, while a known exact owner stays independent of them.
+            related = tuple(combinations(keys, len(keys) - 2))
+            predicate = " OR ".join(
+                "(" + " AND ".join(f"{key}=?" for key in group) + ")"
+                for group in related
+            )
+            rows = connection.execute(
+                f"SELECT * FROM decisions WHERE {predicate} ORDER BY decision_id",
+                tuple(identity[key] for group in related for key in group),
+            ).fetchall()
+            for stored in rows:
+                validated_decision(stored)
+            return None
         except StoreError:
             raise
         except (sqlite3.Error, ValueError, TypeError, KeyError, contracts.ContractError) as exc:
@@ -3225,7 +3311,7 @@ class MemoryStore:
                 raise StoreError("first preparation and decision identity differ")
             for key in (
                 "task_card_digest", "objective_id", "route", "plan_id",
-                "plan_state", "plan_digest", "strategy", "configuration_digest",
+                "plan_state", "plan_digest",
             ):
                 if first_decision[key] != preparation[key]:
                     raise StoreError(f"first preparation and decision {key} differ")
@@ -3251,21 +3337,13 @@ class MemoryStore:
                         raise PreparationConflictError(
                             "another caller claimed the first preparation"
                         )
-                    if owner["created_at"] != first_decision["created_at"]:
-                        raise StoreError("standalone decision creation time changed")
-                    connection.execute(
-                        """UPDATE decisions SET strategy=?, configuration=?,
-                           configuration_digest=?, state=?, content_hash=?, updated_at=?
-                           WHERE decision_id=?""",
-                        (
-                            first_decision["strategy"],
-                            json.dumps(first_decision["configuration"], sort_keys=True),
-                            first_decision["configuration_digest"], first_decision["state"],
-                            first_decision["content_hash"], contracts.utc_now(),
-                            first_decision["decision_id"],
-                        ),
-                    )
+                    if (owner["content_hash"] != first_decision["content_hash"]
+                            or owner["created_at"] != first_decision["created_at"]):
+                        raise StoreError("standalone decision changed before first preparation")
                 else:
+                    for key in ("strategy", "configuration_digest"):
+                        if first_decision[key] != preparation[key]:
+                            raise StoreError(f"first preparation and decision {key} differ")
                     try:
                         connection.execute(
                             """INSERT INTO decisions (

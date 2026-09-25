@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import sys
 import tempfile
 import threading
@@ -227,6 +228,170 @@ class CapturedConfigurationTests(unittest.TestCase):
             first.decision["decision_id"]
         ))
 
+    def test_preparation_identity_recovers_owner_after_three_decision_columns_corrupt(self) -> None:
+        first = self.first()
+        self.state.connection.execute(
+            """UPDATE decisions SET task_card_digest=?, objective_id=?, plan_digest=?
+               WHERE decision_id=?""",
+            ("damaged-task", "damaged-objective", "damaged-plan",
+             first.decision["decision_id"]),
+        )
+        self.state.connection.commit()
+        calls: list[object] = []
+        with self.assertRaisesRegex(preparation.MandatoryStateFailure,
+                                    "logical decision|recover mandatory state"):
+            self.prepare(
+                self.service(strategy="deeper"),
+                stores=[search.SearchStore(
+                    store_id="everos", kind="historical_evidence",
+                    query=lambda query: calls.append(query) or [],
+                )],
+            )
+        self.assertEqual([], calls)
+        self.assertEqual(1, self.state.connection.execute(
+            "SELECT COUNT(*) FROM decisions"
+        ).fetchone()[0])
+        self.assertEqual([first.preparation], self.state.list_preparations(
+            first.decision["decision_id"]
+        ))
+
+    def test_malformed_related_preparation_identity_blocks_corrupt_owner_recovery(self) -> None:
+        first = self.first()
+        packet = dict(first.preparation)
+        packet["plan_digest"] = "damaged-preparation-plan"
+        self.state.connection.execute(
+            "UPDATE preparations SET record=? WHERE preparation_id=?",
+            (json.dumps(packet), first.preparation["preparation_id"]),
+        )
+        self.state.connection.execute(
+            """UPDATE decisions SET task_card_digest=?, objective_id=?, plan_digest=?
+               WHERE decision_id=?""",
+            ("damaged-task", "damaged-objective", "damaged-plan",
+             first.decision["decision_id"]),
+        )
+        self.state.connection.commit()
+        calls: list[object] = []
+        with self.assertRaises(preparation.MandatoryStateFailure):
+            self.prepare(
+                self.service(strategy="deeper"),
+                stores=[search.SearchStore(
+                    store_id="everos", kind="historical_evidence",
+                    query=lambda query: calls.append(query) or [],
+                )],
+            )
+        self.assertEqual([], calls)
+        self.assertEqual(1, self.state.connection.execute(
+            "SELECT COUNT(*) FROM decisions"
+        ).fetchone()[0])
+        self.assertEqual(1, self.state.connection.execute(
+            "SELECT COUNT(*) FROM preparations"
+        ).fetchone()[0])
+
+    def test_unrelated_malformed_preparation_does_not_block_exact_owner(self) -> None:
+        first = self.first()
+        other_card = contracts.make_task_card(task="Unrelated task", base_commit="base-2")
+        other = self.service().prepare(
+            task_card=other_card, plan=self.plan, objective_id="objective-1",
+            deadline=1300.0,
+        )
+        self.state.connection.execute(
+            "UPDATE preparations SET record=? WHERE preparation_id=?",
+            ("{broken", other.preparation["preparation_id"]),
+        )
+        self.state.connection.commit()
+        continued = self.prepare(self.service(strategy="deeper"))
+        self.assertEqual(first.decision, continued.decision)
+        self.assertEqual(2, continued.preparation["attempt"])
+        self.assertEqual(2, self.state.connection.execute(
+            "SELECT COUNT(*) FROM decisions"
+        ).fetchone()[0])
+
+    def test_distinct_plan_malformed_preparation_does_not_block_exact_owner(self) -> None:
+        first = self.first()
+        other_plan = contracts.make_plan(
+            plan_id="another-plan", objective_id="objective-1", route="ordinary",
+            state="candidate", content={"steps": ["unrelated revision"]},
+        )
+        other = self.prepare(self.service(), plan=other_plan)
+        self.state.connection.execute(
+            "UPDATE preparations SET record=? WHERE preparation_id=?",
+            ("{broken", other.preparation["preparation_id"]),
+        )
+        self.state.connection.commit()
+        continued = self.prepare(self.service(strategy="deeper"))
+        self.assertEqual(first.decision, continued.decision)
+        self.assertEqual(2, continued.preparation["attempt"])
+        self.assertEqual(2, self.state.connection.execute(
+            "SELECT COUNT(*) FROM decisions"
+        ).fetchone()[0])
+
+    def test_distinct_plan_corrupt_preparation_column_does_not_block_owner(self) -> None:
+        first = self.first()
+        other_plan = contracts.make_plan(
+            plan_id="another-plan", objective_id="objective-1", route="ordinary",
+            state="candidate", content={"steps": ["unrelated revision"]},
+        )
+        other = self.prepare(self.service(), plan=other_plan)
+        self.state.connection.execute(
+            "UPDATE preparations SET strategy=? WHERE preparation_id=?",
+            ("damaged", other.preparation["preparation_id"]),
+        )
+        self.state.connection.commit()
+        continued = self.prepare(self.service(strategy="deeper"))
+        self.assertEqual(first.decision, continued.decision)
+        self.assertEqual(2, continued.preparation["attempt"])
+
+    def test_distinct_plan_corrupt_decision_does_not_block_prepared_owner(self) -> None:
+        first = self.first()
+        other_plan = contracts.make_plan(
+            plan_id="another-plan", objective_id="objective-1", route="ordinary",
+            state="candidate", content={"steps": ["unrelated revision"]},
+        )
+        other = contracts.make_decision(self.card, other_plan)
+        self.state.record_decision(other)
+        self.state.connection.execute(
+            "UPDATE decisions SET configuration=? WHERE decision_id=?",
+            ("{broken", other["decision_id"]),
+        )
+        self.state.connection.commit()
+        continued = self.prepare(self.service(strategy="deeper"))
+        self.assertEqual(first.decision, continued.decision)
+        self.assertEqual(2, continued.preparation["attempt"])
+
+    def test_distinct_prepared_plan_corrupt_decision_does_not_block_owner(self) -> None:
+        first = self.first()
+        other_plan = contracts.make_plan(
+            plan_id="another-plan", objective_id="objective-1", route="ordinary",
+            state="candidate", content={"steps": ["unrelated revision"]},
+        )
+        other = self.prepare(self.service(), plan=other_plan)
+        self.state.connection.execute(
+            "UPDATE decisions SET configuration=? WHERE decision_id=?",
+            ("{broken", other.decision["decision_id"]),
+        )
+        self.state.connection.commit()
+        continued = self.prepare(self.service(strategy="deeper"))
+        self.assertEqual(first.decision, continued.decision)
+        self.assertEqual(2, continued.preparation["attempt"])
+
+    def test_distinct_plan_corrupt_decision_does_not_block_standalone_owner(self) -> None:
+        standalone = contracts.make_decision(self.card, self.plan)
+        self.state.record_decision(standalone)
+        other_plan = contracts.make_plan(
+            plan_id="another-plan", objective_id="objective-1", route="ordinary",
+            state="candidate", content={"steps": ["unrelated revision"]},
+        )
+        other = contracts.make_decision(self.card, other_plan)
+        self.state.record_decision(other)
+        self.state.connection.execute(
+            "UPDATE decisions SET configuration=? WHERE decision_id=?",
+            ("{broken", other["decision_id"]),
+        )
+        self.state.connection.commit()
+        first = self.prepare(self.service(strategy="deeper"))
+        self.assertEqual(standalone, first.decision)
+        self.assertEqual(1, first.preparation["attempt"])
+
     def test_explicit_dependent_gates_compare_normalized_policy(self) -> None:
         first = self.prepare(self.service(template_memory=False, experience_write=False))
         self.assertFalse(first.preparation["configuration"]["apc"])
@@ -258,14 +423,188 @@ class CapturedConfigurationTests(unittest.TestCase):
         first = self.prepare(self.service(template_memory=False))
         self.assertEqual(standalone["decision_id"], first.decision["decision_id"])
         self.assertEqual(1, first.preparation["attempt"])
-        self.assertFalse(first.preparation["configuration"]["template_memory"])
+        self.assertTrue(first.preparation["configuration"]["template_memory"])
         captured = self.state.get_decision(standalone["decision_id"])
-        self.assertEqual(first.preparation["configuration"], captured["configuration"])
-        self.assertNotEqual(standalone["content_hash"], captured["content_hash"])
+        self.assertEqual(standalone["configuration"], captured["configuration"])
+        self.assertEqual(standalone["content_hash"], captured["content_hash"])
+        self.assertEqual(standalone, first.decision)
         retry = self.prepare(self.service(strategy="deeper"))
         self.assertEqual(first.decision["decision_id"], retry.decision["decision_id"])
-        self.assertFalse(retry.preparation["configuration"]["template_memory"])
+        self.assertTrue(retry.preparation["configuration"]["template_memory"])
         self.assertEqual(2, retry.preparation["attempt"])
+
+    def test_standalone_complete_policy_and_delivered_links_remain_immutable(self) -> None:
+        recorded = asdict(config.resolve_config({
+            "strategy": "standard", "template_memory": False,
+            "experience_read": False,
+        }))
+        standalone = contracts.make_decision(
+            self.card, self.plan, strategy="standard", configuration=recorded,
+        )
+        self.state.record_decision(standalone)
+        original_row = tuple(self.state.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (standalone["decision_id"],)
+        ).fetchone())
+        operation = contracts.make_operation(
+            kind="dispatch", envelope={
+                "content_hash": "delivered-envelope", "decision_id": standalone["decision_id"],
+                "run_id": "run-1",
+            }, status="delivered", observed_invocation={"receipt": "delivered"},
+        )
+        self.state.record_operation(operation)
+        outcome = contracts.make_outcome(
+            decision_id=standalone["decision_id"], plan_id=self.plan["plan_id"],
+            plan_digest=self.plan["content_hash"], status="PASS",
+            evidence_digest="delivered-evidence", linked_run_id="run-1",
+            task_card_digest=self.card["content_hash"], objective_id="objective-1",
+        )
+        self.state.record_outcome(outcome)
+        stored_operation = self.state.get_operation(operation["operation_id"])
+        stored_outcome = self.state.get_outcome(standalone["decision_id"])
+        calls: list[object] = []
+        first = self.prepare(
+            self.service(strategy="deeper", template_memory=True, experience_read=True),
+            stores=[search.SearchStore(
+                store_id="templates", kind="template",
+                query=lambda query: calls.append(query) or [],
+            )],
+        )
+        self.assertEqual(standalone, first.decision)
+        self.assertEqual(standalone["configuration"], self.state.get_decision(
+            standalone["decision_id"]
+        )["configuration"])
+        self.assertEqual(standalone["content_hash"], self.state.get_decision(
+            standalone["decision_id"]
+        )["content_hash"])
+        self.assertFalse(first.preparation["configuration"]["template_memory"])
+        self.assertFalse(first.preparation["configuration"]["experience_read"])
+        self.assertEqual([], calls)
+        self.assertEqual(stored_operation, self.state.get_operation(operation["operation_id"]))
+        self.assertEqual(stored_outcome, self.state.get_outcome(standalone["decision_id"]))
+        self.assertEqual(original_row, tuple(self.state.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (standalone["decision_id"],)
+        ).fetchone()))
+
+    def test_standalone_minimal_deeper_and_known_policy_conflicts(self) -> None:
+        standalone = contracts.make_decision(
+            self.card, self.plan, strategy="deeper",
+            configuration={"strategy": "deeper", "template_memory": False},
+        )
+        self.state.record_decision(standalone)
+        calls: list[object] = []
+        candidate_store = search.SearchStore(
+            store_id="templates", kind="template",
+            query=lambda query: calls.append(query) or [],
+        )
+        for request in ({"strategy": "standard"}, {"template_memory": True}):
+            with self.subTest(request=request):
+                with self.assertRaisesRegex(preparation.MandatoryStateFailure,
+                                            "recover|new decision"):
+                    self.prepare(self.service(), request=request, stores=[candidate_store])
+                self.assertEqual([], self.state.list_preparations(standalone["decision_id"]))
+                self.assertEqual([], calls)
+        first = self.prepare(
+            self.service(strategy="standard", template_memory=True), stores=[candidate_store]
+        )
+        self.assertEqual(standalone, first.decision)
+        self.assertEqual("deeper", first.preparation["requested_strategy"])
+        self.assertEqual("deeper", first.preparation["strategy"])
+        self.assertFalse(first.preparation["configuration"]["template_memory"])
+        self.assertTrue(first.preparation["configuration"]["deeper"])
+        self.assertEqual([], calls)
+        retry = self.prepare(self.service(strategy="standard", template_memory=True))
+        self.assertEqual(standalone, retry.decision)
+        self.assertEqual(first.preparation["configuration"], retry.preparation["configuration"])
+        self.assertEqual(2, retry.preparation["attempt"])
+
+    def test_standalone_inconsistent_recorded_gate_fails_before_claim(self) -> None:
+        standalone = contracts.make_decision(
+            self.card, self.plan, strategy="standard",
+            configuration={
+                "strategy": "standard", "template_memory": False, "apc": True,
+            },
+        )
+        self.state.record_decision(standalone)
+        original_row = tuple(self.state.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (standalone["decision_id"],)
+        ).fetchone())
+        calls: list[object] = []
+        with self.assertRaises(preparation.MandatoryStateFailure):
+            self.prepare(
+                self.service(), stores=[search.SearchStore(
+                    store_id="templates", kind="template",
+                    query=lambda query: calls.append(query) or [],
+                )],
+            )
+        self.assertEqual([], calls)
+        self.assertEqual([], self.state.list_preparations(standalone["decision_id"]))
+        self.assertEqual(original_row, tuple(self.state.connection.execute(
+            "SELECT * FROM decisions WHERE decision_id=?", (standalone["decision_id"],)
+        ).fetchone()))
+
+    def test_standalone_missing_gate_accepts_explicit_first_policy(self) -> None:
+        standalone = contracts.make_decision(
+            self.card, self.plan, strategy="standard",
+            configuration={"strategy": "standard"},
+        )
+        self.state.record_decision(standalone)
+        first = self.prepare(
+            self.service(template_memory=True), request={"template_memory": False}
+        )
+        self.assertEqual(standalone, first.decision)
+        self.assertFalse(first.preparation["configuration"]["template_memory"])
+        self.assertEqual(standalone["content_hash"], self.state.get_decision(
+            standalone["decision_id"]
+        )["content_hash"])
+        retry = self.prepare(self.service(template_memory=True))
+        self.assertFalse(retry.preparation["configuration"]["template_memory"])
+
+    def test_standalone_all_off_policy_survives_service_default_drift(self) -> None:
+        standalone = contracts.make_decision(
+            self.card, self.plan, strategy="standard",
+            configuration=asdict(config.resolve_config({"all_features": False})),
+        )
+        self.state.record_decision(standalone)
+        calls: list[object] = []
+        outcome = self.prepare(
+            self.service(), stores=[search.SearchStore(
+                store_id="everos", kind="historical_evidence",
+                query=lambda query: calls.append(query) or [],
+            )],
+        )
+        self.assertEqual("inherited", outcome.mode)
+        self.assertEqual([], calls)
+        self.assertEqual(standalone["content_hash"], self.state.get_decision(
+            standalone["decision_id"]
+        )["content_hash"])
+        self.assertEqual([], self.state.list_preparations(standalone["decision_id"]))
+        self.assertEqual(1, self.state.connection.execute(
+            "SELECT COUNT(*) FROM decisions"
+        ).fetchone()[0])
+
+    def test_standalone_all_off_service_keeps_recorded_enabled_gate(self) -> None:
+        standalone = contracts.make_decision(
+            self.card, self.plan, strategy="standard",
+            configuration={"strategy": "standard", "template_memory": True},
+        )
+        self.state.record_decision(standalone)
+        first = self.prepare(self.service(all_features=False))
+        self.assertEqual(standalone, first.decision)
+        self.assertTrue(first.preparation["configuration"]["template_memory"])
+        self.assertEqual(1, first.preparation["attempt"])
+
+    def test_standalone_minimal_standard_all_off_service_stays_inherited(self) -> None:
+        standalone = contracts.make_decision(
+            self.card, self.plan, strategy="standard",
+            configuration={"strategy": "standard"},
+        )
+        self.state.record_decision(standalone)
+        outcome = self.prepare(self.service(all_features=False))
+        self.assertEqual("inherited", outcome.mode)
+        self.assertEqual([], self.state.list_preparations(standalone["decision_id"]))
+        self.assertEqual(standalone["content_hash"], self.state.get_decision(
+            standalone["decision_id"]
+        )["content_hash"])
 
     def test_standalone_claim_rolls_back_and_racing_caller_reuses_winner(self) -> None:
         standalone = contracts.make_decision(
@@ -279,9 +618,9 @@ class CapturedConfigurationTests(unittest.TestCase):
         )
         with self.assertRaises(preparation.MandatoryStateFailure):
             self.prepare(self.service(template_memory=False))
-        self.assertEqual(standalone["configuration"], self.state.get_decision(
-            standalone["decision_id"]
-        )["configuration"])
+        rolled_back = self.state.get_decision(standalone["decision_id"])
+        self.assertEqual(standalone["configuration"], rolled_back["configuration"])
+        self.assertEqual(standalone["content_hash"], rolled_back["content_hash"])
         self.assertEqual([], self.state.list_preparations(standalone["decision_id"]))
         self.state.connection.execute("DROP TRIGGER fail_first_prep")
         self.state.connection.commit()
@@ -326,6 +665,9 @@ class CapturedConfigurationTests(unittest.TestCase):
         self.assertEqual(1, self.state.connection.execute(
             "SELECT COUNT(*) FROM decisions"
         ).fetchone()[0])
+        self.assertEqual(standalone["content_hash"], self.state.get_decision(
+            standalone["decision_id"]
+        )["content_hash"])
 
     def test_standalone_identifier_collision_preserves_the_other_plan(self) -> None:
         captured_config = asdict(config.resolve_config({}))

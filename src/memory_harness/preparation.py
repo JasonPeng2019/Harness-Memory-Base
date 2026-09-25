@@ -150,6 +150,95 @@ class PreparationService:
         return MemoryConfig(**recorded)
 
     @staticmethod
+    def _standalone_config(
+        decision: Mapping[str, Any], request: Mapping[str, Any] | None = None,
+    ) -> MemoryConfig:
+        """Fill only absent decision fields without changing its recorded meaning."""
+
+        recorded = decision.get("configuration")
+        names = {field.name for field in fields(MemoryConfig)}
+        boolean_names = names - {"strategy", "requested_strategy", "reason"}
+        if not isinstance(recorded, Mapping) or not set(recorded) <= names:
+            raise MandatoryStateFailure(
+                "standalone logical decision policy is unreadable; recover mandatory state"
+            )
+        if (recorded.get("strategy") != decision.get("strategy")
+                or recorded["strategy"] not in (STANDARD, PROBLEM_FOCUSED, DEEPER)
+                or any(not isinstance(recorded[key], bool) for key in boolean_names & recorded.keys())
+                or any(
+                    not isinstance(recorded[key], str) or not recorded[key]
+                    for key in ("requested_strategy", "reason") if key in recorded
+                )):
+            raise MandatoryStateFailure(
+                "standalone logical decision policy is invalid; recover mandatory state"
+            )
+        raw = {"strategy": recorded["strategy"]}
+        raw.update({key: recorded[key] for key in boolean_names if key in recorded})
+        baseline = resolve_config(raw)
+        if baseline.strategy != decision["strategy"] or any(
+            getattr(baseline, key) != recorded[key]
+            for key in boolean_names & recorded.keys()
+        ):
+            raise MandatoryStateFailure(
+                "standalone logical decision strategy or feature gates conflict with "
+                "their dependency rules; "
+                "recover mandatory state"
+            )
+        requested_strategy = recorded.get("requested_strategy", decision["strategy"])
+        if request and "strategy" in request and request["strategy"] != requested_strategy:
+            raise MandatoryStateFailure(
+                "explicit strategy policy conflicts with the captured logical decision; "
+                "recover mandatory state or start a new decision"
+            )
+        candidate_raw = (
+            {"strategy": recorded["strategy"]}
+            if request and "all_features" in request else dict(raw)
+        )
+        for key in boolean_names | {"all_features"}:
+            if request and key in request:
+                candidate_raw[key] = request[key]
+        candidate = resolve_config(candidate_raw)
+        if candidate.strategy != baseline.strategy or any(
+            getattr(candidate, key) != getattr(baseline, key)
+            for key in boolean_names if key in recorded
+        ) or any(
+            request[key] != recorded[key]
+            for key in ("requested_strategy", "reason")
+            if request and key in request and key in recorded
+        ):
+            raise MandatoryStateFailure(
+                "explicit feature policy conflicts with the captured logical decision; "
+                "recover mandatory state or start a new decision"
+            )
+        return replace(
+            candidate, requested_strategy=requested_strategy,
+            reason=recorded.get("reason", candidate.reason),
+        )
+
+    @classmethod
+    def _check_decision_preparation(
+        cls, decision: Mapping[str, Any], captured: MemoryConfig,
+    ) -> None:
+        recorded = decision["configuration"]
+        missing = {
+            field.name: getattr(captured, field.name)
+            for field in fields(MemoryConfig)
+            if isinstance(getattr(captured, field.name), bool) and field.name not in recorded
+        }
+        expected = cls._standalone_config(decision, missing)
+        if (captured.requested_strategy != expected.requested_strategy
+                or captured.strategy not in (decision["strategy"], STANDARD)
+                or any(
+                    getattr(captured, field.name) != getattr(expected, field.name)
+                    for field in fields(MemoryConfig)
+                    if isinstance(getattr(captured, field.name), bool)
+                )):
+            raise MandatoryStateFailure(
+                "first preparation conflicts with its immutable logical decision policy; "
+                "recover mandatory state"
+            )
+
+    @staticmethod
     def _check_explicit_policy(
         request: Mapping[str, Any] | None, resolved: MemoryConfig, captured: MemoryConfig,
     ) -> None:
@@ -322,15 +411,28 @@ class PreparationService:
             raise MandatoryStateFailure(
                 "captured logical decision preparations are unreadable; recover mandatory state"
             )
-        # A valid standalone decision has not captured preparation policy yet.
-        # The first preparation claims its resolved policy atomically. All-off
-        # still follows the inherited path while no policy has been claimed.
+        # A valid standalone decision already owns its recorded policy. Only
+        # absent fields may be filled for its first preparation; the decision
+        # row itself remains immutable. All-off still takes the inherited path.
         if not prior:
-            return (None, None, None, None) if requested.all_off else (
-                decision, None, None, None
+            self._standalone_config(decision, request)
+            return decision, None, None, None
+        first = [packet for packet in prior if packet.get("attempt") == 1]
+        if len(first) != 1:
+            raise MandatoryStateFailure(
+                "captured logical decision first preparation is unreadable; "
+                "recover mandatory state"
             )
-        captured = self._decision_config(decision)
-        self._check_explicit_policy(request, requested, captured)
+        captured = self._decision_config({
+            "configuration": first[0].get("configuration"),
+            "strategy": first[0].get("strategy"),
+        })
+        self._check_decision_preparation(decision, captured)
+        normalized_request = (
+            requested if not request or "all_features" in request
+            else resolve_config({**asdict(captured), **request})
+        )
+        self._check_explicit_policy(request, normalized_request, captured)
         network_modes = set()
         for packet in prior:
             if not isinstance(packet, Mapping) or any(
@@ -360,7 +462,7 @@ class PreparationService:
                 )
             if packet.get("attempt") == 1 and packet_config != captured:
                 raise MandatoryStateFailure(
-                    "first preparation conflicts with its captured decision configuration; "
+                    "first preparation conflicts with its captured preparation configuration; "
                     "recover mandatory state"
                 )
             mode = packet.get("network_mode")
@@ -519,7 +621,23 @@ class PreparationService:
             durable, captured, captured_network, captured_source = self._logical_owner(
                 identity, request, supplied_config, network_mode
             )
-            if durable is None and supplied_config.all_off:
+            standalone_policy = (
+                self._standalone_config(durable, request)
+                if durable is not None and captured is None else None
+            )
+            # The global all-off service setting can cover absent gates on a
+            # strategy-only standalone row, but cannot disable a recorded gate.
+            standalone_all_off = (
+                standalone_policy is not None and request is None
+                and supplied_config.all_off and durable["strategy"] == STANDARD
+                and not any(
+                    enabled for name, enabled in durable["configuration"].items()
+                    if name not in ("strategy", "requested_strategy", "reason")
+                )
+            )
+            if ((durable is None and supplied_config.all_off)
+                    or (standalone_policy is not None and standalone_policy.all_off)
+                    or standalone_all_off):
                 if plan is None:
                     raise MandatoryStateFailure(
                         "all-off preparation still needs its exact plan state"
@@ -530,8 +648,9 @@ class PreparationService:
                     reason="all enhancements are off; the inherited harness path applies",
                 )
             if captured is None:
+                initial_policy = standalone_policy or supplied_config
                 requested_config = self._effective_config(
-                    supplied_config, failure_context=failure_context,
+                    initial_policy, failure_context=failure_context,
                     unknown_time=unknown_time,
                 )
                 if durable is not None:
@@ -609,16 +728,12 @@ class PreparationService:
                 resolved_config.strategy, remaining, unknown_time, admitted=admitted
             )
             decision = (
-                durable if captured is not None else contracts.make_decision(
+                durable if durable is not None else contracts.make_decision(
                     task_card, plan_of_record, strategy=resolved_config.strategy,
                     configuration=asdict(resolved_config),
                     decision_id=ownership_decision["decision_id"],
                 )
             )
-            if durable is not None and captured is None:
-                decision["created_at"] = durable["created_at"]
-                decision["content_hash"] = contracts.content_hash(decision)
-                contracts.validate_decision(decision)
             preparation = contracts.make_preparation(
                 task_card=task_card,
                 decision_id=decision["decision_id"],
