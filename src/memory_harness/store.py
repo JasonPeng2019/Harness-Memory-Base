@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 from pathlib import Path
@@ -37,6 +38,10 @@ class ProcedureConflictError(StoreError):
 
 class ProcedureDesignationConflictError(ProcedureConflictError):
     """A delayed designation or withdrawal lost its conditional generation race."""
+
+
+class PreparationConflictError(StoreError):
+    """A preparation attempt lost the durable decision-budget race."""
 
 
 _SCHEMA = [
@@ -3147,36 +3152,100 @@ class MemoryStore:
         contracts.validate_preparation(preparation)
         connection = self._require_connection()
         payload = self._serialize_record(preparation)
-        with connection:
-            connection.execute(
-                """
-                INSERT INTO preparations (
-                    preparation_id, decision_id, task_card_digest, objective_id,
-                    route, strategy, current_plan_state, status, supersedes,
-                    superseded_by, record, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(preparation_id) DO UPDATE SET
-                    status=excluded.status,
-                    superseded_by=excluded.superseded_by,
-                    record=excluded.record,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    preparation["preparation_id"],
-                    preparation["decision_id"],
-                    preparation["task_card_digest"],
-                    preparation["objective_id"],
-                    preparation["route"],
-                    preparation["strategy"],
-                    preparation["current_plan_state"],
-                    preparation["status"],
-                    preparation.get("supersedes"),
-                    preparation.get("superseded_by"),
-                    payload,
-                    preparation["created_at"],
-                    preparation["created_at"],
-                ),
+        # BEGIN IMMEDIATE makes the decision-wide read and the attempt write
+        # one SQLite claim across separate callers/connections.  A delayed
+        # caller can retry with the new minimum rather than overwrite it.
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            prior = self.list_preparations(str(preparation["decision_id"]))
+            existing = next(
+                (row for row in prior if row["preparation_id"] == preparation["preparation_id"]),
+                None,
             )
+            if existing is not None:
+                stable_keys = (set(existing) | set(preparation)) - {
+                    "status", "superseded_by", "content_hash"
+                }
+                if any(existing.get(key) != preparation.get(key) for key in stable_keys):
+                    raise PreparationConflictError("preparation attempt identity already has different state")
+                if existing.get("superseded_by") and (
+                    preparation.get("superseded_by") != existing["superseded_by"]
+                    or preparation["status"] != existing["status"]
+                ):
+                    raise PreparationConflictError("a superseded preparation cannot become current")
+                connection.execute(
+                    """UPDATE preparations SET status=?, superseded_by=?, record=?, updated_at=?
+                       WHERE preparation_id=?""",
+                    (
+                        preparation["status"], preparation.get("superseded_by"),
+                        payload, contracts.utc_now(), preparation["preparation_id"],
+                    ),
+                )
+            else:
+                attempts = [row.get("attempt") for row in prior]
+                if any(
+                    isinstance(value, bool) or not isinstance(value, int) or value < 1
+                    for value in attempts
+                ):
+                    raise StoreError("durable preparation attempt state is unreadable")
+                if attempts and preparation["attempt"] <= max(attempts):
+                    raise PreparationConflictError("preparation attempt was claimed by another caller")
+                if preparation["budget_source"] == "trusted_deadline":
+                    deadlines = []
+                    for row in prior:
+                        if row.get("budget_source") != "trusted_deadline":
+                            continue
+                        deadline = row.get("deadline_monotonic")
+                        if (
+                            isinstance(deadline, bool)
+                            or not isinstance(deadline, (int, float))
+                            or not math.isfinite(deadline)
+                        ):
+                            raise StoreError("durable preparation budget is unreadable")
+                        deadlines.append(float(deadline))
+                    if deadlines and preparation["deadline_monotonic"] > min(deadlines):
+                        raise PreparationConflictError("preparation would extend the durable cutoff")
+                supersedes = preparation.get("supersedes")
+                if supersedes is not None:
+                    old = next((row for row in prior if row["preparation_id"] == supersedes), None)
+                    if old is None or old.get("superseded_by") or old.get("status") == "superseded":
+                        raise PreparationConflictError("the superseded preparation is no longer current")
+                    updated_old = dict(old)
+                    updated_old["status"] = "superseded"
+                    updated_old["superseded_by"] = preparation["preparation_id"]
+                    updated_old["content_hash"] = contracts.content_hash(updated_old)
+                    connection.execute(
+                        """UPDATE preparations SET status=?, superseded_by=?, record=?, updated_at=?
+                           WHERE preparation_id=?""",
+                        (
+                            "superseded", preparation["preparation_id"],
+                            self._serialize_record(updated_old), contracts.utc_now(), supersedes,
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO preparations (
+                        preparation_id, decision_id, task_card_digest, objective_id,
+                        route, strategy, current_plan_state, status, supersedes,
+                        superseded_by, record, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        preparation["preparation_id"], preparation["decision_id"],
+                        preparation["task_card_digest"], preparation["objective_id"],
+                        preparation["route"], preparation["strategy"],
+                        preparation["current_plan_state"], preparation["status"],
+                        supersedes, preparation.get("superseded_by"), payload,
+                        preparation["created_at"], preparation["created_at"],
+                    ),
+                )
+            connection.commit()
+        except sqlite3.Error as exc:
+            connection.rollback()
+            raise StoreError(f"cannot record preparation: {exc}") from exc
+        except Exception:
+            connection.rollback()
+            raise
         return self.get_preparation(str(preparation["preparation_id"]))
 
     def get_preparation(self, preparation_id: str) -> dict[str, Any]:
@@ -3511,5 +3580,5 @@ class MemoryStore:
 __all__ = [
     "MemoryStore", "StoreError", "OperationConflictError", "OutcomeConflictError",
     "TrajectoryConflictError", "ExperienceConflictError", "ProcedureConflictError",
-    "ProcedureDesignationConflictError",
+    "ProcedureDesignationConflictError", "PreparationConflictError",
 ]

@@ -833,6 +833,190 @@ class Step04ContractCorrectionTests(unittest.TestCase):
         self.assertEqual(70.0, later.preparation["remaining_seconds"])
         self.assertEqual(50.0, later.preparation["spent_seconds"])
 
+    def test_followup_level_zero_uses_decision_wide_tightened_budget(self) -> None:
+        first = self.service.prepare(
+            task_card=self.card, plan=self.candidate, objective_id="objective-1",
+            deadline=self.clock() + 300.0,
+        )
+        self.clock.advance(30.0)
+        tightened = self.service.prepare(
+            task_card=self.card, plan=self.candidate, objective_id="objective-1",
+            deadline=self.clock() + 35.0,
+        )
+        self.clock.advance(20.0)
+        queried: list[object] = []
+        corrected = self.service.apply_level_zero(
+            preparation=first.preparation,
+            decision=first.decision,
+            task_card=self.card,
+            plan=first.plan,
+            objective_id="objective-1",
+            stores=[search.SearchStore(
+                store_id="everos", kind="historical_evidence",
+                query=lambda query: queried.append(query) or [],
+            )],
+        )
+        self.assertEqual(first.decision["decision_id"], corrected.decision["decision_id"])
+        self.assertEqual(tightened.preparation["deadline_monotonic"], corrected.preparation["deadline_monotonic"])
+        self.assertEqual(15.0, corrected.preparation["remaining_seconds"])
+        self.assertEqual(50.0, corrected.preparation["spent_seconds"])
+        self.assertEqual(0.0, corrected.preparation["stage_allowance_seconds"])
+        self.assertEqual([], queried)
+        self.assertEqual(0, corrected.trace["rounds"])
+
+    def test_followup_overlapping_callers_keep_distinct_attempts_and_minimum_cutoff(self) -> None:
+        first = self.service.prepare(
+            task_card=self.card, plan=self.candidate, objective_id="objective-1",
+            deadline=self.clock() + 300.0,
+        )
+        self.clock.advance(30.0)
+        other_store = store.MemoryStore(self.store_path)
+        other_store.initialize()
+        shorter_service = preparation.PreparationService(
+            store=other_store, limits=self.limits, clock=self.clock
+        )
+        interleaved: list[preparation.PreparationOutcome] = []
+
+        class InterleavedReadStore:
+            def __init__(self, inner):
+                self.inner = inner
+                self.once = False
+
+            def list_preparations(self, decision_id):
+                prior = self.inner.list_preparations(decision_id)
+                if not self.once:
+                    self.once = True
+                    interleaved.append(shorter_service.prepare(
+                        task_card=self_card, plan=self_plan, objective_id="objective-1",
+                        deadline=self_clock() + 90.0,
+                    ))
+                return prior
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        self_card, self_plan, self_clock = self.card, self.candidate, self.clock
+        try:
+            later_service = preparation.PreparationService(
+                store=InterleavedReadStore(self.memory_store),
+                limits=self.limits, clock=self.clock,
+            )
+            later = later_service.prepare(
+                task_card=self.card, plan=self.candidate, objective_id="objective-1",
+                deadline=self.clock() + 600.0,
+            )
+            durable = self.memory_store.list_preparations(first.decision["decision_id"])
+            self.assertEqual([1, 2, 3], sorted(item["attempt"] for item in durable))
+            self.assertEqual(3, len({item["preparation_id"] for item in durable}))
+            self.assertNotEqual(interleaved[0].preparation["preparation_id"], later.preparation["preparation_id"])
+            self.assertEqual(1120.0, min(item["deadline_monotonic"] for item in durable))
+            self.assertEqual(1120.0, later.preparation["deadline_monotonic"])
+        finally:
+            other_store.close()
+
+    def test_followup_slow_durable_lookup_and_stage_boundary_keep_reserve(self) -> None:
+        self.service.prepare(
+            task_card=self.card, plan=self.candidate, objective_id="objective-1",
+            deadline=self.clock() + 120.0,
+        )
+        self.clock.advance(20.0)
+
+        class SlowBudgetReadStore:
+            def __init__(self, inner, clock):
+                self.inner, self.clock = inner, clock
+
+            def list_preparations(self, decision_id):
+                prior = self.inner.list_preparations(decision_id)
+                self.clock.advance(65.0)
+                return prior
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        queried: list[object] = []
+        service = preparation.PreparationService(
+            store=SlowBudgetReadStore(self.memory_store, self.clock),
+            limits=self.limits, clock=self.clock,
+        )
+        canonical = service._canonical_objective
+
+        def delayed_canonical(*args):
+            self.clock.advance(10.0)
+            return canonical(*args)
+
+        service._canonical_objective = delayed_canonical
+        outcome = service.prepare(
+            task_card=self.card, plan=self.candidate, objective_id="objective-1",
+            deadline=self.clock() + 600.0,
+            stores=[search.SearchStore(
+                store_id="everos", kind="historical_evidence",
+                query=lambda query: queried.append(query) or [],
+            )],
+        )
+        self.assertEqual(1120.0, outcome.preparation["deadline_monotonic"])
+        self.assertEqual(35.0, outcome.preparation["remaining_seconds"])
+        self.assertEqual(85.0, outcome.preparation["spent_seconds"])
+        self.assertEqual([], queried)
+        self.assertEqual(0, outcome.trace["rounds"])
+        self.assertEqual("unattempted-by-budget", outcome.trace["attempts"][0]["status"])
+
+    def test_followup_unreadable_budget_retains_mandatory_and_completed_state(self) -> None:
+        accepted = contracts.make_plan(
+            plan_id="accepted-plan", objective_id="objective-1", route="ordinary",
+            state="accepted", accepted_by="ROOT", content={"steps": ["execute"]},
+        )
+        first = self.service.prepare(
+            task_card=self.card, plan=accepted, objective_id="objective-1",
+            stores=[self._store("everos", "historical_evidence", [self._evidence()])],
+        )
+        completed_trace = self.memory_store.get_search_trace(first.preparation["preparation_id"])
+        self.assertEqual("optional_memory", completed_trace["outcome"])
+
+        class UnreadableBudgetStore:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def list_preparations(self, decision_id):
+                record = dict(self.inner.list_preparations(decision_id)[0])
+                record["deadline_monotonic"] = "unreadable"
+                return [record]
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        queried: list[object] = []
+        launched: list[object] = []
+        checked: list[object] = []
+        service = preparation.PreparationService(
+            store=UnreadableBudgetStore(self.memory_store),
+            limits=self.limits, clock=self.clock,
+        )
+        outcome = service.prepare(
+            task_card=self.card, plan=accepted, objective_id="objective-1",
+            stores=[search.SearchStore(
+                store_id="everos", kind="historical_evidence",
+                query=lambda query: queried.append(query) or [],
+            )],
+            apc_launcher=lambda request: launched.append(request) or None,
+            lane_id="lane-1", run_id="run-1", worktree_path=str(self.root),
+            base_commit="base-1", finalize=True,
+            mandatory_content=[{"id": "task", "content": self.card["task"]}],
+            freshness_check=lambda item: checked.append(item) or True,
+        )
+        self.assertEqual("no_memory_continuation", outcome.mode)
+        self.assertEqual(accepted, outcome.plan)
+        self.assertEqual(first.decision["decision_id"], outcome.decision["decision_id"])
+        self.assertIsNone(outcome.trace)
+        self.assertIsNone(outcome.context)
+        self.assertIsNone(outcome.envelope)
+        self.assertIn("durable", outcome.reason)
+        self.assertEqual([], queried)
+        self.assertEqual([], launched)
+        self.assertEqual([], checked)
+        self.assertEqual([first.preparation], self.memory_store.list_preparations(first.decision["decision_id"]))
+        self.assertEqual(completed_trace, self.memory_store.get_search_trace(first.preparation["preparation_id"]))
+        self.assertIsNone(self.memory_store.get_final_context_for_decision(first.decision["decision_id"]))
+
     def test_failed_or_unreadable_budget_lookup_fails_before_optional_work(self) -> None:
         first = self.service.prepare(
             task_card=self.card,
@@ -867,20 +1051,25 @@ class Step04ContractCorrectionTests(unittest.TestCase):
                         limits=self.limits,
                         clock=self.clock,
                     )
-                    with self.assertRaisesRegex(preparation.PreparationError, "durable.*budget"):
-                        service.prepare(
-                            task_card=self.card,
-                            plan=self.candidate,
-                            objective_id="objective-1",
-                            deadline=supplied_deadline,
-                            root_replan={"requested_by": "ROOT", "reason": "retry"},
-                            stores=[search.SearchStore(
-                                store_id="everos",
-                                kind="historical_evidence",
-                                query=lambda query: queried.append(query) or [],
-                            )],
-                            apc_launcher=lambda request: launched.append(request) or None,
-                        )
+                    blocked = service.prepare(
+                        task_card=self.card,
+                        plan=self.candidate,
+                        objective_id="objective-1",
+                        deadline=supplied_deadline,
+                        root_replan={"requested_by": "ROOT", "reason": "retry"},
+                        stores=[search.SearchStore(
+                            store_id="everos",
+                            kind="historical_evidence",
+                            query=lambda query: queried.append(query) or [],
+                        )],
+                        apc_launcher=lambda request: launched.append(request) or None,
+                    )
+                    self.assertEqual("no_memory_continuation", blocked.mode)
+                    self.assertEqual(self.candidate, blocked.plan)
+                    self.assertEqual(first.decision["decision_id"], blocked.decision["decision_id"])
+                    self.assertIsNone(blocked.preparation)
+                    self.assertIsNone(blocked.trace)
+                    self.assertIn("durable", blocked.reason)
                     self.assertEqual([], queried)
                     self.assertEqual([], launched)
                     self.assertEqual(

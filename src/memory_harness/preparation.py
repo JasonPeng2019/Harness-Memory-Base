@@ -26,6 +26,7 @@ from .config import (
 )
 from .privacy import PrivacyPolicy, sanitize_text
 from .search import BoundedSearch, SearchStore
+from .store import PreparationConflictError, StoreError
 
 
 class PreparationError(RuntimeError):
@@ -142,6 +143,21 @@ class PreparationService:
             f"mandatory current-plan state is inconsistent for {objective_id!r}: {exc}"
         )
 
+    @staticmethod
+    def _blocked_budget_outcome(
+        *, decision: Mapping[str, Any], plan: Mapping[str, Any], reason: str,
+        preparation: Mapping[str, Any] | None = None,
+    ) -> PreparationOutcome:
+        return PreparationOutcome(
+            mode="no_memory_continuation",
+            decision=dict(decision),
+            preparation=dict(preparation) if preparation is not None else None,
+            trace=None,
+            disposition=None,
+            plan=dict(plan),
+            reason=f"durable preparation budget blocked optional work: {reason}",
+        )
+
     def _recover_budget(
         self, decision_id: str
     ) -> tuple[tuple[float, float] | None, int]:
@@ -212,14 +228,6 @@ class PreparationService:
             trusted, key=lambda item: (item[1], item[0])
         )
         return (tightest_deadline, granted_budget), max(attempts) + 1
-
-    def _next_attempt(self, decision_id: str) -> int:
-        if self.store is None:
-            return 1
-        try:
-            return len(self.store.list_preparations(decision_id)) + 1
-        except Exception:
-            return 1
 
     # -- preparation -------------------------------------------------------
 
@@ -337,23 +345,6 @@ class PreparationService:
             strategy=resolved_config.strategy,
             configuration=asdict(resolved_config),
         )
-        # One decision owns one deadline.  A later trusted cutoff may tighten
-        # the durable bound, but an explicit or default cutoff cannot extend it.
-        recovered, next_attempt = self._recover_budget(provisional["decision_id"])
-        if recovered is not None:
-            durable_deadline, granted_budget = recovered
-            durable_remaining = max(0.0, durable_deadline - now)
-            spent_seconds = max(0.0, granted_budget - durable_remaining)
-            absolute_deadline = (
-                min(absolute_deadline, durable_deadline)
-                if explicit_deadline
-                else durable_deadline
-            )
-            budget_source = "trusted_deadline"
-            unknown_time = False
-        else:
-            spent_seconds = 0.0
-        remaining = max(0.0, absolute_deadline - now) if not unknown_time else 0.0
         # One logical decision owns one captured configuration.  Stage
         # admission only demotes the *packet*; it must not mint a fresh
         # decision identity, because a later call with less remaining time
@@ -364,45 +355,89 @@ class PreparationService:
             strategy=resolved_config.strategy,
             configuration=asdict(resolved_config),
         )
-        resolved_config, admitted, admission_reason = self._admit_config(
-            resolved_config, remaining=remaining, unknown_time=unknown_time
-        )
-        stage_allowance = self._stage_allowance(
-            resolved_config.strategy, remaining, unknown_time, admitted=admitted
-        )
-        decision = contracts.make_decision(
-            task_card,
-            plan_of_record,
-            strategy=resolved_config.strategy,
-            configuration=asdict(resolved_config),
-            decision_id=ownership_decision["decision_id"],
-        )
-        if self.store is not None:
-            self.store.record_decision(decision)
-
-        preparation = contracts.make_preparation(
-            task_card=task_card,
-            decision_id=decision["decision_id"],
-            objective_id=objective_id,
-            route=route,
-            plan_id=plan_of_record["plan_id"],
-            plan_digest=plan_of_record["content_hash"],
-            plan_state=plan_of_record["state"],
-            current_plan_state=current_plan_state,
-            strategy=resolved_config.strategy,
-            requested_strategy=resolved_config.requested_strategy,
-            configuration=decision["configuration"],
-            network_mode=network_mode,
-            budget_source=budget_source,
-            remaining_seconds=None if unknown_time else remaining,
-            deadline_monotonic=None if unknown_time else absolute_deadline,
-            execution_reserve_seconds=self.limits.execution_reserve_seconds,
-            stage_allowance_seconds=stage_allowance,
-            spent_seconds=spent_seconds,
-            attempt=next_attempt,
-        )
-        if self.store is not None:
-            self.store.record_preparation(preparation)
+        requested_config = resolved_config
+        proposed_deadline = absolute_deadline
+        proposed_budget_source = budget_source
+        proposed_unknown_time = unknown_time
+        for _ in range(2):
+            try:
+                # One decision owns one deadline. A later trusted cutoff may
+                # tighten it, while a conflict retries against the new minimum.
+                recovered, next_attempt = self._recover_budget(provisional["decision_id"])
+            except PreparationError as exc:
+                return self._blocked_budget_outcome(
+                    decision=provisional, plan=plan_of_record, reason=str(exc)
+                )
+            now = self.clock()  # The durable read itself spends trusted time.
+            absolute_deadline = proposed_deadline
+            budget_source = proposed_budget_source
+            unknown_time = proposed_unknown_time
+            resolved_config = requested_config
+            if recovered is not None:
+                durable_deadline, granted_budget = recovered
+                durable_remaining = max(0.0, durable_deadline - now)
+                spent_seconds = max(0.0, granted_budget - durable_remaining)
+                absolute_deadline = (
+                    min(absolute_deadline, durable_deadline)
+                    if explicit_deadline else durable_deadline
+                )
+                budget_source = "trusted_deadline"
+                unknown_time = False
+            else:
+                spent_seconds = 0.0
+            remaining = max(0.0, absolute_deadline - now) if not unknown_time else 0.0
+            resolved_config, admitted, admission_reason = self._admit_config(
+                resolved_config, remaining=remaining, unknown_time=unknown_time
+            )
+            stage_allowance = self._stage_allowance(
+                resolved_config.strategy, remaining, unknown_time, admitted=admitted
+            )
+            decision = contracts.make_decision(
+                task_card,
+                plan_of_record,
+                strategy=resolved_config.strategy,
+                configuration=asdict(resolved_config),
+                decision_id=ownership_decision["decision_id"],
+            )
+            if self.store is not None:
+                self.store.record_decision(decision)
+            preparation = contracts.make_preparation(
+                task_card=task_card,
+                decision_id=decision["decision_id"],
+                objective_id=objective_id,
+                route=route,
+                plan_id=plan_of_record["plan_id"],
+                plan_digest=plan_of_record["content_hash"],
+                plan_state=plan_of_record["state"],
+                current_plan_state=current_plan_state,
+                strategy=resolved_config.strategy,
+                requested_strategy=resolved_config.requested_strategy,
+                configuration=decision["configuration"],
+                network_mode=network_mode,
+                budget_source=budget_source,
+                remaining_seconds=None if unknown_time else remaining,
+                deadline_monotonic=None if unknown_time else absolute_deadline,
+                execution_reserve_seconds=self.limits.execution_reserve_seconds,
+                stage_allowance_seconds=stage_allowance,
+                spent_seconds=spent_seconds,
+                attempt=next_attempt,
+            )
+            if self.store is None:
+                break
+            try:
+                preparation = self.store.record_preparation(preparation)
+            except PreparationConflictError:
+                continue
+            except StoreError as exc:
+                return self._blocked_budget_outcome(
+                    decision=provisional, plan=plan_of_record, reason=str(exc)
+                )
+            break
+        else:
+            return self._blocked_budget_outcome(
+                decision=provisional, plan=plan_of_record,
+                reason="another caller changed the decision budget during the bounded retry",
+            )
 
         accepted_precedence = current_plan_state == "execution_accepted"
         replan = self._validate_root_replan(root_replan)
@@ -697,6 +732,18 @@ class PreparationService:
                     "memory instead of launching a second re-prepare"
                 ),
             )
+        packet = durable if durable is not None else preparation
+        try:
+            recovered, next_attempt = self._recover_budget(decision["decision_id"])
+        except PreparationError as exc:
+            return self._blocked_budget_outcome(
+                decision=decision, plan=plan, preparation=packet, reason=str(exc)
+            )
+        if self.store is not None and recovered is None and packet["budget_source"] != "unknown_time":
+            return self._blocked_budget_outcome(
+                decision=decision, plan=plan, preparation=packet,
+                reason="the exact decision has no readable durable cutoff",
+            )
         replacement_id = contracts.sha256_hex(
             {
                 "domain": "memory-preparation/v1",
@@ -704,23 +751,23 @@ class PreparationService:
                 "route_correction": "level-0",
             }
         )
-        deadline_monotonic = preparation.get("deadline_monotonic")
+        deadline_monotonic = recovered[0] if recovered is not None else packet.get("deadline_monotonic")
         if isinstance(deadline_monotonic, (int, float)):
             remaining = max(0.0, float(deadline_monotonic) - self.clock())
         else:
-            remaining = preparation.get("remaining_seconds")
-        # The correction never replenishes spent time: the granted budget is
-        # the remaining time the abandoned packet originally recorded plus the
-        # cost it had already paid, and the elapsed cost is recomputed against
-        # the current clock.
-        prior_spent = float(preparation.get("spent_seconds") or 0.0)
-        prior_remaining = preparation.get("remaining_seconds")
-        if isinstance(prior_remaining, (int, float)) and not isinstance(prior_remaining, bool):
+            remaining = packet.get("remaining_seconds")
+        # The correction recomputes elapsed cost from the decision's tightest
+        # durable grant, never from this possibly older packet's allowance.
+        prior_spent = float(packet.get("spent_seconds") or 0.0)
+        prior_remaining = packet.get("remaining_seconds")
+        if recovered is not None:
+            granted = recovered[1]
+        elif isinstance(prior_remaining, (int, float)) and not isinstance(prior_remaining, bool):
             granted = prior_spent + float(prior_remaining)
         else:
             granted = None
-        replacement_config = self._captured_config(preparation)
-        unknown_time = preparation["budget_source"] == "unknown_time"
+        replacement_config = self._captured_config(packet)
+        unknown_time = packet["budget_source"] == "unknown_time"
         remaining_value = None if remaining is None else max(0.0, float(remaining))
         if granted is None:
             spent = prior_spent
@@ -751,30 +798,33 @@ class PreparationService:
             plan_id=plan["plan_id"],
             plan_digest=plan["content_hash"],
             plan_state=plan["state"],
-            current_plan_state=preparation["current_plan_state"],
+            current_plan_state=packet["current_plan_state"],
             strategy=replacement_config.strategy,
             requested_strategy=replacement_config.requested_strategy,
             configuration=asdict(replacement_config),
-            network_mode=preparation["network_mode"],
-            budget_source=preparation["budget_source"],
+            network_mode=packet["network_mode"],
+            budget_source=packet["budget_source"],
             remaining_seconds=remaining_value,
             deadline_monotonic=deadline_monotonic,
-            execution_reserve_seconds=preparation["execution_reserve_seconds"],
+            execution_reserve_seconds=packet["execution_reserve_seconds"],
             stage_allowance_seconds=stage_allowance,
             spent_seconds=spent,
-            attempt=self._next_attempt(decision["decision_id"]),
+            attempt=next_attempt,
             preparation_id=replacement_id,
             supersedes=preparation["preparation_id"],
             route_correction={"level": 0, "action": "bounded_ordinary_reprepare"},
         )
-        old = dict(preparation)
+        old = dict(packet)
         old["status"] = "superseded"
         old["superseded_by"] = replacement_id
         if self.store is not None:
-            old = self.store.mark_preparation_superseded(
-                preparation["preparation_id"], superseded_by=replacement_id
-            )
-            self.store.record_preparation(replacement)
+            try:
+                replacement = self.store.record_preparation(replacement)
+                old = self.store.get_preparation(preparation["preparation_id"])
+            except (PreparationConflictError, StoreError) as exc:
+                return self._blocked_budget_outcome(
+                    decision=decision, plan=plan, preparation=packet, reason=str(exc)
+                )
         else:
             old["content_hash"] = contracts.content_hash(old)
         # The one bounded ordinary re-prepare obeys the same admission rule and
@@ -1018,6 +1068,16 @@ class PreparationService:
             stage_allowance = min(
                 stage_allowance, self.limits.unknown_time_budget_seconds
             )
+        elif stage_allowance > 0:
+            # Admission is checked again immediately before the optional
+            # stage: durable writes and objective construction also spend time.
+            remaining = max(0.0, float(preparation["deadline_monotonic"]) - self.clock())
+            if remaining < stage_allowance + preparation["execution_reserve_seconds"]:
+                stage_allowance = 0.0
+                budget_reason = (
+                    "the full optional stage and positive execution reserve no longer "
+                    "fit the trusted deadline"
+                )
         if not enabled or stage_allowance <= 0:
             for store in enabled:
                 attempts.append(
