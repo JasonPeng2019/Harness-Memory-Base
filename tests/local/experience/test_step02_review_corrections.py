@@ -244,6 +244,14 @@ class EverOSRootBindingRegressionTests(unittest.TestCase):
                                         session_id="receipt-1", query="root guard"
                                     )
                                 )
+                            with self.assertRaisesRegex(
+                                experience.ScopeBoundaryError, "current EverOS root"
+                            ):
+                                asyncio.run(
+                                    adapter.readback_cases(
+                                        session_id="receipt-1", query="root guard"
+                                    )
+                                )
                 self.assertEqual(0, public.memorize_calls)
                 self.assertEqual(0, public.get_request_calls)
                 self.assertEqual(0, public.get_calls)
