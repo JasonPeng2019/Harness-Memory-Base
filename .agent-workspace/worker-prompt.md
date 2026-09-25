@@ -1,0 +1,20 @@
+READ-ONLY independent review of exact Lane 2 STEP-13-2 candidate commit 288632862280a88676712137c0ffba065a8e16df, parent fa0c32689fec57d1dd0240dcc96e3cc6aacb7340, from product manager root C:/Users/Jason/Documents/Jason/Orchestrator-Harness-3/development/product/lane-roots/lane-2. Review only this commit's four files and necessary nearby code. Read product AGENTS.md, harness/AGENTS.md, the exact STEP at C:/Users/Jason/Documents/Jason/Orchestrator-Harness-3/.plans/memory-backed-harness/steps/lane-2-product-harness/STEP-13-2-launched-network-controls.md, BEHAVIOR-07 at C:/Users/Jason/Documents/Jason/Orchestrator-Harness-3/.plans/memory-backed-harness/specification/behaviors/BEHAVIOR-07-network-mode-claims-match-enforcement.md, and the prior rejected review RESULT at C:/Users/Jason/Documents/Jason/Orchestrator-Harness-3/development/product/lane-roots/lane-2/.harness-runtime/worktrees/3a08183bc38644e1aee70b69f87d00b5/lane2-step13-launched-network-surface-01-review/RESULT.json. Reproduce closure of its four contract findings: Qwen untrusted settings/env override false soft claim; reparse/junction outside write; malformed deny-list false verification; invalid explicit profile pre-spawn cleanup. Inspect actual installed Qwen 0.21.10 --exclude-tools argument and whole-tool registration/deny semantics, including launcher argv at spawn/resume and version mismatch downgrade. Check accepted preservation: Codex/Claude controls, legacy None, unrelated settings, shell/MCP caveats, Atlas-only and restricted-local downgraded claims, no Lane 1 schema invention. Run focused and proportionate affected checks; cite exact counts/skips. Distinguish fixture-level provider payload proof from pending Lane 1 profile and STEP-15/17/18 joins. Report REVIEW: SHIP/REVISE/BLOCK with material findings first, exact file:line and smallest correction, contract coverage, questions, verification gaps, in schema-valid RESULT.json. The reviewed target is commit 288632862280a88676712137c0ffba065a8e16df only. Do not edit source, stage, commit, accept, retire, or modify another lane. Do not use native collaboration/subagents.
+
+## Acceptance criteria
+- Read-only fresh review of exact commit 288632862280a88676712137c0ffba065a8e16df against STEP-13-2, BEHAVIOR-07, and all four reproduced earlier defects.
+- Source-shaped checks confirm actual provider launch controls and truthful downgrade, with explicit remaining joined limitations and no false soft or Atlas-only claim.
+- Focused and affected checks are reported with exact observed outcomes; material findings cite contract, consequence, and narrow fix.
+- Only RESULT.json and native generated review overlay change; source and Git tip remain at the target commit.
+
+## Deliverables
+- Schema-valid RESULT.json containing REVIEW: SHIP, REVISE, or BLOCK, findings first, contract coverage, questions, and verification gaps.
+- Exact source and test evidence for the four prior defects, actual installed-tool behavior, and preservation cases.
+
+## Reason for acceptance and deliverables
+STEP-13-2 controls affect the actual provider network surface. Fresh exact-tip judgment must verify closure of the rejected false claims before the Lane 2 manager accepts a product commit.
+
+
+## Escalation (managed coordination)
+If this work needs a ROOT decision, authority, missing input, or help, run:
+  python .agent-workspace/manager-notify.py --severity blocking --summary "<decision/action needed>"
+Include the decision/action ROOT needs plus relevant local evidence.  Do not rely on a final chat answer as a notification.  After a blocking escalation, stop at a safe boundary rather than inventing the missing decision.
