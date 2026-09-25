@@ -1655,5 +1655,219 @@ class NativeApcChildTests(unittest.TestCase):
         self.assertEqual(lane_id, ambiguous["launch_intent"]["lane_id"])
         self.assertEqual(str(worktree), ambiguous["launch_intent"]["worktree_path"])
 
+    # -- the failed git-add ownership boundary ------------------------------
+
+    def test_failed_git_add_boundary_keeps_exact_residual_ownership(self) -> None:
+        """A failed git worktree add never hides a surviving attempt path.
+
+        The real add boundary runs here with only the OS-level git calls
+        faked: ``git worktree add`` fails after leaving the attempt worktree
+        path behind and its internal cleanup cannot remove it.  The exact lane
+        and path must stay visible as an unresolved operation and a retry must
+        reconcile it instead of relaunching; the same boundary with nothing
+        left behind stays a proven-no-child refusal.
+        """
+
+        real_add = bootstrap._git_worktree_add
+
+        def fake_git(partial_path):
+            def run(argv, **kwargs):
+                command = list(argv)[3:]
+                if command[:2] == ["worktree", "add"]:
+                    if partial_path is not None:
+                        partial_path.mkdir(parents=True, exist_ok=True)
+                    return bootstrap.subprocess.CompletedProcess(
+                        argv, 128, "", "fatal: could not create worktree dir"
+                    )
+                if command[:2] == ["worktree", "remove"]:
+                    return bootstrap.subprocess.CompletedProcess(
+                        argv, 1, "", "fatal: not a working tree"
+                    )
+                if command[:1] == ["show-ref"]:
+                    return bootstrap.subprocess.CompletedProcess(argv, 1, "", "")
+                return bootstrap.subprocess.CompletedProcess(argv, 0, "", "")
+
+            return run
+
+        request = apc.make_apc_request(
+            template={
+                "template_id": "template-7",
+                "version": 1,
+                "allowed_edits": ["bindings"],
+            },
+            parent_decision_id="decision-7",
+            parent_objective_id="objective-1",
+            permitted_edits=["bindings"],
+            binding=BINDING,
+        )
+        lane_id = "apc-child-" + str(request["content_hash"])[:12]
+        worktree = (
+            self.fixture.runtime / "worktrees" / self.fixture.EPOCH / lane_id
+        )
+        template_record = {
+            "template_id": "template-7",
+            "fixed_steps": [],
+            "verification_intent": "verify",
+        }
+
+        with self._native_stack(provider_behavior=self.fixture.idle_child()):
+            with patch.object(bootstrap, "_git_worktree_add", real_add):
+                with patch.object(
+                    bootstrap.subprocess, "run", side_effect=fake_git(worktree)
+                ):
+                    with self.assertRaises(
+                        harness_bridge.ApcChildAmbiguityError
+                    ) as caught:
+                        harness_bridge.run_apc_child(
+                            request=request,
+                            template_record=template_record,
+                            launcher=self._launcher(),
+                            store=self.memory_store,
+                            limits=self.limits,
+                            clock=self.clock,
+                            deadline=self.clock() + 240.0,
+                        )
+                    self.assertIn("reconcile the exact child", str(caught.exception))
+                    self.assertEqual([lane_id], self.fixture.bootstrap_calls)
+                    # The partial path this attempt created is preserved, not
+                    # silently deleted, while its ownership stays visible.
+                    self.assertTrue(worktree.is_dir())
+                    with self.assertRaises(
+                        harness_bridge.ApcChildAmbiguityError
+                    ) as retry:
+                        harness_bridge.run_apc_child(
+                            request=request,
+                            template_record=template_record,
+                            launcher=self._launcher(),
+                            store=self.memory_store,
+                            limits=self.limits,
+                            clock=self.clock,
+                            deadline=self.clock() + 240.0,
+                        )
+                    self.assertIn("already exists", str(retry.exception))
+                    self.assertEqual([lane_id], self.fixture.bootstrap_calls)
+
+            # A failed add can also leave only the attempt-created branch
+            # behind, with no path: that branch is still this attempt's exact
+            # identity, so the operation stays unresolved rather than becoming
+            # a terminal no-child refusal.
+            branch_request = apc.make_apc_request(
+                template={
+                    "template_id": "template-7",
+                    "version": 1,
+                    "allowed_edits": ["bindings"],
+                },
+                parent_decision_id="decision-700",
+                parent_objective_id="objective-1",
+                permitted_edits=["bindings"],
+                binding=BINDING,
+            )
+            branch_lane = "apc-child-" + str(branch_request["content_hash"])[:12]
+            branch_ref = f"refs/heads/lane/{branch_lane}"
+            show_ref_calls = {"count": 0}
+
+            def fake_git_branch_only(argv, **kwargs):
+                command = list(argv)[3:]
+                if command[:2] == ["worktree", "add"]:
+                    return bootstrap.subprocess.CompletedProcess(
+                        argv, 128, "", "fatal: could not create worktree dir"
+                    )
+                if command[:2] == ["worktree", "remove"]:
+                    return bootstrap.subprocess.CompletedProcess(
+                        argv, 1, "", "fatal: not a working tree"
+                    )
+                if command[:1] == ["show-ref"]:
+                    show_ref_calls["count"] += 1
+                    if show_ref_calls["count"] == 1:
+                        # The branch did not exist before this attempt.
+                        return bootstrap.subprocess.CompletedProcess(argv, 1, "", "")
+                    # The attempt-created branch survives its cleanup.
+                    return bootstrap.subprocess.CompletedProcess(argv, 0, "", "")
+                return bootstrap.subprocess.CompletedProcess(argv, 0, "", "")
+
+            with patch.object(bootstrap, "_git_worktree_add", real_add):
+                with patch.object(
+                    bootstrap.subprocess, "run", side_effect=fake_git_branch_only
+                ):
+                    with self.assertRaises(harness_bridge.ApcChildAmbiguityError):
+                        harness_bridge.run_apc_child(
+                            request=branch_request,
+                            template_record=template_record,
+                            launcher=self._launcher(),
+                            store=self.memory_store,
+                            limits=self.limits,
+                            clock=self.clock,
+                            deadline=self.clock() + 240.0,
+                        )
+
+            # The same failed boundary with nothing left behind stays a proven
+            # no-child refusal with no identity claimed for the later attempt.
+            absent_request = apc.make_apc_request(
+                template={
+                    "template_id": "template-7",
+                    "version": 1,
+                    "allowed_edits": ["bindings"],
+                },
+                parent_decision_id="decision-70",
+                parent_objective_id="objective-1",
+                permitted_edits=["bindings"],
+                binding=BINDING,
+            )
+            absent_lane = "apc-child-" + str(absent_request["content_hash"])[:12]
+            absent_worktree = (
+                self.fixture.runtime
+                / "worktrees"
+                / self.fixture.EPOCH
+                / absent_lane
+            )
+            with patch.object(bootstrap, "_git_worktree_add", real_add):
+                with patch.object(
+                    bootstrap.subprocess, "run", side_effect=fake_git(None)
+                ):
+                    with self.assertRaises(
+                        harness_bridge.ApcChildUnavailableError
+                    ):
+                        harness_bridge.run_apc_child(
+                            request=absent_request,
+                            template_record=template_record,
+                            launcher=self._launcher(),
+                            store=self.memory_store,
+                            limits=self.limits,
+                            clock=self.clock,
+                            deadline=self.clock() + 240.0,
+                        )
+            self.assertFalse(absent_worktree.exists())
+
+        operations = self.memory_store.list_apc_child_operations("decision-7")
+        self.assertEqual(
+            ["ambiguous"], [operation["status"] for operation in operations]
+        )
+        ambiguous = operations[-1]
+        self.assertIn("ambiguous", contracts.APC_CHILD_UNRESOLVED_STATUSES)
+        self.assertIsNone(ambiguous.get("observed_invocation"))
+        self.assertEqual("bootstrap", ambiguous["launch_intent"]["phase"])
+        self.assertEqual(lane_id, ambiguous["launch_intent"]["lane_id"])
+        self.assertEqual(str(worktree), ambiguous["launch_intent"]["worktree_path"])
+
+        # The branch-only survivor is unresolved with its exact lane and the
+        # attempt-created branch ref kept visible for reconciliation.
+        branch_operations = self.memory_store.list_apc_child_operations("decision-700")
+        self.assertEqual(
+            ["ambiguous"], [operation["status"] for operation in branch_operations]
+        )
+        branch_ambiguous = branch_operations[-1]
+        self.assertEqual(
+            branch_lane, branch_ambiguous["launch_intent"]["lane_id"]
+        )
+        self.assertIn(
+            branch_ref, branch_ambiguous["launch_intent"]["acknowledgement"]
+        )
+
+        absent_operations = self.memory_store.list_apc_child_operations("decision-70")
+        self.assertEqual(
+            ["refused"], [operation["status"] for operation in absent_operations]
+        )
+        self.assertIn("refused", contracts.APC_CHILD_TERMINAL_STATUSES)
+
 if __name__ == "__main__":
     unittest.main()

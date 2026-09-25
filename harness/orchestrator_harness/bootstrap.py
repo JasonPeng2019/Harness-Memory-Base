@@ -56,9 +56,16 @@ PLAIN_EXCLUDED_HELPERS = (
 
 
 class BootstrapError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        attempt_effects: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.attempt_effects = attempt_effects
 
 
 def _read_task_card(path: Path) -> dict[str, Any]:
@@ -179,9 +186,33 @@ def _git_worktree_add(
             if rollback_notes
             else ""
         )
+        # Record the exact proof of this failed boundary for the caller: the
+        # attempt path never existed at entry, so a surviving path is this
+        # attempt's exact identity, and the rollback helper's own
+        # re-verification (an empty note list) is the only proof that an
+        # attempt-created branch was removed.  A pre-existing branch is never
+        # claimed by this attempt.
+        surviving_path = worktree_path.exists()
+        branch_unproven = (not branch_existed) and bool(rollback_notes)
+        rollback_proven = not surviving_path and not branch_unproven
+        boundary_effects: dict[str, Any] = {
+            "worktree_created": False,
+            "worktree_add_attempted": True,
+            "lane_record_written": False,
+            "worktree_path": str(worktree_path),
+            "rollback_proven": rollback_proven,
+        }
+        if not rollback_proven:
+            notes = list(rollback_notes)
+            if surviving_path and not any(
+                "partial worktree path remains" in note for note in notes
+            ):
+                notes.append(f"partial worktree path remains: {worktree_path}")
+            boundary_effects["rollback_notes"] = notes
         raise BootstrapError(
             BOOTSTRAP_REQUEST_INVALID,
             f"git worktree add failed: {completed.stderr.strip()}{rollback_suffix}",
+            attempt_effects=boundary_effects,
         )
 
 
@@ -882,6 +913,12 @@ def run_bootstrap(
         publish_lane(lane)
     except BootstrapError as exc:
         summary, effects = close_failed_attempt(str(exc))
+        boundary_effects = getattr(exc, "attempt_effects", None)
+        if isinstance(boundary_effects, dict):
+            # The failed boundary recorded the exact proof of its own attempt; a
+            # surviving attempt-created path or branch keeps its exact ownership
+            # visible instead of a proven-no-child refusal.
+            effects.update(boundary_effects)
         return {
             "ok": False,
             "code": exc.code,

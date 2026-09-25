@@ -405,8 +405,10 @@ def make_native_apc_launcher(
                 return None
             effects = queued.get("attempt_effects")
             if isinstance(effects, Mapping) and effects.get("rollback_proven") is not True:
-                owns_identity = bool(effects.get("worktree_created")) or bool(
-                    effects.get("lane_record_written")
+                owns_identity = (
+                    bool(effects.get("worktree_created"))
+                    or bool(effects.get("lane_record_written"))
+                    or bool(effects.get("worktree_add_attempted"))
                 )
                 if owns_identity:
                     # The harness could not prove its attempt was rolled back,
