@@ -80,6 +80,7 @@ def finalize_context(
     recipient: str,
     mandatory_content: Iterable[Mapping[str, Any]],
     optional_items: Iterable[Mapping[str, Any]] = (),
+    selected_provenance: Mapping[str, Mapping[str, Any]] | None = None,
     omitted: Iterable[str | Mapping[str, Any]] = (),
     privacy_policy: PrivacyPolicy | None = None,
     limits: PreparationLimits | None = None,
@@ -122,10 +123,17 @@ def finalize_context(
     for raw in optional_items:
         item = _normalize_optional_item(raw)
         item_id = item["id"]
-        if detect_secrets({key: value for key, value in item.items() if key != "content"}, policy):
+        source = (selected_provenance or {}).get(item_id, {})
+        if not isinstance(source, Mapping) or any(
+            key in {"id", "content", "payload"} or (key in item and item[key] != value)
+            for key, value in source.items()
+        ):
+            raise OptionalItemError("selected provenance conflicts with rendered optional content")
+        selected_item = {**item, **source}
+        if detect_secrets({key: value for key, value in selected_item.items() if key != "content"}, policy):
             raise OptionalItemError("optional provenance contains prohibited secret")
         affects_plan = bool(item.get("plan_affecting", False))
-        descriptor = contracts._optional_descriptor(item)
+        descriptor = contracts._optional_descriptor(selected_item)
         selected_by_id[item_id] = descriptor
         selected.append(descriptor)
         item.pop("plan_affecting", None)

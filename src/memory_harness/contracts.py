@@ -194,13 +194,10 @@ def _validate_delivery_trace(
         raise ContractError("finalized delivery selected partition is duplicated")
     for item in packed:
         selected_item = selected_by_id[item["id"]]
-        rendered_provenance = dict(selected_item["provenance"])
-        rendered_provenance.pop("plan_affecting", None)
-        if item != {
-            **selected_item,
-            "provenance": rendered_provenance,
-            "provenance_digest": sha256_hex(rendered_provenance),
-        }:
+        if item["content_digest"] != selected_item["content_digest"] or any(
+            key not in selected_item["provenance"] or selected_item["provenance"][key] != value
+            for key, value in item["provenance"].items()
+        ):
             raise ContractError("finalized delivery selected/packed provenance mismatch")
     for item in omitted:
         if not isinstance(item.get("reason"), str) or not item["reason"].strip():

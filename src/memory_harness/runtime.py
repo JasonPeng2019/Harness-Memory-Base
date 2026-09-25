@@ -274,6 +274,10 @@ class MemoryRuntime:
         run_id: str,
         worktree_path: str,
         base_commit: str,
+        checkpoint: str | None = None,
+        execution_role: str | None = None,
+        invocation_target: str | None = None,
+        recipient: str | None = None,
         launcher: Callable[[Mapping[str, Any]], Mapping[str, Any] | None],
     ) -> dict[str, Any]:
         """Validate against the actual target, then dispatch exactly once."""
@@ -281,6 +285,13 @@ class MemoryRuntime:
         from . import context as context_module
 
         try:
+            if context is None:
+                raise contracts.ContractError("finalized dispatch requires its domain-finalized context")
+            for field, value in (
+                ("checkpoint", checkpoint), ("execution_role", execution_role),
+                ("invocation_target", invocation_target), ("recipient", recipient),
+            ):
+                contracts._require_canonical_identity(value, field)
             contracts.validate_envelope(
                 envelope,
                 task_card=task_card,
@@ -289,18 +300,22 @@ class MemoryRuntime:
                 run_id=run_id,
                 base_commit=base_commit,
                 worktree_path=str(worktree_path),
+                require_final_context=True,
             )
-            if context is not None:
-                context_module.validate_final_context(
-                    context,
-                    envelope=envelope,
-                    task_card=task_card,
-                    plan=plan,
-                    lane_id=lane_id,
-                    run_id=run_id,
-                    base_commit=base_commit,
-                    worktree_path=str(worktree_path),
-                )
+            context_module.validate_final_context(
+                context,
+                envelope=envelope,
+                task_card=task_card,
+                plan=plan,
+                lane_id=lane_id,
+                run_id=run_id,
+                base_commit=base_commit,
+                worktree_path=str(worktree_path),
+                checkpoint=checkpoint,
+                execution_role=execution_role,
+                invocation_target=invocation_target,
+                recipient=recipient,
+            )
         except Exception as exc:
             raise RuntimeError(f"finalized dispatch does not match its target: {exc}") from exc
         return self.dispatch(envelope, launcher)

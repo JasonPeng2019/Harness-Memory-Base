@@ -438,6 +438,10 @@ class FinalContextDispatchTests(unittest.TestCase):
             run_id="run-1",
             worktree_path=str(self.worktree),
             base_commit="base-1",
+            checkpoint="checkpoint-1",
+            execution_role="worker",
+            invocation_target="harness:worker",
+            recipient="worker:lane-1",
             launcher=launcher,
         )
         self.assertEqual("delivered", delivered["status"])
@@ -451,6 +455,10 @@ class FinalContextDispatchTests(unittest.TestCase):
             run_id="run-1",
             worktree_path=str(self.worktree),
             base_commit="base-1",
+            checkpoint="checkpoint-1",
+            execution_role="worker",
+            invocation_target="harness:worker",
+            recipient="worker:lane-1",
             launcher=lambda envelope: self.fail("the same intent launched twice"),
         )
         self.assertEqual(delivered["operation_id"], replay["operation_id"])
@@ -474,6 +482,10 @@ class FinalContextDispatchTests(unittest.TestCase):
                 run_id="run-1",
                 worktree_path=str(self.worktree),
                 base_commit="base-1",
+                checkpoint="checkpoint-1",
+                execution_role="worker",
+                invocation_target="harness:worker",
+                recipient="worker:lane-1",
                 launcher=lost_ack,
             )
         with self.assertRaises(runtime.DispatchAmbiguityError):
@@ -486,6 +498,10 @@ class FinalContextDispatchTests(unittest.TestCase):
                 run_id="run-1",
                 worktree_path=str(self.worktree),
                 base_commit="base-1",
+                checkpoint="checkpoint-1",
+                execution_role="worker",
+                invocation_target="harness:worker",
+                recipient="worker:lane-1",
                 launcher=lost_ack,
             )
         self.assertEqual(1, len(calls))
@@ -513,8 +529,136 @@ class FinalContextDispatchTests(unittest.TestCase):
                 run_id="run-2",
                 worktree_path=str(self.worktree),
                 base_commit="base-1",
+                checkpoint="checkpoint-1",
+                execution_role="worker",
+                invocation_target="harness:worker",
+                recipient="worker:lane-1",
                 launcher=lambda envelope: self.fail("invalid target must not launch"),
             )
+
+    def test_dispatch_finalized_rejects_absent_context_and_stripped_generic_envelope(self) -> None:
+        finalized = self._finalize()
+        stripped = deepcopy(finalized.envelope)
+        for field in (
+            "final_context", "final_context_id", "final_context_integrity", "task",
+            "plan_revision", "accepted_by", "checkpoint", "execution_role",
+            "invocation_target", "recipient", "delivery_trace",
+        ):
+            stripped.pop(field)
+        stripped["schema"] = contracts.ENVELOPE_SCHEMA
+        stripped["content_hash"] = contracts.content_hash(stripped)
+        contracts.validate_envelope(
+            stripped, task_card=self.card, plan=self.accepted, lane_id="lane-1",
+            run_id="run-1", worktree_path=str(self.worktree), base_commit="base-1",
+        )
+        memory_runtime = runtime.MemoryRuntime(self.memory_store)
+        calls: list[object] = []
+        for envelope, record in (
+            (finalized.envelope, None), (stripped, None), (stripped, finalized.context),
+        ):
+            with self.subTest(schema=envelope["schema"], context=record is not None):
+                with self.assertRaises(runtime.RuntimeError):
+                    memory_runtime.dispatch_finalized(
+                        envelope=envelope, context=record, task_card=self.card,
+                        plan=self.accepted, lane_id="lane-1", run_id="run-1",
+                        worktree_path=str(self.worktree), base_commit="base-1",
+                        checkpoint="checkpoint-1", execution_role="worker",
+                        invocation_target="harness:worker", recipient="worker:lane-1",
+                        launcher=lambda value: calls.append(value) or {"invocation_id": "unexpected"},
+                    )
+                operation = contracts.make_operation(kind="dispatch", envelope=envelope)
+                with self.assertRaises(store.StoreError):
+                    self.memory_store.get_operation(operation["operation_id"])
+        self.assertEqual([], calls)
+
+    def test_dispatch_finalized_requires_each_actual_destination_field(self) -> None:
+        finalized = self._finalize()
+        memory_runtime = runtime.MemoryRuntime(self.memory_store)
+        calls: list[object] = []
+        actual = {
+            "checkpoint": "checkpoint-1", "execution_role": "worker",
+            "invocation_target": "harness:worker", "recipient": "worker:lane-1",
+        }
+        for field in actual:
+            for value in (None, "", "wrong-value"):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(runtime.RuntimeError):
+                        memory_runtime.dispatch_finalized(
+                            envelope=finalized.envelope, context=finalized.context,
+                            task_card=self.card, plan=self.accepted,
+                            lane_id="lane-1", run_id="run-1",
+                            worktree_path=str(self.worktree), base_commit="base-1",
+                            launcher=lambda value: calls.append(value) or {"invocation_id": "unexpected"},
+                            **(actual | {field: value}),
+                        )
+            with self.subTest(field=field, omitted=True):
+                with self.assertRaises(runtime.RuntimeError):
+                    memory_runtime.dispatch_finalized(
+                        envelope=finalized.envelope, context=finalized.context,
+                        task_card=self.card, plan=self.accepted,
+                        lane_id="lane-1", run_id="run-1",
+                        worktree_path=str(self.worktree), base_commit="base-1",
+                        launcher=lambda value: calls.append(value) or {"invocation_id": "unexpected"},
+                        **{key: value for key, value in actual.items() if key != field},
+                    )
+        self.assertEqual([], calls)
+        operation = contracts.make_operation(kind="dispatch", envelope=finalized.envelope)
+        with self.assertRaises(store.StoreError):
+            self.memory_store.get_operation(operation["operation_id"])
+
+    def test_selected_candidate_source_provenance_changes_ready_identity(self) -> None:
+        payload = {"summary": "identical rendered content"}
+        candidates = []
+        for source_id in ("source-a", "source-b"):
+            candidate = contracts.make_candidate(
+                kind="historical_evidence", logical_id="case-1", revision_id="r1",
+                origin="everos", source_id=source_id,
+                payload_digest=contracts.sha256_hex(payload), payload=payload,
+                scope={"project": "p"}, provenance=[{"store_id": "everos"}],
+                freshness="frozen", disposition="selected",
+            )
+            candidate["approval_id"] = "approval-1"
+            candidate["plan_affecting"] = False
+            candidate["content_hash"] = contracts.content_hash(candidate)
+            candidates.append(candidate)
+        service = preparation.PreparationService(limits=self.limits)
+        mandatory = self._finalize().envelope["mandatory_content"]
+        def finalize_candidate(candidate):
+            outcome = preparation.PreparationOutcome(
+                mode="planning", decision=self.decision, preparation=None,
+                trace={"candidates": [candidate]}, disposition=None, plan=self.accepted,
+            )
+            return service._finalize(
+                outcome=outcome, task_card=self.card, plan=self.accepted,
+                lane_id="lane-1", run_id="run-1", worktree_path=str(self.worktree),
+                base_commit="base-1", checkpoint="checkpoint-1",
+                execution_role="worker", invocation_target="harness:worker",
+                recipient="worker:lane-1", mandatory_content=mandatory,
+                optional_items=(), freshness_check=None,
+            )
+        finalized = [finalize_candidate(candidate) for candidate in candidates]
+        for candidate, prepared in zip(candidates, finalized):
+            selected = prepared.context["delivery_trace"]["selected"][0]
+            self.assertEqual(candidate["source_id"], selected["provenance"]["source_id"])
+            self.assertEqual("approval-1", selected["provenance"]["approval_id"])
+            self.assertEqual("frozen", selected["provenance"]["freshness"])
+            self.assertEqual(candidate["scope"], selected["provenance"]["scope"])
+            self.assertEqual(candidate["provenance"], selected["provenance"]["provenance"])
+            self.assertNotIn("payload", selected["provenance"])
+        self.assertEqual(finalized[0].envelope["optional_content"], finalized[1].envelope["optional_content"])
+        self.assertNotEqual(finalized[0].context["context_id"], finalized[1].context["context_id"])
+        for field, value in (
+            ("scope", {"project": "other"}), ("approval_id", "approval-2"),
+            ("freshness", "live"), ("provenance", [{"store_id": "other"}]),
+            ("plan_affecting", True),
+        ):
+            with self.subTest(field=field):
+                changed = deepcopy(candidates[0])
+                changed[field] = value
+                changed["content_hash"] = contracts.content_hash(changed)
+                revised = finalize_candidate(changed)
+                self.assertEqual(finalized[0].envelope["optional_content"], revised.envelope["optional_content"])
+                self.assertNotEqual(finalized[0].context["context_id"], revised.context["context_id"])
 
     # -- all-off and legacy cards stay ordinary ----------------------------
 

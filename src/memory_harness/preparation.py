@@ -2045,7 +2045,15 @@ class PreparationService:
             contracts._require_canonical_identity(value, field)
         selected = outcome.selected_candidates
         packed_optional: list[dict[str, Any]] = []
+        selected_provenance: dict[str, dict[str, Any]] = {}
         for candidate in selected:
+            selected_provenance[candidate["candidate_id"]] = {
+                key: value for key, value in candidate.items()
+                if key not in {
+                    "candidate_id", "payload", "payload_digest", "content_hash",
+                    "score", "comparable", "disposition", "reasons", "id", "content",
+                }
+            }
             packed_optional.append(
                 {
                     "id": candidate["candidate_id"],
@@ -2073,6 +2081,7 @@ class PreparationService:
             recipient=str(recipient),
             mandatory_content=list(mandatory_content),
             optional_items=packed_optional,
+            selected_provenance=selected_provenance,
             omitted=omitted,
             privacy_policy=self.privacy_policy,
             limits=self.limits,
