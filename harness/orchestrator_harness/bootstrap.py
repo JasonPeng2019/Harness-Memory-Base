@@ -526,12 +526,19 @@ def _install_managed_material(
 
 def _managed_payload(harness_root: Path, rt: Path, provider_id: str) -> Path:
     """Fail closed when the installed tree differs from setup's exact plan."""
-    from .setup import COMPOSED_PAYLOADS, SetupError, _validated_worker_payload
+    from .setup import (
+        COMPOSED_PAYLOADS,
+        SETUP_CACHE_INVALID,
+        SetupError,
+        _require_plain_workspace_boundary,
+        _validated_worker_payload,
+    )
 
     payload = rt / "super-cache" / COMPOSED_PAYLOADS / provider_id
-    if not payload.is_dir():
-        raise BootstrapError(BOOTSTRAP_CACHE_MISSING, f"installed worker composition missing: {payload}")
     try:
+        _require_plain_workspace_boundary(rt, code=SETUP_CACHE_INVALID)
+        if not payload.is_dir():
+            raise BootstrapError(BOOTSTRAP_CACHE_MISSING, f"installed worker composition missing: {payload}")
         return _validated_worker_payload(harness_root, rt, provider_id)
     except (SetupError, OSError) as exc:
         raise BootstrapError(
@@ -712,6 +719,19 @@ def run_bootstrap(
                 "summary": str(exc),
                 "evidence_paths": [],
                 "next_action": "run harness setup and verify the installed worker composition",
+            }
+    else:
+        from .setup import SetupError, _validated_cache_for_dispatch
+
+        try:
+            _validated_cache_for_dispatch(harness_root, config.runtime_root)
+        except (SetupError, OSError) as exc:
+            return {
+                "ok": False,
+                "code": BOOTSTRAP_CACHE_COLLISION,
+                "summary": str(exc),
+                "evidence_paths": [],
+                "next_action": "run harness setup and verify the installed cache",
             }
     def allowance_expired() -> bool:
         """Report one absolute expiry without touching any effectful phase."""
