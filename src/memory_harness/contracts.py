@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from .privacy import PrivacyPolicy, guard_mandatory
-from .config import NetworkResolution, resolve_network_mode
+from .config import NetworkResolution, NETWORK_MODES, NETWORK_CONTEXT_FIELDS
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
 # The explicit worker-environment boundary a task card may declare.  A
@@ -3530,6 +3530,8 @@ def network_resolution_record(resolution: NetworkResolution) -> dict[str, Any]:
         "enforcement_sources": list(resolution.enforcement_sources),
         "disclosed_limits": list(resolution.disclosed_limits),
         "input_evidence": dict(resolution.input_evidence),
+        "context": dict(resolution.context),
+        "verification_result": resolution.verification_result,
     }
 
 
@@ -3691,16 +3693,75 @@ def validate_preparation(record: Mapping[str, Any]) -> None:
         resolution = record["network_resolution"]
         if not isinstance(resolution, Mapping) or set(resolution) != {
             "requested_mode", "effective_mode", "enforcement_sources",
-            "disclosed_limits", "input_evidence",
+            "disclosed_limits", "input_evidence", "context", "verification_result",
         }:
             raise ContractError("network resolution fields are invalid")
-        try:
-            expected = network_resolution_record(resolve_network_mode(
-                resolution["requested_mode"], evidence=resolution["input_evidence"]
-            ))
-        except (ValueError, TypeError, KeyError) as exc:
-            raise ContractError(f"network resolution is invalid: {exc}") from exc
-        if dict(resolution) != expected or record["network_mode"] != expected["effective_mode"]:
+        context = resolution["context"]
+        expected_context = {key: record[key] for key in (
+            "objective_id", "task_card_digest", "plan_id", "plan_digest",
+            "decision_id", "route", "plan_state",
+        )}
+        if not isinstance(context, Mapping) or set(context) != NETWORK_CONTEXT_FIELDS or dict(context) != expected_context:
+            raise ContractError("network resolution context conflicts with preparation")
+        requested = resolution["requested_mode"]
+        effective = resolution["effective_mode"]
+        sources = resolution["enforcement_sources"]
+        limits = resolution["disclosed_limits"]
+        evidence = resolution["input_evidence"]
+        verified = resolution["verification_result"]
+        if (requested not in NETWORK_MODES or effective not in NETWORK_MODES
+                or not isinstance(sources, list) or not all(isinstance(x, str) for x in sources)
+                or not isinstance(limits, list) or not all(isinstance(x, str) for x in limits)
+                or not isinstance(evidence, Mapping)):
+            raise ContractError("network resolution is invalid")
+        allowed_effective = {
+            "normal": "normal", "soft_guardrail_network": "soft_guardrail_network",
+            "restricted_local": "restricted_local", "atlas_memory_only": "soft_guardrail_network",
+        }
+        if effective != "atlas_memory_only" and effective != allowed_effective[requested]:
+            raise ContractError("network resolution requested/effective modes conflict")
+        if effective != "atlas_memory_only":
+            expected_sources = (
+                ["legacy_normal_compatibility"] if requested == "normal" else
+                ["service_entry_policy_required"] if requested == "restricted_local" else
+                ["requested_soft_guardrail_policy"]
+            )
+            if sources != expected_sources:
+                raise ContractError("network resolution enforcement source is invalid")
+            if effective == "soft_guardrail_network" and not any(
+                "shell egress" in limit for limit in limits
+            ):
+                raise ContractError("soft network resolution omits shell-egress limit")
+            if requested == "atlas_memory_only" and not any(
+                "missing or unverified" in limit for limit in limits
+            ):
+                raise ContractError("downgraded network resolution omits proof limit")
+        if effective == "atlas_memory_only":
+            payload = evidence.get("launched_payload")
+            block = evidence.get("unrelated_destination_block")
+            if (requested != "atlas_memory_only" or not isinstance(payload, Mapping)
+                    or not isinstance(block, Mapping) or payload.get("verified") is not True
+                    or block.get("blocked") is not True or block.get("independent") is not True
+                    or block.get("source_kind") != "independent_network_boundary"
+                    or not isinstance(payload.get("evidence_id"), str)
+                    or not isinstance(block.get("evidence_id"), str)
+                    or not payload["evidence_id"] or not block["evidence_id"]
+                    or verified is not True and not (
+                        isinstance(verified, Mapping) and set(verified) == {
+                            "context", "launched_payload", "unrelated_destination_block",
+                        } and verified["context"] == context
+                        and verified["launched_payload"] == payload
+                        and verified["unrelated_destination_block"] == block
+                    ) or sources != [
+                        f"verified_launched_payload:{payload['evidence_id']}",
+                        f"independent_egress_block:{block['evidence_id']}",
+                    ]):
+                raise ContractError("network resolution lacks captured verified proof")
+        elif (verified is not None or any(source.startswith((
+                "verified_launched_payload:", "independent_egress_block:"
+        )) for source in sources)):
+            raise ContractError("unverified network resolution claims verified enforcement")
+        if record["network_mode"] != effective:
             raise ContractError("network resolution conflicts with captured effective mode")
     if record.get("supersedes") is not None:
         _require_nonempty_str(record["supersedes"], "supersedes")

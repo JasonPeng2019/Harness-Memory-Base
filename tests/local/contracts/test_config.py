@@ -78,10 +78,51 @@ class FixedConfigurationTests(unittest.TestCase):
             },
         }
         resolved = config.resolve_network_mode("atlas_memory_only", evidence=evidence)
-        self.assertEqual("atlas_memory_only", resolved.effective_mode)
+        self.assertEqual("soft_guardrail_network", resolved.effective_mode)
         self.assertEqual(evidence, resolved.input_evidence)
-        self.assertIn("verified_launched_payload:payload-7", resolved.enforcement_sources)
-        self.assertIn("independent_egress_block:egress-4", resolved.enforcement_sources)
+        self.assertNotIn("verified_launched_payload:payload-7", resolved.enforcement_sources)
+        self.assertIn("unverified", " ".join(resolved.disclosed_limits))
+
+        context = {
+            "objective_id": "objective-1", "task_card_digest": "card-1",
+            "plan_id": "plan-1", "plan_digest": "plan-hash-1",
+            "decision_id": "decision-1", "route": "ordinary", "plan_state": "candidate",
+        }
+        for verifier in (None, lambda evidence, context: False,
+                         lambda evidence, context: (_ for _ in ()).throw(RuntimeError("unavailable")),
+                         lambda evidence, context: {"context": {**context, "decision_id": "other"},
+                                                     "launched_payload": evidence["launched_payload"],
+                                                     "unrelated_destination_block": evidence["unrelated_destination_block"]}):
+            with self.subTest(verifier=verifier):
+                weaker = config.NetworkResolver(verifier=verifier).resolve(
+                    "atlas_memory_only", evidence=evidence, context=context,
+                )
+                self.assertEqual("soft_guardrail_network", weaker.effective_mode)
+                self.assertIn("shell egress", " ".join(weaker.disclosed_limits))
+        trusted = config.NetworkResolver(verifier=lambda evidence, received: received == context)
+        verified = trusted.resolve("atlas_memory_only", evidence=evidence, context=context)
+        self.assertEqual("atlas_memory_only", verified.effective_mode)
+        self.assertEqual(context, verified.context)
+        self.assertIs(verified.verification_result, True)
+        self.assertIn("verified_launched_payload:payload-7", verified.enforcement_sources)
+        self.assertIn("independent_egress_block:egress-4", verified.enforcement_sources)
+        self.assertEqual("soft_guardrail_network", trusted.resolve(
+            "atlas_memory_only", evidence=evidence,
+        ).effective_mode)
+        self.assertEqual("soft_guardrail_network", trusted.resolve(
+            "atlas_memory_only", evidence=evidence, context={**context, "decision_id": "other"},
+        ).effective_mode)
+        verified_record = config.NetworkResolver(verifier=lambda facts, received: {
+            "context": received, "launched_payload": facts["launched_payload"],
+            "unrelated_destination_block": facts["unrelated_destination_block"],
+        }).resolve("atlas_memory_only", evidence=evidence, context=context)
+        self.assertEqual("atlas_memory_only", verified_record.effective_mode)
+        self.assertEqual(context, verified_record.verification_result["context"])
+        with self.assertRaises(TypeError):
+            config.resolve_network_mode("atlas_memory_only", evidence=evidence, verifier=lambda *_: True)
+        with self.assertRaises(TypeError):
+            trusted.resolve("atlas_memory_only", evidence=evidence, context=context,
+                            verifier=lambda *_: True)
 
         for absent in ("launched_payload", "unrelated_destination_block"):
             with self.subTest(absent=absent):
@@ -100,6 +141,10 @@ class FixedConfigurationTests(unittest.TestCase):
         })
         self.assertEqual("soft_guardrail_network", same_user.effective_mode)
         self.assertIn("independent", " ".join(same_user.disclosed_limits))
+        self.assertEqual("soft_guardrail_network", config.NetworkResolver(
+            verifier=lambda evidence, context: True,
+        ).resolve("atlas_memory_only", evidence=same_user.input_evidence,
+                  context=context).effective_mode)
 
     def test_soft_restricted_and_invalid_network_requests(self) -> None:
         soft = config.resolve_network_mode("soft_guardrail_network")

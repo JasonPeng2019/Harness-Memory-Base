@@ -21,10 +21,10 @@ from .config import (
     PROBLEM_FOCUSED,
     STANDARD,
     MemoryConfig,
+    NetworkResolver,
     PreparationLimits,
     resolve_config,
     resolve_limits,
-    resolve_network_mode,
 )
 from .privacy import PrivacyPolicy, safe_query_payload, sanitize_text
 from .search import BoundedSearch, SearchStore
@@ -87,6 +87,7 @@ class PreparationService:
         privacy_policy: PrivacyPolicy | None = None,
         clock: Callable[[], float] | None = None,
         registry: Sequence[templates.Template] | None = None,
+        network_resolver: NetworkResolver | None = None,
     ) -> None:
         self.store = store
         self.config = config
@@ -96,6 +97,7 @@ class PreparationService:
         self.registry = (
             tuple(registry) if registry is not None else templates.load_default_templates()
         )
+        self.network_resolver = network_resolver or NetworkResolver()
         self.search = BoundedSearch(
             limits=self.limits, privacy_policy=self.privacy_policy, clock=self.clock
         )
@@ -570,7 +572,7 @@ class PreparationService:
         contracts.validate_task_card(task_card)
         if network_mode is not None or network_evidence is not None:
             # Validate even on the inherited/all-off path and before optional work.
-            resolve_network_mode(
+            self.network_resolver.resolve(
                 network_mode if network_mode is not None else "normal",
                 evidence=network_evidence,
             )
@@ -737,9 +739,18 @@ class PreparationService:
                 requested_config = captured
             network_resolution = (
                 captured_resolution if captured_network is not None
-                else contracts.network_resolution_record(resolve_network_mode(
+                else contracts.network_resolution_record(self.network_resolver.resolve(
                     network_mode if network_mode is not None else "normal",
                     evidence=network_evidence,
+                    context={
+                        "objective_id": objective_id,
+                        "task_card_digest": task_card["content_hash"],
+                        "plan_id": plan_of_record["plan_id"],
+                        "plan_digest": plan_of_record["content_hash"],
+                        "decision_id": ownership_decision["decision_id"],
+                        "route": route,
+                        "plan_state": plan_of_record["state"],
+                    },
                 ))
             )
             effective_network_mode = (

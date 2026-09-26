@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 STANDARD = "standard"
 PROBLEM_FOCUSED = "problem_focused"
@@ -17,11 +17,13 @@ NETWORK_MODES = frozenset({
 
 @dataclass(frozen=True)
 class NetworkResolution:
-    """Per-objective claim and the exact nonsecret evidence supplied by its caller.
+    """Per-objective claim, attribution, and capture-time verification result.
 
     This is separate from MemoryConfig: network facts never enter the fixed
     strategy configuration or its decision digest. A proof reference identifies
-    evidence held by the launch/egress owner; this resolver does not measure it.
+    evidence held by the launch/egress owner. Its booleans are untrusted hints;
+    only a constructor-bound verifier can attest that the actual launch and
+    independent egress measurement match.
     """
 
     requested_mode: str
@@ -29,20 +31,66 @@ class NetworkResolution:
     enforcement_sources: tuple[str, ...]
     disclosed_limits: tuple[str, ...]
     input_evidence: dict[str, Any]
+    context: dict[str, str]
+    verification_result: bool | dict[str, Any] | None
+
+
+NETWORK_CONTEXT_FIELDS = frozenset({
+    "objective_id", "task_card_digest", "plan_id", "plan_digest",
+    "decision_id", "route", "plan_state",
+})
+
+
+class NetworkResolver:
+    """Resolve network claims with a verifier fixed by the trusted composer.
+
+    The verifier receives normalized nonsecret references and exact context.
+    It returns literal True, or a record containing that context and both
+    matching proof facts, only after checking the installed/launched payload
+    and an independent unrelated-destination block measurement. Exceptions,
+    absent proof, and mismatches fail closed. A same-user setting is never
+    independent egress proof.
+    """
+
+    def __init__(self, verifier: Callable[[dict[str, Any], dict[str, str]], Any] | None = None):
+        self._verifier = verifier
+
+    def resolve(
+        self, requested_mode: str = "normal", *, evidence: Mapping[str, Any] | None = None,
+        context: Mapping[str, str] | None = None,
+    ) -> NetworkResolution:
+        """Resolve one requested profile from opaque proof references.
+
+        ``evidence`` accepts ``launched_payload`` with ``verified`` and
+        ``evidence_id``, and ``unrelated_destination_block`` with ``blocked``,
+        ``independent``, ``source_kind``, and ``evidence_id``. Positive facts
+        need a nonempty opaque ID. The caller supplies nonsecret IDs.
+        """
+        return _resolve_network_mode(requested_mode, evidence, context, self._verifier)
 
 
 def resolve_network_mode(
     requested_mode: str = "normal", *, evidence: Mapping[str, Any] | None = None,
 ) -> NetworkResolution:
-    """Resolve one requested profile from lane-2 supplied proof references.
+    """Legacy untrusted entry point; per-call evidence cannot authorize Atlas-only."""
+    return NetworkResolver().resolve(requested_mode, evidence=evidence)
 
-    ``evidence`` accepts ``launched_payload`` with ``verified`` and
-    ``evidence_id``, and ``unrelated_destination_block`` with ``blocked``,
-    ``independent``, ``source_kind``, and ``evidence_id``. Positive facts need a nonempty opaque
-    evidence ID. The caller must supply nonsecret IDs, never credentials.
-    """
+
+def _resolve_network_mode(
+    requested_mode: str, evidence: Mapping[str, Any] | None,
+    context: Mapping[str, str] | None,
+    verifier: Callable[[dict[str, Any], dict[str, str]], Any] | None,
+) -> NetworkResolution:
     if not isinstance(requested_mode, str) or requested_mode not in NETWORK_MODES:
         raise ValueError("unsupported network mode")
+    if context is None:
+        normalized_context: dict[str, str] = {}
+    elif not isinstance(context, Mapping) or set(context) != NETWORK_CONTEXT_FIELDS or any(
+        not isinstance(value, str) or not value for value in context.values()
+    ):
+        raise ValueError("network context is incomplete")
+    else:
+        normalized_context = dict(context)
     if evidence is None:
         evidence = {}
     if not isinstance(evidence, Mapping) or set(evidence) - {
@@ -74,11 +122,12 @@ def resolve_network_mode(
             requested_mode, requested_mode, ("service_entry_policy_required",),
             ("optional Atlas task-path work requires service-entry blocking; "
              "authorized safety administration may remain pending",), normalized,
+            normalized_context, None,
         )
     if requested_mode == "normal":
         return NetworkResolution(
             requested_mode, requested_mode, ("legacy_normal_compatibility",),
-            ("no network restriction is claimed",), normalized,
+            ("no network restriction is claimed",), normalized, normalized_context, None,
         )
     sources = ["requested_soft_guardrail_policy"]
     limits = [
@@ -87,7 +136,7 @@ def resolve_network_mode(
     ]
     if requested_mode == "soft_guardrail_network":
         return NetworkResolution(requested_mode, requested_mode, tuple(sources),
-                                 tuple(limits), normalized)
+                                 tuple(limits), normalized, normalized_context, None)
     payload = normalized.get("launched_payload")
     block = normalized.get("unrelated_destination_block")
     payload_ok = payload is not None and payload["verified"]
@@ -97,15 +146,36 @@ def resolve_network_mode(
         limits.append("launched_payload verification is missing")
     if not block_ok:
         limits.append("independent unrelated_destination_block proof is missing")
-    if not (payload_ok and block_ok):
+    verified: bool | dict[str, Any] | None = None
+    if payload_ok and block_ok and normalized_context and verifier is not None:
+        try:
+            result = verifier(dict(normalized), dict(normalized_context))
+            if result is True:
+                verified = True
+            elif isinstance(result, Mapping) and set(result) == {
+                "context", "launched_payload", "unrelated_destination_block",
+            } and result["context"] == normalized_context and (
+                result["launched_payload"] == payload
+                and result["unrelated_destination_block"] == block
+            ):
+                verified = {
+                    "context": dict(normalized_context),
+                    "launched_payload": dict(payload),
+                    "unrelated_destination_block": dict(block),
+                }
+        except Exception:
+            pass  # An unavailable verifier cannot grant a stronger claim.
+    if verified is None:
+        limits.append("trusted launched-payload and independent egress proof is missing or unverified")
         return NetworkResolution(requested_mode, "soft_guardrail_network",
-                                 tuple(sources), tuple(limits), normalized)
+                                 tuple(sources), tuple(limits), normalized,
+                                 normalized_context, None)
     return NetworkResolution(
         requested_mode, requested_mode,
         (f"verified_launched_payload:{payload['evidence_id']}",
          f"independent_egress_block:{block['evidence_id']}"),
-        ("lane-2 must retain actual launched-payload and measured egress proof; "
-         "this resolution alone does not enforce isolation",), normalized,
+        ("capture-time verifier confirmed launched payload and independent measured egress; "
+         "a new launch requires a new check",), normalized, normalized_context, verified,
     )
 
 LEARNED_REQUEST_KEYS = (
@@ -443,6 +513,7 @@ __all__ = [
     "resolve_config",
     "NETWORK_MODES",
     "NetworkResolution",
+    "NetworkResolver",
     "resolve_network_mode",
     "LimitsError",
     "PreparationLimits",
