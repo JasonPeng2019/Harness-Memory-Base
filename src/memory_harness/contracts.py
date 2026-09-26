@@ -31,6 +31,13 @@ FINAL_CONTEXT_SECURITY = {
     "may_execute_parent": False,
 }
 OPERATION_SCHEMA = "memory-operation/v1"
+EFFECT_OPERATION_SCHEMA = "effect-operation/v1"
+LOCAL_EFFECT_KINDS = (
+    "review_receipt", "recent_evidence", "experience_ingestion", "generated_skill_creation",
+)
+EFFECT_OPERATION_STATUSES = frozenset({
+    "waiting_source", "waiting_payload", "pending", "in_flight", "uncertain", "confirmed",
+})
 OUTCOME_SCHEMA = "memory-outcome/v1"
 NATIVE_TERMINAL_EVIDENCE_SCHEMA = "native-terminal-evidence/v1"
 REJECTED_NATIVE_ATTEMPT_SCHEMA = "rejected-native-attempt/v1"
@@ -103,6 +110,14 @@ def sha256_hex(value: Any) -> str:
 def content_hash(record: Mapping[str, Any]) -> str:
     payload = {key: value for key, value in record.items() if key != "content_hash"}
     return sha256_hex(payload)
+
+
+def effect_operation_id(outcome_id: str, kind: str, scope_key: str = "outcome") -> str:
+    """Stable slot identity shared by local and later source-specific effects."""
+    for name, value in (("outcome_id", outcome_id), ("kind", kind), ("scope_key", scope_key)):
+        _require_nonempty_str(value, name)
+    return sha256_hex({"schema": EFFECT_OPERATION_SCHEMA, "outcome_id": outcome_id,
+                       "kind": kind, "scope_key": scope_key})
 
 
 def validate_record(record: Mapping[str, Any], schema: str) -> None:
@@ -4207,6 +4222,7 @@ __all__ = [
     "ENVELOPE_SCHEMA",
     "FINAL_ENVELOPE_SCHEMA",
     "OPERATION_SCHEMA",
+    "EFFECT_OPERATION_SCHEMA",
     "OUTCOME_SCHEMA",
     "NATIVE_TERMINAL_EVIDENCE_SCHEMA",
     "REJECTED_NATIVE_ATTEMPT_SCHEMA",
@@ -4231,6 +4247,8 @@ __all__ = [
     "ROUTES",
     "OUTCOME_STATUSES",
     "OPERATION_STATUSES",
+    "LOCAL_EFFECT_KINDS",
+    "EFFECT_OPERATION_STATUSES",
     "REVIEW_STATES",
     "REVIEWED_TRAJECTORY_STATUSES",
     "GENERATED_SKILL_STATES",
@@ -4242,6 +4260,7 @@ __all__ = [
     "canonical_json",
     "sha256_hex",
     "content_hash",
+    "effect_operation_id",
     "validate_record",
     "make_task_card",
     "validate_task_card",

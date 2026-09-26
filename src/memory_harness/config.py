@@ -60,6 +60,16 @@ class MemoryConfig:
         )
 
 
+def effect_submission_enabled(configuration: Mapping[str, Any] | MemoryConfig, kind: str) -> bool:
+    """Apply the captured or current effective write gate to an effect kind."""
+    resolved = configuration if isinstance(configuration, MemoryConfig) else resolve_config(configuration)
+    if kind == "experience_ingestion":
+        return resolved.experience_write
+    if kind == "generated_skill_creation":
+        return resolved.experience_write and resolved.generated_skill_creation
+    return True
+
+
 def _reject_learned_requests(raw: Mapping[str, Any]) -> None:
     requested_strategy = raw.get("strategy")
     if isinstance(requested_strategy, str) and requested_strategy.lower() in {
