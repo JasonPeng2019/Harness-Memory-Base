@@ -1037,11 +1037,34 @@ def supersession_id_for_launch(
     attempt = get_rejected_native_attempt(
         worktree_path=worktree_path, rejected_attempt_id=rejected_id,
     )
+    evidence = attempt.get("terminal_evidence")
+    dispatch = evidence.get("dispatch") if isinstance(evidence, Mapping) else None
+    prior = dispatch.get("envelope") if isinstance(dispatch, Mapping) else None
+    acceptance = evidence.get("acceptance") if isinstance(evidence, Mapping) else None
+    if (
+        attempt.get("content_hash") != content_hash(attempt)
+        or not isinstance(prior, Mapping)
+        or evidence.get("content_hash") != attempt.get("evidence_digest")
+        or not isinstance(acceptance, Mapping)
+        or acceptance.get("approval") != "REJECTED"
+        or prior.get("decision_id") != attempt.get("decision_id")
+        or prior.get("run_id") != attempt.get("run_id")
+    ):
+        raise MemoryHandoffError("native supersession lacks exact durable rejected-review provenance")
     for field in ("rejected_attempt_id", "run_id", "decision_id", "operation_id", "evidence_digest"):
         if attempt.get(field) != handoff[field]:
             raise MemoryHandoffError(f"native supersession {field} differs from domain authority")
     if attempt["decision_id"] != envelope["decision_id"] or attempt["run_id"] == envelope["run_id"]:
         raise MemoryHandoffError("native supersession is for a different decision or run")
+    for field in (
+        "task_card_digest", "objective_id", "plan_id", "plan_digest", "base_commit",
+        "worktree_path", "route", "recipient", "lane_id", "checkpoint",
+        "configuration_digest",
+    ):
+        if prior.get(field) != envelope.get(field):
+            raise MemoryHandoffError(f"native supersession {field} changed from rejected run")
+    if prior.get("final_context_id") == envelope.get("final_context_id"):
+        raise MemoryHandoffError("native supersession final_context_id was reused")
     return rejected_id
 
 

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from memory_harness import contracts, store
 from orchestrator_harness import controller, launch, manager_queue, memory_handoff, monitor, operator_launch, resume, review, terminal_evidence
@@ -842,13 +842,6 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             self.lane.update(mutate(self.lane))
             return self.lane
 
-        def write_invocation(worktree, *, lane_id, run_id, **_kwargs):
-            value = {"schema": "controller-invocation/v1", "lane_id": lane_id, "run_id": run_id,
-                     "provider": {"id": "codex"}}
-            value["content_hash"] = content_hash(value)
-            atomic_write_json(Path(worktree) / ".agent-workspace" / "invocation.json", value)
-            return value
-
         resumed_context = _finalized_lane1_fixture(
             self.card, self.plan, self.worktree, run_id="run-2"
         )
@@ -860,8 +853,6 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             patch.object(resume, "update_lane", side_effect=update_lane),
             patch.object(resume, "_live_controller", return_value=False),
             patch.object(resume, "new_id", return_value="run-2"),
-            patch.object(resume, "_write_worker_prompt"),
-            patch.object(resume, "_write_invocation", side_effect=write_invocation),
             patch.object(memory_handoff, "_prepare_memory_outcome", return_value=resumed_context),
         ):
             resumed = resume.run_resume(lane_id=self.lane_id, resume_task_card=str(resume_card))
@@ -870,25 +861,42 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         self.assertEqual(rejected["rejected_attempt_id"], self.lane["native_supersession"]["rejected_attempt_id"])
         self.assertEqual(prior, terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-1"))
         self.assertIsNone(terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-2"))
-        self.run_id = "run-2"
-        self.lane["lifecycle"] = "review_pending"
-        self.lane["process"] = {"pid": 124, "creation_time": "incarnation-2"}
-        self._result("PASS")
         fresh_envelope = memory_handoff.load_envelope(self.worktree)
         assert fresh_envelope is not None
-        fresh_context = memory_handoff.load_final_context(worktree_path=self.worktree, envelope=fresh_envelope)
-        memory_handoff.record_dispatch_intent(
-            worktree_path=self.worktree, envelope=fresh_envelope,
-            supersedes_rejected_attempt_id=memory_handoff.supersession_id_for_launch(
-                worktree_path=self.worktree, lane=self.lane, envelope=fresh_envelope,
-            ),
+        self.assertEqual("checkpoint-1", fresh_envelope["checkpoint"])
+        self.assertEqual("checkpoint-1", fresh_envelope["final_context"]["checkpoint"])
+        binding = self.root / "orchestrator_harness" / "provider_adapters" / "codex" / "launcher_binding.py"
+        binding.parent.mkdir(parents=True)
+        binding.write_text("# test provider binding\n", encoding="utf-8")
+        status = {
+            "schema": "controller-status/v1", "lane_id": self.lane_id, "run_id": "run-2",
+            "controller_state": "exited", "provider_state": {"state": "exited", "exit_code": 0},
+            "cleanup_proven": True, "recorded_status": "review_pending",
+        }
+        with (
+            patch.object(launch, "find_harness_root", return_value=self.root),
+            patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.rt)),
+            patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "find_active_lane", return_value=(self.epoch_id, self.lane)),
+            patch.object(launch, "read_lane", side_effect=lambda *_: self.lane),
+            patch.object(launch, "update_lane", side_effect=update_lane),
+            patch.object(launch, "_validate_provider_launch_config", return_value={}),
+            patch.object(launch, "_wait_for_spawn_attestation", return_value={"pid": 124, "creation_time": "incarnation-2"}),
+            patch.object(launch, "_read_controller_status", return_value=status),
+            patch.object(launch, "_delivered_provider_outcome", return_value=("LAUNCH_OK", "provider started")),
+            patch.object(launch.processes, "spawn_detached", return_value=MagicMock(pid=124)) as spawn,
+            patch.object(memory_handoff, "record_dispatch_intent", wraps=memory_handoff.record_dispatch_intent) as intent,
+        ):
+            launched = launch.run_launch(self.lane_id)
+        self.assertTrue(launched["ok"], launched)
+        spawn.assert_called_once()
+        self.assertEqual(
+            authorization["rejected_attempt_id"],
+            intent.call_args.kwargs["supersedes_rejected_attempt_id"],
         )
-        memory_handoff.record_observed_invocation(
-            worktree_path=self.worktree, envelope=fresh_envelope,
-            observed_invocation=memory_handoff.native_observation(
-                envelope=fresh_envelope, context=fresh_context, controller_identity=self.lane["process"],
-            ),
-        )
+        self.run_id = "run-2"
+        self.lane["lifecycle"] = "review_pending"
+        self._result("PASS")
         fresh_response = self._review()
         self.assertTrue(fresh_response["ok"], fresh_response)
         fresh = terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-2")
@@ -944,6 +952,19 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             worktree_path=self.worktree, lane=self.lane, envelope=second,
         )
         self.assertEqual(authorization["rejected_attempt_id"], exact_id)
+        for field in (
+            "task_card_digest", "plan_digest", "base_commit", "lane_id",
+            "worktree_path", "recipient", "checkpoint", "final_context_id",
+        ):
+            with self.subTest(field=field):
+                changed = {**second, field: (
+                    self.envelope["final_context_id"] if field == "final_context_id"
+                    else "wrong-identity"
+                )}
+                with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, field):
+                    memory_handoff.supersession_id_for_launch(
+                        worktree_path=self.worktree, lane=self.lane, envelope=changed,
+                    )
         self.lane["native_supersession"] = {**handoff, "evidence_digest": "wrong-digest"}
         with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "evidence_digest"):
             memory_handoff.supersession_id_for_launch(
