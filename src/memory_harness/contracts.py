@@ -61,6 +61,13 @@ PROCEDURE_REMOTE_OPERATION_SCHEMA = "trusted-procedure-remote-operation/v1"
 PROCEDURE_EXPOSURE_SCHEMA = "trusted-procedure-exposure/v1"
 APC_REQUEST_SCHEMA = "apc-request/v1"
 APC_RESULT_SCHEMA = "apc-result/v1"
+NATIVE_USAGE_START_SCHEMA = "native-usage-start/v1"
+NATIVE_USAGE_RECEIPT_SCHEMA = "native-usage-receipt/v1"
+NATIVE_USAGE_CATEGORIES = frozenset({
+    "outer_implementation", "product_test_root", "inner_candidate",
+    "online_adaptation", "online_planning", "online_review", "online_execution",
+    "maintenance", "embedding", "retrieval",
+})
 
 PLAN_STATES = frozenset({"candidate", "accepted", "proposed", "fresh"})
 ROUTES = frozenset({"ordinary", "problem_focused", "deeper"})
@@ -4180,6 +4187,120 @@ def validate_apc_child_operation(record: Mapping[str, Any]) -> None:
         raise ContractError("launched APC child operation requires an observed invocation")
 
 
+def _native_usage_identity(
+    *, source: str, invocation_id: str, objective_id: str | None,
+    decision_id: str | None, maintenance_operation_id: str | None,
+    stage: str, category: str, window_id: str, binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    for name, value in (("source", source), ("invocation_id", invocation_id),
+                        ("stage", stage), ("window_id", window_id)):
+        _require_canonical_identity(value, name)
+    if (objective_id is None) == (maintenance_operation_id is None):
+        raise ContractError("usage requires exactly one objective or maintenance operation")
+    for name, value in (("objective_id", objective_id), ("decision_id", decision_id),
+                        ("maintenance_operation_id", maintenance_operation_id)):
+        if value is not None:
+            _require_canonical_identity(value, name)
+    if decision_id is not None and objective_id is None:
+        raise ContractError("usage decision requires an objective")
+    if category not in NATIVE_USAGE_CATEGORIES:
+        raise ContractError("unknown native usage category")
+    if not isinstance(binding, Mapping) or set(binding) != {"requested", "resolved", "native"}:
+        raise ContractError("usage binding needs requested, resolved, and native values")
+    for name, value in binding.items():
+        if value is not None:
+            _require_nonempty_str(value, f"binding {name}")
+    return dict(source=source, invocation_id=invocation_id, objective_id=objective_id,
+                decision_id=decision_id, maintenance_operation_id=maintenance_operation_id,
+                stage=stage, category=category, window_id=window_id, binding=dict(binding))
+
+
+def make_native_usage_start(
+    *, source: str, invocation_id: str, objective_id: str | None,
+    decision_id: str | None, maintenance_operation_id: str | None,
+    stage: str, category: str, window_id: str, binding: Mapping[str, Any],
+    parent_invocation_id: str | None = None, parent_source: str | None = None,
+    accepted_support: bool = False,
+) -> dict[str, Any]:
+    """Declare one actual started call. Binding values may be unknown (None)."""
+    identity = _native_usage_identity(**dict(
+        source=source, invocation_id=invocation_id, objective_id=objective_id,
+        decision_id=decision_id, maintenance_operation_id=maintenance_operation_id,
+        stage=stage, category=category, window_id=window_id, binding=binding))
+    if parent_invocation_id is not None:
+        _require_canonical_identity(parent_invocation_id, "parent_invocation_id")
+        parent_source = parent_source or source
+        _require_canonical_identity(parent_source, "parent_source")
+        if (parent_source == source and parent_invocation_id == invocation_id) or category != "online_adaptation":
+            raise ContractError("APC support needs a distinct online adaptation parent")
+    elif parent_source is not None:
+        raise ContractError("APC parent source requires a parent invocation")
+    if not isinstance(accepted_support, bool) or (accepted_support and parent_invocation_id is None):
+        raise ContractError("accepted support needs a parent invocation")
+    record = {"schema": NATIVE_USAGE_START_SCHEMA, **identity,
+              "parent_invocation_id": parent_invocation_id, "parent_source": parent_source,
+              "accepted_support": accepted_support}
+    record["content_hash"] = content_hash(record)
+    return record
+
+
+def validate_native_usage_start(record: Mapping[str, Any]) -> None:
+    validate_record(record, NATIVE_USAGE_START_SCHEMA)
+    expected = make_native_usage_start(**{key: record.get(key) for key in (
+        "source", "invocation_id", "objective_id", "decision_id", "maintenance_operation_id",
+        "stage", "category", "window_id", "binding", "parent_invocation_id",
+        "parent_source", "accepted_support")})
+    if dict(record) != expected:
+        raise ContractError("native usage start has unexpected fields")
+
+
+def make_native_usage_receipt(
+    *, source: str, invocation_id: str, receipt_id: str,
+    objective_id: str | None, decision_id: str | None,
+    maintenance_operation_id: str | None, stage: str, category: str,
+    window_id: str, binding: Mapping[str, Any], mode: str, complete: bool,
+    measures: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Capture source-native measures; each value keeps its unit and total inclusion."""
+    identity = _native_usage_identity(**dict(
+        source=source, invocation_id=invocation_id, objective_id=objective_id,
+        decision_id=decision_id, maintenance_operation_id=maintenance_operation_id,
+        stage=stage, category=category, window_id=window_id, binding=binding))
+    _require_canonical_identity(receipt_id, "receipt_id")
+    if mode not in {"cumulative", "incremental"} or not isinstance(complete, bool):
+        raise ContractError("usage receipt mode or completeness is invalid")
+    if not isinstance(measures, Mapping):
+        raise ContractError("usage measures must be a mapping")
+    validated = {}
+    for name, measure in measures.items():
+        _require_canonical_identity(name, "measure name")
+        if not isinstance(measure, Mapping) or set(measure) != {"value", "unit", "included_in_total"}:
+            raise ContractError("usage measure needs value, unit, and included_in_total")
+        value = measure["value"]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0):
+            raise ContractError("usage measure value must be finite and nonnegative")
+        _require_canonical_identity(measure["unit"], "measure unit")
+        if measure["included_in_total"] is not None and not isinstance(measure["included_in_total"], bool):
+            raise ContractError("usage total inclusion must be true, false, or unknown")
+        validated[name] = dict(measure)
+    record = {"schema": NATIVE_USAGE_RECEIPT_SCHEMA, **identity,
+              "receipt_id": receipt_id, "mode": mode, "complete": complete,
+              "measures": validated}
+    record["content_hash"] = content_hash(record)
+    return record
+
+
+def validate_native_usage_receipt(record: Mapping[str, Any]) -> None:
+    validate_record(record, NATIVE_USAGE_RECEIPT_SCHEMA)
+    expected = make_native_usage_receipt(**{key: record.get(key) for key in (
+        "source", "invocation_id", "receipt_id", "objective_id", "decision_id",
+        "maintenance_operation_id", "stage", "category", "window_id", "binding",
+        "mode", "complete", "measures")})
+    if dict(record) != expected:
+        raise ContractError("native usage receipt has unexpected fields")
+
+
 def accept_plan(
     proposal: Mapping[str, Any],
     *,
@@ -4365,5 +4486,12 @@ __all__ = [
     "validate_final_source_recheck",
     "make_apc_child_operation",
     "validate_apc_child_operation",
+    "NATIVE_USAGE_START_SCHEMA",
+    "NATIVE_USAGE_RECEIPT_SCHEMA",
+    "NATIVE_USAGE_CATEGORIES",
+    "make_native_usage_start",
+    "validate_native_usage_start",
+    "make_native_usage_receipt",
+    "validate_native_usage_receipt",
     "accept_plan",
 ]

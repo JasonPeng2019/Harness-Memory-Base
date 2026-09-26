@@ -47,6 +47,10 @@ class PreparationConflictError(StoreError):
     """A preparation attempt lost the durable decision-budget race."""
 
 
+class NativeUsageConflictError(StoreError):
+    """Native invocation identity, ownership, or receipt evidence conflicts."""
+
+
 _SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS decisions (
@@ -474,6 +478,27 @@ _SCHEMA = [
         envelope_digest TEXT NOT NULL,
         record TEXT NOT NULL,
         created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS native_usage_starts (
+        source TEXT NOT NULL,
+        invocation_id TEXT NOT NULL,
+        objective_id TEXT,
+        maintenance_operation_id TEXT,
+        record TEXT NOT NULL,
+        PRIMARY KEY (source, invocation_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS native_usage_receipts (
+        source TEXT NOT NULL,
+        invocation_id TEXT NOT NULL,
+        receipt_id TEXT NOT NULL,
+        record TEXT NOT NULL,
+        PRIMARY KEY (source, invocation_id, receipt_id),
+        FOREIGN KEY (source, invocation_id)
+            REFERENCES native_usage_starts (source, invocation_id)
     )
     """,
 ]
@@ -4816,10 +4841,203 @@ class MemoryStore:
             return None
         return self._stored_record(row, contracts.validate_finalized_context)
 
+    def start_native_usage(self, start: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist an actual call before counters arrive; exact replay is safe."""
+        contracts.validate_native_usage_start(start)
+        connection = self._require_connection()
+        if start["decision_id"] is not None:
+            row = connection.execute(
+                "SELECT objective_id FROM decisions WHERE decision_id=?", (start["decision_id"],)
+            ).fetchone()
+            if row is None or row["objective_id"] != start["objective_id"]:
+                raise NativeUsageConflictError("usage decision does not own the objective")
+        with connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO native_usage_starts "
+                "(source, invocation_id, objective_id, maintenance_operation_id, record) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (start["source"], start["invocation_id"], start["objective_id"],
+                 start["maintenance_operation_id"], self._serialize_record(start)),
+            )
+            row = connection.execute(
+                "SELECT record FROM native_usage_starts WHERE source=? AND invocation_id=?",
+                (start["source"], start["invocation_id"]),
+            ).fetchone()
+            if json.loads(row["record"]) != dict(start):
+                raise NativeUsageConflictError("native invocation already belongs to different evidence")
+            if start["accepted_support"]:
+                parent = connection.execute(
+                    "SELECT record FROM native_usage_starts WHERE source=? AND invocation_id=?",
+                    (start["parent_source"], start["parent_invocation_id"]),
+                ).fetchone()
+                if parent is None:
+                    raise NativeUsageConflictError("accepted APC support parent is not started")
+                parent_record = json.loads(parent["record"])
+                if (parent_record["objective_id"] != start["objective_id"]
+                        or parent_record["window_id"] != start["window_id"]
+                        or parent_record["category"] != "online_adaptation"):
+                    raise NativeUsageConflictError("accepted APC support parent has different ownership")
+                peers = connection.execute(
+                    "SELECT record FROM native_usage_starts WHERE objective_id=?",
+                    (start["objective_id"],),
+                ).fetchall()
+                if any((item := json.loads(peer["record"]))["accepted_support"]
+                       and item["parent_invocation_id"] == start["parent_invocation_id"]
+                       and item["parent_source"] == start["parent_source"]
+                       and (item["source"], item["invocation_id"]) != (start["source"], start["invocation_id"])
+                       for peer in peers):
+                    raise NativeUsageConflictError("adaptation already has an accepted APC support child")
+        return self.get_native_usage(start["source"], start["invocation_id"])
+
+    def record_native_usage_receipt(self, receipt: Mapping[str, Any]) -> dict[str, Any]:
+        """Add one partial, cumulative, or incremental native receipt by its source id."""
+        contracts.validate_native_usage_receipt(receipt)
+        connection = self._require_connection()
+        with connection:
+            row = connection.execute(
+                "SELECT record FROM native_usage_starts WHERE source=? AND invocation_id=?",
+                (receipt["source"], receipt["invocation_id"]),
+            ).fetchone()
+            if row is None:
+                raise NativeUsageConflictError("receipt has no known started invocation")
+            start = json.loads(row["record"])
+            for field in ("source", "invocation_id", "objective_id", "decision_id",
+                          "maintenance_operation_id", "stage", "category", "window_id"):
+                if receipt[field] != start[field]:
+                    raise NativeUsageConflictError(f"native usage receipt conflicts on {field}")
+            connection.execute(
+                "INSERT OR IGNORE INTO native_usage_receipts "
+                "(source, invocation_id, receipt_id, record) VALUES (?, ?, ?, ?)",
+                (receipt["source"], receipt["invocation_id"], receipt["receipt_id"],
+                 self._serialize_record(receipt)),
+            )
+            row = connection.execute(
+                "SELECT record FROM native_usage_receipts "
+                "WHERE source=? AND invocation_id=? AND receipt_id=?",
+                (receipt["source"], receipt["invocation_id"], receipt["receipt_id"]),
+            ).fetchone()
+            if json.loads(row["record"]) != dict(receipt):
+                raise NativeUsageConflictError("native receipt id already belongs to different evidence")
+            # Projection validates compatible receipt modes before the write commits.
+            return self.get_native_usage(receipt["source"], receipt["invocation_id"])
+
+    def get_native_usage(self, source: str, invocation_id: str) -> dict[str, Any]:
+        """Project one durable start and all its receipts without changing quality state."""
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT record FROM native_usage_starts WHERE source=? AND invocation_id=?",
+            (source, invocation_id),
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"native invocation not found: {source}/{invocation_id}")
+        start = json.loads(row["record"])
+        contracts.validate_native_usage_start(start)
+        rows = connection.execute(
+            "SELECT record FROM native_usage_receipts WHERE source=? AND invocation_id=? ORDER BY receipt_id",
+            (source, invocation_id),
+        ).fetchall()
+        measures_by_source: dict[tuple[str, str], dict[str, Any]] = {}
+        modes: dict[tuple[str, str], str] = {}
+        effective_binding = dict(start["binding"])
+        complete = False
+        for item in rows:
+            receipt = json.loads(item["record"])
+            contracts.validate_native_usage_receipt(receipt)
+            for name, value in receipt["binding"].items():
+                if value is not None:
+                    if effective_binding[name] is not None and effective_binding[name] != value:
+                        raise NativeUsageConflictError(f"native usage receipt conflicts on binding {name}")
+                    effective_binding[name] = value
+            complete = complete or receipt["complete"]
+            for name, measure in receipt["measures"].items():
+                source_key = (name, measure["unit"])
+                previous_mode = modes.setdefault(source_key, receipt["mode"])
+                if previous_mode != receipt["mode"]:
+                    raise NativeUsageConflictError("mixed cumulative and incremental native measure")
+                previous = measures_by_source.get(source_key)
+                value = measure["value"]
+                if previous is not None:
+                    old_inclusion = previous["included_in_total"]
+                    new_inclusion = measure["included_in_total"]
+                    if (old_inclusion is not None and new_inclusion is not None
+                            and old_inclusion != new_inclusion):
+                        raise NativeUsageConflictError("native measure total inclusion conflicts")
+                    value = (max(previous["value"], value) if receipt["mode"] == "cumulative"
+                             else previous["value"] + value)
+                    if new_inclusion is None:
+                        measure = {**measure, "included_in_total": old_inclusion}
+                measures_by_source[source_key] = {**measure, "value": value}
+        measures: dict[str, dict[str, Any]] = {}
+        for (name, unit), measure in measures_by_source.items():
+            inclusion = ("included" if measure["included_in_total"] is True else
+                         "excluded" if measure["included_in_total"] is False else "unknown")
+            measures[f"{name}|{unit}|{inclusion}"] = measure
+        return {**start, "coverage": "complete" if complete and measures else "incomplete",
+                "effective_binding": effective_binding,
+                "measures": measures, "receipt_count": len(rows)}
+
+    def list_native_usage(
+        self, *, objective_id: str | None = None,
+        maintenance_operation_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Inspect each started call under one caller-selected owner."""
+        if (objective_id is None) == (maintenance_operation_id is None):
+            raise StoreError("aggregate requires exactly one objective or maintenance operation")
+        column, owner = (("objective_id", objective_id) if objective_id is not None
+                         else ("maintenance_operation_id", maintenance_operation_id))
+        connection = self._require_connection()
+        rows = connection.execute(
+            f"SELECT source, invocation_id FROM native_usage_starts WHERE {column}=? "
+            "ORDER BY source, invocation_id", (owner,),
+        ).fetchall()
+        return [self.get_native_usage(row["source"], row["invocation_id"]) for row in rows]
+
+    def aggregate_native_usage(
+        self, *, objective_id: str | None = None,
+        maintenance_operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Sum compatible measures and qualify each by coverage of all started calls."""
+        usages = self.list_native_usage(
+            objective_id=objective_id, maintenance_operation_id=maintenance_operation_id)
+        total: dict[str, dict[str, Any]] = {}
+        categories: dict[str, dict[str, Any]] = {}
+        measure_counts: dict[str, int] = {}
+        category_measure_counts: dict[str, dict[str, int]] = {}
+        incomplete = []
+        for usage in usages:
+            category = categories.setdefault(usage["category"], {"invocations": 0, "measures": {}})
+            category["invocations"] += 1
+            if usage["coverage"] != "complete":
+                incomplete.append({"source": usage["source"], "invocation_id": usage["invocation_id"]})
+            for key, measure in usage["measures"].items():
+                current = total.setdefault(key, {**measure, "value": 0})
+                current["value"] += measure["value"]
+                in_category = category["measures"].setdefault(key, {**measure, "value": 0})
+                in_category["value"] += measure["value"]
+                if usage["coverage"] == "complete":
+                    measure_counts[key] = measure_counts.get(key, 0) + 1
+                    counts = category_measure_counts.setdefault(usage["category"], {})
+                    counts[key] = counts.get(key, 0) + 1
+        for name, category in categories.items():
+            counts = category_measure_counts.get(name, {})
+            category["measure_coverage"] = {
+                key: "complete" if counts.get(key, 0) == category["invocations"] else "incomplete"
+                for key in category["measures"]
+            }
+        return {"invocations": len(usages), "by_category": categories,
+                "measures": total,
+                "measure_coverage": {
+                    key: "complete" if measure_counts.get(key, 0) == len(usages) else "incomplete"
+                    for key in total
+                },
+                "incomplete_invocations": incomplete,
+                "coverage": "incomplete" if incomplete else "complete"}
+
 
 
 __all__ = [
     "MemoryStore", "StoreError", "OperationConflictError", "OutcomeConflictError",
     "TrajectoryConflictError", "ExperienceConflictError", "ProcedureConflictError",
     "ProcedureDesignationConflictError", "PreparationConflictError",
+    "NativeUsageConflictError",
 ]
