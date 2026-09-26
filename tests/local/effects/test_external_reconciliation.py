@@ -151,7 +151,8 @@ class ExternalReconciliationTests(unittest.TestCase):
         with self.assertRaises(store.OperationConflictError):
             self.state.claim_effect_operation(intent["operation_id"], current_config=config.MemoryConfig())
 
-    def test_exact_absence_or_original_idempotency_authorizes_one_retry(self) -> None:
+    def test_exact_absence_or_original_idempotency_has_distinct_off_state(self) -> None:
+        off = config.resolve_config({"shared_publication": False})
         for result, extra in (("absent", {}),
                               ("idempotent", {"idempotency_key": "original"})):
             with self.subTest(result=result):
@@ -168,20 +169,107 @@ class ExternalReconciliationTests(unittest.TestCase):
                 pending = self.state.reconcile_external_effect_operation(
                     identity, evidence=evidence, result=result,
                 )
-                self.assertEqual("pending", pending["status"])
+                self.assertEqual("pending" if result == "absent" else "uncertain", pending["status"])
                 self.assertIsNone(pending["acknowledgement"])
                 self.assertEqual(evidence, pending["reconciliation"])
                 if result == "absent":
+                    self.assertEqual("off", self.state.external_effect_off_state(
+                        identity, current_config=off,
+                    ))
                     self.assertEqual("confirmed", self.state.confirm_effect_operation(
                         identity, self._evidence(intent),
                     )["status"])
                 else:
+                    self.assertEqual("pending_off", self.state.external_effect_off_state(
+                        identity, current_config=off,
+                    ))
+                    with self.assertRaisesRegex(store.OperationConflictError, "off"):
+                        self.state.claim_effect_operation(identity, current_config=off)
                     self.assertEqual(identity, self.state.claim_effect_operation(
                         identity, current_config=config.MemoryConfig(),
                     )["operation_id"])
+                    with self.assertRaises(store.OperationConflictError):
+                        self.state.claim_effect_operation(identity, current_config=config.MemoryConfig())
+                    self.assertEqual("pending_off", self.state.external_effect_off_state(
+                        identity, current_config=off,
+                    ))
+                    self.assertEqual("confirmed", self.state.confirm_effect_operation(
+                        identity, self._evidence(intent),
+                    )["status"])
+                    self.assertEqual("off", self.state.external_effect_off_state(
+                        identity, current_config=off,
+                    ))
+
+    def test_idempotency_proof_keeps_unresolved_effect_pending_off(self) -> None:
+        off = config.resolve_config({"shared_publication": False})
+        intent = self._create()
+        identity = intent["operation_id"]
+        self.state.claim_effect_operation(identity, current_config=config.MemoryConfig())
+        self.state.mark_effect_uncertain(identity, "response lost")
+        self.assertEqual("pending_off", self.state.external_effect_off_state(
+            identity, current_config=off,
+        ))
+
+        proved = self.state.reconcile_external_effect_operation(
+            identity,
+            evidence=self._evidence(intent, idempotency_key=identity),
+            result="idempotent",
+        )
+        self.assertEqual("uncertain", proved["status"])
+        self.assertIsNone(proved["acknowledgement"])
+        self.assertEqual("pending_off", self.state.external_effect_off_state(
+            identity, current_config=off,
+        ))
+        self.state.close()
+        self.state = store.MemoryStore(Path(self.directory.name) / "effects.sqlite3")
+        self.state.initialize()
+        self.assertEqual("uncertain", self.state.get_effect_operation(identity)["status"])
+        self.assertEqual("pending_off", self.state.external_effect_off_state(
+            identity, current_config=off,
+        ))
+        retried = self.state.claim_effect_operation(
+            identity, current_config=config.MemoryConfig(),
+        )
+        self.assertEqual(identity, retried["operation_id"])
+        self.assertEqual(proved["reconciliation"], retried["reconciliation"])
+
+    def test_late_acknowledgement_after_idempotency_proof_closes_original(self) -> None:
+        intent = self._create()
+        identity = intent["operation_id"]
+        self.state.claim_effect_operation(identity, current_config=config.MemoryConfig())
+        self.state.mark_effect_uncertain(identity, "response lost")
+        self.state.reconcile_external_effect_operation(
+            identity, evidence=self._evidence(intent, idempotency_key=identity),
+            result="idempotent",
+        )
+        confirmed = self.state.reconcile_external_effect_operation(
+            identity, evidence=self._evidence(intent), result="acknowledged",
+        )
+        self.assertEqual("confirmed", confirmed["status"])
+        self.assertEqual(self._evidence(intent), confirmed["acknowledgement"])
+        with self.assertRaises(store.OperationConflictError):
+            self.state.claim_effect_operation(identity, current_config=config.MemoryConfig())
+
+    def test_absence_proof_cannot_authorize_another_retry_after_new_lost_ack(self) -> None:
+        intent = self._create()
+        identity = intent["operation_id"]
+        self.state.claim_effect_operation(identity, current_config=config.MemoryConfig())
+        self.state.mark_effect_uncertain(identity, "first response lost")
+        self.state.reconcile_external_effect_operation(
+            identity,
+            evidence=self._evidence(intent, readback_complete=True, idempotency_key=identity),
+            result="absent",
+        )
+        self.state.claim_effect_operation(identity, current_config=config.MemoryConfig())
+        self.assertIsNone(self.state.get_effect_operation(identity)["reconciliation"])
+        self.state.mark_effect_uncertain(identity, "second response lost")
+        with self.assertRaises(store.OperationConflictError):
+            self.state.claim_effect_operation(identity, current_config=config.MemoryConfig())
 
     def test_feature_off_blocks_new_and_pending_and_shows_in_flight(self) -> None:
         off = config.resolve_config({"shared_publication": False})
+        with self.assertRaisesRegex(store.OperationConflictError, "captured feature is off"):
+            self._create(captured_config=off)
         with self.assertRaisesRegex(store.OperationConflictError, "off"):
             self._create(current_config=off)
         pending = self._create()
@@ -208,6 +296,13 @@ class ExternalReconciliationTests(unittest.TestCase):
     def test_two_connections_serialize_one_claim_and_leave_other_scope_free(self) -> None:
         intent = self._create()
         other = self._create(scope_key="recipient-2")
+        self.state.claim_effect_operation(intent["operation_id"], current_config=config.MemoryConfig())
+        self.state.mark_effect_uncertain(intent["operation_id"], "response lost")
+        self.state.reconcile_external_effect_operation(
+            intent["operation_id"],
+            evidence=self._evidence(intent, idempotency_key=intent["operation_id"]),
+            result="idempotent",
+        )
         barrier = threading.Barrier(2)
 
         def claim() -> str:

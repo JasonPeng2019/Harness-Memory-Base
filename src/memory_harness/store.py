@@ -1570,7 +1570,7 @@ class MemoryStore:
     def external_effect_off_state(
         self, operation_id: str, *, current_config: Mapping[str, Any] | MemoryConfig,
     ) -> str:
-        """Return on, off, or pending_off for an exact source-owned operation."""
+        """Report pending_off while an exact source-owned mutation is unresolved."""
         operation = self.get_effect_operation(operation_id)
         if operation["outcome_id"] is not None:
             raise OperationConflictError("operation is not source-owned")
@@ -1586,6 +1586,7 @@ class MemoryStore:
         The trusted adapter supplies evidence bound to this operation. `absent`
         means its readback can prove no mutation exists; `idempotent` means a
         retry with this operation ID is demonstrably deduplicated by the remote.
+        Idempotency leaves the remote outcome uncertain until exact resolution.
         """
         if result not in ("acknowledged", "absent", "idempotent"):
             raise contracts.ContractError("unknown external reconciliation result")
@@ -1621,12 +1622,14 @@ class MemoryStore:
             else:
                 if operation["status"] != "uncertain":
                     raise OperationConflictError("only an uncertain effect can be retry-authorized")
-                status = "pending"
+                status = "pending" if result == "absent" else "uncertain"
             connection.execute(
-                "UPDATE effect_operations SET status=?, acknowledgement=?, reconciliation=?, uncertainty=NULL, "
+                "UPDATE effect_operations SET status=?, acknowledgement=?, reconciliation=?, uncertainty=?, "
                 "version=version+1, updated_at=? WHERE operation_id=?",
                 (status, self._serialize_record(evidence) if status == "confirmed" else None,
-                 self._serialize_record(evidence), contracts.utc_now(), operation_id),
+                 self._serialize_record(evidence),
+                 operation["uncertainty"] if status == "uncertain" else None,
+                 contracts.utc_now(), operation_id),
             )
         return self.get_effect_operation(operation_id)
 
@@ -1737,7 +1740,11 @@ class MemoryStore:
     def claim_effect_operation(
         self, operation_id: str, *, current_config: Mapping[str, Any] | MemoryConfig
     ) -> dict[str, Any]:
-        """One SQLite writer claims a pending submission; off blocks the claim."""
+        """Claim pending work or a proved same-ID retry; off blocks either claim.
+
+        A new submission consumes an absence proof, so a later lost acknowledgement
+        cannot reuse that proof as permission for another retry.
+        """
         connection = self._require_connection()
         with connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1749,10 +1756,17 @@ class MemoryStore:
                 self.get_experience_ingestion_for_trajectory(operation["source_id"]) is not None
             ):
                 raise OperationConflictError("existing experience ingestion requires exact reconciliation")
-            if operation["status"] != "pending":
+            idempotent_retry = (
+                operation["outcome_id"] is None and operation["status"] == "uncertain" and
+                operation["reconciliation"] is not None and
+                operation["reconciliation"].get("idempotency_key") == operation_id
+            )
+            if operation["status"] != "pending" and not idempotent_retry:
                 raise OperationConflictError("effect is not pending; reconcile existing claim")
             connection.execute(
-                "UPDATE effect_operations SET status='in_flight', version=version+1, updated_at=? "
+                "UPDATE effect_operations SET status='in_flight', "
+                "reconciliation=CASE WHEN outcome_id IS NULL AND status='pending' "
+                "THEN NULL ELSE reconciliation END, version=version+1, updated_at=? "
                 "WHERE operation_id=?", (contracts.utc_now(), operation_id),
             )
         return self.get_effect_operation(operation_id)
