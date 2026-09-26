@@ -1085,16 +1085,19 @@ class ReviewedExperienceService:
         for operation_id, trajectory_id in operations.items():
             operation = self.store.get_effect_operation(operation_id)
             if operation["status"] == "confirmed":
-                # Existing stores may retain the old, candidate-specific payload.
-                # A confirmed outcome slot cannot be rebound for another skill.
+                # The candidate store owns each distinct proposed skill.
                 continue
             # The effect belongs to the reviewed outcome. Exact generated skill
             # identities and provenance live in the candidate store below.
             payload = {"source_trajectory_id": trajectory_id}
             acknowledgement = payload
-            if operation["payload_record"] == candidate_payload:
-                # Finish an in-flight operation created by an earlier version.
-                payload = candidate_payload
+            retained = operation["payload_record"]
+            if retained is not None and set(retained) == set(candidate_payload):
+                # Older writers bound this one outcome slot to one candidate.
+                # Another valid candidate must not rebind or confirm that claim.
+                if retained != candidate_payload:
+                    continue
+                payload = retained
                 acknowledgement = {"candidate_id": candidate["candidate_id"]}
             operation = self.store.bind_effect_payload(operation_id, payload)
             acknowledgements[operation_id] = acknowledgement

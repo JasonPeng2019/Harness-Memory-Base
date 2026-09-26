@@ -681,6 +681,149 @@ class JoinedNativeEffectTests(unittest.TestCase):
         self.assertEqual(original_effect, self.case.state.get_effect_operation(operation_id))
         self.assertEqual(second, service.resolve_generated_skill_candidate(skill, adapter))
 
+    def test_generated_effect_identity_reopen_matrix(self) -> None:
+        # Each row has a fresh fixed outcome and SQLite file. The legacy rows
+        # model the payload left by the original candidate-specific writer.
+        rows = [("umbrella", "new-first")]
+        rows += [
+            (status, order)
+            for status in ("pending", "in_flight", "uncertain")
+            for order in ("old-first", "different-first")
+        ]
+        rows.append(("confirmed", "different-first"))
+        for index, (status, order) in enumerate(rows):
+            with self.subTest(status=status, order=order):
+                if index:
+                    self.case.tearDown()
+                    self.case = native_fixture.TerminalOutcomeTests(
+                        methodName="test_exact_observed_native_chain_fixes_pass"
+                    )
+                    self.case.setUp()
+                outcome, trajectory, scope, service = self._native()
+                surface = _EverOSSurface()
+                adapter = self._adapter(scope, surface)
+                ingestion = asyncio.run(service.extract_trajectory(
+                    trajectory["trajectory_id"], adapter
+                ))
+                surface.case_results = [OutcomeToIngestionRetryTests._case(
+                    adapter, ingestion["session_id"]
+                )]
+                asyncio.run(service.reconcile_extraction(trajectory["trajectory_id"], adapter))
+                receipt = self.case.state.get_case_receipt(scope.to_record(), "retry-case-1")
+                source = [{
+                    "case_id": receipt["case_id"],
+                    "case_receipt_id": receipt["case_receipt_id"],
+                    "trajectory_id": trajectory["trajectory_id"],
+                    "review_receipt_id": trajectory["review_receipt_id"],
+                    "review_receipt_digest": trajectory["review_receipt_digest"],
+                }]
+                skills = [
+                    {
+                        "id": skill_id, "agent_id": adapter.everos_owner_id,
+                        "app_id": adapter.everos_application_id,
+                        "project_id": adapter.everos_project_id,
+                        "content": content, "source_case_ids": ["retry-case-1"],
+                    }
+                    for skill_id, content in (
+                        ("old-skill", "Check the parser."),
+                        ("different-skill", "Investigate parser history."),
+                    )
+                ]
+                expected = [contracts.make_generated_skill_candidate(
+                    scope=scope.to_record(), skill_id=skill["id"],
+                    content=skill["content"], source_cases=source,
+                ) for skill in skills]
+                operation_id = contracts.effect_operation_id(
+                    outcome["outcome_id"], "generated_skill_creation"
+                )
+                if status != "umbrella":
+                    self.case.state.bind_effect_source(
+                        operation_id, trajectory["trajectory_id"], trajectory
+                    )
+                    self.case.state.bind_effect_payload(operation_id, {
+                        key: expected[0][key] for key in (
+                            "candidate_id", "skill_id", "content_digest",
+                            "source_cases", "metadata",
+                        )
+                    })
+                    if status != "pending":
+                        self.case.state.claim_effect_operation(
+                            operation_id, current_config=config.MemoryConfig()
+                        )
+                    if status == "uncertain":
+                        self.case.state.mark_effect_uncertain(
+                            operation_id, "acknowledgement unavailable"
+                        )
+                    if status == "confirmed":
+                        self.case.state.record_generated_skill_candidate(expected[0])
+                        self.case.state.confirm_effect_operation(
+                            operation_id, {"candidate_id": expected[0]["candidate_id"]}
+                        )
+                    self.case.state.close()
+                    self.case.state = store.MemoryStore(self.case.root / "state.sqlite3")
+                    self.case.state.initialize()
+                    service = experience.ReviewedExperienceService(self.case.state)
+                before = self.case.state.get_effect_operation(operation_id)
+                original_outcome = self.case.state.get_outcome(outcome["decision_id"])
+                if order == "different-first":
+                    if status == "in_flight":
+                        with self.assertRaises(experience.ProvenanceError):
+                            service.resolve_generated_skill_candidate(
+                                {**skills[1], "source_case_ids": ["foreign-case"]}, adapter
+                            )
+                        with self.assertRaises(experience.ScopeBoundaryError):
+                            service.resolve_generated_skill_candidate(
+                                {**skills[1], "agent_id": "foreign-owner"}, adapter
+                            )
+                    for switch in ("experience_write", "generated_skill_creation"):
+                        self.assertIsNone(service.resolve_generated_skill_candidate(
+                            skills[1], adapter,
+                            current_config=config.resolve_config({switch: False}),
+                        ))
+                    self.assertEqual(before, self.case.state.get_effect_operation(operation_id))
+                    self.assertEqual([], self.case.state.read_generated_skill_candidates_for_scope(
+                        skills[1]["id"], scope.to_record()
+                    ))
+                    different = service.resolve_generated_skill_candidate(skills[1], adapter)
+                    self.assertEqual(expected[1]["candidate_id"], different["candidate_id"])
+                    self.assertEqual(source, different["source_cases"])
+                    self.assertEqual("proposed", different["state"])
+                    self.assertEqual(before, self.case.state.get_effect_operation(operation_id))
+                    if status != "confirmed":
+                        self.assertIn(operation_id, {
+                            effect["operation_id"] for effect in
+                            self.case.state.list_effect_operations(
+                                outcome["outcome_id"], actionable_only=True
+                            )
+                        })
+                    old = service.resolve_generated_skill_candidate(skills[0], adapter)
+                else:
+                    old = service.resolve_generated_skill_candidate(skills[0], adapter)
+                    different = service.resolve_generated_skill_candidate(skills[1], adapter)
+                self.assertEqual(expected[0]["candidate_id"], old["candidate_id"])
+                self.assertEqual(expected[1]["candidate_id"], different["candidate_id"])
+                self.assertEqual(old, service.resolve_generated_skill_candidate(skills[0], adapter))
+                self.assertEqual(different, service.resolve_generated_skill_candidate(
+                    skills[1], adapter
+                ))
+                after = self.case.state.get_effect_operation(operation_id)
+                self.assertEqual("confirmed", after["status"])
+                self.assertEqual(before["operation_id"], after["operation_id"])
+                self.assertEqual(before["payload_record"] if status != "umbrella" else
+                                 {"source_trajectory_id": trajectory["trajectory_id"]},
+                                 after["payload_record"])
+                self.assertEqual(
+                    {"candidate_id": old["candidate_id"]} if status != "umbrella" else
+                    after["payload_record"], after["acknowledgement"]
+                )
+                self.assertEqual(1, len([
+                    effect for effect in self.case.state.list_effect_operations(outcome["outcome_id"])
+                    if effect["kind"] == "generated_skill_creation"
+                ]))
+                self.assertEqual(original_outcome, self.case.state.get_outcome(
+                    outcome["decision_id"]
+                ))
+
 
 if __name__ == "__main__":
     unittest.main()
