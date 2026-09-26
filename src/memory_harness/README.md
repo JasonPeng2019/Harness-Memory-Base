@@ -1,5 +1,53 @@
 ﻿# memory_harness
 
+## Isolated SQLite snapshot and restore
+
+`snapshot.SnapshotService` captures one initialized `MemoryStore` into a new
+artifact directory and restores it into a closed `MemoryStore` at a nonexistent
+path. Supply a fixed operator authorizer at construction; it receives
+`(action, exact_scope, store_path, credential)` and must return literal `True`.
+The four scope fields are `application`, `project`, `namespace`, and `owner`.
+Per-call credentials are inputs to this fixed authorizer, never replacement
+authority. An absent, rejecting, or throwing authorizer fails closed.
+
+```python
+from memory_harness.snapshot import SnapshotService
+from memory_harness.store import MemoryStore
+
+service = SnapshotService(authorizer=operator_authorizer)
+scope = {"application": "harness", "project": "product",
+         "namespace": "isolated", "owner": "root-agent"}
+source = MemoryStore("source/memory.sqlite3")
+source.initialize()
+manifest = service.export(source, "capture", scope=scope, credential=operator_credential)
+target = MemoryStore("fresh/memory.sqlite3")  # closed; file does not exist
+service.restore("capture", target, scope=scope, credential=operator_credential)
+target.initialize()
+```
+
+The published `capture/` directory contains `state.sqlite3` and
+`manifest.json` (`snapshot/v1`). The manifest binds the exact source root,
+path, scope, capture time, store format and schema digest, database SHA-256,
+its own canonical content hash, completeness, dependency references/readiness,
+and pending dispatch/effect/remote-operation statuses. The whole SQLite store
+is backed up; no domain IDs, configuration digests, or operation statuses are
+remapped. A failed capture leaves no published artifact. Restore checks all
+integrity and compatibility facts before installing into a fresh path and
+never merges, overwrites, or replays work. Reopen the restored store, then use
+the existing STEP-09/10 exact reconciliation paths for pending or uncertain
+remote effects. A preflight failure leaves the source and target file intact.
+
+`export(..., dependencies=[{"capability": "atlas", "reference": "..."}])`
+adds source-specific references. Protected review references and known EverOS
+and Atlas operation references are discovered from the backup. They default to
+unready. A constructor-bound `dependency_verifier(capability, reference,
+exact_scope)` may attest them; it is called at export and again at restore.
+`restore(..., required_capabilities=("local", "atlas"))` refuses an unready
+requested capability. Unresolved dependencies make the overall manifest
+`incomplete`; local-only restore may still proceed. SQLite capture does not
+prove simultaneous remote state or protected-source availability. Lane 2 must
+bind real operator authority; lanes 3 and 4 must supply their dependency proof.
+
 `memory_harness` is the Stage-A Python package for deterministic memory- and
 plan-reuse contracts.  It provides:
 
