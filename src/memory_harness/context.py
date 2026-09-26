@@ -116,6 +116,16 @@ def _plan_depends_on(
     source = plan.get("source")
     if not isinstance(source, Mapping):
         return False
+    dependencies = source.get("dependencies")
+    if isinstance(dependencies, (list, tuple)) and any(
+        isinstance(dependency, Mapping) and _source_matches(dependency, item)
+        for dependency in dependencies
+    ):
+        return True
+    return _source_matches(source, item)
+
+
+def _source_matches(source: Mapping[str, Any], item: Mapping[str, Any]) -> bool:
     if source.get("candidate_id") == item.get("id"):
         return True
     logical_id = item.get("logical_id")
@@ -130,6 +140,63 @@ def _plan_depends_on(
         or (source.get("template_id") == logical_id and source.get("template_version") == revision_id)
         or (source.get("procedure_id") == logical_id and source.get("procedure_revision_id") == revision_id)
     ))
+
+
+def _checked_procedure_guidance(
+    item: Mapping[str, Any], selected_item: Mapping[str, Any],
+    *, recheck: Mapping[str, Any] | None,
+    source_owner_recheck: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Project approved behavior only after an exact selected-source recheck.
+
+    The complete approval and source controls stay in the search trace. The
+    worker receives the approved behavior and exact nonsecret identities, with
+    the original payload digest retained as final-recheck provenance.
+    """
+
+    if (source_owner_recheck is None or recheck is None
+            or recheck.get("status") != "eligible" or item.get("kind") != "procedure"):
+        return None
+    source_id = selected_item.get("source_id")
+    content = item.get("content")
+    if not isinstance(content, Mapping):
+        return None
+    source_kind = None
+    if (source_id == "everos-generated-skills"
+            and isinstance(content.get("source"), Mapping)
+            and content["source"].get("kind") == "generated_skill"):
+        source_kind = "everos_generated_skill"
+    elif (source_id == "atlas-shared-procedures"
+          and content.get("authority") == "atlas_trusted_procedure"):
+        source_kind = "atlas_trusted_procedure"
+    if source_kind is None:
+        return None
+    procedure = content.get("procedure")
+    approval = content.get("approval")
+    if not isinstance(procedure, Mapping) or not isinstance(approval, Mapping):
+        return None
+    try:
+        contracts.validate_procedure_approval(approval, procedure=procedure)
+    except contracts.ContractError:
+        return None
+    if (procedure["logical_id"] != selected_item.get("logical_id")
+            or procedure["revision_id"] != selected_item.get("revision_id")
+            or procedure["revision_id"] != item.get("revision_id")
+            or content.get("logical_id") != procedure["logical_id"]
+            or content.get("revision_id") != procedure["revision_id"]
+            or content.get("recipient") != selected_item.get("scope")):
+        return None
+    behavior = procedure["behavior"]
+    return {
+        "source_kind": source_kind,
+        "logical_id": procedure["logical_id"],
+        "revision_id": procedure["revision_id"],
+        "procedure_digest": procedure["content_hash"],
+        "approval_digest": approval["content_hash"],
+        "recipient": dict(content["recipient"]),
+        "body": behavior["body"],
+        "references": [dict(reference) for reference in behavior["references"]],
+    }
 
 
 def finalize_context(
@@ -213,6 +280,13 @@ def finalize_context(
         ):
             raise OptionalItemError("selected provenance conflicts with rendered optional content")
         selected_item = {**item, **source}
+        # A caller cannot claim the post-recheck guidance representation. Only
+        # the validated projection below may introduce these fields.
+        if item.get("delivery_representation") == "guidance":
+            item.pop("delivery_representation", None)
+            item.pop("full_content_digest", None)
+            selected_item.pop("delivery_representation", None)
+            selected_item.pop("full_content_digest", None)
         # These raw fields can identify a candidate, but cannot authorize a
         # frozen readback, compact approval, or plan dependency.
         for claim in ("frozen_contract", "compact_representation", "compact_approval", "plan_affecting", "source_owner_approval_digest", "source_owner_compact_approval_digest"):
@@ -355,6 +429,21 @@ def finalize_context(
                 )
             omissions.append({**descriptor, "reason": f"final recheck: {status}" if recheck is not None else "not fresh"})
             continue
+        guidance = _checked_procedure_guidance(
+            item, selected_item, recheck=recheck,
+            source_owner_recheck=source_owner_recheck,
+        )
+        if guidance is not None:
+            original_digest = contracts.sha256_hex(item["content"])
+            item["content"] = guidance
+            item["source_id"] = selected_item["source_id"]
+            item["delivery_representation"] = "guidance"
+            item["full_content_digest"] = original_digest
+            selected_item["delivery_representation"] = "guidance"
+            selected_item["full_content_digest"] = original_digest
+            descriptor = contracts._optional_descriptor(selected_item)
+            selected[slot] = descriptor
+            selected_by_id[item_id] = descriptor
         if worker_bound_finding(item, item_policy):
             if affects_plan:
                 raise PlanAffectingFreshnessError("plan-dependent optional content contains prohibited worker-bound meaning; ROOT must replan")

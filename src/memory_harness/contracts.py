@@ -331,12 +331,17 @@ def _validate_delivery_trace(
         raise ContractError("finalized delivery selected partition is duplicated")
     for item in packed:
         selected_item = selected_by_id[item["id"]]
-        if item["content_digest"] != selected_item["content_digest"] or any(
+        guidance = item["provenance"].get("delivery_representation") == "guidance"
+        if ((not guidance and item["content_digest"] != selected_item["content_digest"])
+                or (guidance and item["provenance"].get("full_content_digest")
+                    != selected_item["content_digest"]) or any(
             key not in selected_item["provenance"] or selected_item["provenance"][key] != value
             for key, value in item["provenance"].items()
-        ):
+        )):
             raise ContractError("finalized delivery selected/packed provenance mismatch")
         recheck = item["provenance"].get("final_recheck")
+        if guidance and recheck is None:
+            raise ContractError("procedure guidance requires an exact source recheck")
         if recheck is not None:
             validate_final_source_recheck(recheck)
             if recheck["item_id"] != item["id"] or recheck["status"] not in {"eligible", "frozen"}:
@@ -345,9 +350,11 @@ def _validate_delivery_trace(
                     or recheck["revision_id"] != item["provenance"].get("revision_id")):
                 raise ContractError("finalized delivery recheck source identity mismatch")
             if (item["provenance"].get("kind") != "historical_evidence"
-                    and item["provenance"].get("delivery_representation") != "compact"
+                    and item["provenance"].get("delivery_representation") not in {"compact", "guidance"}
                     and recheck["content_digest"] != item["content_digest"]):
                 raise ContractError("finalized delivery content differs from rechecked source")
+            if guidance and recheck["content_digest"] != selected_item["content_digest"]:
+                raise ContractError("procedure guidance lacks rechecked full content binding")
             frozen = item["provenance"].get("frozen_contract")
             if (recheck["status"] == "frozen" or item["provenance"].get("freshness") == "frozen") and (
                 recheck["status"] != "frozen"
@@ -4225,6 +4232,29 @@ def validate_finalized_context(record: Mapping[str, Any]) -> None:
             if (item.get("full_procedure_digest") != representation["procedure_digest"]
                     or item.get("full_approval_digest") != approval["full_approval_digest"]):
                 raise ContractError("compact procedure approval does not bind the full revision")
+        if item.get("delivery_representation") == "guidance":
+            content = item.get("content")
+            recheck = selected_provenance.get("final_recheck")
+            if (item.get("kind") != "procedure" or not isinstance(content, Mapping)
+                    or set(content) != {"source_kind", "logical_id", "revision_id",
+                                        "procedure_digest", "approval_digest", "recipient",
+                                        "body", "references"}
+                    or content.get("source_kind") not in {
+                        "everos_generated_skill", "atlas_trusted_procedure"
+                    }
+                    or content.get("logical_id") != selected_provenance.get("logical_id")
+                    or content.get("revision_id") != selected_provenance.get("revision_id")
+                    or content.get("recipient") != selected_provenance.get("scope")
+                    or not isinstance(content.get("body"), str) or not content["body"]
+                    or not isinstance(content.get("references"), list)
+                    or not isinstance(recheck, Mapping) or recheck.get("status") != "eligible"
+                    or item.get("full_content_digest") != recheck.get("content_digest")):
+                raise ContractError("procedure guidance does not bind its rechecked source")
+            for field in ("procedure_digest", "approval_digest"):
+                value = content.get(field)
+                if (not isinstance(value, str) or len(value) != 64
+                        or any(char not in "0123456789abcdef" for char in value)):
+                    raise ContractError("procedure guidance digest is invalid")
     if record["integrity"] != _final_context_integrity(record):
         raise ContractError("finalized context integrity mismatch")
     if record["context_id"] != _final_context_id(record):
