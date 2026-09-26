@@ -74,6 +74,7 @@ def accepted_card(*, task: str = "Fix the regression and verify it",
         route="ordinary",
         plan=plan,
         configuration=configuration,
+        checkpoint="checkpoint-1",
     )
     card = contracts.make_task_card(
         task=task,
@@ -1266,6 +1267,35 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
             self.assertTrue(retry["ok"], retry)
             second_spawn.assert_not_called()
 
+    def test_launch_passes_exact_supersession_id_before_native_spawn(self) -> None:
+        self.fixture.write_lane_fields("launch-lane", native_supersession={
+            "rejected_attempt_id": "domain-returned-id",
+        })
+
+        def inspect_intent(**kwargs: object) -> None:
+            self.assertEqual("domain-returned-id", kwargs["supersedes_rejected_attempt_id"])
+            raise memory_handoff.MemoryHandoffError("intent blocked for inspection")
+
+        with (
+            patch.object(memory_handoff, "supersession_id_for_launch", return_value="domain-returned-id"),
+            patch.object(memory_handoff, "record_dispatch_intent", side_effect=inspect_intent),
+        ):
+            result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"])
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, result["code"])
+        spawn.assert_not_called()
+
+    def test_forged_supersession_id_blocks_launch_before_spawn(self) -> None:
+        self.fixture.write_lane_fields("launch-lane", native_supersession={
+            "rejected_attempt_id": "forged",
+            "run_id": "prior-run", "decision_id": self.envelope["decision_id"],
+            "operation_id": "prior-operation", "evidence_digest": "prior-evidence",
+        })
+        result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"])
+        self.assertEqual(launch.LAUNCH_DISPATCH_AMBIGUOUS, result["code"])
+        spawn.assert_not_called()
+
     def test_delivered_observation_survives_later_lane_write_failure(self) -> None:
         with patch.object(launch, "update_lane", side_effect=OSError("lane write failed")):
             first, spawn = self.fixture.run_launch(lane_id="launch-lane")
@@ -1281,7 +1311,7 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
         self.assertTrue(retry["ok"], retry)
         second_spawn.assert_not_called()
 
-    def test_attested_pre_provider_failure_is_preserved_on_exact_retry(self) -> None:
+    def test_attested_pre_provider_failure_exact_retry_blocks_unreviewed_new_run(self) -> None:
         lane = self.fixture.lane_record("launch-lane")
         controller._append_event(lane, "lease_busy", "resource is held")
         status = {
@@ -1314,8 +1344,9 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
         self.assertEqual(self.envelope["run_id"], self.fixture.lane_record("launch-lane")["run_id"])
         with patch.object(processes, "identity_matches", return_value=False):
             recovered = self.fixture.run_resume(lane_id="launch-lane", card=self.card)
-        self.assertTrue(recovered["ok"], recovered)
-        self.assertNotEqual(self.envelope["run_id"], self.fixture.lane_record("launch-lane")["run_id"])
+        self.assertFalse(recovered["ok"], recovered)
+        self.assertIn("ROOT-rejected review", recovered["summary"])
+        self.assertEqual(self.envelope["run_id"], self.fixture.lane_record("launch-lane")["run_id"])
 
     def test_delivered_controller_without_provider_outcome_stays_ambiguous(self) -> None:
         status = {
@@ -1407,7 +1438,8 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
             base_commit=self.card["base_commit"],
             branch=self.card["branch"],
             memory_handoff=contracts.make_memory_handoff(
-                objective_id=self.plan["objective_id"], route=self.plan["route"], plan=revised
+                objective_id=self.plan["objective_id"], route=self.plan["route"], plan=revised,
+                checkpoint=self.card["memory_handoff"]["checkpoint"],
             ),
         )
         self.fixture.write_json(self.worktree / ".agent-workspace" / "task-card.json", card)
@@ -1694,7 +1726,8 @@ class Step04ResumeBoundaryTests(unittest.TestCase):
             base_commit=card["base_commit"],
             branch=card["branch"],
             memory_handoff=contracts.make_memory_handoff(
-                objective_id=plan["objective_id"], route=plan["route"], plan=revised
+                objective_id=plan["objective_id"], route=plan["route"], plan=revised,
+                checkpoint=card["memory_handoff"]["checkpoint"],
             ),
         )
         resumed = self.fixture.run_resume(

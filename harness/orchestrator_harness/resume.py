@@ -335,6 +335,7 @@ def run_resume(
             worktree_path=worktree,
             base_commit=str(task_card.get("base_commit") or "HEAD"),
         )
+        supersession = None
         if current_memory_state == "execution_accepted":
             prior_envelope = memory_handoff.load_envelope(worktree)
             assert prior_envelope is not None
@@ -374,6 +375,37 @@ def run_resume(
                 raise memory_handoff.MemoryHandoffError(
                     "prior dispatch was reconciled; review its native lifecycle before resume"
                 )
+            if prior_operation is not None and prior_operation["status"] == "delivered":
+                retained = terminal_evidence.read_terminal_evidence(
+                    rt, epoch_id, lane_id, run_id=prior_run_id,
+                )
+                if retained is None or retained["acceptance"]["approval"] != "REJECTED":
+                    raise memory_handoff.MemoryHandoffError(
+                        "delivered native run has no exact ROOT-rejected review for correction"
+                    )
+                authorization = terminal_evidence.record_domain_review(
+                    rt, epoch_id, lane, retained,
+                )
+                assert authorization is not None
+                if (authorization["operation_id"] != prior_operation["operation_id"]
+                        or authorization["decision_id"] != prior_envelope["decision_id"]):
+                    raise memory_handoff.MemoryHandoffError(
+                        "rejected native attempt differs from the prior dispatch"
+                    )
+                supersession = {
+                    field: authorization[field] for field in (
+                        "rejected_attempt_id", "run_id", "decision_id", "operation_id", "evidence_digest",
+                    )
+                }
+            elif lane.get("native_supersession") is not None:
+                if prior_operation is not None and prior_operation["status"] != "failed_pre_spawn":
+                    raise memory_handoff.MemoryHandoffError(
+                        "native supersession belongs to an unresolved prior dispatch"
+                    )
+                memory_handoff.supersession_id_for_launch(
+                    worktree_path=worktree, lane=lane, envelope=prior_envelope,
+                )
+                supersession = dict(lane["native_supersession"])
             if not isinstance(session_id, str) or not session_id:
                 from . import launch
 
@@ -477,10 +509,11 @@ def run_resume(
                     "lane run or status changed before resume mutation"
                 )
             return {
-                **current,
+                **{key: value for key, value in current.items() if key != "native_supersession"},
                 "lifecycle": "resuming",
                 "resume_started_at": iso_utc(),
                 "resume_from_run_id": prior_run_id,
+                **({"native_supersession": supersession} if supersession is not None else {}),
             }
 
         update_lane(

@@ -33,32 +33,6 @@ class PendingPlanError(MemoryHandoffError):
     """
 
 
-_FINAL_CONTEXT_FIELDS = (
-    "plan_revision",
-    "plan_integrity",
-    "execution_role",
-    "invocation_target",
-    "recipient",
-    "recipient_authorization",
-    "rendered_context",
-    "delivery_trace",
-)
-_HANDOFF_FIELDS = (
-    "task",
-    "plan_revision",
-    "plan_integrity",
-    "context_id",
-    "context_integrity",
-    "context_digest",
-    "execution_role",
-    "invocation_target",
-    "recipient",
-    "recipient_authorization",
-    "rendered_context",
-    "delivery_trace",
-)
-
-
 def _memory_module(name: str):
     """Import one ``memory_harness`` module for the enhanced path only.
 
@@ -228,6 +202,23 @@ def require_accepted_handoff(task_card: Mapping[str, Any]) -> dict[str, Any]:
     return plan
 
 
+def _accepted_checkpoint(task_card: Mapping[str, Any]) -> str:
+    """Read the canonical pre-bootstrap checkpoint from ROOT's bound handoff."""
+
+    handoff = validate_task_card(task_card)
+    if handoff is None or handoff["plan_state"] != "execution_accepted":
+        raise MemoryHandoffError("the task card has no accepted checkpoint source")
+    try:
+        return _memory_module("contracts")._require_canonical_identity(
+            handoff.get("checkpoint"), "handoff checkpoint"
+        )
+    except Exception as exc:
+        raise MemoryHandoffError(
+            "accepted memory finalization requires an authoritative canonical "
+            "checkpoint in the bound task handoff"
+        ) from exc
+
+
 def plan_state_summary(plan_state: str) -> str:
     """Return the operator-facing meaning of one enhanced plan state."""
 
@@ -251,154 +242,17 @@ def _write_envelope(worktree: str | Path, envelope: Mapping[str, Any]) -> Path:
     return envelope_path
 
 
-def _final_context_handoff_fields(
-    context: Mapping[str, Any],
-    envelope: Mapping[str, Any],
-    task_card: Mapping[str, Any],
-    plan: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Project only domain-finalized, recipient-ready meaning into the lane envelope.
-
-    The cc5b4f2 domain finalizer predates these STEP-06 fields. Its existing
-    envelope keeps the inherited seam until lane 1 joins. A partially upgraded
-    finalized record is unsafe and never gets that compatibility path.
-    """
-
-    if not any(field in context for field in _FINAL_CONTEXT_FIELDS):
-        if any(field in envelope for field in _HANDOFF_FIELDS):
-            raise MemoryHandoffError(
-                "dispatch envelope claims final-context fields absent from the domain record"
-            )
-        return None
-    missing = [
-        field
-        for field in (*_FINAL_CONTEXT_FIELDS, "context_id", "integrity", "content_hash")
-        if field not in context
-    ]
-    if missing:
-        raise MemoryHandoffError(
-            f"finalized context is missing handoff fields: {', '.join(missing)}"
-        )
-    if context.get("content_hash") != content_hash(dict(context)):
-        raise MemoryHandoffError("finalized context payload integrity changed")
-    if context["plan_revision"] != plan["revision"]:
-        raise MemoryHandoffError("finalized context plan revision changed")
-    if context["plan_integrity"] != plan["content_hash"]:
-        raise MemoryHandoffError("finalized context plan integrity changed")
-    for field in ("execution_role", "invocation_target", "recipient"):
-        if not isinstance(context[field], str) or not context[field].strip():
-            raise MemoryHandoffError(f"finalized context {field} is missing")
-    if context["execution_role"] != "worker":
-        raise MemoryHandoffError("finalized context execution role is not the lane worker")
-    if context["invocation_target"] != "orchestrator_harness.controller":
-        raise MemoryHandoffError("finalized context invocation target changed")
-    if context["recipient"] != f"worker:{envelope['lane_id']}":
-        raise MemoryHandoffError("finalized context recipient does not match the lane")
-    authorization = context["recipient_authorization"]
-    if (
-        not isinstance(authorization, Mapping)
-        or authorization.get("recipient") != context["recipient"]
-        or authorization.get("authorized") is not True
-        or authorization.get("sanitized") is not True
-    ):
-        raise MemoryHandoffError(
-            "finalized context lacks sanitized recipient authorization"
-        )
-    if context.get("freshness", {}).get("state") != "current":
-        raise MemoryHandoffError("finalized context is stale or revoked")
-    if context.get("configuration") != envelope.get("configuration"):
-        raise MemoryHandoffError("finalized context captured configuration changed")
-
-    mandatory = envelope.get("mandatory_content")
-    optional = envelope.get("optional_content")
-    if not isinstance(mandatory, list) or not isinstance(optional, list):
-        raise MemoryHandoffError("finalized envelope has no rendered content lists")
-    content_ids = [item["id"] for item in mandatory + optional]
-    if len(content_ids) != len(set(content_ids)):
-        raise MemoryHandoffError("finalized context has duplicate rendered identities")
-    by_id = {item.get("id"): item.get("content") for item in mandatory if isinstance(item, Mapping)}
-    required = {
-        "task": task_card["task"],
-        "accepted-plan": plan["content"],
-        "base": task_card["base_commit"],
-        "route": plan["route"],
-    }
-    for identifier, value in required.items():
-        if by_id.get(identifier) != value:
-            raise MemoryHandoffError(
-                f"finalized context mandatory {identifier} meaning changed or is missing"
-            )
-    if not by_id.get("security"):
-        raise MemoryHandoffError("finalized context mandatory security meaning is missing")
-    rendered = context["rendered_context"]
-    if not isinstance(rendered, Mapping) or dict(rendered) != {
-        "mandatory": mandatory,
-        "optional": optional,
-    }:
-        raise MemoryHandoffError("finalized rendered context differs from the envelope")
-    trace = context["delivery_trace"]
-    if not isinstance(trace, Mapping):
-        raise MemoryHandoffError("finalized context delivery trace is missing")
-    if set(trace) != {"selected", "packed", "omitted", "delivered"}:
-        raise MemoryHandoffError("finalized context delivery trace is incomplete")
-    if any(
-        not isinstance(trace[field], list)
-        or any(not isinstance(item, str) or not item for item in trace[field])
-        for field in ("selected", "packed", "omitted", "delivered")
-    ):
-        raise MemoryHandoffError("finalized context delivery trace has invalid identities")
-    if any(
-        len(trace[field]) != len(set(trace[field]))
-        for field in ("selected", "packed", "omitted", "delivered")
-    ):
-        raise MemoryHandoffError("finalized context delivery trace has duplicate identities")
-    packed = [item["id"] for item in optional]
-    if trace["packed"] != packed or trace["omitted"] != envelope["delivery"]["omitted"]:
-        raise MemoryHandoffError("finalized context packed or omitted trace changed")
-    if context.get("omitted") != trace["omitted"]:
-        raise MemoryHandoffError("finalized context omission evidence changed")
-    if set(packed) & set(trace["omitted"]):
-        raise MemoryHandoffError("finalized context marks an item both packed and omitted")
-    if trace["delivered"] != packed:
-        raise MemoryHandoffError("finalized context delivered trace differs from rendered optional items")
-    if not set(packed).issubset(trace["selected"]):
-        raise MemoryHandoffError("finalized context packed trace was not selected")
-    return {
-        "task": task_card["task"],
-        "plan_revision": context["plan_revision"],
-        "plan_integrity": context["plan_integrity"],
-        "context_id": context["context_id"],
-        "context_integrity": context["integrity"],
-        "context_digest": context["content_hash"],
-        "execution_role": context["execution_role"],
-        "invocation_target": context["invocation_target"],
-        "recipient": context["recipient"],
-        "recipient_authorization": {
-            "recipient": context["recipient"],
-            "authorized": True,
-            "sanitized": True,
-        },
-        "rendered_context": dict(rendered),
-        "delivery_trace": dict(trace),
-    }
-
-
 def _bind_final_context(
     envelope: Mapping[str, Any],
     context: Mapping[str, Any],
-    task_card: Mapping[str, Any],
-    plan: Mapping[str, Any],
 ) -> dict[str, Any]:
-    bound = dict(envelope)
-    fields = _final_context_handoff_fields(context, bound, task_card, plan)
-    if fields is None:
-        return bound
-    for field, value in fields.items():
-        if field in bound and bound[field] != value:
-            raise MemoryHandoffError(f"dispatch envelope {field} differs from finalized context")
-    bound.update(fields)
-    bound["content_hash"] = content_hash(bound)
-    return bound
+    """Keep Lane 1's canonical envelope and its embedded context intact."""
+
+    if envelope.get("schema") != _memory_module("contracts").FINAL_ENVELOPE_SCHEMA:
+        raise MemoryHandoffError("the accepted plan has no domain-finalized envelope")
+    if envelope.get("final_context") != context:
+        raise MemoryHandoffError("dispatch envelope differs from the durable finalized context")
+    return dict(envelope)
 
 
 def _record_bound_final_context(
@@ -444,6 +298,7 @@ def _prepare_memory_outcome(
     store = _memory_module("store")
 
     plan = handoff["plan"]
+    checkpoint = _accepted_checkpoint(task_card) if finalize else None
     mandatory_content = [
         {"id": "task", "kind": "task", "content": task_card["task"]},
     ]
@@ -455,6 +310,13 @@ def _prepare_memory_outcome(
                 "content": plan["content"],
             }
         )
+    if finalize:
+        mandatory_content.extend([
+            {"id": "base", "kind": "base", "content": base_commit},
+            {"id": "route", "kind": "route", "content": handoff["route"]},
+            {"id": "checkpoint", "kind": "checkpoint", "content": checkpoint},
+            {"id": "security", "kind": "security", "content": _memory_module("contracts").FINAL_CONTEXT_SECURITY},
+        ])
     store_path, _ = memory_paths(worktree_path)
     memory_store = store.MemoryStore(store_path)
     memory_store.initialize()
@@ -471,6 +333,10 @@ def _prepare_memory_outcome(
             worktree_path=str(worktree_path),
             base_commit=base_commit,
             mandatory_content=mandatory_content,
+            checkpoint=checkpoint,
+            execution_role="worker" if finalize else None,
+            invocation_target="orchestrator_harness.controller" if finalize else None,
+            recipient=f"worker:{lane_id}" if finalize else None,
             finalize=finalize,
         )
     finally:
@@ -561,8 +427,6 @@ def prepare_lane_memory(
         envelope = _bind_final_context(
             outcome.envelope,
             outcome.context,
-            task_card,
-            require_accepted_handoff(task_card),
         )
         validate_envelope_for_launch(
             envelope=envelope,
@@ -765,14 +629,11 @@ def validate_final_context_for_launch(
             run_id=run_id,
             base_commit=base_commit,
             worktree_path=str(worktree_path),
+            checkpoint=_accepted_checkpoint(task_card),
+            execution_role="worker",
+            invocation_target="orchestrator_harness.controller",
+            recipient=f"worker:{lane_id}",
         )
-        fields = _final_context_handoff_fields(context, envelope, task_card, plan)
-        if fields is not None:
-            for field, value in fields.items():
-                if envelope.get(field) != value:
-                    raise MemoryHandoffError(
-                        f"dispatch envelope {field} differs from the durable finalized context"
-                    )
     except PendingPlanError:
         raise
     except MemoryHandoffError:
@@ -812,6 +673,7 @@ def validate_envelope_for_launch(
         from memory_harness import contracts
 
         plan = require_accepted_handoff(task_card)
+        checkpoint = _accepted_checkpoint(task_card)
         if envelope.get("observed_invocation") is not None:
             raise MemoryHandoffError("finalized envelope cannot claim an observed launch")
         contracts.validate_envelope(
@@ -822,16 +684,14 @@ def validate_envelope_for_launch(
             run_id=run_id,
             base_commit=base_commit,
             worktree_path=str(worktree_path),
+            require_final_context=True,
         )
-        if any(field in envelope for field in _HANDOFF_FIELDS):
-            if any(field not in envelope for field in _HANDOFF_FIELDS):
-                raise MemoryHandoffError("dispatch envelope final-context identity is incomplete")
-            if envelope["task"] != task_card["task"]:
-                raise MemoryHandoffError("dispatch envelope task changed")
-            if envelope["plan_revision"] != plan["revision"]:
-                raise MemoryHandoffError("dispatch envelope plan revision changed")
-            if envelope["plan_integrity"] != plan["content_hash"]:
-                raise MemoryHandoffError("dispatch envelope plan integrity changed")
+        if envelope.get("checkpoint") != checkpoint:
+            raise MemoryHandoffError("dispatch envelope checkpoint changed from the bound task handoff")
+        if envelope.get("invocation_target") != "orchestrator_harness.controller":
+            raise MemoryHandoffError("dispatch envelope invocation target changed")
+        if envelope.get("recipient") != f"worker:{lane_id}":
+            raise MemoryHandoffError("dispatch envelope recipient does not match the lane")
     except PendingPlanError:
         raise
     except MemoryHandoffError:
@@ -1103,7 +963,8 @@ def dispatch(
 
 
 def record_dispatch_intent(
-    *, worktree_path: str | Path, envelope: Mapping[str, Any]
+    *, worktree_path: str | Path, envelope: Mapping[str, Any],
+    supersedes_rejected_attempt_id: str | None = None,
 ) -> dict[str, Any]:
     """Record the exact dispatch intent before the existing launcher runs."""
 
@@ -1114,7 +975,9 @@ def record_dispatch_intent(
             raise MemoryHandoffError(
                 f"{existing['status']} dispatch intent already exists; reconcile exact native ownership"
             )
-        intent = memory_runtime.record_dispatch_intent(envelope)
+        intent = memory_runtime.record_dispatch_intent(
+            envelope, supersedes_rejected_attempt_id=supersedes_rejected_attempt_id,
+        )
         confirmed = _dispatch_operation(memory_store, envelope)
         if confirmed is None or confirmed["operation_id"] != intent["operation_id"] or confirmed["status"] != "pending":
             raise MemoryHandoffError("dispatch intent was not durably confirmed")
@@ -1125,6 +988,61 @@ def record_dispatch_intent(
         raise MemoryHandoffError(f"cannot record dispatch intent: {exc}") from exc
     finally:
         memory_store.close()
+
+
+def record_native_review(
+    *, worktree_path: str | Path, evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Submit the complete retained native bundle to the domain transaction."""
+
+    memory_store, memory_runtime = _open_runtime(worktree_path)
+    try:
+        if evidence["acceptance"]["approval"] == "REJECTED":
+            return memory_runtime.record_rejected_native_attempt(evidence)
+        return memory_runtime.record_terminal_outcome(evidence)
+    except Exception as exc:
+        raise MemoryHandoffError(f"cannot record native review: {exc}") from exc
+    finally:
+        memory_store.close()
+
+
+def get_rejected_native_attempt(
+    *, worktree_path: str | Path, rejected_attempt_id: str,
+) -> dict[str, Any]:
+    """Read the domain's exact rejected attempt for handoff verification."""
+    memory_store, _ = _open_runtime(worktree_path)
+    try:
+        return memory_store.get_rejected_native_attempt(rejected_attempt_id)
+    except Exception as exc:
+        raise MemoryHandoffError(f"cannot read rejected native attempt: {exc}") from exc
+    finally:
+        memory_store.close()
+
+
+def supersession_id_for_launch(
+    *, worktree_path: str | Path, lane: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+) -> str | None:
+    """Verify lane-owned provenance and return only the domain-issued ID."""
+    handoff = lane.get("native_supersession")
+    if handoff is None:
+        return None
+    if not isinstance(handoff, Mapping) or set(handoff) != {
+        "rejected_attempt_id", "run_id", "decision_id", "operation_id", "evidence_digest",
+    }:
+        raise MemoryHandoffError("native supersession handoff is malformed")
+    rejected_id = handoff["rejected_attempt_id"]
+    if not isinstance(rejected_id, str) or not rejected_id:
+        raise MemoryHandoffError("native supersession has no returned rejected attempt ID")
+    attempt = get_rejected_native_attempt(
+        worktree_path=worktree_path, rejected_attempt_id=rejected_id,
+    )
+    for field in ("rejected_attempt_id", "run_id", "decision_id", "operation_id", "evidence_digest"):
+        if attempt.get(field) != handoff[field]:
+            raise MemoryHandoffError(f"native supersession {field} differs from domain authority")
+    if attempt["decision_id"] != envelope["decision_id"] or attempt["run_id"] == envelope["run_id"]:
+        raise MemoryHandoffError("native supersession is for a different decision or run")
+    return rejected_id
 
 
 def _dispatch_operation(memory_store: Any, envelope: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1313,8 +1231,9 @@ def omit_optional_content(
     """Omit legacy optional content; enriched finalization owns its own trace."""
 
     persisted = load_envelope(worktree_path)
-    if any(field in envelope for field in _HANDOFF_FIELDS) or (
-        persisted is not None and any(field in persisted for field in _HANDOFF_FIELDS)
+    final_schema = _memory_module("contracts").FINAL_ENVELOPE_SCHEMA
+    if envelope.get("schema") == final_schema or (
+        persisted is not None and persisted.get("schema") == final_schema
     ):
         raise MemoryHandoffError(
             "final freshness omission for enriched context must run through the "
@@ -1342,6 +1261,7 @@ __all__ = [
     "handoff_plan",
     "handoff_plan_state",
     "get_dispatch_operation",
+    "get_rejected_native_attempt",
     "lane_handoff_state",
     "prepare_lane_memory",
     "load_envelope",
@@ -1354,6 +1274,8 @@ __all__ = [
     "prepare_resume_envelope",
     "record_ambiguous_dispatch",
     "record_dispatch_intent",
+    "record_native_review",
+    "supersession_id_for_launch",
     "record_observed_invocation",
     "redact_control_diagnostic",
     "require_accepted_handoff",

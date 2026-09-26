@@ -15,10 +15,12 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from orchestrator_harness import bootstrap, memory_handoff
-from memory_harness import contracts, runtime, store
+from memory_harness import context, contracts, runtime, store
 
 
-def _task_card(configuration: dict | None = None) -> tuple[dict, dict]:
+def _task_card(
+    configuration: dict | None = None, *, checkpoint: str | None = "checkpoint-1"
+) -> tuple[dict, dict]:
     plan = contracts.make_plan(
         plan_id="plan-1",
         objective_id="objective-1",
@@ -32,6 +34,7 @@ def _task_card(configuration: dict | None = None) -> tuple[dict, dict]:
         route="ordinary",
         plan=plan,
         configuration=configuration,
+        checkpoint=checkpoint,
     )
     card = contracts.make_task_card(
         task="Fix the regression and verify it",
@@ -42,82 +45,43 @@ def _task_card(configuration: dict | None = None) -> tuple[dict, dict]:
     return card, plan
 
 
-def _finalized_lane1_fixture(card: dict, plan: dict, worktree: Path) -> SimpleNamespace:
-    """Deterministic STEP-06-1 record shape until the lane-1 join is available."""
+def _finalized_lane1_fixture(
+    card: dict, plan: dict, worktree: Path, *, run_id: str = "run-1"
+) -> SimpleNamespace:
+    """A real Lane 1 finalized record for the explicit test dispatch target."""
 
     configuration = {"strategy": "standard"}
     decision_id = contracts.make_decision(card, plan)["decision_id"]
     mandatory = [
         {"id": "task", "kind": "task", "content": card["task"]},
         {"id": "accepted-plan", "kind": "accepted-plan", "content": plan["content"]},
-        {"id": "base", "kind": "repository-base", "content": card["base_commit"]},
+        {"id": "base", "kind": "base", "content": card["base_commit"]},
         {"id": "route", "kind": "route", "content": plan["route"]},
-        {"id": "security", "kind": "trusted-security", "content": {"worker_environment": "scrubbed"}},
+        {"id": "checkpoint", "kind": "checkpoint", "content": card["memory_handoff"]["checkpoint"]},
+        {"id": "security", "kind": "security", "content": contracts.FINAL_CONTEXT_SECURITY},
     ]
     optional = [
         {"id": "case-1", "kind": "experience", "origin": "reviewed", "content": "prior failure"}
     ]
     omitted = ["case-2"]
-    envelope = contracts.make_envelope(
+    return context.finalize_context(
         task_card=card,
         plan=plan,
         decision_id=decision_id,
         lane_id="lane-1",
-        run_id="run-1",
+        run_id=run_id,
         worktree_path=str(worktree),
         base_commit=card["base_commit"],
-        mandatory_content=mandatory,
-        optional_content=optional,
-        omitted_content=omitted,
-        configuration=configuration,
-    )
-    context = contracts.make_finalized_context(
-        lane_id="lane-1",
-        run_id="run-1",
-        decision_id=decision_id,
-        task_card_digest=card["content_hash"],
-        objective_id=plan["objective_id"],
-        route=plan["route"],
-        plan_id=plan["plan_id"],
-        plan_digest=plan["content_hash"],
-        base_commit=card["base_commit"],
-        worktree_path=str(worktree),
         strategy="standard",
         configuration=configuration,
-        mandatory_items=mandatory,
-        optional_items=optional,
-        omitted=omitted,
-        role_separation={"experience": "evidence", "procedure": "approved-guidance"},
-        freshness={"state": "current"},
-        context_limit=10000,
-    )
-    context.update(
-        plan_revision=plan["revision"],
-        plan_integrity=plan["content_hash"],
+        checkpoint=card["memory_handoff"]["checkpoint"],
         execution_role="worker",
         invocation_target="orchestrator_harness.controller",
         recipient="worker:lane-1",
-        recipient_authorization={
-            "recipient": "worker:lane-1",
-            "authorized": True,
-            "sanitized": True,
-        },
-        rendered_context={"mandatory": mandatory, "optional": optional},
-        delivery_trace={
-            "selected": ["case-1", "case-2"],
-            "packed": ["case-1"],
-            "omitted": omitted,
-            "delivered": ["case-1"],
-        },
+        mandatory_content=mandatory,
+        optional_items=optional,
+        omitted=omitted,
     )
-    context["integrity"] = contracts.sha256_hex(
-        {key: value for key, value in context.items() if key not in {"integrity", "content_hash"}}
-    )
-    context["context_id"] = contracts.sha256_hex(
-        {"decision_id": decision_id, "integrity": context["integrity"]}
-    )
-    context["content_hash"] = contracts.content_hash(context)
-    return SimpleNamespace(envelope=envelope, context=context)
 
 
 def _record_domain_fixture(worktree: Path, outcome: SimpleNamespace) -> None:
@@ -158,6 +122,38 @@ class MemoryHandoffSeamTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_accepted_target_without_authoritative_checkpoint_fails_closed(self) -> None:
+        card, _ = _task_card(checkpoint=None)
+        with self.assertRaisesRegex(
+            memory_handoff.MemoryHandoffError, "authoritative canonical checkpoint"
+        ):
+            memory_handoff.prepare_bootstrap_envelope(
+                task_card=card, lane_id="lane-1", run_id="run-1",
+                worktree_path=self.worktree, base_commit="base-1",
+            )
+        store_path, envelope_path = memory_handoff.memory_paths(self.worktree)
+        self.assertFalse(store_path.exists())
+        self.assertFalse(envelope_path.exists())
+
+    def test_bound_checkpoint_reaches_normal_finalized_bootstrap(self) -> None:
+        card, _ = _task_card(checkpoint="root-checkpoint-42")
+        envelope = memory_handoff.prepare_bootstrap_envelope(
+            task_card=card, lane_id="lane-1", run_id="run-1",
+            worktree_path=self.worktree, base_commit="base-1",
+        )
+        self.assertEqual("root-checkpoint-42", envelope["checkpoint"])
+        self.assertEqual("root-checkpoint-42", envelope["final_context"]["checkpoint"])
+        self.assertEqual(
+            "root-checkpoint-42",
+            next(item["content"] for item in envelope["mandatory_content"]
+                 if item["id"] == "checkpoint"),
+        )
+        self.assertEqual(envelope, memory_handoff.load_envelope(self.worktree))
+        self.assertEqual(
+            envelope["final_context"],
+            memory_handoff.load_final_context(worktree_path=self.worktree, envelope=envelope),
+        )
 
     def test_legacy_task_card_has_no_memory_envelope(self) -> None:
         legacy = contracts.make_task_card(
@@ -302,49 +298,19 @@ class MemoryHandoffSeamTests(unittest.TestCase):
             )
 
     def test_bootstrap_rejects_a_final_context_for_another_base_before_writing(self) -> None:
-        decision_id = contracts.make_decision(self.card, self.plan)["decision_id"]
-        mandatory = [
-            {"id": "task", "kind": "task", "content": self.card["task"]},
-            {"id": "accepted-plan", "kind": "accepted-plan", "content": self.plan["content"]},
-        ]
-        configuration = {"strategy": "standard"}
-        envelope = contracts.make_envelope(
-            task_card=self.card,
-            plan=self.plan,
-            decision_id=decision_id,
-            lane_id="lane-1",
-            run_id="run-1",
-            worktree_path=str(self.worktree),
-            base_commit="base-1",
-            mandatory_content=mandatory,
-            configuration=configuration,
-        )
-        context = contracts.make_finalized_context(
-            lane_id="lane-1",
-            run_id="run-1",
-            decision_id=decision_id,
-            task_card_digest=self.card["content_hash"],
-            objective_id=self.plan["objective_id"],
-            route=self.plan["route"],
-            plan_id=self.plan["plan_id"],
-            plan_digest=self.plan["content_hash"],
+        wrong_card = contracts.make_task_card(
+            task=self.card["task"],
             base_commit="base-2",
-            worktree_path=str(self.worktree),
-            strategy="standard",
-            configuration=configuration,
-            mandatory_items=mandatory,
-            optional_items=[],
-            omitted=[],
-            role_separation={},
-            freshness={},
-            context_limit=10000,
+            branch=self.card["branch"],
+            memory_handoff=self.card["memory_handoff"],
         )
+        outcome = _finalized_lane1_fixture(wrong_card, self.plan, self.worktree)
         with patch.object(
             memory_handoff,
             "_prepare_memory_outcome",
-            return_value=SimpleNamespace(envelope=envelope, context=context),
+            return_value=outcome,
         ):
-            with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "finalized context"):
+            with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "task card|base"):
                 memory_handoff.prepare_bootstrap_envelope(
                     task_card=self.card,
                     lane_id="lane-1",
@@ -400,21 +366,23 @@ class MemoryHandoffSeamTests(unittest.TestCase):
             )
         self.assertEqual(self.card["task"], envelope["task"])
         self.assertEqual(self.plan["revision"], envelope["plan_revision"])
-        self.assertEqual(self.plan["content_hash"], envelope["plan_integrity"])
-        self.assertEqual(outcome.context["integrity"], envelope["context_integrity"])
-        self.assertEqual(outcome.context["context_id"], envelope["context_id"])
-        for field in ("execution_role", "invocation_target", "recipient", "recipient_authorization", "rendered_context", "delivery_trace"):
+        self.assertEqual(self.plan["content_hash"], envelope["plan_digest"])
+        self.assertEqual(outcome.context["integrity"], envelope["final_context_integrity"])
+        self.assertEqual(outcome.context["context_id"], envelope["final_context_id"])
+        self.assertEqual(outcome.context, envelope["final_context"])
+        for field in ("execution_role", "invocation_target", "recipient", "delivery_trace"):
             self.assertEqual(outcome.context[field], envelope[field], field)
-        self.assertEqual(["case-1", "case-2"], envelope["delivery_trace"]["selected"])
-        self.assertEqual(["case-1"], envelope["delivery_trace"]["packed"])
-        self.assertEqual(["case-2"], envelope["delivery_trace"]["omitted"])
-        self.assertEqual(["case-1"], envelope["delivery_trace"]["delivered"])
+        trace = envelope["delivery_trace"]
+        self.assertEqual(["case-2", "case-1"], [item["id"] for item in trace["selected"]])
+        self.assertEqual(["case-1"], [item["id"] for item in trace["packed"]])
+        self.assertEqual(["case-2"], [item["id"] for item in trace["omitted"]])
+        self.assertEqual(trace["packed"], trace["context_delivered"])
         self.assertNotIn("observed_invocation", envelope)
         self.assertEqual(envelope, memory_handoff.load_envelope(self.worktree))
         prompt_context = "\n".join(bootstrap._render_memory_context(self.worktree))
         self.assertIn("base-1", prompt_context)
         self.assertIn("ordinary", prompt_context)
-        self.assertIn("scrubbed", prompt_context)
+        self.assertIn("control_plane", prompt_context)
         self.assertIn("prior failure", prompt_context)
 
     def test_bound_envelope_relinks_the_durable_final_context_digest(self) -> None:
@@ -432,7 +400,7 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         stored_digest, stored_context = _stored_final_context(
             self.worktree, outcome.context["context_id"]
         )
-        self.assertNotEqual(outcome.envelope["content_hash"], written["content_hash"])
+        self.assertEqual(outcome.envelope["content_hash"], written["content_hash"])
         self.assertEqual(envelope["content_hash"], written["content_hash"])
         self.assertEqual(written["content_hash"], stored_digest)
         self.assertEqual(outcome.context, stored_context)
@@ -512,13 +480,13 @@ class MemoryHandoffSeamTests(unittest.TestCase):
 
     def test_enriched_handoff_rejects_revocation_and_wrong_execution_recipient(self) -> None:
         for change, expected in (
-            (lambda context: context["freshness"].update(state="revoked"), "stale or revoked"),
-            (lambda context: context.update(execution_role="reviewer"), "execution role"),
-            (lambda context: context.update(invocation_target="another.controller"), "invocation target"),
-            (lambda context: context.update(recipient="worker:another-lane"), "recipient does not match"),
+            (lambda context: context["freshness"].update(mode="revoked"), "differs"),
+            (lambda context: context.update(execution_role="reviewer"), "differs"),
+            (lambda context: context.update(invocation_target="another.controller"), "differs"),
+            (lambda context: context.update(recipient="worker:another-lane"), "differs"),
             (
-                lambda context: context["recipient_authorization"].update(sanitized=False),
-                "sanitized recipient authorization",
+                lambda context: context["role_separation"].update(control_plane="included"),
+                "differs",
             ),
         ):
             with self.subTest(expected=expected):
@@ -545,12 +513,8 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         outcome.envelope["mandatory_digest"] = contracts.sha256_hex(mandatory)
         outcome.envelope["delivery"]["mandatory"] = [item["id"] for item in mandatory]
         outcome.envelope["content_hash"] = contracts.content_hash(outcome.envelope)
-        outcome.context["mandatory_items"] = [item["id"] for item in mandatory]
-        outcome.context["mandatory_digest"] = contracts.sha256_hex(mandatory)
-        outcome.context["rendered_context"]["mandatory"] = mandatory
-        outcome.context["content_hash"] = contracts.content_hash(outcome.context)
         with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=outcome):
-            with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "mandatory security"):
+            with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "mandatory security|context binding"):
                 memory_handoff.prepare_bootstrap_envelope(
                     task_card=self.card,
                     lane_id="lane-1",
@@ -570,10 +534,6 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         outcome.envelope["mandatory_digest"] = contracts.sha256_hex(mandatory)
         outcome.envelope["delivery"]["mandatory"] = [item["id"] for item in mandatory]
         outcome.envelope["content_hash"] = contracts.content_hash(outcome.envelope)
-        outcome.context["mandatory_items"] = [item["id"] for item in mandatory]
-        outcome.context["mandatory_digest"] = contracts.sha256_hex(mandatory)
-        outcome.context["rendered_context"]["mandatory"] = mandatory
-        outcome.context["content_hash"] = contracts.content_hash(outcome.context)
         with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=outcome):
             with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "duplicate"):
                 memory_handoff.prepare_bootstrap_envelope(
@@ -614,9 +574,9 @@ class MemoryHandoffSeamTests(unittest.TestCase):
                 base_commit="base-1",
             )
         changed = dict(envelope)
-        changed["rendered_context"] = {"mandatory": [], "optional": []}
+        changed["optional_content"][0]["content"] = "changed after finalization"
         changed["content_hash"] = contracts.content_hash(changed)
-        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "rendered_context"):
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "optional digest|context binding"):
             memory_handoff.validate_final_context_for_launch(
                 context=outcome.context,
                 envelope=changed,
@@ -629,7 +589,7 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         changed_context = json.loads(json.dumps(outcome.context))
         changed_context["integrity"] = "changed-integrity"
         changed_context["content_hash"] = contracts.content_hash(changed_context)
-        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "context_integrity"):
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "integrity|record does not match"):
             memory_handoff.validate_final_context_for_launch(
                 context=changed_context,
                 envelope=envelope,
@@ -642,10 +602,14 @@ class MemoryHandoffSeamTests(unittest.TestCase):
 
     def test_enriched_handoff_rejects_delivery_trace_that_omits_rendered_item(self) -> None:
         outcome = _finalized_lane1_fixture(self.card, self.plan, self.worktree)
-        outcome.context["delivery_trace"]["delivered"] = []
-        outcome.context["content_hash"] = contracts.content_hash(outcome.context)
-        with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=outcome):
-            with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "delivered trace"):
+        changed = json.loads(json.dumps(outcome.envelope))
+        changed["delivery_trace"]["context_delivered"] = []
+        changed["content_hash"] = contracts.content_hash(changed)
+        with patch.object(
+            memory_handoff, "_prepare_memory_outcome",
+            return_value=SimpleNamespace(envelope=changed, context=outcome.context),
+        ):
+            with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "context-delivered"):
                 memory_handoff.prepare_bootstrap_envelope(
                     task_card=self.card,
                     lane_id="lane-1",
@@ -659,11 +623,8 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         outcome = _finalized_lane1_fixture(self.card, self.plan, self.worktree)
         outcome.envelope["delivery"]["omitted"] = ["case-1", "case-2"]
         outcome.envelope["content_hash"] = contracts.content_hash(outcome.envelope)
-        outcome.context["omitted"] = ["case-1", "case-2"]
-        outcome.context["delivery_trace"]["omitted"] = ["case-1", "case-2"]
-        outcome.context["content_hash"] = contracts.content_hash(outcome.context)
         with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=outcome):
-            with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "packed and omitted"):
+            with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "omitted|partition"):
                 memory_handoff.prepare_bootstrap_envelope(
                     task_card=self.card,
                     lane_id="lane-1",
@@ -698,24 +659,17 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         )
 
         changed_context = json.loads(json.dumps(outcome.context))
-        changed_context["rendered_context"]["optional"][0]["content"] = "changed after finalization"
+        changed_context["optional_content"][0]["content"] = "changed after finalization"
         changed_context["content_hash"] = contracts.content_hash(changed_context)
-        memory_store = store.MemoryStore(store_path)
-        memory_store.initialize()
-        try:
-            memory_store.record_final_context(
-                changed_context, envelope_digest=envelope["content_hash"]
-            )
-        finally:
-            memory_store.close()
-        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "rendered context"):
-            memory_handoff.validate_resume_handoff(
-                task_card=self.card,
-                lane_id="lane-1",
-                prior_run_id="run-1",
-                worktree_path=self.worktree,
-                base_commit="base-1",
-            )
+        with patch.object(memory_handoff, "load_final_context", return_value=changed_context):
+            with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "finalized context|integrity"):
+                memory_handoff.validate_resume_handoff(
+                    task_card=self.card,
+                    lane_id="lane-1",
+                    prior_run_id="run-1",
+                    worktree_path=self.worktree,
+                    base_commit="base-1",
+                )
 
     def test_resume_rejects_revised_plan_and_changed_prior_payload(self) -> None:
         envelope = memory_handoff.prepare_bootstrap_envelope(
@@ -733,7 +687,8 @@ class MemoryHandoffSeamTests(unittest.TestCase):
             base_commit="base-1",
             branch="lane/memory",
             memory_handoff=contracts.make_memory_handoff(
-                objective_id="objective-1", route="ordinary", plan=revised
+                objective_id="objective-1", route="ordinary", plan=revised,
+                checkpoint=self.card["memory_handoff"]["checkpoint"],
             ),
         )
         with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "task card"):
@@ -763,7 +718,7 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         changed["content_hash"] = contracts.content_hash(changed)
         _, envelope_path = memory_handoff.memory_paths(self.worktree)
         envelope_path.write_text(json.dumps(changed), encoding="utf-8")
-        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "finalized context"):
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "finalized mandatory task|finalized context"):
             memory_handoff.prepare_resume_envelope(
                 task_card=self.card,
                 lane_id="lane-1",
@@ -772,6 +727,30 @@ class MemoryHandoffSeamTests(unittest.TestCase):
                 base_commit="base-1",
             )
         self.assertEqual(changed, memory_handoff.load_envelope(self.worktree))
+
+    def test_copied_checkpoint_card_cannot_launch_or_resume_saved_context(self) -> None:
+        envelope = memory_handoff.prepare_bootstrap_envelope(
+            task_card=self.card, lane_id="lane-1", run_id="run-1",
+            worktree_path=self.worktree, base_commit="base-1",
+        )
+        copied_card = contracts.make_task_card(
+            task=self.card["task"], base_commit="base-1", branch=self.card["branch"],
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id="objective-1", route="ordinary", plan=self.plan,
+                checkpoint="different-root-checkpoint",
+            ),
+        )
+        with self.assertRaises(memory_handoff.MemoryHandoffError):
+            memory_handoff.validate_envelope_for_launch(
+                envelope=envelope, task_card=copied_card, lane_id="lane-1",
+                run_id="run-1", worktree_path=self.worktree, base_commit="base-1",
+            )
+        with self.assertRaises(memory_handoff.MemoryHandoffError):
+            memory_handoff.prepare_resume_envelope(
+                task_card=copied_card, lane_id="lane-1", run_id="run-2",
+                worktree_path=self.worktree, base_commit="base-1",
+            )
+        self.assertEqual(envelope, memory_handoff.load_envelope(self.worktree))
 
     def test_dispatch_is_idempotent_and_lost_ack_blocks_duplicate(self) -> None:
         envelope = memory_handoff.prepare_bootstrap_envelope(
@@ -831,6 +810,10 @@ class MemoryHandoffSeamTests(unittest.TestCase):
             run_id="run-1",
             worktree_path=self.worktree,
             base_commit="base-1",
+        )
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree,
+            envelope=envelope,
         )
         memory_handoff.record_ambiguous_dispatch(
             worktree_path=self.worktree,

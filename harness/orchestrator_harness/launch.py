@@ -609,7 +609,7 @@ def run_launch(
                         for field in (
                             "lane_id", "run_id", "worktree_path", "provider",
                             "memory_plan_state", "worker_environment", "dispatchable",
-                            "launch_pending", "lifecycle",
+                            "launch_pending", "lifecycle", "native_supersession",
                         )
                     ):
                         raise memory_handoff.MemoryHandoffError(
@@ -762,8 +762,13 @@ def run_launch(
                         "the enclosing allowance expired before dispatch intent; no native controller started",
                     )
                 try:
+                    supersedes_rejected_attempt_id = memory_handoff.supersession_id_for_launch(
+                        worktree_path=lane["worktree_path"], lane=locked_lane,
+                        envelope=memory_envelope,
+                    )
                     memory_handoff.record_dispatch_intent(
-                        worktree_path=lane["worktree_path"], envelope=memory_envelope
+                        worktree_path=lane["worktree_path"], envelope=memory_envelope,
+                        supersedes_rejected_attempt_id=supersedes_rejected_attempt_id,
                     )
                 except memory_handoff.MemoryHandoffError as exc:
                     raise LaunchError(LAUNCH_DISPATCH_AMBIGUOUS, str(exc)) from exc
