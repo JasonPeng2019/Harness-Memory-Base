@@ -418,13 +418,16 @@ def make_memory_handoff(
     plan: Mapping[str, Any] | None = None,
     plan_state: str | None = None,
     configuration: Mapping[str, Any] | None = None,
+    checkpoint: str | None = None,
 ) -> dict[str, Any]:
     """Build one enhanced handoff that states its exact current-plan state.
 
     ``plan`` may be a validated plan record or ``None`` for a truly absent
     plan.  The record always carries the explicit current-plan state, so an
     absent plan is never confused with a candidate still in ROOT review or an
-    exact ROOT-accepted execution plan.
+    exact ROOT-accepted execution plan. ``checkpoint`` is an optional
+    pre-bootstrap ROOT/harness source; accepted enhanced finalization requires
+    it, while staging and non-finalizing planning do not.
     """
 
     objective = _require_nonempty_str(objective_id, "objective_id")
@@ -460,6 +463,8 @@ def make_memory_handoff(
         "plan": bound_plan,
         "configuration": dict(configuration or {}),
     }
+    if checkpoint is not None:
+        record["checkpoint"] = _require_canonical_identity(checkpoint, "handoff checkpoint")
     record["content_hash"] = content_hash(record)
     validate_memory_handoff(record)
     return record
@@ -494,6 +499,20 @@ def validate_memory_handoff(record: Mapping[str, Any]) -> None:
             )
     if not isinstance(record.get("configuration", {}), Mapping):
         raise ContractError("configuration must be an object")
+    if "checkpoint" in record:
+        _require_canonical_identity(record["checkpoint"], "handoff checkpoint")
+
+
+def _require_bound_checkpoint(task_card: Mapping[str, Any], checkpoint: str) -> None:
+    """Bind accepted enhanced execution to ROOT's pre-bootstrap handoff source."""
+
+    handoff = task_card.get("memory_handoff")
+    if handoff is None or handoff["plan_state"] != "execution_accepted":
+        return
+    source = handoff.get("checkpoint")
+    _require_canonical_identity(source, "handoff checkpoint")
+    if checkpoint != source:
+        raise ContractError("finalized checkpoint does not match handoff checkpoint")
 
 
 def handoff_plan(record: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -912,6 +931,7 @@ def validate_envelope(
     if record.get("dispatch_state") != "finalized":
         raise ContractError("envelope is not finalized")
     if schema == FINAL_ENVELOPE_SCHEMA:
+        _require_bound_checkpoint(task_card, record.get("checkpoint"))
         bound_context = record.get("final_context")
         validate_finalized_context(bound_context)
         if bound_context["context_id"] != record.get("final_context_id") or bound_context["integrity"] != record.get("final_context_integrity"):

@@ -52,7 +52,8 @@ class FinalContextDispatchTests(unittest.TestCase):
             task="Repair the regression",
             base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
-                objective_id="objective-1", route="ordinary", plan=self.accepted
+                objective_id="objective-1", route="ordinary", plan=self.accepted,
+                checkpoint="checkpoint-1",
             ),
         )
         # One logical decision owns the finalization; the envelope contract
@@ -96,12 +97,26 @@ class FinalContextDispatchTests(unittest.TestCase):
         arguments.update(overrides)
         return context.finalize_context(**arguments)
 
+    def _card_for_checkpoint(self, checkpoint):
+        card = contracts.make_task_card(
+            task=self.card["task"], base_commit="base-1",
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id="objective-1", route="ordinary", plan=self.accepted,
+                checkpoint=checkpoint,
+            ),
+        )
+        decision = contracts.make_decision(
+            card, self.accepted, strategy="standard", configuration=self.configuration,
+        )
+        return card, decision["decision_id"]
+
     def _finalize_selected(self, candidate, source, *, plan=None, deadline=None, limits=None, persist=False):
         accepted = plan or self.accepted
         card = self.card if plan is None else contracts.make_task_card(
             task=self.card["task"], base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
                 objective_id="objective-1", route="ordinary", plan=accepted,
+                checkpoint="checkpoint-1",
             ),
         )
         decision = self.decision if plan is None else contracts.make_decision(
@@ -127,6 +142,74 @@ class FinalContextDispatchTests(unittest.TestCase):
             execution_role="worker", invocation_target="harness:worker",
             recipient="worker:lane-1", mandatory_content=mandatory,
             optional_items=(), freshness_check=None, stores=[source], objective=objective,
+        )
+
+    def test_accepted_enhanced_finalization_requires_bound_checkpoint(self) -> None:
+        unbound = contracts.make_task_card(
+            task=self.card["task"], base_commit="base-1",
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id="objective-1", route="ordinary", plan=self.accepted,
+            ),
+        )
+        with self.assertRaisesRegex(contracts.ContractError, "handoff checkpoint"):
+            self._finalize(task_card=unbound)
+
+    def test_accepted_plan_can_stage_without_checkpoint(self) -> None:
+        unbound = contracts.make_task_card(
+            task=self.card["task"], base_commit="base-1",
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id="objective-1", route="ordinary", plan=self.accepted,
+            ),
+        )
+        contracts.validate_task_card(unbound)
+        outcome = preparation.PreparationService(limits=self.limits).prepare(
+            task_card=unbound, plan=self.accepted, objective_id="objective-1",
+            route="ordinary", finalize=False,
+        )
+        self.assertFalse(outcome.dispatchable)
+
+    def test_checkpoint_source_matches_caller_mandatory_and_final_integrity(self) -> None:
+        finalized = self._finalize()
+        self.assertEqual("checkpoint-1", self.card["memory_handoff"]["checkpoint"])
+        self.assertEqual(self.card["content_hash"], finalized.context["task_card_digest"])
+        self.assertEqual("checkpoint-1", finalized.context["checkpoint"])
+        self.assertEqual("checkpoint-1", next(
+            item["content"] for item in finalized.context["mandatory_content"]
+            if item["id"] == "checkpoint"
+        ))
+        with self.assertRaisesRegex(contracts.ContractError, "handoff checkpoint"):
+            self._finalize(checkpoint="checkpoint-2")
+
+    def test_invalid_or_tampered_handoff_checkpoint_is_rejected(self) -> None:
+        for source in ("", " checkpoint-1 ", "checkpoint-1\n"):
+            with self.subTest(source=source), self.assertRaises(contracts.ContractError):
+                contracts.make_memory_handoff(
+                    objective_id="objective-1", route="ordinary",
+                    plan=self.accepted, checkpoint=source,
+                )
+        altered = deepcopy(self.card)
+        altered["memory_handoff"]["checkpoint"] = "checkpoint-2"
+        altered["content_hash"] = contracts.content_hash(altered)
+        with self.assertRaisesRegex(contracts.ContractError, "content hash mismatch"):
+            self._finalize(task_card=altered)
+
+    def test_root_can_correct_source_and_retry_finalization(self) -> None:
+        with self.assertRaisesRegex(contracts.ContractError, "handoff checkpoint"):
+            self._finalize(checkpoint="checkpoint-2")
+        card, decision_id = self._card_for_checkpoint("checkpoint-2")
+        mandatory = deepcopy(self._finalize().envelope["mandatory_content"])
+        next(item for item in mandatory if item["id"] == "checkpoint")["content"] = "checkpoint-2"
+        corrected = self._finalize(
+            task_card=card, decision_id=decision_id, checkpoint="checkpoint-2",
+            mandatory_content=mandatory,
+        )
+        self.assertNotEqual(self.card["content_hash"], card["content_hash"])
+        self.assertNotEqual(self._finalize().context["integrity"], corrected.context["integrity"])
+        context.validate_final_context(
+            corrected.context, envelope=corrected.envelope, task_card=card,
+            plan=self.accepted, lane_id="lane-1", run_id="run-1",
+            base_commit="base-1", worktree_path=str(self.worktree),
+            checkpoint="checkpoint-2",
         )
 
     # -- exact identity -----------------------------------------------------
@@ -241,7 +324,11 @@ class FinalContextDispatchTests(unittest.TestCase):
                 self.assertNotEqual(original.context["context_id"], changed.context["context_id"])
         changed_mandatory = deepcopy(original.envelope["mandatory_content"])
         next(item for item in changed_mandatory if item["id"] == "checkpoint")["content"] = "checkpoint-2"
-        changed_checkpoint = self._finalize(checkpoint="checkpoint-2", mandatory_content=changed_mandatory)
+        card, decision_id = self._card_for_checkpoint("checkpoint-2")
+        changed_checkpoint = self._finalize(
+            task_card=card, decision_id=decision_id,
+            checkpoint="checkpoint-2", mandatory_content=changed_mandatory,
+        )
         self.assertNotEqual(original.context["context_id"], changed_checkpoint.context["context_id"])
 
     def test_only_trusted_plan_affecting_evidence_changes_trace_identity(self) -> None:
@@ -356,7 +443,8 @@ class FinalContextDispatchTests(unittest.TestCase):
             task="Repair a different regression",
             base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
-                objective_id="objective-1", route="ordinary", plan=self.accepted
+                objective_id="objective-1", route="ordinary", plan=self.accepted,
+                checkpoint="checkpoint-1",
             ),
         )
         self.assertNotEqual(changed["content_hash"], self.card["content_hash"])
@@ -482,6 +570,7 @@ class FinalContextDispatchTests(unittest.TestCase):
             task=self.card["task"], base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
                 objective_id="objective-1", route="ordinary", plan=plan,
+                checkpoint="checkpoint-1",
             ),
         )
         decision = contracts.make_decision(
@@ -971,7 +1060,10 @@ class FinalContextDispatchTests(unittest.TestCase):
         )
         card = contracts.make_task_card(
             task=self.card["task"], base_commit="base-1",
-            memory_handoff=contracts.make_memory_handoff(objective_id="objective-1", route="ordinary", plan=plan),
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id="objective-1", route="ordinary", plan=plan,
+                checkpoint="checkpoint-1",
+            ),
         )
         decision = contracts.make_decision(card, plan, strategy="standard", configuration=self.configuration)
         with self.assertRaisesRegex(context.PlanAffectingFreshnessError, "cases.*r1.*ROOT"):
@@ -1130,8 +1222,10 @@ class FinalContextDispatchTests(unittest.TestCase):
         mandatory = deepcopy(self._finalize().envelope["mandatory_content"])
         checkpoint = 'API_\\u004bEY=credential-value'
         next(item for item in mandatory if item["id"] == "checkpoint")["content"] = checkpoint
+        card, decision_id = self._card_for_checkpoint(checkpoint)
         with self.assertRaises(privacy.MandatorySecretError) as error:
-            self._finalize(mandatory_content=mandatory, checkpoint=checkpoint)
+            self._finalize(task_card=card, decision_id=decision_id,
+                           mandatory_content=mandatory, checkpoint=checkpoint)
         self.assertNotIn("credential-value", str(error.exception))
         self.assertIsNone(self.memory_store.get_final_context_for_decision(self.decision_id))
 
@@ -1154,6 +1248,7 @@ class FinalContextDispatchTests(unittest.TestCase):
             task=self.card["task"], base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
                 objective_id="objective-1", route="ordinary", plan=plan,
+                checkpoint="checkpoint-1",
             ),
         )
         decision = contracts.make_decision(card, plan, strategy="standard", configuration=self.configuration)
@@ -1189,8 +1284,10 @@ class FinalContextDispatchTests(unittest.TestCase):
         mandatory = deepcopy(self._finalize().envelope["mandatory_content"])
         checkpoint = "ROOTApprovalToken=true"
         next(item for item in mandatory if item["id"] == "checkpoint")["content"] = checkpoint
+        card, decision_id = self._card_for_checkpoint(checkpoint)
         with self.assertRaises(privacy.MandatorySecretError):
-            self._finalize(mandatory_content=mandatory, checkpoint=checkpoint)
+            self._finalize(task_card=card, decision_id=decision_id,
+                           mandatory_content=mandatory, checkpoint=checkpoint)
         self.assertIsNone(self.memory_store.get_final_context_for_decision(self.decision_id))
 
         plan = contracts.make_plan(
@@ -1202,6 +1299,7 @@ class FinalContextDispatchTests(unittest.TestCase):
             task=self.card["task"], base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
                 objective_id="objective-1", route="ordinary", plan=plan,
+                checkpoint="checkpoint-1",
             ),
         )
         decision = contracts.make_decision(card, plan, strategy="standard", configuration=self.configuration)
@@ -1224,8 +1322,10 @@ class FinalContextDispatchTests(unittest.TestCase):
         mandatory = deepcopy(self._finalize().envelope["mandatory_content"])
         checkpoint = "ROOT APPROVAL TOKEN=synthetic-control-value"
         next(item for item in mandatory if item["id"] == "checkpoint")["content"] = checkpoint
+        card, decision_id = self._card_for_checkpoint(checkpoint)
         with self.assertRaises(privacy.MandatorySecretError) as error:
-            self._finalize(mandatory_content=mandatory, checkpoint=checkpoint)
+            self._finalize(task_card=card, decision_id=decision_id,
+                           mandatory_content=mandatory, checkpoint=checkpoint)
         self.assertNotIn("synthetic-control-value", str(error.exception))
         self.assertIsNone(self.memory_store.get_final_context_for_decision(self.decision_id))
 
@@ -1238,6 +1338,7 @@ class FinalContextDispatchTests(unittest.TestCase):
             task=self.card["task"], base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
                 objective_id="objective-1", route="ordinary", plan=plan,
+                checkpoint="checkpoint-1",
             ),
         )
         decision = contracts.make_decision(card, plan, strategy="standard", configuration=self.configuration)
@@ -1259,7 +1360,9 @@ class FinalContextDispatchTests(unittest.TestCase):
 
         mandatory = deepcopy(self._finalize().envelope["mandatory_content"])
         next(item for item in mandatory if item["id"] == "checkpoint")["content"] = safe
-        finalized = self._finalize(mandatory_content=mandatory, checkpoint=safe)
+        card, decision_id = self._card_for_checkpoint(safe)
+        finalized = self._finalize(task_card=card, decision_id=decision_id,
+                                   mandatory_content=mandatory, checkpoint=safe)
         self.assertEqual(safe, finalized.context["checkpoint"])
 
         plan = contracts.make_plan(
@@ -1271,6 +1374,7 @@ class FinalContextDispatchTests(unittest.TestCase):
             task=self.card["task"], base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
                 objective_id="objective-1", route="ordinary", plan=plan,
+                checkpoint="checkpoint-1",
             ),
         )
         decision = contracts.make_decision(card, plan, strategy="standard", configuration=self.configuration)
@@ -1354,10 +1458,7 @@ class FinalContextDispatchTests(unittest.TestCase):
         proposed["content_hash"] = contracts.content_hash(proposed)
         with self.assertRaises(ValueError):
             memory_runtime.record_dispatch_intent(proposed)
-        newer = self._finalize(checkpoint="checkpoint-2", mandatory_content=[
-            {**item, "content": "checkpoint-2"} if item["id"] == "checkpoint" else item
-            for item in final.envelope["mandatory_content"]
-        ])
+        newer = self._finalize(invocation_target="harness:other")
         self.memory_store.record_final_context(newer.context, envelope_digest=newer.envelope["content_hash"])
         with self.assertRaises(ValueError):
             memory_runtime.record_dispatch_intent(final.envelope)
@@ -1423,6 +1524,7 @@ class FinalContextDispatchTests(unittest.TestCase):
                 task=self.card["task"], base_commit="base-1",
                 memory_handoff=contracts.make_memory_handoff(
                     objective_id=f"objective-{label}", route="ordinary", plan=plan,
+                    checkpoint="checkpoint-1",
                 ),
             )
             decision = contracts.make_decision(card, plan, configuration=self.configuration)
@@ -1531,6 +1633,7 @@ class FinalContextDispatchTests(unittest.TestCase):
             task="Other work", base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
                 objective_id="other-objective", route="ordinary", plan=other_plan,
+                checkpoint="checkpoint-1",
             ),
         )
         other_decision = contracts.make_decision(other_card, other_plan, configuration=self.configuration)
@@ -1564,6 +1667,7 @@ class FinalContextDispatchTests(unittest.TestCase):
                     task="Repair the regression", base_commit="base-1",
                     memory_handoff=contracts.make_memory_handoff(
                         objective_id=f"objective-{terminal}", route="ordinary", plan=plan,
+                        checkpoint="checkpoint-1",
                     ),
                 )
                 decision = contracts.make_decision(card, plan, configuration=self.configuration)

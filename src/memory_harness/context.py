@@ -165,6 +165,7 @@ def finalize_context(
     contracts.validate_task_card(task_card)
     contracts.validate_plan(plan, expected_state="accepted")
     contracts.validate_task_plan_binding(task_card, plan)
+    contracts._require_bound_checkpoint(task_card, checkpoint)
     if task_card["base_commit"] != base_commit:
         raise ContextError("task card base does not match the finalization base")
 
