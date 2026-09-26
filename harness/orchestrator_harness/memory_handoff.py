@@ -12,7 +12,7 @@ import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .core import content_hash, read_json
 from .records import atomic_write_json
@@ -343,6 +343,7 @@ def _prepare_memory_outcome(
     base_commit: str,
     finalize: bool,
     network_mode: str,
+    search_stores: Sequence[Any] = (),
 ):
     """Run one bounded preparation for the exact handoff state.
 
@@ -398,6 +399,7 @@ def _prepare_memory_outcome(
             invocation_target="orchestrator_harness.controller" if finalize else None,
             recipient=f"worker:{lane_id}" if finalize else None,
             finalize=finalize,
+            stores=search_stores,
         )
     finally:
         memory_store.close()
@@ -435,6 +437,7 @@ def prepare_lane_memory(
     run_id: str,
     worktree_path: str | Path,
     base_commit: str,
+    search_stores: Sequence[Any] = (),
 ) -> "LaneMemory":
     """Run one bounded lane preparation and report its exact disposition.
 
@@ -475,6 +478,7 @@ def prepare_lane_memory(
             base_commit=base_commit,
             finalize=accepted,
             network_mode=requested_network,
+            search_stores=search_stores,
         )
         if not accepted:
             _, envelope_path = memory_paths(worktree_path)

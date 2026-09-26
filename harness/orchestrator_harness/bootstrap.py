@@ -18,7 +18,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .config import load_config, load_resource_manifest
 from .core import content_hash, iso_utc, new_id, read_json, require_schema
@@ -628,6 +628,7 @@ def run_bootstrap(
     exclusive_resources: list[str],
     task_card_path: str,
     allowance_seconds: float | None = None,
+    search_stores: Sequence[Any] = (),
 ) -> dict[str, Any]:
     """Execute ``lane bootstrap`` and return the structured result.
 
@@ -880,6 +881,7 @@ def run_bootstrap(
             run_id=run_id,
             worktree_path=worktree_path,
             base_commit=base_commit,
+            search_stores=search_stores,
         )
         if memory.envelope is not None:
             network = memory_handoff.captured_network_resolution(
