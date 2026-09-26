@@ -139,6 +139,104 @@ class ExternalReconciliationTests(unittest.TestCase):
         self.assertEqual("confirmed", confirmed["status"])
         self.assertEqual(2, confirmed["claim_generation"])
 
+    def test_active_claim_voluntary_uncertainty_and_retry_matrix(self) -> None:
+        intent = self._create()
+        identity = intent["operation_id"]
+        off = config.resolve_config({"shared_publication": False})
+        claimed_a = self.state.claim_effect_operation(
+            identity, current_config=config.MemoryConfig(),
+            claimant=self._claimant("native-A", 4401, "created-A"),
+        )
+        claim_a = claimed_a["active_claim_id"]
+        for claim_id in (None, "wrong"):
+            with self.subTest(stage="active", claim_id=claim_id):
+                with self.assertRaises(store.OperationConflictError):
+                    self.state.mark_effect_uncertain(identity, "acknowledgement lost", claim_id=claim_id)
+                self.assertEqual(claimed_a, self.state.get_effect_operation(identity))
+
+        uncertain = self.state.mark_effect_uncertain(
+            identity, "acknowledgement lost", claim_id=claim_a,
+        )
+        self.assertEqual("uncertain", uncertain["status"])
+        self.assertEqual("pending_off", self.state.external_effect_off_state(identity, current_config=off))
+        with self.assertRaises(store.OperationConflictError):
+            self.state.claim_effect_operation(
+                identity, current_config=config.MemoryConfig(),
+                claimant=self._claimant("native-B", 4402, "created-B"),
+            )
+        for claim_id in (None, "wrong"):
+            with self.subTest(stage="uncertain", claim_id=claim_id):
+                with self.assertRaises(store.OperationConflictError):
+                    self.state.reconcile_external_effect_operation(
+                        identity, evidence=self._evidence(intent, readback_complete=True),
+                        result="absent", claim_id=claim_id,
+                    )
+                self.assertEqual(uncertain, self.state.get_effect_operation(identity))
+        with self.assertRaises(store.OperationConflictError):
+            self.state.reconcile_external_effect_operation(
+                identity, evidence=self._evidence(intent), result="absent", claim_id=claim_a,
+            )
+        self.assertEqual(uncertain, self.state.get_effect_operation(identity))
+        pending = self.state.reconcile_external_effect_operation(
+            identity, evidence=self._evidence(intent, readback_complete=True),
+            result="absent", claim_id=claim_a,
+        )
+        self.assertEqual("pending", pending["status"])
+        self.assertEqual("off", self.state.external_effect_off_state(identity, current_config=off))
+        with self.assertRaisesRegex(store.OperationConflictError, "off"):
+            self.state.claim_effect_operation(
+                identity, current_config=off,
+                claimant=self._claimant("native-B", 4402, "created-B"),
+            )
+        claimed_b = self.state.claim_effect_operation(
+            identity, current_config=config.MemoryConfig(),
+            claimant=self._claimant("native-B", 4402, "created-B"),
+        )
+        self.assertEqual(claimed_a["claim_generation"] + 1, claimed_b["claim_generation"])
+        self.assertNotEqual(claim_a, claimed_b["active_claim_id"])
+        for action in (
+            lambda: self.state.mark_effect_uncertain(identity, "stale", claim_id=claim_a),
+            lambda: self.state.confirm_effect_operation(
+                identity, self._evidence(intent), claim_id=claim_a,
+            ),
+            lambda: self.state.reconcile_external_effect_operation(
+                identity, evidence=self._evidence(intent), result="acknowledged", claim_id=claim_a,
+            ),
+        ):
+            with self.subTest(stage="stale", action=action):
+                with self.assertRaises(store.OperationConflictError):
+                    action()
+                self.assertEqual(claimed_b, self.state.get_effect_operation(identity))
+
+    def test_active_claim_idempotency_proof_preserves_uncertainty_until_retry(self) -> None:
+        intent = self._create()
+        identity = intent["operation_id"]
+        claimed_a = self.state.claim_effect_operation(
+            identity, current_config=config.MemoryConfig(),
+            claimant=self._claimant("native-A", 4501, "created-A"),
+        )
+        claim_a = claimed_a["active_claim_id"]
+        self.state.mark_effect_uncertain(identity, "acknowledgement lost", claim_id=claim_a)
+        with self.assertRaises(store.OperationConflictError):
+            self.state.reconcile_external_effect_operation(
+                identity, evidence=self._evidence(intent, idempotency_key="other"),
+                result="idempotent", claim_id=claim_a,
+            )
+        proved = self.state.reconcile_external_effect_operation(
+            identity,
+            evidence=self._evidence(intent, idempotency_key=identity),
+            result="idempotent", claim_id=claim_a,
+        )
+        self.assertEqual("uncertain", proved["status"])
+        self.assertIsNone(proved["acknowledgement"])
+        claimed_b = self.state.claim_effect_operation(
+            identity, current_config=config.MemoryConfig(),
+            claimant=self._claimant("native-B", 4502, "created-B"),
+        )
+        self.assertEqual(2, claimed_b["claim_generation"])
+        self.assertEqual(proved["reconciliation"], claimed_b["reconciliation"])
+        self.assertNotEqual(claim_a, claimed_b["active_claim_id"])
+
     def test_claim_fence_verifier_identity_and_off_gate(self) -> None:
         intent = self._create()
         identity = intent["operation_id"]
@@ -184,9 +282,7 @@ class ExternalReconciliationTests(unittest.TestCase):
         with self.assertRaises(store.OperationConflictError):
             self.state.mark_effect_uncertain(identity, "response lost")
         with self.assertRaises(store.OperationConflictError):
-            self.state.mark_effect_uncertain(
-                identity, "response lost", claim_id=claimed["active_claim_id"],
-            )
+            self.state.mark_effect_uncertain(identity, "response lost", claim_id="wrong")
         with self.assertRaises(store.OperationConflictError):
             self.state.reconcile_external_effect_operation(
                 identity, evidence=self._evidence(intent, readback_complete=True),

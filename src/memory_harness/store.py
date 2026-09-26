@@ -1921,7 +1921,7 @@ class MemoryStore:
     def mark_effect_uncertain(
         self, operation_id: str, reason: str, *, claim_id: str | None = None,
     ) -> dict[str, Any]:
-        """Mark legacy ambiguity; claimant-aware in-flight work needs trusted isolation."""
+        """Let the exact active claimant declare its submission ambiguous."""
         if not isinstance(reason, str) or not reason:
             raise contracts.ContractError("uncertainty needs a reason")
         connection = self._require_connection()
@@ -1929,8 +1929,6 @@ class MemoryStore:
             connection.execute("BEGIN IMMEDIATE")
             operation = self.get_effect_operation(operation_id)
             self._require_effect_claim(operation, claim_id)
-            if operation["status"] == "in_flight" and operation["active_claim_id"] is not None:
-                raise OperationConflictError("claimant-aware in-flight effect requires trusted isolation")
             if operation["status"] not in ("in_flight", "uncertain"):
                 raise OperationConflictError("only an in-flight effect can become uncertain")
             if operation["status"] == "uncertain" and operation["uncertainty"] != reason:
