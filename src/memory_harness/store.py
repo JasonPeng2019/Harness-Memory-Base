@@ -584,6 +584,9 @@ class MemoryStore:
                     self._bridge_local_source_in_transaction(
                         outcome["outcome_id"], kind, record["trajectory_id"], record,
                     )
+                ingestion = self.get_experience_ingestion_for_trajectory(record["trajectory_id"])
+                if ingestion is not None:
+                    self._bridge_experience_ingestion_in_transaction(ingestion)
 
     def _migrate_dispatch_authorizations(self, authorization_table_existed: bool) -> None:
         connection = self._require_connection()
@@ -1592,13 +1595,13 @@ class MemoryStore:
             operation = self.get_effect_operation(operation_id)
             if not effect_submission_enabled(current_config, operation["kind"]):
                 raise OperationConflictError("current effective feature is off")
-            if operation["status"] != "pending":
-                raise OperationConflictError("effect is not pending; reconcile existing claim")
             if operation["kind"] == "experience_ingestion" and (
                 operation["adapter_operation_id"] is not None or
                 self.get_experience_ingestion_for_trajectory(operation["source_id"]) is not None
             ):
                 raise OperationConflictError("existing experience ingestion requires exact reconciliation")
+            if operation["status"] != "pending":
+                raise OperationConflictError("effect is not pending; reconcile existing claim")
             connection.execute(
                 "UPDATE effect_operations SET status='in_flight', version=version+1, updated_at=? "
                 "WHERE operation_id=?", (contracts.utc_now(), operation_id),
@@ -2044,7 +2047,9 @@ class MemoryStore:
                     ingestion["created_at"],
                 ),
             )
-            self._bridge_experience_ingestion_in_transaction(ingestion)
+            self._bridge_experience_ingestion_in_transaction(
+                self.get_experience_ingestion(str(ingestion["ingestion_id"]))
+            )
         persisted = self.get_experience_ingestion(str(ingestion["ingestion_id"]))
         if cursor.rowcount == 0:
             for field in (
@@ -2062,7 +2067,7 @@ class MemoryStore:
         return persisted, cursor.rowcount == 1
 
     def _bridge_experience_ingestion_in_transaction(self, ingestion: Mapping[str, Any]) -> None:
-        """Retain the existing adapter identity without claiming payload or remote success."""
+        """Project exact adapter progress into the local effect in the same transaction."""
         connection = self._require_connection()
         if connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='effect_operations'"
@@ -2086,15 +2091,57 @@ class MemoryStore:
             if (operation["adapter_operation_id"] != ingestion["ingestion_id"] or
                     operation["adapter_payload_digest"] != ingestion["payload_digest"]):
                 raise ExperienceConflictError("effect already has a different ingestion identity")
-            return
         if (operation["payload_digest"] is not None and
                 operation["payload_digest"] != ingestion["payload_digest"]):
             raise ExperienceConflictError("ingestion payload differs from retained effect payload")
+        if ingestion["status"] == "confirmed":
+            receipts = []
+            for case_id in ingestion["case_ids"]:
+                row = connection.execute(
+                    "SELECT * FROM experience_case_receipts WHERE case_id=? AND scope_digest=?",
+                    (case_id, ingestion["scope_digest"]),
+                ).fetchone()
+                if row is None:
+                    raise ExperienceConflictError("confirmed ingestion has no exact case receipt")
+                receipt = self._case_receipt_from_row(row)
+                if (receipt["ingestion_id"] != ingestion["ingestion_id"] or
+                        receipt["trajectory_id"] != ingestion["trajectory_id"] or
+                        receipt["scope"] != ingestion["scope"]):
+                    raise ExperienceConflictError("confirmed ingestion case receipt differs")
+                receipts.append(receipt)
+            status = "confirmed"
+            acknowledgement = {
+                "ingestion_id": ingestion["ingestion_id"],
+                "payload_digest": ingestion["payload_digest"],
+                "case_receipts": receipts,
+            }
+            uncertainty = None
+        elif ingestion["status"] == "pending":
+            # The durable intent precedes the remote call. Its outcome may be unknown.
+            status = "in_flight" if operation["status"] != "uncertain" else "uncertain"
+            acknowledgement = None
+            uncertainty = operation["uncertainty"] if status == "uncertain" else None
+        else:
+            status = "uncertain"
+            acknowledgement = None
+            uncertainty = ingestion["error"] or "adapter ingestion requires reconciliation"
+        if operation["status"] == "confirmed" and (
+            status != "confirmed" or operation["acknowledgement"] != acknowledgement
+        ):
+            raise ExperienceConflictError("confirmed effect conflicts with ingestion evidence")
+        if (operation["adapter_operation_id"] == ingestion["ingestion_id"] and
+                operation["adapter_payload_digest"] == ingestion["payload_digest"] and
+                operation["status"] == status and
+                operation["acknowledgement"] == acknowledgement and
+                operation["uncertainty"] == uncertainty):
+            return
         connection.execute(
             "UPDATE effect_operations SET adapter_operation_id=?, adapter_payload_digest=?, "
-            "version=version+1, updated_at=? WHERE operation_id=?",
-            (ingestion["ingestion_id"], ingestion["payload_digest"],
-             contracts.utc_now(), operation_id),
+            "status=?, acknowledgement=?, uncertainty=?, version=version+1, updated_at=? "
+            "WHERE operation_id=?",
+            (ingestion["ingestion_id"], ingestion["payload_digest"], status,
+             self._serialize_record(acknowledgement) if acknowledgement is not None else None,
+             uncertainty, contracts.utc_now(), operation_id),
         )
 
     def get_experience_ingestion(self, ingestion_id: str) -> dict[str, Any]:
@@ -2181,6 +2228,7 @@ class MemoryStore:
                 raise ExperienceConflictError(
                     f"stale experience ingestion update for {ingestion_id}"
                 )
+            self._bridge_experience_ingestion_in_transaction(updated)
         return self.get_experience_ingestion(ingestion_id)
 
     @staticmethod
@@ -2326,6 +2374,7 @@ class MemoryStore:
                 raise ExperienceConflictError(
                     f"stale experience ingestion confirmation for {ingestion_id}"
                 )
+            self._bridge_experience_ingestion_in_transaction(updated)
         return self.get_experience_ingestion(ingestion_id)
 
     def read_confirmed_case_join(

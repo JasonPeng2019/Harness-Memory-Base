@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import threading
 import unittest
@@ -11,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
-from memory_harness import config, context, contracts, runtime, store
+from memory_harness import config, context, contracts, experience, privacy, runtime, store
 from tests.local.contracts import test_terminal_outcome as fixture_module
 
 
@@ -265,6 +266,163 @@ class LocalEffectStateTests(unittest.TestCase):
         self.assertEqual(ingestion["ingestion_id"], effect["adapter_operation_id"])
         with self.assertRaisesRegex(store.OperationConflictError, "reconciliation"):
             case.state.claim_effect_operation(operation_id, current_config=config.MemoryConfig())
+
+    def test_confirmed_legacy_ingestion_replays_as_confirmed_effect(self) -> None:
+        case = self.case
+        case.observe()
+        outcome = case.runtime.record_terminal_outcome(case.bundle())
+        review, trajectory = self._review(outcome)
+        operation_id = contracts.effect_operation_id(outcome["outcome_id"], "experience_ingestion")
+        ingestion = contracts.make_experience_ingestion(
+            trajectory=trajectory, destination="everos", session_id="session-1",
+            payload_digest=contracts.sha256_hex({"payload": "exact"}),
+        )
+        persisted, _ = case.state.create_experience_ingestion(ingestion)
+        receipt = contracts.make_case_receipt(
+            trajectory=trajectory, ingestion=persisted, source_case={"id": "case-1"},
+        )
+        confirmed = case.state.confirm_experience_ingestion(
+            persisted["ingestion_id"], [receipt], expected_version=persisted["version"],
+        )
+        effect = case.state.get_effect_operation(operation_id)
+        self.assertEqual("confirmed", effect["status"])
+        self.assertEqual(confirmed["ingestion_id"], effect["adapter_operation_id"])
+        self.assertEqual([receipt], effect["acknowledgement"]["case_receipts"])
+        self.assertEqual(review, case.state.get_review_receipt(review["review_receipt_id"]))
+        self.assertEqual(trajectory, case.state.get_reviewed_trajectory(trajectory["trajectory_id"]))
+        self.assertEqual(outcome["status"], case.state.get_outcome(case.decision["decision_id"])["status"])
+        case.state.close()
+        case.state = store.MemoryStore(case.root / "state.sqlite3")
+        case.state.initialize()
+        self.assertEqual("confirmed", case.state.get_effect_operation(operation_id)["status"])
+        self.assertNotIn(operation_id, {
+            item["operation_id"] for item in case.state.list_effect_operations(actionable_only=True)
+        })
+        with self.assertRaises(store.OperationConflictError):
+            case.state.claim_effect_operation(operation_id, current_config=config.MemoryConfig())
+        # Reopen a pre-bridge row that retained identity but not adapter progress.
+        case.state.connection.execute(
+            "UPDATE effect_operations SET status='waiting_payload', acknowledgement=NULL "
+            "WHERE operation_id=?", (operation_id,),
+        )
+        case.state.connection.commit()
+        case.state.close()
+        case.state = store.MemoryStore(case.root / "state.sqlite3")
+        case.state.initialize()
+        self.assertEqual("confirmed", case.state.get_effect_operation(operation_id)["status"])
+        # Older databases may also lack the effect row entirely.
+        case.state.connection.execute("DELETE FROM effect_operations WHERE operation_id=?", (operation_id,))
+        case.state.connection.commit()
+        case.state.close()
+        case.state = store.MemoryStore(case.root / "state.sqlite3")
+        case.state.initialize()
+        migrated = case.state.get_effect_operation(operation_id)
+        self.assertEqual("confirmed", migrated["status"])
+        self.assertEqual([receipt], migrated["acknowledgement"]["case_receipts"])
+
+    def test_pending_and_uncertain_adapter_ingestion_keep_reconciliation_fence(self) -> None:
+        case = self.case
+        case.observe()
+        outcome = case.runtime.record_terminal_outcome(case.bundle())
+        _, trajectory = self._review(outcome)
+        operation_id = contracts.effect_operation_id(outcome["outcome_id"], "experience_ingestion")
+        ingestion = contracts.make_experience_ingestion(
+            trajectory=trajectory, destination="everos", session_id="session-1",
+            payload_digest=contracts.sha256_hex({"payload": "exact"}),
+        )
+        pending, created = case.state.create_experience_ingestion(ingestion)
+        self.assertTrue(created)
+        self.assertEqual("in_flight", case.state.get_effect_operation(operation_id)["status"])
+        with self.assertRaisesRegex(store.OperationConflictError, "reconciliation"):
+            case.state.claim_effect_operation(operation_id, current_config=config.MemoryConfig())
+        uncertain = case.state.update_experience_ingestion(
+            pending["ingestion_id"], status="uncertain", expected_version=pending["version"],
+            error="response lost",
+        )
+        case.state.close()
+        case.state = store.MemoryStore(case.root / "state.sqlite3")
+        case.state.initialize()
+        effect = case.state.get_effect_operation(operation_id)
+        self.assertEqual("uncertain", effect["status"])
+        self.assertEqual("response lost", effect["uncertainty"])
+        self.assertEqual(pending["ingestion_id"], effect["adapter_operation_id"])
+        replay, created = case.state.create_experience_ingestion(ingestion)
+        self.assertFalse(created)
+        self.assertEqual(uncertain, replay)
+        self.assertEqual("uncertain", case.state.get_effect_operation(operation_id)["status"])
+        with self.assertRaisesRegex(store.OperationConflictError, "reconciliation"):
+            case.state.claim_effect_operation(operation_id, current_config=config.MemoryConfig())
+
+    def test_real_experience_reconciliation_confirms_same_effect_after_restart(self) -> None:
+        case = self.case
+        case.observe()
+        outcome = case.runtime.record_terminal_outcome(case.bundle())
+        _, trajectory = self._review(outcome)
+        operation_id = contracts.effect_operation_id(outcome["outcome_id"], "experience_ingestion")
+        scope = experience.ExperienceScope(**trajectory["scope"])
+        policy = privacy.PrivacyPolicy()
+
+        class Surface:
+            def __init__(self) -> None:
+                self.add_calls = 0
+                self.case_results: list[dict] = []
+
+            async def memorize(self, payload: dict, **_: object) -> dict:
+                self.add_calls += 1
+                return {"status": "extracted"}
+
+            def make_search_request(self, **kwargs: object) -> dict:
+                return dict(kwargs)
+
+            async def search(self, _: object) -> dict:
+                return {"request_id": "search-1", "data": {
+                    "agent_cases": self.case_results, "agent_skills": [],
+                }}
+
+        surface = Surface()
+        base_root = case.root / "everos"
+        memory_root = experience.EverOSAdapter.memory_root_for_scope(base_root, scope)
+        adapter = experience.EverOSAdapter(
+            scope=scope, base_root=base_root,
+            surface=experience.EverOSPublicSurface.from_object(
+                surface, memory_root=memory_root, resolve_memory_root=lambda: memory_root,
+            ),
+            privacy_policy=policy,
+        )
+        service = experience.ReviewedExperienceService(case.state, privacy_policy=policy)
+        pending = asyncio.run(service.extract_trajectory(trajectory["trajectory_id"], adapter))
+        self.assertEqual("pending", pending["status"])
+        self.assertEqual(1, surface.add_calls)
+        surface.case_results = [{
+            "id": "case-1", "agent_id": adapter.everos_owner_id,
+            "app_id": adapter.everos_application_id,
+            "project_id": adapter.everos_project_id,
+            "session_id": pending["session_id"],
+            "task_intent": "reviewed task", "approach": "reviewed approach",
+            "quality_score": 1.0, "key_insight": "exact case", "timestamp": "2026-09-21T00:00:00Z",
+            "score": 1.0,
+        }]
+        confirmed = asyncio.run(service.reconcile_extraction(trajectory["trajectory_id"], adapter))
+        self.assertEqual("confirmed", confirmed["status"])
+        case.state.close()
+        case.state = store.MemoryStore(case.root / "state.sqlite3")
+        case.state.initialize()
+        effect = case.state.get_effect_operation(operation_id)
+        self.assertEqual("confirmed", effect["status"])
+        self.assertEqual(confirmed["ingestion_id"], effect["adapter_operation_id"])
+        self.assertEqual(confirmed["case_ids"], [
+            receipt["case_id"] for receipt in effect["acknowledgement"]["case_receipts"]
+        ])
+        self.assertNotIn(operation_id, {
+            item["operation_id"] for item in case.state.list_effect_operations(actionable_only=True)
+        })
+        replay = asyncio.run(
+            experience.ReviewedExperienceService(case.state, privacy_policy=policy).extract_trajectory(
+                trajectory["trajectory_id"], adapter,
+            )
+        )
+        self.assertEqual(confirmed, replay)
+        self.assertEqual(1, surface.add_calls)
 
     def test_simultaneous_connections_claim_only_once(self) -> None:
         case = self.case
