@@ -59,7 +59,11 @@ class _Collection:
 
 class _FaultAdapter(atlas.AtlasProcedureAdapter):
     def __init__(self, *, collection: _Collection) -> None:
-        super().__init__(collection=collection, vector_store=object())
+        super().__init__(
+            collection=collection, vector_store=object(),
+            location={"database": "procedures_test", "collection": "trusted",
+                      "index": "vector_index"},
+        )
         self.publication_writes = 0
         self.lose_ack = False
         self.lose_before_commit = False
@@ -103,7 +107,9 @@ class _FaultAdapter(atlas.AtlasProcedureAdapter):
 class AtlasExternalReconciliationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.memory_store = store.MemoryStore(Path(self.temporary.name) / "memory.sqlite3")
+        self.terminated_claimants: set[tuple[str, int, str]] = set()
+        self.memory_store = store.MemoryStore(Path(self.temporary.name) / "memory.sqlite3",
+            external_claim_fence_verifier=self._verified_fence)
         self.memory_store.initialize()
         self.scope = {
             "application": "harness",
@@ -178,6 +184,384 @@ class AtlasExternalReconciliationTests(unittest.TestCase):
             designation=self.designation,
             adapter=self.adapter,
         )
+
+    def _claimant(self, invocation: str = "native-test") -> dict:
+        record = {"schema": "external-effect-claimant/v1", "native_invocation_id": invocation,
+                  "pid": 4142 if invocation == "native-test" else 5153,
+                  "process_created_at": ("2026-09-26T09:00:00Z" if invocation == "native-test"
+                                         else "2026-09-26T09:05:00Z")}
+        record["content_hash"] = contracts.content_hash(record)
+        return record
+
+    def _verified_fence(self, claimant: dict, fence: dict) -> bool:
+        identity = (claimant["native_invocation_id"], claimant["pid"],
+                    claimant["process_created_at"])
+        return (identity in self.terminated_claimants
+                and fence.get("verifier_proof") == "terminated-by-test-root"
+                and fence.get("claimant") == claimant)
+
+    def _fence(self, effect: dict) -> dict:
+        record = {"schema": "external-effect-claim-fence/v1",
+                  "operation_id": effect["operation_id"], "claim_id": effect["active_claim_id"],
+                  "claim_generation": effect["claim_generation"],
+                  "claimant_digest": effect["claimant_digest"],
+                  "claimant": effect["claimant_record"], "terminated": True,
+                  "verifier_proof": "terminated-by-test-root"}
+        record["content_hash"] = contracts.content_hash(record)
+        return record
+
+    def _governed_publish(self, *, current_on: bool = True,
+                          claim_fence: dict | None = None,
+                          invocation: str = "native-test") -> dict:
+        return self.service.publish(
+            procedure=self.procedure,
+            approval=self.approval,
+            representation=self.representation,
+            designation=self.designation,
+            adapter=self.adapter,
+            claimant=self._claimant(invocation), claim_fence=claim_fence,
+            captured_config={"shared_publication": True},
+            current_config={"shared_publication": current_on},
+            atlas_scope={
+                "database": "procedures_test",
+                "collection": "trusted",
+                "index": "vector_index",
+                "namespace": self.partition["namespace"],
+                "recipients": self.partition["recipients"],
+            },
+        )
+
+    def test_governed_publication_persists_exact_intent_before_one_write(self) -> None:
+        original_write = self.adapter.write_publication
+
+        def inspect_before_write(publication: dict) -> dict:
+            effects = [row for row in self.memory_store.list_effect_operations()
+                       if row["kind"] == "procedure_publication"]
+            self.assertEqual(1, len(effects))
+            effect = effects[0]
+            self.assertEqual("in_flight", effect["status"])
+            self.assertEqual(publication, effect["source_record"])
+            self.assertEqual(atlas.make_atlas_procedure_document(publication), effect["payload_record"]["document"])
+            self.assertEqual("procedures_test", effect["payload_record"]["atlas_scope"]["database"])
+            self.assertEqual({"shared_publication": True}, effect["configuration"])
+            return original_write(publication)
+
+        self.adapter.write_publication = inspect_before_write  # type: ignore[method-assign]
+        publication = self._governed_publish()
+        self.assertEqual("acknowledged", publication["status"])
+        self.assertEqual("confirmed", [row for row in self.memory_store.list_effect_operations()
+                                       if row["kind"] == "procedure_publication"][0]["status"])
+        self.assertEqual(1, self.adapter.publication_writes)
+
+    def test_governed_lost_ack_reconciles_while_off_without_another_write(self) -> None:
+        self.adapter.lose_ack = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        effect = [row for row in self.memory_store.list_effect_operations()
+                  if row["kind"] == "procedure_publication"][0]
+        self.assertEqual("uncertain", effect["status"])
+        self.assertEqual("pending_off", self.memory_store.external_effect_off_state(
+            effect["operation_id"], current_config={"shared_publication": False}))
+        recovered = self._governed_publish(current_on=False)
+        self.assertEqual("acknowledged", recovered["status"])
+        confirmed = self.memory_store.get_effect_operation(effect["operation_id"])
+        self.assertEqual("confirmed", confirmed["status"])
+        self.assertEqual({"shared_publication": True}, confirmed["configuration"])
+        self.assertEqual(1, self.adapter.publication_writes)
+
+    def test_governed_complete_absence_allows_one_same_id_retry(self) -> None:
+        self.adapter.lose_before_commit = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        effect = [row for row in self.memory_store.list_effect_operations()
+                  if row["kind"] == "procedure_publication"][0]
+        with self.assertRaises(procedures.ProcedureIneligibleError):
+            self._governed_publish(current_on=False)
+        pending = self.memory_store.get_effect_operation(effect["operation_id"])
+        self.assertEqual("pending", pending["status"])
+        self.assertEqual(1, self.adapter.publication_writes)
+        recovered = self._governed_publish()
+        self.assertEqual("acknowledged", recovered["status"])
+        retained = self.memory_store.get_effect_operation(effect["operation_id"])
+        self.assertEqual(effect["operation_id"], retained["operation_id"])
+        self.assertEqual(retained["payload_record"]["document"],
+                         self.collection.documents[recovered["publication_id"]])
+        self.assertEqual(2, self.adapter.publication_writes)
+
+    def test_governed_incomplete_readback_keeps_pending_off_without_retry(self) -> None:
+        self.adapter.lose_before_commit = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        effect = [row for row in self.memory_store.list_effect_operations()
+                  if row["kind"] == "procedure_publication"][0]
+        self.adapter.fail_exact_read = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish(current_on=False)
+        self.assertEqual("uncertain", self.memory_store.get_effect_operation(
+            effect["operation_id"])["status"])
+        self.assertEqual("pending_off", self.memory_store.external_effect_off_state(
+            effect["operation_id"], current_config={"shared_publication": False}))
+        self.assertEqual(1, self.adapter.publication_writes)
+
+    def test_governed_uncertainty_requires_exact_readback_on_legacy_entry_points(self) -> None:
+        self.adapter.lose_ack = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        publication = self.memory_store.list_procedure_publications()[0]
+        with self.assertRaises(procedures.ProcedureError):
+            self._publish()
+        recovered = self.service.reconcile_publication(publication["publication_id"], self.adapter)
+        self.assertEqual("acknowledged", recovered["status"])
+        self.assertEqual("confirmed", [row for row in self.memory_store.list_effect_operations()
+                                       if row["kind"] == "procedure_publication"][0]["status"])
+        self.assertEqual(1, self.adapter.publication_writes)
+
+    def test_governed_lost_ack_then_withdrawal_preserves_original_uncertainty(self) -> None:
+        self.adapter.lose_ack = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        publication = self.memory_store.list_procedure_publications()[0]
+        self.service.withdraw_partition(
+            logical_id=self.procedure["logical_id"], partition=self.partition,
+            issuer="ROOT", adapter=self.adapter,
+        )
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self.service.reconcile_publication(publication["publication_id"], self.adapter)
+        self.assertEqual("uncertain", [row for row in self.memory_store.list_effect_operations()
+                                       if row["kind"] == "procedure_publication"][0]["status"])
+        self.assertEqual(1, self.adapter.publication_writes)
+
+    def test_governed_lost_ack_then_revocation_preserves_original_uncertainty(self) -> None:
+        self.adapter.lose_ack = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        publication = self.memory_store.list_procedure_publications()[0]
+        self.service.revoke(
+            procedure=self.procedure, issuer="ROOT", reason="superseded",
+            adapter=self.adapter,
+        )
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self.service.reconcile_publication(publication["publication_id"], self.adapter)
+        self.assertEqual("uncertain", [row for row in self.memory_store.list_effect_operations()
+                                       if row["kind"] == "procedure_publication"][0]["status"])
+        self.assertEqual(1, self.adapter.publication_writes)
+
+    def test_governed_recovery_rejects_changed_atlas_scope(self) -> None:
+        self.adapter.lose_before_commit = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        with self.assertRaises(procedures.ProcedureError):
+            self.service.publish(
+                procedure=self.procedure, approval=self.approval,
+                representation=self.representation, designation=self.designation,
+                adapter=self.adapter, captured_config={"shared_publication": True},
+                current_config={"shared_publication": True},
+                atlas_scope={"database": "other_database", "collection": "trusted",
+                             "index": "vector_index", "namespace": self.partition["namespace"],
+                             "recipients": self.partition["recipients"]},
+            )
+        self.assertEqual(1, self.adapter.publication_writes)
+        self.assertEqual(1, len([row for row in self.memory_store.list_effect_operations()
+                                 if row["kind"] == "procedure_publication"]))
+
+    def test_governed_direct_recovery_rejects_wrong_adapter_location(self) -> None:
+        self.adapter.lose_ack = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        publication = self.memory_store.list_procedure_publications()[0]
+        wrong_adapter = _FaultAdapter(collection=self.collection)
+        wrong_adapter.location = {"database": "other_database", "collection": "trusted",
+                                  "index": "vector_index"}
+        with self.assertRaises(procedures.ProcedureError):
+            self.service.reconcile_publication(publication["publication_id"], wrong_adapter)
+        self.assertEqual("uncertain", [row for row in self.memory_store.list_effect_operations()
+                                       if row["kind"] == "procedure_publication"][0]["status"])
+        self.service.reconcile_publication(publication["publication_id"], self.adapter)
+        with self.assertRaises(procedures.ProcedureError):
+            self.service.reconcile_publication(publication["publication_id"], wrong_adapter)
+
+    def test_governed_off_rejects_new_effect_before_remote_publication(self) -> None:
+        with self.assertRaises(procedures.ProcedureIneligibleError):
+            self._governed_publish(current_on=False)
+        self.assertEqual([], [row for row in self.memory_store.list_effect_operations()
+                              if row["kind"] == "procedure_publication"])
+        self.assertEqual([], self.memory_store.list_procedure_publications())
+        self.assertEqual(0, self.adapter.publication_writes)
+        self.assertEqual("acknowledged", self._governed_publish()["status"])
+        self.assertEqual(1, self.adapter.publication_writes)
+
+    def test_acknowledged_governed_replay_rejects_wrong_scope_config_and_adapter(self) -> None:
+        self.assertEqual("acknowledged", self._governed_publish()["status"])
+        self.assertEqual("acknowledged", self._governed_publish()["status"])
+        for overrides in (
+            {"captured_config": {"shared_publication": False}},
+            {"atlas_scope": {"database": "other", "collection": "trusted",
+                             "index": "vector_index", "namespace": self.partition["namespace"],
+                             "recipients": self.partition["recipients"]}},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(procedures.ProcedureError):
+                self.service.publish(
+                    procedure=self.procedure, approval=self.approval,
+                    representation=self.representation, designation=self.designation,
+                    adapter=self.adapter, claimant=self._claimant(),
+                    captured_config=overrides.get("captured_config", {"shared_publication": True}),
+                    current_config={"shared_publication": True},
+                    atlas_scope=overrides.get("atlas_scope", self._atlas_scope()),
+                )
+        wrong = _FaultAdapter(collection=self.collection)
+        wrong.location = {**wrong.location, "database": "other"}
+        with self.assertRaises(procedures.ProcedureError):
+            self.service.publish(
+                procedure=self.procedure, approval=self.approval,
+                representation=self.representation, designation=self.designation,
+                adapter=wrong, claimant=self._claimant(),
+                captured_config={"shared_publication": True},
+                current_config={"shared_publication": True}, atlas_scope=self._atlas_scope())
+        self.assertEqual(1, self.adapter.publication_writes)
+
+    def _atlas_scope(self) -> dict:
+        return {"database": "procedures_test", "collection": "trusted",
+                "index": "vector_index", "namespace": self.partition["namespace"],
+                "recipients": self.partition["recipients"]}
+
+    def test_legacy_acknowledgement_cannot_be_adopted_as_governed(self) -> None:
+        self.assertEqual("acknowledged", self._publish()["status"])
+        with self.assertRaises(procedures.ProcedureError):
+            self._governed_publish()
+        self.assertEqual([], self.memory_store.list_effect_operations())
+
+    def test_acknowledged_governed_replay_still_requires_content_bound_claimant(self) -> None:
+        self._governed_publish()
+        invalid = self._claimant()
+        invalid["pid"] = 0
+        invalid["content_hash"] = contracts.content_hash(invalid)
+        with self.assertRaises(procedures.ProcedureError):
+            self.service.publish(
+                procedure=self.procedure, approval=self.approval,
+                representation=self.representation, designation=self.designation,
+                adapter=self.adapter, claimant=invalid,
+                captured_config={"shared_publication": True},
+                current_config={"shared_publication": True}, atlas_scope=self._atlas_scope())
+
+    def test_partial_publication_then_safety_transition_does_not_confirm_original(self) -> None:
+        self.collection.fail_next_read_for = atlas.publication_state_document_id(
+            contracts.make_procedure_publication(
+                procedure=self.procedure, approval=self.approval,
+                representation=self.representation, designation=self.designation)["publication_id"])
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        publication = self.memory_store.list_procedure_publications()[0]
+        self.service.withdraw_partition(logical_id=self.procedure["logical_id"],
+            partition=self.partition, issuer="ROOT", adapter=self.adapter)
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self.service.reconcile_publication(publication["publication_id"], self.adapter)
+        effect = self.memory_store.list_effect_operations()[0]
+        self.assertNotEqual("confirmed", effect["status"])
+        self.assertEqual("withdrawn", self.collection.documents[
+            atlas.publication_state_document_id(publication["publication_id"])]["state"])
+
+    def test_confirmed_publication_retains_original_proof_after_safety_revocation(self) -> None:
+        publication = self._governed_publish()
+        effect = self.memory_store.list_effect_operations()[0]
+        original_proof = effect["acknowledgement"]
+        safety = self.service.revoke(procedure=self.procedure, issuer="ROOT",
+            reason="unsafe", adapter=self.adapter)
+        self.assertTrue(safety["managed_complete"])
+        self.assertEqual("confirmed", self.memory_store.get_effect_operation(
+            effect["operation_id"])["status"])
+        self.assertEqual(original_proof, self.memory_store.get_effect_operation(
+            effect["operation_id"])["acknowledgement"])
+        self.assertEqual("revoked", self.collection.documents[
+            atlas.publication_state_document_id(publication["publication_id"])]["state"])
+
+    def test_abandoned_in_flight_claim_needs_provider_fence_before_absent_retry(self) -> None:
+        def interrupted_write(_publication: dict) -> dict:
+            raise RuntimeError("synthetic process interruption after durable claim")
+
+        self.adapter.write_publication = interrupted_write  # type: ignore[method-assign]
+        with self.assertRaises(RuntimeError):
+            self._governed_publish()
+        effect = [row for row in self.memory_store.list_effect_operations()
+                  if row["kind"] == "procedure_publication"][0]
+        self.assertEqual("in_flight", effect["status"])
+        self.assertTrue(self.adapter.publication_effect_absent(effect["source_id"]))
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        self.assertEqual("in_flight", self.memory_store.get_effect_operation(
+            effect["operation_id"])["status"])
+
+    def test_reopened_claim_needs_exact_verified_fence_before_new_generation(self) -> None:
+        original_write = self.adapter.write_publication
+
+        def interrupted_write(_publication: dict) -> dict:
+            raise RuntimeError("synthetic process interruption after claim")
+
+        self.adapter.write_publication = interrupted_write  # type: ignore[method-assign]
+        with self.assertRaises(RuntimeError):
+            self._governed_publish()
+        first = self.memory_store.list_effect_operations()[0]
+        self.memory_store.close()
+        self.terminated_claimants.add(("native-test", 4142, "2026-09-26T09:00:00Z"))
+        self.memory_store = store.MemoryStore(Path(self.temporary.name) / "memory.sqlite3",
+            external_claim_fence_verifier=self._verified_fence)
+        self.memory_store.initialize()
+        self.service = procedures.TrustedProcedureService(
+            self.memory_store, trusted_issuers={"ROOT"})
+        self.adapter.write_publication = original_write  # type: ignore[method-assign]
+        wrong = self._fence(first)
+        wrong["claim_id"] = "wrong-claim"
+        wrong["content_hash"] = contracts.content_hash(wrong)
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish(claim_fence=wrong)
+        self.assertEqual("in_flight", self.memory_store.get_effect_operation(
+            first["operation_id"])["status"])
+        with self.assertRaises(procedures.ProcedureIneligibleError):
+            self._governed_publish(current_on=False, claim_fence=self._fence(first))
+        pending = self.memory_store.get_effect_operation(first["operation_id"])
+        self.assertEqual("pending", pending["status"])
+        self.assertEqual(1, pending["claim_generation"])
+        recovered = self._governed_publish(invocation="native-recovery")
+        self.assertEqual("acknowledged", recovered["status"])
+        confirmed = self.memory_store.get_effect_operation(first["operation_id"])
+        self.assertEqual(2, confirmed["claim_generation"])
+        self.assertNotEqual(first["active_claim_id"], confirmed["active_claim_id"])
+        self.assertEqual(1, self.adapter.publication_writes)
+        with self.assertRaises(store.OperationConflictError):
+            self.memory_store.confirm_effect_operation(
+                first["operation_id"], confirmed["acknowledgement"],
+                claim_id=first["active_claim_id"])
+
+    def test_reopened_claim_without_constructor_verifier_stays_in_flight(self) -> None:
+        def interrupted_write(_publication: dict) -> dict:
+            raise RuntimeError("synthetic process interruption after claim")
+
+        self.adapter.write_publication = interrupted_write  # type: ignore[method-assign]
+        with self.assertRaises(RuntimeError):
+            self._governed_publish()
+        first = self.memory_store.list_effect_operations()[0]
+        self.memory_store.close()
+        self.memory_store = store.MemoryStore(Path(self.temporary.name) / "memory.sqlite3")
+        self.memory_store.initialize()
+        self.service = procedures.TrustedProcedureService(
+            self.memory_store, trusted_issuers={"ROOT"})
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish(claim_fence=self._fence(first))
+        self.assertEqual("in_flight", self.memory_store.get_effect_operation(
+            first["operation_id"])["status"])
+
+    def test_interruption_between_governed_intent_and_local_publication_recovers(self) -> None:
+        original_create = self.memory_store.create_procedure_publication
+
+        def interrupted_create(_publication: dict) -> tuple[dict, bool]:
+            raise RuntimeError("synthetic interruption before local publication intent")
+
+        self.memory_store.create_procedure_publication = interrupted_create  # type: ignore[method-assign]
+        with self.assertRaises(RuntimeError):
+            self._governed_publish()
+        self.assertEqual("pending", self.memory_store.list_effect_operations()[0]["status"])
+        self.assertEqual([], self.memory_store.list_procedure_publications())
+        self.memory_store.create_procedure_publication = original_create  # type: ignore[method-assign]
+        self.assertEqual("acknowledged", self._governed_publish()["status"])
 
     def _publication_and_operation(self) -> tuple[dict, dict]:
         publication = self.memory_store.list_procedure_publications()[0]

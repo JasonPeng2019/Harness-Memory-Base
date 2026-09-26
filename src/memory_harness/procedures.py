@@ -7,9 +7,11 @@ trusted approval and, when enabled, a narrow Atlas adapter.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Any, Iterable, Mapping
 
 from . import atlas, contracts
+from .config import MemoryConfig, effect_submission_enabled
 from .privacy import (
     PrivacyPolicy,
     RemotePayloadPrivacyError,
@@ -17,7 +19,7 @@ from .privacy import (
     guard_worker_bound_remote,
     sanitize_payload,
 )
-from .store import MemoryStore, ProcedureConflictError, StoreError
+from .store import MemoryStore, OperationConflictError, ProcedureConflictError, StoreError
 
 
 class ProcedureError(ValueError):
@@ -455,6 +457,19 @@ class TrustedProcedureService:
             and state.get("designation_generation") == designation.get("generation")
         )
 
+    def _governed_effect_committed(
+        self, snapshot: atlas.AtlasExactProcedureSnapshot | None,
+        publication: Mapping[str, Any], payload: Mapping[str, Any],
+    ) -> bool:
+        if snapshot is None or snapshot.publication_state is None:
+            return False
+        state = snapshot.publication_state
+        original_state = payload["publication_state"]
+        if snapshot.document.get("content_hash") != payload["document"]["content_hash"]:
+            return False
+        return (state.get("content_hash") == original_state["content_hash"] and
+                self._snapshot_matches_publication(snapshot, publication))
+
     @staticmethod
     def _snapshot_matches_publication_state(
         snapshot: atlas.AtlasExactProcedureSnapshot | None,
@@ -624,8 +639,24 @@ class TrustedProcedureService:
         representation: Mapping[str, Any],
         designation: Mapping[str, Any],
         adapter: atlas.AtlasProcedureAdapter,
+        captured_config: Mapping[str, Any] | MemoryConfig | None = None,
+        current_config: Mapping[str, Any] | MemoryConfig | None = None,
+        atlas_scope: Mapping[str, Any] | None = None,
+        claimant: Mapping[str, Any] | None = None,
+        claim_fence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Publish one authorized partition after privacy and lifecycle checks."""
+        """Publish after trust/privacy checks.
+
+        To govern a new Atlas effect, supply both configurations, exact scope,
+        and a content-bound claimant from trusted native composition. For
+        example, ``captured_config={"shared_publication": True}``,
+        ``current_config={"shared_publication": True}``, and ``atlas_scope``
+        with database, collection, index, namespace, and exact recipients.
+        Repeat the same call after a lost acknowledgement: exact readback
+        resolves it; complete absence permits a new claim generation. A
+        reopened in-flight claim additionally needs a trusted claim fence
+        verified by the store's constructor-bound verifier.
+        """
 
         self._require_trusted_issuer(approval.get("issuer"))
         try:
@@ -645,10 +676,80 @@ class TrustedProcedureService:
                 guard_remote_payload(publication, self.privacy_policy)
             except RemotePayloadPrivacyError as exc:
                 raise ProcedureError("privacy scan rejected procedure publication") from exc
+            wants_governance = any(value is not None for value in (
+                captured_config, current_config, atlas_scope, claimant, claim_fence))
+            prior_effects = [row for row in self.store.list_effect_operations()
+                if row["outcome_id"] is None and row["kind"] == "procedure_publication"
+                and row["source_id"] == publication["publication_id"]]
+            if wants_governance:
+                if (captured_config is None or current_config is None or atlas_scope is None
+                        or claimant is None):
+                    raise ProcedureError("governed publication needs a trusted claimant, configurations and scope")
+                try:
+                    self.store._validate_external_claimant(claimant)
+                except contracts.ContractError as exc:
+                    raise ProcedureError("governed publication needs a valid native claimant") from exc
+                expected_keys = {"database", "collection", "index", "namespace", "recipients"}
+                if (set(atlas_scope) != expected_keys or
+                        any(not isinstance(atlas_scope[key], str) or not atlas_scope[key]
+                            for key in ("database", "collection", "index", "namespace")) or
+                        atlas_scope["namespace"] != publication["partition"]["namespace"] or
+                        atlas_scope["recipients"] != publication["partition"]["recipients"]):
+                    raise ProcedureError("Atlas scope must name exact collection, index, namespace, and recipients")
+                if getattr(adapter, "location", None) != {
+                    key: atlas_scope[key] for key in ("database", "collection", "index")
+                }:
+                    raise ProcedureError("Atlas scope differs from the adapter's bound location")
+                if not effect_submission_enabled(captured_config, "procedure_publication"):
+                    raise ProcedureIneligibleError("captured shared publication feature is off")
+                if not prior_effects and not effect_submission_enabled(
+                    current_config, "procedure_publication"
+                ):
+                    raise ProcedureIneligibleError("current shared publication feature is off")
+                scope_key = contracts.sha256_hex(atlas_scope)
+                effect_id = contracts.external_effect_operation_id(
+                    publication["publication_id"], "procedure_publication", scope_key)
+                if any(row["operation_id"] != effect_id for row in prior_effects):
+                    raise ProcedureError("publication is already bound to another Atlas scope")
+                if prior_effects:
+                    source = prior_effects[0]["source_record"]
+                    expected_source = contracts.make_procedure_publication(
+                        procedure=procedure, approval=approval,
+                        representation=representation, designation=designation,
+                        created_at=source["created_at"])
+                    if source != expected_source:
+                        raise ProcedureError("governed publication source differs from original intent")
+                    publication = source
+                else:
+                    try:
+                        self.store.get_procedure_publication(publication["publication_id"])
+                    except StoreError:
+                        pass
+                    else:
+                        raise ProcedureError("legacy publication cannot acquire a retrospective governed effect")
+                payload = {
+                    "atlas_scope": dict(atlas_scope),
+                    "document": atlas.make_atlas_procedure_document(publication),
+                    "publication_state": atlas.make_atlas_publication_state_document(
+                        publication, state="active"),
+                }
+                try:
+                    self.store.create_external_effect_operation(
+                        kind="procedure_publication", scope_key=scope_key,
+                        source_id=publication["publication_id"], source_record=publication,
+                        payload=payload, captured_config=captured_config,
+                        current_config=current_config)
+                except (contracts.ContractError, OperationConflictError) as exc:
+                    raise ProcedureIneligibleError("governed publication intent is off or conflicts") from exc
             publication, _ = self.store.create_procedure_publication(publication)
         except (contracts.ContractError, ProcedureConflictError) as exc:
             raise ProcedureError("could not create a durable publication intent") from exc
-        if publication["status"] == "acknowledged":
+        governed_effects = [row for row in self.store.list_effect_operations()
+            if row["outcome_id"] is None and row["kind"] == "procedure_publication"
+            and row["source_id"] == publication["publication_id"]]
+        if governed_effects and not wants_governance:
+            raise ProcedureError("governed publication recovery needs original scope and configuration")
+        if not wants_governance and publication["status"] == "acknowledged":
             return publication
         operation = self._create_remote_operation(
             kind="publication",
@@ -658,10 +759,15 @@ class TrustedProcedureService:
             payload_digest=publication["payload_digest"],
             partition_id=publication["partition_id"],
         )
-        if publication["status"] not in {"intent", "ambiguous", "remote_committed"} or operation[
-            "status"
-        ] not in {"intent", "ambiguous", "remote_committed"}:
+        if (publication["status"] not in {"intent", "ambiguous", "remote_committed", "acknowledged"}
+                or operation["status"] not in {"intent", "ambiguous", "remote_committed", "acknowledged"}):
             raise ProcedureIneligibleError("publication is no longer eligible for remote submission")
+        if wants_governance:
+            return self._publish_governed(
+                publication, operation, designation, adapter,
+                captured_config=captured_config, current_config=current_config,
+                atlas_scope=atlas_scope, claimant=claimant, claim_fence=claim_fence,
+            )
         self.publish_designation(designation, adapter)
         if publication["status"] in {"ambiguous", "remote_committed"} or operation[
             "status"
@@ -764,12 +870,220 @@ class TrustedProcedureService:
             publication, status="acknowledged", remote_receipt=self._receipt(remote)
         )
 
+    def _publish_governed(
+        self, publication: Mapping[str, Any], operation: Mapping[str, Any],
+        designation: Mapping[str, Any], adapter: atlas.AtlasProcedureAdapter,
+        *, captured_config: Mapping[str, Any] | MemoryConfig,
+        current_config: Mapping[str, Any] | MemoryConfig,
+        atlas_scope: Mapping[str, Any],
+        claimant: Mapping[str, Any],
+        claim_fence: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        scope = dict(atlas_scope)
+        scope_key = contracts.sha256_hex(scope)
+        effect_id = contracts.external_effect_operation_id(
+            str(publication["publication_id"]), "procedure_publication", scope_key
+        )
+        if any(
+            row["outcome_id"] is None and row["kind"] == "procedure_publication"
+            and row["source_id"] == publication["publication_id"]
+            and row["operation_id"] != effect_id
+            for row in self.store.list_effect_operations()
+        ):
+            raise ProcedureError("publication is already bound to another Atlas scope")
+        captured = asdict(captured_config) if isinstance(captured_config, MemoryConfig) else dict(captured_config)
+        payload = {
+            "atlas_scope": scope,
+            "document": atlas.make_atlas_procedure_document(publication),
+            "publication_state": atlas.make_atlas_publication_state_document(publication, state="active"),
+        }
+        try:
+            existing = self.store.get_effect_operation(effect_id)
+        except StoreError:
+            existing = None
+        if existing is not None:
+            original = existing["source_record"]
+            expected_source = contracts.make_procedure_publication(
+                procedure=publication["procedure"], approval=publication["approval"],
+                representation=publication["representation"], designation=publication["designation"],
+                created_at=original["created_at"])
+            if (original != expected_source or
+                    existing["payload_record"]["atlas_scope"] != scope or
+                    existing["configuration"] != captured):
+                raise ProcedureError("governed publication replay differs from original intent")
+            source = existing["source_record"]
+            payload = existing["payload_record"]
+        else:
+            source = publication
+        try:
+            effect, _ = self.store.create_external_effect_operation(
+                kind="procedure_publication", scope_key=scope_key,
+                source_id=str(publication["publication_id"]), source_record=source,
+                payload=payload, captured_config=captured_config,
+                current_config=current_config,
+            )
+        except (contracts.ContractError, OperationConflictError) as exc:
+            raise ProcedureIneligibleError("governed publication intent is off or conflicts") from exc
+
+        def evidence(proof: Mapping[str, Any], *, absent: bool = False) -> dict[str, Any]:
+            result = {key: effect[key] for key in (
+                "operation_id", "kind", "scope_key", "source_digest",
+                "payload_digest", "configuration_digest",
+            )}
+            result["adapter_proof"] = dict(proof)
+            if absent:
+                result["readback_complete"] = True
+            return result
+
+        def acknowledge(snapshot: atlas.AtlasExactProcedureSnapshot) -> dict[str, Any]:
+            assert snapshot.publication_state is not None
+            proof = {"publication_id": publication["publication_id"],
+                     "document_digest": snapshot.document["content_hash"],
+                     "state_digest": snapshot.publication_state["content_hash"]}
+            self.store.confirm_effect_operation(effect_id, evidence(proof),
+                claim_id=effect["active_claim_id"])
+            current = self.store.get_current_procedure_designation(
+                publication["logical_id"], publication["partition"]
+            )
+            if (self.store.is_procedure_revoked(publication["revision_id"]) or
+                    current is None or current["state"] != "active" or
+                    current["designation_id"] != publication["designation"]["designation_id"]):
+                self._update_publication(publication, status="fenced", error="local lifecycle changed")
+                self._update_remote_operation(operation, status="fenced", error="local lifecycle changed")
+                raise ProcedureIneligibleError("local lifecycle fenced publication acknowledgement")
+            return self.reconcile_publication(str(publication["publication_id"]), adapter)
+
+        if effect["status"] == "in_flight":
+            if claim_fence is None:
+                raise ProcedureRemoteAmbiguityError("publication claim remains in flight")
+            try:
+                effect = self.store.isolate_external_effect_claim(
+                    effect_id, effect["active_claim_id"], claim_fence)
+            except OperationConflictError as exc:
+                raise ProcedureRemoteAmbiguityError("publication claim fence is unverified") from exc
+        if effect["status"] == "uncertain":
+            try:
+                snapshot = adapter.exact_read(str(publication["publication_id"]))
+            except atlas.AtlasProcedureError as exc:
+                raise ProcedureRemoteAmbiguityError("governed publication exact read failed") from exc
+            if self._governed_effect_committed(snapshot, publication, payload):
+                assert snapshot is not None and snapshot.publication_state is not None
+                return acknowledge(snapshot)
+            try:
+                absent = adapter.publication_effect_absent(str(publication["publication_id"]))
+            except atlas.AtlasProcedureError as exc:
+                raise ProcedureRemoteAmbiguityError("publication absence is unresolved") from exc
+            if not absent:
+                raise ProcedureRemoteAmbiguityError("publication effect remains uncertain")
+            self.store.reconcile_external_effect_operation(
+                effect_id,
+                evidence=evidence({"publication_id": publication["publication_id"],
+                                   "state_id": atlas.publication_state_document_id(
+                                       str(publication["publication_id"]))}, absent=True),
+                result="absent", claim_id=effect["active_claim_id"],
+            )
+            effect = self.store.get_effect_operation(effect_id)
+        if effect["status"] == "confirmed":
+            return self.reconcile_publication(str(publication["publication_id"]), adapter)
+        if effect["status"] != "pending":
+            raise ProcedureIneligibleError("governed publication is not pending")
+        # The current gate is checked before any new non-safety remote work.
+        if not effect_submission_enabled(current_config, "procedure_publication"):
+            raise ProcedureIneligibleError("current shared publication feature is off")
+        self.publish_designation(designation, adapter)
+        try:
+            effect = self.store.claim_effect_operation(
+                effect_id, current_config=current_config, claimant=claimant)
+        except (OperationConflictError, contracts.ContractError) as exc:
+            raise ProcedureIneligibleError("governed publication claim is unavailable") from exc
+        claim_id = effect["active_claim_id"]
+        try:
+            adapter.write_publication(source)
+            snapshot = adapter.exact_read(str(publication["publication_id"]))
+            if not self._governed_effect_committed(snapshot, publication, payload):
+                raise atlas.AtlasProcedureAmbiguityError("publication lacks exact readback")
+        except atlas.AtlasProcedureFencedError as exc:
+            self.store.mark_effect_uncertain(effect_id, "remote publication fenced after claim",
+                claim_id=claim_id)
+            self._update_publication(publication, status="fenced", error="remote publication fenced")
+            self._update_remote_operation(operation, status="fenced", error="remote publication fenced")
+            raise ProcedureIneligibleError("remote publication was fenced") from exc
+        except atlas.AtlasProcedureError as exc:
+            self.store.mark_effect_uncertain(effect_id, "remote publication acknowledgement unresolved",
+                claim_id=claim_id)
+            self._update_publication(publication, status="ambiguous", error="remote acknowledgement unresolved")
+            self._update_remote_operation(operation, status="ambiguous", error="remote acknowledgement unresolved")
+            raise ProcedureRemoteAmbiguityError("remote publication requires exact reconciliation") from exc
+        assert snapshot is not None and snapshot.publication_state is not None
+        return acknowledge(snapshot)
+
     def reconcile_publication(
-        self, publication_id: str, adapter: atlas.AtlasProcedureAdapter
+        self, publication_id: str, adapter: atlas.AtlasProcedureAdapter,
+        *, claim_fence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Resolve a lost acknowledgement through exact read, never blind replay."""
 
         publication = self.store.get_procedure_publication(publication_id)
+        effects = [
+            row for row in self.store.list_effect_operations()
+            if row["outcome_id"] is None and row["kind"] == "procedure_publication"
+            and row["source_id"] == publication_id
+        ]
+        if len(effects) > 1:
+            raise ProcedureError("publication has conflicting governed scopes")
+        if effects:
+            effect = effects[0]
+            scope = effect["payload_record"]["atlas_scope"]
+            if getattr(adapter, "location", None) != {
+                key: scope[key] for key in ("database", "collection", "index")
+            }:
+                raise ProcedureError("Atlas adapter does not match the governed effect scope")
+        if effects and effects[0]["status"] != "confirmed":
+            effect = effects[0]
+            if effect["status"] == "in_flight":
+                if claim_fence is None:
+                    raise ProcedureRemoteAmbiguityError("publication claim remains in flight")
+                try:
+                    effect = self.store.isolate_external_effect_claim(
+                        effect["operation_id"], effect["active_claim_id"], claim_fence)
+                except OperationConflictError as exc:
+                    raise ProcedureRemoteAmbiguityError("publication claim fence is unverified") from exc
+            try:
+                original = adapter.exact_read(publication_id)
+            except atlas.AtlasProcedureError as exc:
+                raise ProcedureRemoteAmbiguityError("governed publication exact read failed") from exc
+            if (effect["status"] not in {"in_flight", "uncertain"} or
+                    not self._governed_effect_committed(
+                        original, publication, effect["payload_record"]
+                    )):
+                raise ProcedureRemoteAmbiguityError(
+                    "governed publication lacks exact original submission evidence"
+                )
+            assert original is not None and original.publication_state is not None
+            proof = {key: effect[key] for key in (
+                "operation_id", "kind", "scope_key", "source_digest",
+                "payload_digest", "configuration_digest",
+            )}
+            proof["adapter_proof"] = {
+                "publication_id": publication_id,
+                "document_digest": original.document["content_hash"],
+                "state_digest": original.publication_state["content_hash"],
+            }
+            self.store.confirm_effect_operation(effect["operation_id"], proof,
+                claim_id=effect["active_claim_id"])
+            if original.publication_state["state"] == "active":
+                current = self.store.get_current_procedure_designation(
+                    publication["logical_id"], publication["partition"]
+                )
+                if (self.store.is_procedure_revoked(publication["revision_id"]) or
+                        current is None or current["state"] != "active" or
+                        current["designation_id"] != publication["designation"]["designation_id"]):
+                    self._update_publication(
+                        publication, status="fenced", error="local lifecycle changed"
+                    )
+                    raise ProcedureIneligibleError(
+                        "local lifecycle fenced publication acknowledgement"
+                    )
         operations = [
             operation
             for operation in self.store.list_procedure_remote_operations(payload_id=publication_id)

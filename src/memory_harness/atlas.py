@@ -463,6 +463,7 @@ class AtlasProcedureAdapter:
         vector_store: Any,
         metric: str = "cosine",
         privacy_policy: PrivacyPolicy | None = None,
+        location: Mapping[str, str] | None = None,
     ) -> None:
         if metric not in _ATLAS_VECTOR_METRICS:
             raise AtlasProcedureError("Atlas procedure metric is unsupported")
@@ -470,6 +471,19 @@ class AtlasProcedureAdapter:
         self.vector_store = vector_store
         self.metric = metric
         self.privacy_policy = privacy_policy or PrivacyPolicy()
+        self.location = None if location is None else dict(location)
+        if self.location is not None:
+            if (set(self.location) != {"database", "collection", "index"} or
+                    any(not isinstance(value, str) or not value
+                        for value in self.location.values())):
+                raise AtlasProcedureError("Atlas adapter location must name database, collection, and index")
+            actual_collection = getattr(collection, "name", None)
+            actual_database = getattr(getattr(collection, "database", None), "name", None)
+            if ((isinstance(actual_collection, str) and
+                 actual_collection != self.location["collection"]) or
+                    (isinstance(actual_database, str) and
+                     actual_database != self.location["database"])):
+                raise AtlasProcedureError("Atlas adapter location differs from its collection")
 
     @classmethod
     def from_pymongo_collection(
@@ -506,6 +520,8 @@ class AtlasProcedureAdapter:
             vector_store=vector_store,
             metric=metric,
             privacy_policy=privacy_policy,
+            location={"database": collection.database.name,
+                      "collection": collection.name, "index": index_name},
         )
 
     def create_vector_search_index(
@@ -847,6 +863,19 @@ class AtlasProcedureAdapter:
             publication_state=state,
             revocation=revocation,
         )
+
+    def publication_effect_absent(self, publication_id: str) -> bool:
+        """Prove both IDs written by publication are absent by exact reads.
+
+        A missing publication document alone is insufficient: the companion
+        lifecycle state may have committed before an acknowledgement was lost.
+        """
+        try:
+            document = self._find_one(publication_id)
+            state = self._find_one(publication_state_document_id(publication_id))
+        except Exception as exc:
+            raise AtlasProcedureError("Atlas publication absence read failed") from exc
+        return document is None and state is None
 
     def exact_current(
         self, logical_id: str, partition_id: str
