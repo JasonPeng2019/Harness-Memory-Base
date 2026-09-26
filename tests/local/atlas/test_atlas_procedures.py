@@ -938,18 +938,13 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
             )
         self.assertIn(secret, procedure["behavior"]["body"])
         self.assertEqual({}, self.collection.documents)
-        publication = self.memory_store.list_procedure_publications(
-            revision_id=procedure["revision_id"]
-        )[0]
-        self.assertEqual("blocked", publication["status"])
-        publication_operation = next(
-            operation
-            for operation in self.memory_store.list_procedure_remote_operations(
-                payload_id=publication["publication_id"]
-            )
-            if operation["kind"] == "publication"
+        self.assertEqual(
+            [], self.memory_store.list_procedure_publications(revision_id=procedure["revision_id"])
         )
-        self.assertEqual("blocked", publication_operation["status"])
+        self.assertEqual(
+            [], [op for op in self.memory_store.list_procedure_remote_operations()
+                 if op["kind"] == "publication"]
+        )
 
     def test_service_policy_sanitizes_discovery_query_before_atlas(self) -> None:
         self.service.publish_designation(self.designation, self.adapter)

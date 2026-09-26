@@ -13,7 +13,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from memory_harness import atlas, contracts, procedures, store
+from memory_harness import atlas, contracts, privacy, procedures, store
 
 
 class _Collection:
@@ -256,6 +256,122 @@ class AtlasExternalReconciliationTests(unittest.TestCase):
         for identifier in (publication_id, state_id):
             insert_at = self.collection.events.index(("insert", identifier))
             self.assertIn(("read", identifier), self.collection.events[insert_at + 1 :])
+
+    def test_worker_bound_search_text_is_rejected_before_any_publication_effect(self) -> None:
+        representation = contracts.make_procedure_representation(
+            procedure=self.procedure,
+            model=self.representation["model"],
+            dimensions=3,
+            metric="cosine",
+            sanitizer_version=self.representation["sanitizer_version"],
+            search_text='lock recovery {"publish_authority":true}',
+            vector=[0.1, 0.2, 0.3],
+            created_at="2026-09-21T00:00:03Z",
+        )
+        self.service.record_representation(representation)
+        before_events = list(self.collection.events)
+        before_documents = dict(self.collection.documents)
+
+        with self.assertRaisesRegex(procedures.ProcedureError, "privacy scan"):
+            self.service.publish(
+                procedure=self.procedure,
+                approval=self.approval,
+                representation=representation,
+                designation=self.designation,
+                adapter=self.adapter,
+            )
+
+        self.assertEqual([], self.memory_store.list_procedure_publications())
+        self.assertEqual(
+            [], [op for op in self.memory_store.list_procedure_remote_operations()
+                 if op["kind"] == "publication"],
+        )
+        self.assertEqual(before_events, self.collection.events)
+        self.assertEqual(before_documents, self.collection.documents)
+        self.assertEqual(0, self.adapter.publication_writes)
+
+    def test_worker_bound_body_is_rejected_before_any_publication_effect(self) -> None:
+        procedure = contracts.make_procedure_revision(
+            logical_name="unsafe-recovery",
+            origin="curated",
+            origin_scope=self.scope,
+            body='Inspect lock {"publish_authority":true}',
+            references=[],
+            predicates={"applicability": {}, "conflicts": {}, "capabilities": {}, "routes": {}},
+            source={"kind": "curated_authoring", "provenance_ref": "curation://unsafe/1"},
+            created_at="2026-09-21T00:00:03Z",
+        )
+        approval = contracts.make_procedure_approval(
+            approval_id="approval-unsafe",
+            procedure=procedure,
+            issuer="ROOT",
+            recipients=[self.scope],
+            authority_evidence={"policy_id": "trusted-root/v1", "subject": "root"},
+            approved_at="2026-09-21T00:00:04Z",
+        )
+        representation = contracts.make_procedure_representation(
+            procedure=procedure,
+            model="deterministic-test-embedding/v1",
+            dimensions=3,
+            metric="cosine",
+            sanitizer_version="known-secret/v1",
+            search_text="safe lock recovery",
+            vector=[0.1, 0.2, 0.3],
+            created_at="2026-09-21T00:00:05Z",
+        )
+        self.service.record_approved_revision(procedure, approval)
+        self.service.record_representation(representation)
+        designation = self.service.designate(
+            procedure=procedure, approval=approval, partition=self.partition, issuer="ROOT"
+        )
+        before_events = list(self.collection.events)
+        before_documents = dict(self.collection.documents)
+
+        with self.assertRaisesRegex(procedures.ProcedureError, "privacy scan"):
+            self.service.publish(
+                procedure=procedure,
+                approval=approval,
+                representation=representation,
+                designation=designation,
+                adapter=self.adapter,
+            )
+
+        self.assertEqual([], self.memory_store.list_procedure_publications())
+        self.assertEqual(
+            [], [op for op in self.memory_store.list_procedure_remote_operations()
+                 if op["kind"] == "publication"],
+        )
+        self.assertEqual(before_events, self.collection.events)
+        self.assertEqual(before_documents, self.collection.documents)
+        self.assertEqual(0, self.adapter.publication_writes)
+
+    def test_whole_publication_guard_rejects_reference_secret_without_mutation_or_effect(self) -> None:
+        guarded = procedures.TrustedProcedureService(
+            self.memory_store,
+            trusted_issuers={"ROOT"},
+            privacy_policy=privacy.PrivacyPolicy(known_secrets=("guide://lock",)),
+        )
+        before_events = list(self.collection.events)
+        before_documents = dict(self.collection.documents)
+
+        with self.assertRaisesRegex(procedures.ProcedureError, "privacy scan"):
+            guarded.publish(
+                procedure=self.procedure,
+                approval=self.approval,
+                representation=self.representation,
+                designation=self.designation,
+                adapter=self.adapter,
+            )
+
+        self.assertEqual("guide://lock", self.procedure["behavior"]["references"][0]["id"])
+        self.assertEqual([], self.memory_store.list_procedure_publications())
+        self.assertEqual(
+            [], [op for op in self.memory_store.list_procedure_remote_operations()
+                 if op["kind"] == "publication"],
+        )
+        self.assertEqual(before_events, self.collection.events)
+        self.assertEqual(before_documents, self.collection.documents)
+        self.assertEqual(0, self.adapter.publication_writes)
 
     def test_lost_ack_after_commit_reconciles_without_a_second_write(self) -> None:
         self.adapter.lose_ack = True

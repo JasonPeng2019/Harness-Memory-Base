@@ -14,6 +14,7 @@ from .privacy import (
     PrivacyPolicy,
     RemotePayloadPrivacyError,
     guard_remote_payload,
+    guard_worker_bound_remote,
     sanitize_payload,
 )
 from .store import MemoryStore, ProcedureConflictError, StoreError
@@ -638,6 +639,12 @@ class TrustedProcedureService:
                 raise ProcedureIneligibleError(
                     "procedure representation metric does not match the configured Atlas index"
                 )
+            try:
+                guard_worker_bound_remote(procedure["behavior"]["body"], self.privacy_policy)
+                guard_worker_bound_remote(representation["search_text"], self.privacy_policy)
+                guard_remote_payload(publication, self.privacy_policy)
+            except RemotePayloadPrivacyError as exc:
+                raise ProcedureError("privacy scan rejected procedure publication") from exc
             publication, _ = self.store.create_procedure_publication(publication)
         except (contracts.ContractError, ProcedureConflictError) as exc:
             raise ProcedureError("could not create a durable publication intent") from exc
@@ -655,18 +662,6 @@ class TrustedProcedureService:
             "status"
         ] not in {"intent", "ambiguous", "remote_committed"}:
             raise ProcedureIneligibleError("publication is no longer eligible for remote submission")
-        try:
-            # The Atlas designation is also an Atlas mutation.  Complete the
-            # full outbound publication preflight before it can advance remote
-            # current state, while retaining the durable local intent above.
-            guard_remote_payload(
-                publication,
-                self.privacy_policy,
-            )
-        except RemotePayloadPrivacyError as exc:
-            self._update_publication(publication, status="blocked", error="privacy scan rejected publication")
-            self._update_remote_operation(operation, status="blocked", error="privacy scan rejected publication")
-            raise ProcedureError("privacy scan rejected procedure publication") from exc
         self.publish_designation(designation, adapter)
         if publication["status"] in {"ambiguous", "remote_committed"} or operation[
             "status"
