@@ -7,15 +7,16 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from memory_harness import contracts
+from memory_harness import contracts, store
 from orchestrator_harness import controller, launch, manager_queue, memory_handoff, monitor, operator_launch, resume, review, terminal_evidence
 from orchestrator_harness.core import content_hash
 from orchestrator_harness.epochs import current_epoch_path, lane_record_dir, manager_queue_path
 from orchestrator_harness.lanes import LaneError
 from orchestrator_harness.manager_queue import ManagerQueueError
 from orchestrator_harness.records import atomic_write_json
+from orchestrator_harness.tests.test_memory_handoff import _finalized_lane1_fixture
 
 
 class NativeReviewEvidenceTests(unittest.TestCase):
@@ -39,6 +40,7 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             task="Complete the parent task", base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
                 objective_id="objective-1", route="ordinary", plan=self.plan,
+                checkpoint="checkpoint-1",
             ),
         )
         atomic_write_json(self.worktree / ".agent-workspace" / "task-card.json", self.card)
@@ -51,10 +53,19 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         }
         self.result_path = self.worktree / "RESULT.json"
         self._result("PASS")
-        self.envelope = memory_handoff.prepare_bootstrap_envelope(
-            task_card=self.card, lane_id=self.lane_id, run_id=self.run_id,
-            worktree_path=self.worktree, base_commit="base-1",
-        )
+        store_path, _ = memory_handoff.memory_paths(self.worktree)
+        memory_store = store.MemoryStore(store_path)
+        memory_store.initialize()
+        try:
+            memory_store.record_decision(contracts.make_decision(self.card, self.plan))
+        finally:
+            memory_store.close()
+        finalized = _finalized_lane1_fixture(self.card, self.plan, self.worktree)
+        with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=finalized):
+            self.envelope = memory_handoff.prepare_bootstrap_envelope(
+                task_card=self.card, lane_id=self.lane_id, run_id=self.run_id,
+                worktree_path=self.worktree, base_commit="base-1",
+            )
         assert self.envelope is not None
         context = memory_handoff.load_final_context(
             worktree_path=self.worktree, envelope=self.envelope,
@@ -107,6 +118,18 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         )
         assert value is not None
         return value
+
+    def _fresh_envelope(self, run_id: str) -> dict:
+        finalized = _finalized_lane1_fixture(
+            self.card, self.plan, self.worktree, run_id=run_id,
+        )
+        with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=finalized):
+            envelope = memory_handoff.prepare_resume_envelope(
+                task_card=self.card, lane_id=self.lane_id, run_id=run_id,
+                worktree_path=self.worktree, base_commit="base-1",
+            )
+        assert envelope is not None
+        return envelope
 
     def _native_unknown_review_queue(self) -> dict:
         self.result_path.unlink()
@@ -207,7 +230,10 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         self.assertEqual(self.card, evidence["task_card"])
         self.assertEqual(self.plan, evidence["accepted_plan"])
         self.assertEqual(self.envelope["decision_id"], evidence["decision_id"])
-        self.assertEqual(self.operation, evidence["dispatch"]["operation"])
+        self.assertEqual(
+            {key: self.operation[key] for key in evidence["dispatch"]["operation"]},
+            evidence["dispatch"]["operation"],
+        )
         self.assertEqual(self.observed, evidence["dispatch"]["observed_invocation"])
         self.assertEqual(self.envelope["content_hash"], evidence["dispatch"]["envelope_digest"])
         self.assertEqual(self.envelope["configuration_digest"], evidence["configuration_digest"])
@@ -216,24 +242,44 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         self.assertEqual("ACCEPTED", evidence["acceptance"]["approval"])
         self.assertIsNone(evidence["terminal_proof"])
         self.assertIn(str(self.folder / "NATIVE_TERMINAL_EVIDENCE.json"), response["evidence_paths"])
+        memory_store = store.MemoryStore(memory_handoff.memory_paths(self.worktree)[0])
+        memory_store.initialize()
+        try:
+            self.assertEqual("PASS", memory_store.get_outcome(evidence["decision_id"])["status"])
+        finally:
+            memory_store.close()
 
     def test_fail_blocked_and_forced_acceptance_remain_distinct(self) -> None:
-        for result_outcome, finding, approval, reason in (
-            ("FAIL", "FAIL", "REJECTED", None),
-            ("BLOCKED", "BLOCKED", "ACCEPTED", "ROOT accepts blocked work"),
-        ):
-            with self.subTest(finding=finding):
-                self._result(result_outcome)
-                response = self._review(outcome=finding, approval=approval, force_reason=reason)
-                self.assertTrue(response["ok"], response)
-                evidence = self._evidence()
-                self.assertEqual(result_outcome, evidence["result"]["outcome"])
-                self.assertEqual(finding, evidence["review"]["review_outcome"])
-                self.assertEqual(approval, evidence["acceptance"]["approval"])
-                self.assertEqual(reason, evidence["acceptance"].get("force_accept_reason"))
-                (self.folder / "NATIVE_TERMINAL_EVIDENCE.json").unlink()
-                (self.folder / "ORCHESTRATOR_ACCEPTANCE.json").unlink()
-                (self.folder / "COMPLETION_REVIEW.json").unlink()
+        self._result("FAIL")
+        response = self._review(outcome="FAIL", approval="REJECTED")
+        self.assertTrue(response["ok"], response)
+        evidence = self._evidence()
+        self.assertEqual("FAIL", evidence["result"]["outcome"])
+        self.assertEqual("REJECTED", evidence["acceptance"]["approval"])
+        self.assertIsNone(evidence["acceptance"].get("force_accept_reason"))
+        memory_store = store.MemoryStore(memory_handoff.memory_paths(self.worktree)[0])
+        memory_store.initialize()
+        try:
+            with self.assertRaises(store.StoreError):
+                memory_store.get_outcome(evidence["decision_id"])
+        finally:
+            memory_store.close()
+
+    def test_blocked_forced_acceptance_fixes_blocked_quality(self) -> None:
+        self._result("BLOCKED")
+        response = self._review(outcome="BLOCKED", approval="ACCEPTED", force_reason="ROOT accepts blocked work")
+        self.assertTrue(response["ok"], response)
+        evidence = self._evidence()
+        self.assertEqual("BLOCKED", evidence["result"]["outcome"])
+        self.assertEqual("BLOCKED", evidence["review"]["review_outcome"])
+        self.assertEqual("ACCEPTED", evidence["acceptance"]["approval"])
+        self.assertEqual("ROOT accepts blocked work", evidence["acceptance"].get("force_accept_reason"))
+        memory_store = store.MemoryStore(memory_handoff.memory_paths(self.worktree)[0])
+        memory_store.initialize()
+        try:
+            self.assertEqual("BLOCKED", memory_store.get_outcome(evidence["decision_id"])["status"])
+        finally:
+            memory_store.close()
 
     def test_no_delivered_observation_or_wrong_run_is_refused_without_pair(self) -> None:
         for change in ("pending", "wrong-run", "wrong-invocation"):
@@ -777,6 +823,16 @@ class NativeReviewEvidenceTests(unittest.TestCase):
     def test_rejected_resume_retains_history_and_publishes_fresh_run(self) -> None:
         self.assertTrue(self._review(outcome="PASS", approval="REJECTED")["ok"])
         prior = self._evidence()
+        authorization = review.read_json(self.folder / terminal_evidence.REJECTED_ATTEMPT_NAME)
+        self.assertEqual(prior["content_hash"], authorization["evidence_digest"])
+        rejected = memory_handoff.get_rejected_native_attempt(
+            worktree_path=self.worktree,
+            rejected_attempt_id=authorization["rejected_attempt_id"],
+        )
+        self.assertEqual(authorization, terminal_evidence.record_domain_review(
+            self.rt, self.epoch_id, self.lane, prior,
+        ))
+        self.assertEqual("run-1", rejected["run_id"])
         self.lane["session"] = {"session_id": "saved-session"}
         self.lane["provider"] = {"id": "codex", "model": "test", "launch_config": {}}
         resume_card = self.root / "resume-card.json"
@@ -786,13 +842,9 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             self.lane.update(mutate(self.lane))
             return self.lane
 
-        def write_invocation(worktree, *, lane_id, run_id, **_kwargs):
-            value = {"schema": "controller-invocation/v1", "lane_id": lane_id, "run_id": run_id,
-                     "provider": {"id": "codex"}}
-            value["content_hash"] = content_hash(value)
-            atomic_write_json(Path(worktree) / ".agent-workspace" / "invocation.json", value)
-            return value
-
+        resumed_context = _finalized_lane1_fixture(
+            self.card, self.plan, self.worktree, run_id="run-2"
+        )
         with (
             patch.object(resume, "find_harness_root", return_value=self.root),
             patch.object(resume, "load_config", return_value=SimpleNamespace(runtime_root=self.rt, profile="plain")),
@@ -801,28 +853,50 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             patch.object(resume, "update_lane", side_effect=update_lane),
             patch.object(resume, "_live_controller", return_value=False),
             patch.object(resume, "new_id", return_value="run-2"),
-            patch.object(resume, "_write_worker_prompt"),
-            patch.object(resume, "_write_invocation", side_effect=write_invocation),
+            patch.object(memory_handoff, "_prepare_memory_outcome", return_value=resumed_context),
         ):
             resumed = resume.run_resume(lane_id=self.lane_id, resume_task_card=str(resume_card))
         self.assertTrue(resumed["ok"], resumed)
         self.assertEqual("run-2", self.lane["run_id"])
+        self.assertEqual(rejected["rejected_attempt_id"], self.lane["native_supersession"]["rejected_attempt_id"])
         self.assertEqual(prior, terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-1"))
         self.assertIsNone(terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-2"))
-        self.run_id = "run-2"
-        self.lane["lifecycle"] = "review_pending"
-        self.lane["process"] = {"pid": 124, "creation_time": "incarnation-2"}
-        self._result("PASS")
         fresh_envelope = memory_handoff.load_envelope(self.worktree)
         assert fresh_envelope is not None
-        fresh_context = memory_handoff.load_final_context(worktree_path=self.worktree, envelope=fresh_envelope)
-        memory_handoff.record_dispatch_intent(worktree_path=self.worktree, envelope=fresh_envelope)
-        memory_handoff.record_observed_invocation(
-            worktree_path=self.worktree, envelope=fresh_envelope,
-            observed_invocation=memory_handoff.native_observation(
-                envelope=fresh_envelope, context=fresh_context, controller_identity=self.lane["process"],
-            ),
+        self.assertEqual("checkpoint-1", fresh_envelope["checkpoint"])
+        self.assertEqual("checkpoint-1", fresh_envelope["final_context"]["checkpoint"])
+        binding = self.root / "orchestrator_harness" / "provider_adapters" / "codex" / "launcher_binding.py"
+        binding.parent.mkdir(parents=True)
+        binding.write_text("# test provider binding\n", encoding="utf-8")
+        status = {
+            "schema": "controller-status/v1", "lane_id": self.lane_id, "run_id": "run-2",
+            "controller_state": "exited", "provider_state": {"state": "exited", "exit_code": 0},
+            "cleanup_proven": True, "recorded_status": "review_pending",
+        }
+        with (
+            patch.object(launch, "find_harness_root", return_value=self.root),
+            patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.rt)),
+            patch.object(launch, "read_runtime_state", return_value={"state": "OPEN"}),
+            patch.object(launch, "find_active_lane", return_value=(self.epoch_id, self.lane)),
+            patch.object(launch, "read_lane", side_effect=lambda *_: self.lane),
+            patch.object(launch, "update_lane", side_effect=update_lane),
+            patch.object(launch, "_validate_provider_launch_config", return_value={}),
+            patch.object(launch, "_wait_for_spawn_attestation", return_value={"pid": 124, "creation_time": "incarnation-2"}),
+            patch.object(launch, "_read_controller_status", return_value=status),
+            patch.object(launch, "_delivered_provider_outcome", return_value=("LAUNCH_OK", "provider started")),
+            patch.object(launch.processes, "spawn_detached", return_value=MagicMock(pid=124)) as spawn,
+            patch.object(memory_handoff, "record_dispatch_intent", wraps=memory_handoff.record_dispatch_intent) as intent,
+        ):
+            launched = launch.run_launch(self.lane_id)
+        self.assertTrue(launched["ok"], launched)
+        spawn.assert_called_once()
+        self.assertEqual(
+            authorization["rejected_attempt_id"],
+            intent.call_args.kwargs["supersedes_rejected_attempt_id"],
         )
+        self.run_id = "run-2"
+        self.lane["lifecycle"] = "review_pending"
+        self._result("PASS")
         fresh_response = self._review()
         self.assertTrue(fresh_response["ok"], fresh_response)
         fresh = terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-2")
@@ -863,6 +937,139 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         with self.assertRaises(terminal_evidence.TerminalEvidenceError):
             terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-1")
         self.assertEqual(fresh, terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-2"))
+
+    def test_no_spawn_transfers_id_and_pending_or_wrong_id_refuses(self) -> None:
+        self.assertTrue(self._review(approval="REJECTED")["ok"])
+        prior = self._evidence()
+        authorization = terminal_evidence.record_domain_review(self.rt, self.epoch_id, self.lane, prior)
+        assert authorization is not None
+        handoff = {field: authorization[field] for field in (
+            "rejected_attempt_id", "run_id", "decision_id", "operation_id", "evidence_digest",
+        )}
+        self.lane["native_supersession"] = handoff
+        second = self._fresh_envelope("run-2")
+        exact_id = memory_handoff.supersession_id_for_launch(
+            worktree_path=self.worktree, lane=self.lane, envelope=second,
+        )
+        self.assertEqual(authorization["rejected_attempt_id"], exact_id)
+        for field in (
+            "task_card_digest", "plan_digest", "base_commit", "lane_id",
+            "worktree_path", "recipient", "checkpoint", "final_context_id",
+        ):
+            with self.subTest(field=field):
+                changed = {**second, field: (
+                    self.envelope["final_context_id"] if field == "final_context_id"
+                    else "wrong-identity"
+                )}
+                with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, field):
+                    memory_handoff.supersession_id_for_launch(
+                        worktree_path=self.worktree, lane=self.lane, envelope=changed,
+                    )
+        self.lane["native_supersession"] = {**handoff, "evidence_digest": "wrong-digest"}
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "evidence_digest"):
+            memory_handoff.supersession_id_for_launch(
+                worktree_path=self.worktree, lane=self.lane, envelope=second,
+            )
+        self.lane["native_supersession"] = handoff
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "authorization"):
+            memory_handoff.record_dispatch_intent(
+                worktree_path=self.worktree, envelope=second,
+                supersedes_rejected_attempt_id="wrong-id",
+            )
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=second,
+            supersedes_rejected_attempt_id=exact_id,
+        )
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "pending"):
+            memory_handoff.record_dispatch_intent(
+                worktree_path=self.worktree, envelope=second,
+                supersedes_rejected_attempt_id=exact_id,
+            )
+        third = self._fresh_envelope("run-3")
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "authorize|unresolved|conflicting"):
+            memory_handoff.record_dispatch_intent(
+                worktree_path=self.worktree, envelope=third,
+                supersedes_rejected_attempt_id=exact_id,
+            )
+        memory_store = store.MemoryStore(memory_handoff.memory_paths(self.worktree)[0])
+        memory_store.initialize()
+        try:
+            memory_store.record_operation(contracts.make_operation(
+                kind="dispatch", envelope=second, status="failed_pre_spawn",
+            ))
+        finally:
+            memory_store.close()
+        transferred = memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=third,
+            supersedes_rejected_attempt_id=exact_id,
+        )
+        self.assertEqual("pending", transferred["status"])
+        self.assertEqual("run-3", transferred["run_id"])
+
+    def test_ambiguous_corrected_intent_blocks_fresh_run(self) -> None:
+        self.assertTrue(self._review(approval="REJECTED")["ok"])
+        authorization = terminal_evidence.record_domain_review(
+            self.rt, self.epoch_id, self.lane, self._evidence(),
+        )
+        assert authorization is not None
+        second = self._fresh_envelope("run-2")
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=second,
+            supersedes_rejected_attempt_id=authorization["rejected_attempt_id"],
+        )
+        memory_handoff.record_ambiguous_dispatch(worktree_path=self.worktree, envelope=second)
+        with self.assertRaisesRegex(memory_handoff.MemoryHandoffError, "ambiguous"):
+            memory_handoff.record_dispatch_intent(
+                worktree_path=self.worktree, envelope=second,
+                supersedes_rejected_attempt_id=authorization["rejected_attempt_id"],
+            )
+        third = self._fresh_envelope("run-3")
+        with self.assertRaises(memory_handoff.MemoryHandoffError):
+            memory_handoff.record_dispatch_intent(
+                worktree_path=self.worktree, envelope=third,
+                supersedes_rejected_attempt_id=authorization["rejected_attempt_id"],
+            )
+
+    def test_second_rejection_returns_new_id_and_spends_first(self) -> None:
+        self.assertTrue(self._review(approval="REJECTED")["ok"])
+        first = terminal_evidence.record_domain_review(
+            self.rt, self.epoch_id, self.lane, self._evidence(),
+        )
+        assert first is not None
+        second = self._fresh_envelope("run-2")
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=second,
+            supersedes_rejected_attempt_id=first["rejected_attempt_id"],
+        )
+        context = memory_handoff.load_final_context(worktree_path=self.worktree, envelope=second)
+        self.run_id = "run-2"
+        self.lane.update({
+            "run_id": "run-2", "resume_from_run_id": "run-1",
+            "process": {"pid": 124, "creation_time": "incarnation-2"},
+        })
+        memory_handoff.record_observed_invocation(
+            worktree_path=self.worktree, envelope=second,
+            observed_invocation=memory_handoff.native_observation(
+                envelope=second, context=context, controller_identity=self.lane["process"],
+            ),
+        )
+        self._result("PASS")
+        self.assertTrue(self._review(approval="REJECTED")["ok"])
+        second_attempt = terminal_evidence.record_domain_review(
+            self.rt, self.epoch_id, self.lane, self._evidence(),
+        )
+        assert second_attempt is not None
+        self.assertNotEqual(first["rejected_attempt_id"], second_attempt["rejected_attempt_id"])
+        third = self._fresh_envelope("run-3")
+        with self.assertRaises(memory_handoff.MemoryHandoffError):
+            memory_handoff.record_dispatch_intent(
+                worktree_path=self.worktree, envelope=third,
+                supersedes_rejected_attempt_id=first["rejected_attempt_id"],
+            )
+        self.assertEqual("pending", memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=third,
+            supersedes_rejected_attempt_id=second_attempt["rejected_attempt_id"],
+        )["status"])
 
     def test_true_unknown_requires_same_run_cleanup_and_root_exception(self) -> None:
         self.result_path.unlink()

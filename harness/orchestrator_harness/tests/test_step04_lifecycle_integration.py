@@ -36,6 +36,7 @@ def _accepted_card(configuration: dict | None = None) -> tuple[dict, dict]:
         route="ordinary",
         plan=plan,
         configuration=configuration,
+        checkpoint="checkpoint-1",
     )
     card = contracts.make_task_card(
         task="Fix the regression and verify it",

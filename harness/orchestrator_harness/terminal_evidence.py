@@ -13,9 +13,12 @@ from typing import Any, Mapping
 
 from .core import content_hash, read_json, sha256_hex
 from .epochs import lane_record_dir
+from .records import atomic_write_json, RecordLock
 
 TERMINAL_EVIDENCE_SCHEMA = "native-terminal-evidence/v1"
 TERMINAL_EVIDENCE_NAME = "NATIVE_TERMINAL_EVIDENCE.json"
+REJECTED_ATTEMPT_NAME = "REJECTED_NATIVE_ATTEMPT.json"
+ACCEPTED_OUTCOME_NAME = "NATIVE_OUTCOME_RECORDED.json"
 
 
 class TerminalEvidenceError(ValueError):
@@ -46,6 +49,62 @@ def publication_dir(rt: Path, epoch_id: str, lane: Mapping[str, Any]) -> Path:
     return lane_record_dir(rt, epoch_id, str(lane["lane_id"]))
 
 
+def record_domain_review(
+    rt: Path, epoch_id: str, lane: Mapping[str, Any], evidence: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Replay the domain transaction and retain only its returned rejection ID."""
+    from . import memory_handoff
+
+    validate_terminal_evidence(evidence, lane_id=lane["lane_id"], run_id=lane["run_id"])
+    _require(evidence["epoch_id"] == epoch_id, "terminal evidence epoch mismatch")
+    folder = publication_dir(rt, epoch_id, lane)
+    root_folder = lane_record_dir(rt, epoch_id, lane["lane_id"])
+    if not (folder / TERMINAL_EVIDENCE_NAME).is_file() and (root_folder / TERMINAL_EVIDENCE_NAME).is_file():
+        _require(read_json(root_folder / TERMINAL_EVIDENCE_NAME) == dict(evidence),
+                 "retained root native evidence differs from the reviewed run")
+        folder = root_folder
+    rejected = evidence["acceptance"]["approval"] == "REJECTED"
+    path = folder / (REJECTED_ATTEMPT_NAME if rejected else ACCEPTED_OUTCOME_NAME)
+    if not Path(lane["worktree_path"]).is_dir():
+        _require(lane.get("lifecycle") == "retired" and path.is_file(),
+                 "domain review cannot be recovered without its worktree")
+        retained = read_json(path)
+        _require(retained.get("schema") == (
+            "rejected-native-authorization/v1" if rejected else "native-outcome-recorded/v1"
+        ) and retained.get("content_hash") == content_hash(retained)
+                 and isinstance(retained.get("rejected_attempt_id" if rejected else "outcome_id"), str)
+                 and bool(retained["rejected_attempt_id" if rejected else "outcome_id"])
+                 and retained.get("run_id") == evidence["run_id"]
+                 and retained.get("decision_id") == evidence["decision_id"]
+                 and retained.get("evidence_digest") == evidence["content_hash"],
+                 "retained domain review provenance mismatch")
+        return retained if rejected else None
+    result = memory_handoff.record_native_review(
+        worktree_path=lane["worktree_path"], evidence=evidence,
+    )
+    authorization = ({
+        "schema": "rejected-native-authorization/v1",
+        "rejected_attempt_id": result["rejected_attempt_id"],
+        "run_id": evidence["run_id"],
+        "decision_id": evidence["decision_id"],
+        "operation_id": evidence["dispatch"]["operation"]["operation_id"],
+        "evidence_digest": evidence["content_hash"],
+    } if rejected else {
+        "schema": "native-outcome-recorded/v1",
+        "outcome_id": result["outcome_id"],
+        "run_id": evidence["run_id"],
+        "decision_id": evidence["decision_id"],
+        "evidence_digest": evidence["content_hash"],
+    })
+    authorization["content_hash"] = content_hash(authorization)
+    with RecordLock(path):
+        if path.exists():
+            _require(read_json(path) == authorization, "rejected attempt authorization conflicts")
+        else:
+            atomic_write_json(path, authorization)
+    return authorization if rejected else None
+
+
 def _validate_retained_sources(
     evidence: dict[str, Any], card: dict[str, Any], plan: dict[str, Any],
     lane: str, run: str,
@@ -58,7 +117,7 @@ def _validate_retained_sources(
     _require(isinstance(decision.get("created_at"), str) and bool(decision["created_at"]), "decision creation time missing")
     dispatch = evidence.get("dispatch")
     _require(isinstance(dispatch, dict), "dispatch evidence missing")
-    envelope = _hashed(dispatch.get("envelope"), contracts.ENVELOPE_SCHEMA, "dispatch envelope")
+    envelope = _hashed(dispatch.get("envelope"), contracts.FINAL_ENVELOPE_SCHEMA, "dispatch envelope")
     context = _hashed(evidence.get("final_context"), contracts.FINAL_CONTEXT_SCHEMA, "final context")
     configuration = evidence.get("configuration")
     _require(isinstance(configuration, dict), "resolved configuration missing")
@@ -99,24 +158,26 @@ def _validate_retained_sources(
         )
         rebuilt = contracts.make_finalized_context(
             lane_id=lane, run_id=run, decision_id=decision["decision_id"],
+            task=card["task"],
             task_card_digest=card["content_hash"], objective_id=plan["objective_id"],
             route=plan["route"], plan_id=plan["plan_id"],
+            plan_revision=plan["revision"], accepted_by=plan["accepted_by"],
+            accepted_plan_content=plan["content"],
             plan_digest=plan["content_hash"], base_commit=card["base_commit"],
             worktree_path=envelope["worktree_path"], strategy=envelope["strategy"],
-            configuration=configuration, mandatory_items=envelope["mandatory_content"],
-            optional_items=envelope["optional_content"], omitted=context["omitted"],
+            checkpoint=envelope["checkpoint"], configuration=configuration,
+            execution_role=envelope["execution_role"],
+            invocation_target=envelope["invocation_target"], recipient=envelope["recipient"],
+            mandatory_content=envelope["mandatory_content"],
+            optional_content=envelope["optional_content"],
+            delivery_trace=envelope["delivery_trace"],
             role_separation=context["role_separation"], freshness=context["freshness"],
             context_limit=context["context_limit"], context_id=context["context_id"],
             created_at=context["created_at"],
         )
     except Exception as exc:
         raise TerminalEvidenceError(f"retained decision, envelope, or context is invalid: {exc}") from exc
-    for field in ("integrity", "mandatory_digest", "optional_digest", "mandatory_items", "optional_items"):
-        _require(context.get(field) == rebuilt[field], f"final context {field} mismatch")
-    _require(context["context_id"] == sha256_hex({
-        "domain": "memory-final-context-identity/v1",
-        "decision_id": decision["decision_id"], "integrity": context["integrity"],
-    }), "final context identity mismatch")
+    _require(context == rebuilt, "final context rebuilt meaning mismatch")
     return envelope, context
 
 

@@ -474,6 +474,8 @@ def _write_pair(
             atomic_write_json(review_path, review)
         if terminal is not None and existing_terminal is None:
             atomic_write_json(terminal_path, terminal)
+        if terminal is not None:
+            terminal_evidence.record_domain_review(rt, epoch_id, lane, terminal)
         if terminal is not None and managed_event is not None and managed_event.get("state") != "COMPLETE":
             try:
                 close_event(
@@ -522,6 +524,7 @@ def _replay_retained_pair(
             raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
         if terminal is None or terminal["review"] != review or terminal["acceptance"] != acceptance:
             raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained native evidence is absent or conflicts")
+        terminal_evidence.record_domain_review(rt, epoch_id, lane, terminal)
     return review, acceptance
 
 
@@ -569,6 +572,7 @@ def _replay_retained_preparation(
                 )
             except terminal_evidence.TerminalEvidenceError as exc:
                 raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, str(exc)) from exc
+        terminal_evidence.record_domain_review(rt, epoch_id, lane, terminal)
         if managed_event.get("state") != "COMPLETE":
             try:
                 close_event(
