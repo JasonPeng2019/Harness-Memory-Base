@@ -899,7 +899,9 @@ class MemoryStore:
                     continue
                 if row["operation_id"] == operation["operation_id"]:
                     continue
-                if row["decision_id"] == envelope["decision_id"] or row["status"] in ("pending", "ambiguous"):
+                if (row["status"] in ("pending", "ambiguous") or
+                        (row["decision_id"] == envelope["decision_id"] and
+                         row["status"] != "failed_pre_spawn")):
                     raise OperationConflictError("conflicting dispatch owns the decision or lane")
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO operations

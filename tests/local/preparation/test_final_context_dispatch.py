@@ -1367,6 +1367,111 @@ class FinalContextDispatchTests(unittest.TestCase):
         with self.assertRaises(runtime.DispatchAmbiguityError):
             memory_runtime.record_dispatch_intent(newer.envelope)
 
+    def test_failed_pre_spawn_attempts_allow_fresh_run_for_same_decision(self) -> None:
+        memory_runtime = runtime.MemoryRuntime(self.memory_store)
+        first = self._finalize()
+        self.memory_store.record_final_context(
+            first.context, envelope_digest=first.envelope["content_hash"]
+        )
+        original = memory_runtime.record_dispatch_intent(first.envelope)
+        failed = memory_runtime.mark_dispatch_pre_spawn_failed(first.envelope)
+        self.assertEqual("failed_pre_spawn", failed["status"])
+        self.assertIsNone(failed["observed_invocation"])
+        with self.assertRaises(runtime.DispatchAmbiguityError):
+            memory_runtime.record_dispatch_intent(first.envelope)
+        with self.assertRaises(store.OperationConflictError):
+            memory_runtime.mark_dispatch_ambiguous(first.envelope)
+
+        retry = self._finalize(run_id="run-retry")
+        self.memory_store.record_final_context(
+            retry.context, envelope_digest=retry.envelope["content_hash"]
+        )
+        second = memory_runtime.record_dispatch_intent(retry.envelope)
+        self.assertEqual("pending", second["status"])
+        self.assertNotEqual(original["operation_id"], second["operation_id"])
+        self.assertIsNone(second["observed_invocation"])
+        self.assertEqual(failed, self.memory_store.get_operation(original["operation_id"]))
+
+        third = self._finalize(run_id="run-after-pending")
+        self.memory_store.record_final_context(
+            third.context, envelope_digest=third.envelope["content_hash"]
+        )
+        with self.assertRaises(store.OperationConflictError):
+            memory_runtime.record_dispatch_intent(third.envelope)
+        memory_runtime.mark_dispatch_pre_spawn_failed(retry.envelope)
+        third_intent = memory_runtime.record_dispatch_intent(third.envelope)
+        self.assertEqual("pending", third_intent["status"])
+        self.assertEqual(
+            {original["operation_id"]: "failed_pre_spawn",
+             second["operation_id"]: "failed_pre_spawn",
+             third_intent["operation_id"]: "pending"},
+            {row["operation_id"]: row["status"] for row in self.memory_store.list_operations(self.decision_id)},
+        )
+        self.assertTrue(all(row["observed_invocation"] is None
+                            for row in self.memory_store.list_operations(self.decision_id)))
+
+    def test_non_failed_decision_attempts_and_unresolved_lane_owners_block_retry(self) -> None:
+        memory_runtime = runtime.MemoryRuntime(self.memory_store)
+
+        def new_decision(label):
+            plan = contracts.make_plan(
+                plan_id=f"plan-{label}", objective_id=f"objective-{label}",
+                route="ordinary", state="accepted", accepted_by="ROOT",
+                content=self.accepted["content"],
+            )
+            card = contracts.make_task_card(
+                task=self.card["task"], base_commit="base-1",
+                memory_handoff=contracts.make_memory_handoff(
+                    objective_id=f"objective-{label}", route="ordinary", plan=plan,
+                ),
+            )
+            decision = contracts.make_decision(card, plan, configuration=self.configuration)
+            self.memory_store.record_decision(decision)
+            return card, plan, decision["decision_id"]
+
+        for status in ("pending", "ambiguous", "delivered", "abandoned"):
+            with self.subTest(status=status):
+                card, plan, decision_id = new_decision(status)
+                lane_id = f"lane-{status}"
+                first = self._finalize(
+                    task_card=card, plan=plan, decision_id=decision_id,
+                    lane_id=lane_id, run_id=f"run-{status}",
+                )
+                self.memory_store.record_final_context(
+                    first.context, envelope_digest=first.envelope["content_hash"]
+                )
+                owner = memory_runtime.record_dispatch_intent(first.envelope)
+                if status == "ambiguous":
+                    memory_runtime.mark_dispatch_ambiguous(first.envelope)
+                elif status == "delivered":
+                    memory_runtime.record_observed_dispatch(first.envelope, {
+                        "invocation_id": "controller:7:now", "pid": 7, "creation_time": "now",
+                    })
+                elif status == "abandoned":
+                    memory_runtime.abandon_dispatch_intent(first.envelope)
+                retry = self._finalize(
+                    task_card=card, plan=plan, decision_id=decision_id,
+                    lane_id=lane_id, run_id=f"run-{status}-retry",
+                )
+                self.memory_store.record_final_context(
+                    retry.context, envelope_digest=retry.envelope["content_hash"]
+                )
+                with self.assertRaises(store.OperationConflictError):
+                    memory_runtime.record_dispatch_intent(retry.envelope)
+                self.assertEqual(status, self.memory_store.get_operation(owner["operation_id"])["status"])
+
+                if status in ("pending", "ambiguous"):
+                    other_card, other_plan, other_id = new_decision(f"other-{status}")
+                    other = self._finalize(
+                        task_card=other_card, plan=other_plan, decision_id=other_id,
+                        lane_id=lane_id, run_id=f"run-other-{status}",
+                    )
+                    self.memory_store.record_final_context(
+                        other.context, envelope_digest=other.envelope["content_hash"]
+                    )
+                    with self.assertRaises(store.OperationConflictError):
+                        memory_runtime.record_dispatch_intent(other.envelope)
+
     def test_observation_requires_intent_and_exact_receipt(self) -> None:
         final = self._finalize()
         self.memory_store.record_final_context(final.context, envelope_digest=final.envelope["content_hash"])
