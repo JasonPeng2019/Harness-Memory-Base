@@ -1,20 +1,39 @@
-# Provider network payload seam (STEP-13-2 fixture scope)
+# Provider network payload (STEP-13-2)
+
+Product ROOT selects an optional `network_profile` in the content-hashed
+`memory_handoff.configuration` before bootstrap. The accepted values are
+`normal`, `soft_guardrail_network`, `atlas_memory_only`, and
+`restricted_local`; absence means `normal`. Bootstrap and resume pass that
+request to lane 1's `PreparationService.prepare(network_mode=...)`. The
+per-objective preparation row captures requested and effective modes, sources,
+limits, and context. The controller reads and validates that durable row against
+the accepted dispatch before every first, resumed, or correction spawn. Task
+text and provider launch options are not profile authority. Legacy and all-off
+cards retain their ordinary path.
 
 `provider_network_payload.install_soft_controls(provider_id, worktree)` composes
 Qwen's `.qwen/settings.json` after a managed or plain worktree is installed.
 It preserves other settings and refuses malformed settings. Codex and Claude
 use launch arguments and need no settings mutation.
 
-`controller._run_provider(..., requested_network_profile="soft_guardrail_network")`
-passes the explicit string to `resolve_launch` immediately before
-`spawn_provider`. The latter returns the exact argv and facts containing
-requested/effective profile, reason, enforcement sources, suppressed native
-tools, and uncontrolled surfaces. A missing, malformed, redirected, or changed
-Qwen setting, or an unverified provider version, reports `uncontrolled_network`;
-the controller refuses that spawn. Invalid explicit profiles also prove no
-provider started. `None` preserves the existing launch behavior. Resume and
-correction attempts pass through the same controller call. This fixture seam
-does not add a field to a shared invocation or task-card schema.
+For a captured effective mode other than `normal`, the controller applies
+`resolve_launch` immediately before `spawn_provider`. A missing, malformed,
+redirected, or changed Qwen setting, an unsupported Qwen CLI version, or an
+unsupported native control reports `uncontrolled_network`; the controller
+refuses that spawn. The controller has no free-standing requested-profile
+argument or invocation field.
+
+The durable controller status `network_payload` and matching events report
+`captured_requested_mode`, `captured_effective_mode`, captured sources/limits
+and context, and the payload's `requested_profile`, `effective_profile`,
+enforcement sources, reason, and uncovered surfaces. `inspected_argv` with
+`payload_state=inspected_not_started` is a pre-spawn candidate; only
+`payload_state=spawned` includes `spawned_argv` after process creation and
+boundary inspection. `native_forbidden_call_count=null` means no native call
+count was measured. `independent_egress_proven_for_launch=false` prevents this
+status from being used as Atlas-only egress proof. STEP-15 must present the
+captured and launched facts together, and use the payload's downgraded claim
+where it is weaker than the capture-time resolution.
 
 For the installed Codex 0.156.1, Claude Code 2.1.278, and Qwen Code 0.21.10:
 
@@ -40,8 +59,8 @@ the network. No hardened sandbox or Atlas-only isolation is claimed. An
 verified because independent unrelated-destination blocking is unmeasured.
 A `restricted_local` request also reports only soft from this payload seam;
 the controls add no optional Atlas task-path access, but the service-boundary
-forbidden-call proof is pending. Lane 1 must join its resolved profile and
-STEP-15 facade; STEP-17/18 joined checks remain pending.
+forbidden-call proof is pending. STEP-17/18 native and independent-egress
+proof remains pending.
 
 Provider references: [Codex configuration](https://developers.openai.com/codex/config-reference),
 [Claude CLI](https://code.claude.com/docs/en/cli-reference),

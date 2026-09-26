@@ -1,7 +1,8 @@
-"""Explicit STEP-13-2 provider launch controls, pending lane-1 profile wiring.
+"""Provider-native web controls inspected immediately before process spawn.
 
-This seam accepts a resolved profile string from a caller. It does not resolve
-permissions, block shell egress, or prove Atlas service-boundary behavior.
+The controller supplies the requested mode from the durable captured
+preparation. This module does not resolve permissions, block shell egress, or
+prove Atlas service-boundary behavior.
 """
 
 from __future__ import annotations

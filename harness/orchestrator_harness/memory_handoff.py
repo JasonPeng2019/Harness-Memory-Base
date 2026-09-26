@@ -63,6 +63,64 @@ def memory_paths(worktree: str | Path) -> tuple[Path, Path]:
     return root / "memory-state.sqlite3", root / "memory-dispatch.json"
 
 
+def captured_network_resolution(
+    *, worktree_path: str | Path, envelope: Mapping[str, Any],
+    task_card: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Read the per-objective profile that preparation actually captured.
+
+    The task handoff names ROOT's requested profile; the durable preparation
+    owns its effective resolution. Neither the task text nor a launch option
+    can replace that captured record.
+    """
+    handoff = enabled_memory_handoff(task_card)
+    if handoff is None or handoff["plan_state"] != "execution_accepted":
+        raise MemoryHandoffError("network payload requires an accepted memory handoff")
+    requested = handoff.get("configuration", {}).get("network_profile", "normal")
+    if not isinstance(requested, str) or requested not in _memory_module("config").NETWORK_MODES:
+        raise MemoryHandoffError("ROOT handoff has an invalid network_profile")
+    store_path, _ = memory_paths(worktree_path)
+    if not store_path.is_file():
+        raise MemoryHandoffError("captured network preparation is missing")
+    memory_store = _memory_module("store").MemoryStore(store_path)
+    try:
+        memory_store.initialize()
+        rows = memory_store.list_captured_preparations(envelope["decision_id"])
+    except Exception as exc:
+        raise MemoryHandoffError(f"cannot read captured network preparation: {exc}") from exc
+    finally:
+        memory_store.close()
+    first = [row for row in rows if row.get("attempt") == 1]
+    if len(first) != 1 or not rows:
+        raise MemoryHandoffError("captured first network preparation is missing or ambiguous")
+    resolution = first[0].get("network_resolution")
+    expected_context = {
+        "objective_id": envelope["objective_id"],
+        "task_card_digest": envelope["task_card_digest"],
+        "plan_id": envelope["plan_id"],
+        "plan_digest": envelope["plan_digest"],
+        "decision_id": envelope["decision_id"],
+        "route": envelope["route"],
+        "plan_state": envelope["plan_state"],
+    }
+    if any(row.get(key) != envelope[key] for row in rows for key in expected_context):
+        raise MemoryHandoffError("captured network preparation has another dispatch identity")
+    # Older enhanced preparations had only the effective normal-mode column.
+    # Their explicit read projection makes no native suppression claim.
+    if resolution is None and requested == "normal" and all(
+        row.get("network_resolution") is None and row.get("network_mode") == "normal"
+        for row in rows
+    ):
+        return _memory_module("contracts").preparation_network_resolution(first[0])
+    if (not isinstance(resolution, dict)
+            or resolution.get("requested_mode") != requested
+            or resolution.get("effective_mode") != first[0].get("network_mode")
+            or resolution.get("context") != expected_context
+            or any(row.get("network_resolution") != resolution for row in rows)):
+        raise MemoryHandoffError("captured network resolution conflicts with the accepted dispatch")
+    return dict(resolution)
+
+
 def validate_task_card(task_card: Mapping[str, Any]) -> Mapping[str, Any] | None:
     """Validate an optional handoff before any worktree mutation."""
 
@@ -284,6 +342,7 @@ def _prepare_memory_outcome(
     worktree_path: str | Path,
     base_commit: str,
     finalize: bool,
+    network_mode: str,
 ):
     """Run one bounded preparation for the exact handoff state.
 
@@ -328,6 +387,7 @@ def _prepare_memory_outcome(
             objective_id=handoff["objective_id"],
             route=handoff.get("route", "ordinary"),
             request=handoff.get("configuration"),
+            network_mode=network_mode,
             lane_id=lane_id,
             run_id=run_id,
             worktree_path=str(worktree_path),
@@ -396,6 +456,9 @@ def prepare_lane_memory(
         config = _memory_module("config")
 
         resolved_config = config.resolve_config(handoff.get("configuration"))
+        requested_network = handoff.get("configuration", {}).get("network_profile", "normal")
+        if not isinstance(requested_network, str) or requested_network not in config.NETWORK_MODES:
+            raise MemoryHandoffError("ROOT handoff has an invalid network_profile")
         # Only the explicit execution-accepted state finalizes a dispatchable
         # envelope.  An explicitly absent plan and a pending candidate still
         # run one bounded preparation (their fresh ROOT-planning or review
@@ -411,6 +474,7 @@ def prepare_lane_memory(
             worktree_path=worktree_path,
             base_commit=base_commit,
             finalize=accepted,
+            network_mode=requested_network,
         )
         if not accepted:
             _, envelope_path = memory_paths(worktree_path)
