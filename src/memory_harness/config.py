@@ -67,6 +67,8 @@ def effect_submission_enabled(configuration: Mapping[str, Any] | MemoryConfig, k
         return resolved.experience_write
     if kind == "generated_skill_creation":
         return resolved.experience_write and resolved.generated_skill_creation
+    if kind == "procedure_publication":
+        return resolved.shared_publication
     return True
 
 

@@ -120,6 +120,14 @@ def effect_operation_id(outcome_id: str, kind: str, scope_key: str = "outcome") 
                        "kind": kind, "scope_key": scope_key})
 
 
+def external_effect_operation_id(source_id: str, kind: str, scope_key: str) -> str:
+    """One external mutation slot for an exact durable source and recipient scope."""
+    for name, value in (("source_id", source_id), ("kind", kind), ("scope_key", scope_key)):
+        _require_nonempty_str(value, name)
+    return sha256_hex({"schema": EFFECT_OPERATION_SCHEMA, "external_source_id": source_id,
+                       "kind": kind, "scope_key": scope_key})
+
+
 def validate_record(record: Mapping[str, Any], schema: str) -> None:
     if not isinstance(record, Mapping):
         raise ContractError("record must be a JSON object")
@@ -4261,6 +4269,7 @@ __all__ = [
     "sha256_hex",
     "content_hash",
     "effect_operation_id",
+    "external_effect_operation_id",
     "validate_record",
     "make_task_card",
     "validate_task_card",

@@ -6,12 +6,13 @@ import json
 import math
 import os
 import sqlite3
+from dataclasses import asdict
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Mapping
 
 from . import contracts
-from .config import MemoryConfig, effect_submission_enabled
+from .config import MemoryConfig, effect_submission_enabled, resolve_config
 
 
 class StoreError(RuntimeError):
@@ -114,8 +115,8 @@ _SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS effect_operations (
         operation_id TEXT PRIMARY KEY,
-        outcome_id TEXT NOT NULL REFERENCES outcomes(outcome_id),
-        decision_id TEXT NOT NULL,
+        outcome_id TEXT REFERENCES outcomes(outcome_id),
+        decision_id TEXT,
         kind TEXT NOT NULL,
         scope_key TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -130,6 +131,7 @@ _SCHEMA = [
         configuration_digest TEXT NOT NULL,
         version INTEGER NOT NULL,
         acknowledgement TEXT,
+        reconciliation TEXT,
         uncertainty TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -539,6 +541,8 @@ class MemoryStore:
                 self._ensure_column("review_receipts", "route", "TEXT")
                 self._ensure_column("effect_operations", "adapter_operation_id", "TEXT")
                 self._ensure_column("effect_operations", "adapter_payload_digest", "TEXT")
+                self._ensure_column("effect_operations", "reconciliation", "TEXT")
+                self._migrate_external_effect_columns()
                 self._migrate_local_effect_intents()
         except sqlite3.Error as exc:
             if self.connection is not None:
@@ -555,6 +559,20 @@ class MemoryStore:
         }
         if column not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    def _migrate_external_effect_columns(self) -> None:
+        """Allow source-owned effects without changing accepted outcome-owned rows."""
+        connection = self._require_connection()
+        columns = connection.execute("PRAGMA table_info(effect_operations)").fetchall()
+        if not any(row["name"] == "outcome_id" and row["notnull"] for row in columns):
+            return
+        schema = next(statement for statement in _SCHEMA
+                      if "CREATE TABLE IF NOT EXISTS effect_operations (" in statement)
+        connection.execute(schema.replace("effect_operations (", "effect_operations_new (", 1))
+        names = ", ".join(row["name"] for row in columns)
+        connection.execute(f"INSERT INTO effect_operations_new ({names}) SELECT {names} FROM effect_operations")
+        connection.execute("DROP TABLE effect_operations")
+        connection.execute("ALTER TABLE effect_operations_new RENAME TO effect_operations")
 
     def _migrate_local_effect_intents(self) -> None:
         """Recover pre-STEP-09 native outcomes and already retained local evidence."""
@@ -1450,7 +1468,7 @@ class MemoryStore:
     @staticmethod
     def _effect_from_row(row: sqlite3.Row) -> dict[str, Any]:
         record = dict(row)
-        for field in ("source_record", "payload_record", "configuration", "acknowledgement"):
+        for field in ("source_record", "payload_record", "configuration", "acknowledgement", "reconciliation"):
             if record[field] is not None:
                 record[field] = json.loads(record[field])
         record["schema"] = contracts.EFFECT_OPERATION_SCHEMA
@@ -1480,6 +1498,137 @@ class MemoryStore:
             parameters,
         ).fetchall()
         return [self._effect_from_row(row) for row in rows]
+
+    def create_external_effect_operation(
+        self, *, kind: str, scope_key: str, source_id: str,
+        source_record: Mapping[str, Any], payload: Mapping[str, Any],
+        captured_config: Mapping[str, Any] | MemoryConfig,
+        current_config: Mapping[str, Any] | MemoryConfig,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist an immutable source-specific intent before a remote submission.
+
+        The caller owns source authorization, recipient/privacy checks, and remote
+        readback. This store binds their exact records and serializes claims.
+        """
+        operation_id = contracts.external_effect_operation_id(source_id, kind, scope_key)
+        if kind not in ("experience_ingestion", "generated_skill_creation", "procedure_publication"):
+            raise contracts.ContractError("unknown governed external effect kind")
+        if not isinstance(source_record, Mapping) or not isinstance(source_record.get("schema"), str):
+            raise contracts.ContractError("external effect needs a content-bound source record")
+        contracts.validate_record(source_record, source_record["schema"])
+        if source_id not in source_record.values():
+            raise contracts.ContractError("external source ID is not bound to its record")
+        if not isinstance(payload, Mapping) or not payload:
+            raise contracts.ContractError("external effect payload must be nonempty")
+        captured = (asdict(captured_config) if isinstance(captured_config, MemoryConfig)
+                    else dict(captured_config))
+        resolve_config(captured)  # Validate, but retain the caller's exact capture.
+        if not effect_submission_enabled(captured, kind):
+            raise OperationConflictError("captured feature is off")
+        source_digest = contracts.sha256_hex(source_record)
+        payload_digest = contracts.sha256_hex(payload)
+        configuration_digest = contracts.sha256_hex(captured)
+        connection = self._require_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM effect_operations WHERE operation_id=?", (operation_id,),
+            ).fetchone()
+            if row is not None:
+                existing = self._effect_from_row(row)
+                expected = (kind, scope_key, source_id, source_digest, payload_digest,
+                            configuration_digest)
+                actual = tuple(existing[field] for field in (
+                    "kind", "scope_key", "source_id", "source_digest", "payload_digest",
+                    "configuration_digest",
+                ))
+                if existing["outcome_id"] is not None or actual != expected:
+                    raise OperationConflictError("external effect exact replay conflicts")
+                return existing, False
+            duplicate_source = connection.execute(
+                "SELECT operation_id FROM effect_operations WHERE outcome_id IS NULL "
+                "AND kind=? AND scope_key=? AND source_digest=?",
+                (kind, scope_key, source_digest),
+            ).fetchone()
+            if duplicate_source is not None:
+                raise OperationConflictError("external source already owns this effect scope")
+            if not effect_submission_enabled(current_config, kind):
+                raise OperationConflictError("current effective feature is off")
+            now = contracts.utc_now()
+            connection.execute(
+                "INSERT INTO effect_operations (operation_id, outcome_id, decision_id, kind, "
+                "scope_key, status, source_id, source_digest, source_record, payload_digest, "
+                "payload_record, configuration, configuration_digest, version, created_at, updated_at) "
+                "VALUES (?, NULL, NULL, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                (operation_id, kind, scope_key, source_id, source_digest,
+                 self._serialize_record(source_record), payload_digest,
+                 self._serialize_record(payload), self._serialize_record(captured),
+                 configuration_digest, now, now),
+            )
+        return self.get_effect_operation(operation_id), True
+
+    def external_effect_off_state(
+        self, operation_id: str, *, current_config: Mapping[str, Any] | MemoryConfig,
+    ) -> str:
+        """Return on, off, or pending_off for an exact source-owned operation."""
+        operation = self.get_effect_operation(operation_id)
+        if operation["outcome_id"] is not None:
+            raise OperationConflictError("operation is not source-owned")
+        if effect_submission_enabled(current_config, operation["kind"]):
+            return "on"
+        return "pending_off" if operation["status"] in ("in_flight", "uncertain") else "off"
+
+    def reconcile_external_effect_operation(
+        self, operation_id: str, *, evidence: Mapping[str, Any], result: str,
+    ) -> dict[str, Any]:
+        """Record exact readback or demonstrated idempotency under the original ID.
+
+        The trusted adapter supplies evidence bound to this operation. `absent`
+        means its readback can prove no mutation exists; `idempotent` means a
+        retry with this operation ID is demonstrably deduplicated by the remote.
+        """
+        if result not in ("acknowledged", "absent", "idempotent"):
+            raise contracts.ContractError("unknown external reconciliation result")
+        connection = self._require_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = self.get_effect_operation(operation_id)
+            if operation["outcome_id"] is not None:
+                raise OperationConflictError("operation is not source-owned")
+            expected = {key: operation[key] for key in (
+                "operation_id", "kind", "scope_key", "source_digest", "payload_digest",
+                "configuration_digest",
+            )}
+            if (not isinstance(evidence, Mapping) or
+                    any(evidence.get(key) != value for key, value in expected.items()) or
+                    not isinstance(evidence.get("adapter_proof"), Mapping) or
+                    not evidence["adapter_proof"]):
+                raise OperationConflictError("external readback is not bound to exact operation")
+            if result == "idempotent" and evidence.get("idempotency_key") != operation_id:
+                raise OperationConflictError("adapter idempotency does not use original identity")
+            if result == "absent" and evidence.get("readback_complete") is not True:
+                raise OperationConflictError("exact absence requires complete readback")
+            if result == "acknowledged":
+                if operation["status"] == "confirmed":
+                    if operation["acknowledgement"] != dict(evidence):
+                        raise OperationConflictError("external acknowledgement conflicts")
+                    return operation
+                if operation["status"] not in ("in_flight", "uncertain") and not (
+                    operation["status"] == "pending" and operation["reconciliation"] is not None
+                ):
+                    raise OperationConflictError("effect has no submission to acknowledge")
+                status = "confirmed"
+            else:
+                if operation["status"] != "uncertain":
+                    raise OperationConflictError("only an uncertain effect can be retry-authorized")
+                status = "pending"
+            connection.execute(
+                "UPDATE effect_operations SET status=?, acknowledgement=?, reconciliation=?, uncertainty=NULL, "
+                "version=version+1, updated_at=? WHERE operation_id=?",
+                (status, self._serialize_record(evidence) if status == "confirmed" else None,
+                 self._serialize_record(evidence), contracts.utc_now(), operation_id),
+            )
+        return self.get_effect_operation(operation_id)
 
     def bind_effect_source(
         self, operation_id: str, source_id: str, source_record: Mapping[str, Any]
@@ -1595,7 +1744,7 @@ class MemoryStore:
             operation = self.get_effect_operation(operation_id)
             if not effect_submission_enabled(current_config, operation["kind"]):
                 raise OperationConflictError("current effective feature is off")
-            if operation["kind"] == "experience_ingestion" and (
+            if operation["outcome_id"] is not None and operation["kind"] == "experience_ingestion" and (
                 operation["adapter_operation_id"] is not None or
                 self.get_experience_ingestion_for_trajectory(operation["source_id"]) is not None
             ):
@@ -1631,6 +1780,10 @@ class MemoryStore:
     ) -> dict[str, Any]:
         if not isinstance(acknowledgement, Mapping) or not acknowledgement:
             raise contracts.ContractError("confirmation requires an exact acknowledgement")
+        if self.get_effect_operation(operation_id)["outcome_id"] is None:
+            return self.reconcile_external_effect_operation(
+                operation_id, evidence=acknowledgement, result="acknowledged",
+            )
         connection = self._require_connection()
         with connection:
             connection.execute("BEGIN IMMEDIATE")
