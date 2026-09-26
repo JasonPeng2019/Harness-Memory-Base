@@ -10,9 +10,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from memory_harness import contracts, store
-from orchestrator_harness import controller, launch, manager_queue, memory_handoff, monitor, operator_launch, resume, review, terminal_evidence
+from orchestrator_harness import controller, launch, lanes, leases, manager_queue, memory_handoff, monitor, operator_launch, resume, review, terminal_evidence
 from orchestrator_harness.core import content_hash
-from orchestrator_harness.epochs import current_epoch_path, lane_record_dir, manager_queue_path
+from orchestrator_harness.epochs import current_epoch_path, lane_record_dir, manager_queue_path, read_active_lanes, write_active_lanes
 from orchestrator_harness.lanes import LaneError
 from orchestrator_harness.manager_queue import ManagerQueueError
 from orchestrator_harness.records import atomic_write_json
@@ -248,6 +248,150 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             self.assertEqual("PASS", memory_store.get_outcome(evidence["decision_id"])["status"])
         finally:
             memory_store.close()
+
+    def test_two_marker_result_has_separate_review_and_one_fixed_outcome(self) -> None:
+        self.worktree = self.root / "marker-worktree"
+        (self.worktree / ".agent-workspace").mkdir(parents=True)
+        self.result_path = self.worktree / "RESULT.json"
+        self.lane["worktree_path"] = str(self.worktree)
+        self.lane["controller_status_path"] = str(
+            self.worktree / ".agent-workspace" / "controller.status.json"
+        )
+        atomic_write_json(self.worktree / ".agent-workspace" / "task-card.json", self.card)
+        store_path, _ = memory_handoff.memory_paths(self.worktree)
+        memory_store = store.MemoryStore(store_path)
+        memory_store.initialize()
+        try:
+            memory_store.record_decision(contracts.make_decision(self.card, self.plan))
+        finally:
+            memory_store.close()
+        sources = [
+            {"id": "everos-item", "kind": "procedure", "origin": "everos_generated_skill",
+             "source_id": "everos-skill-id", "revision_id": "everos-r1", "freshness": "live",
+             "content": {"guidance": "EVEROS_MVP_MARKER"}},
+            {"id": "atlas-item", "kind": "procedure", "origin": "atlas_trusted_procedure",
+             "source_id": "atlas-procedure-id", "revision_id": "atlas-r1", "freshness": "live",
+             "content": {"guidance": "ATLAS_MVP_MARKER"}},
+        ]
+        finalized = _finalized_lane1_fixture(
+            self.card, self.plan, self.worktree, optional_items=sources,
+        )
+        with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=finalized):
+            self.envelope = memory_handoff.prepare_bootstrap_envelope(
+                task_card=self.card, lane_id=self.lane_id, run_id=self.run_id,
+                worktree_path=self.worktree, base_commit="base-1",
+            )
+        assert self.envelope is not None
+        context = memory_handoff.load_final_context(
+            worktree_path=self.worktree, envelope=self.envelope,
+        )
+        self.observed = memory_handoff.native_observation(
+            envelope=self.envelope, context=context,
+            controller_identity=self.lane["process"],
+        )
+        memory_handoff.record_dispatch_intent(
+            worktree_path=self.worktree, envelope=self.envelope,
+        )
+        self.operation = memory_handoff.record_observed_invocation(
+            worktree_path=self.worktree, envelope=self.envelope,
+            observed_invocation=self.observed,
+        )
+        result = {
+            "schema": "result/v1", "lane_id": self.lane_id, "run_id": self.run_id,
+            "outcome": "PASS", "summary": "local marker-bearing worker result",
+            "evidence": ["EVEROS_MVP_MARKER", "ATLAS_MVP_MARKER"],
+            "completed_at": "2026-09-26T00:00:00Z",
+        }
+        result["content_hash"] = content_hash(result)
+        atomic_write_json(self.result_path, result)
+        self.assertTrue(self._review()["ok"])
+        evidence = self._evidence()
+        self.assertEqual(result, evidence["result"])
+        self.assertEqual(context, evidence["final_context"])
+        self.assertEqual(self.observed, evidence["dispatch"]["observed_invocation"])
+        self.assertEqual("PASS", evidence["review"]["review_outcome"])
+        self.assertNotEqual(result["content_hash"], evidence["review"]["content_hash"])
+        memory_store = store.MemoryStore(store_path)
+        memory_store.initialize()
+        try:
+            outcome = memory_store.get_outcome(evidence["decision_id"])
+            self.assertEqual("PASS", outcome["status"])
+            self.assertEqual(self.plan["plan_id"], outcome["plan_id"])
+            self.assertEqual(self.run_id, outcome["linked_run_id"])
+            self.assertEqual(evidence["content_hash"], outcome["evidence_digest"])
+        finally:
+            memory_store.close()
+        self.assertTrue(self._review()["ok"])
+        changed = copy.deepcopy(evidence)
+        changed["result"]["evidence"] = ["fabricated"]
+        changed["result"]["content_hash"] = content_hash(changed["result"])
+        with self.assertRaises(terminal_evidence.TerminalEvidenceError):
+            terminal_evidence.validate_terminal_evidence(changed)
+        self.assertEqual(evidence, self._evidence())
+
+    def test_exact_enhanced_retirement_keeps_other_owner_and_dirty_worktree(self) -> None:
+        self.assertTrue(self._review()["ok"])
+        self.lane["lifecycle"] = "accepted"
+        lanes.write_lane(self.rt, self.epoch_id, self.lane_id, self.lane)
+        other_worktree = self.root / "other-dirty-worktree"
+        other_worktree.mkdir()
+        dirty_file = other_worktree / "user-change.txt"
+        dirty_file.write_text("keep this work", encoding="utf-8")
+        write_active_lanes(self.rt, self.epoch_id, [
+            {"lane_id": self.lane_id, "run_id": self.run_id},
+            {"lane_id": "other-lane", "run_id": "other-run"},
+        ])
+        leases.acquire_leases(
+            self.rt, ["owned-resource"], lane_id=self.lane_id, run_id=self.run_id,
+            pid=123, creation_time="incarnation-1",
+        )
+        leases.acquire_leases(
+            self.rt, ["other-resource"], lane_id="other-lane", run_id="other-run",
+            pid=999, creation_time="other-incarnation",
+        )
+        boundary = {"root": {"pid": 42, "creation_time": "provider-incarnation"}}
+        status = {
+            "schema": "controller-status/v1", "lane_id": self.lane_id,
+            "run_id": self.run_id, "controller_state": "exited",
+            "provider_state": {"state": "exited", "pid": 42,
+                               "creation_time": "provider-incarnation"},
+            "process_boundary": boundary, "cleanup_proven": False,
+        }
+        checked = []
+        def exact_identity(pid: int, creation: str) -> bool:
+            checked.append((pid, creation))
+            self.assertIn((pid, creation), [
+                (123, "incarnation-1"), (42, "provider-incarnation"),
+            ])
+            return False
+        acceptance = self.folder / "ORCHESTRATOR_ACCEPTANCE.json"
+        with (
+            patch.object(launch, "find_harness_root", return_value=self.root),
+            patch.object(launch, "load_config", return_value=SimpleNamespace(
+                runtime_root=self.rt, root_workspace=self.root,
+            )),
+            patch.object(launch, "find_active_lane", return_value=(self.epoch_id, self.lane)),
+            patch.object(launch, "_read_controller_status", return_value=status),
+            patch.object(launch.processes, "identity_matches", side_effect=exact_identity),
+            patch.object(launch.processes, "process_boundary_is_gone", side_effect=lambda observed: observed == boundary),
+            patch.object(launch, "_prune_worktrees") as prune,
+        ):
+            unresolved = launch.run_retire(str(acceptance))
+            self.assertFalse(unresolved["ok"], unresolved)
+            self.assertEqual(launch.RETIRE_CLEANUP_UNPROVEN, unresolved["code"])
+            self.assertIsNotNone(leases.read_lease(self.rt, "owned-resource"))
+            status["cleanup_proven"] = True
+            retired = launch.run_retire(str(acceptance))
+        self.assertTrue(retired["ok"], retired)
+        self.assertIn((123, "incarnation-1"), checked)
+        self.assertIn((42, "provider-incarnation"), checked)
+        self.assertEqual("retired", lanes.read_lane(self.rt, self.epoch_id, self.lane_id)["lifecycle"])
+        self.assertIsNone(leases.read_lease(self.rt, "owned-resource"))
+        self.assertEqual("other-lane", leases.read_lease(self.rt, "other-resource")["lane_id"])
+        self.assertEqual(["other-lane"], [entry["lane_id"] for entry in read_active_lanes(self.rt, self.epoch_id)])
+        self.assertEqual("keep this work", dirty_file.read_text(encoding="utf-8"))
+        self.assertTrue(acceptance.is_file())
+        prune.assert_called_once()
 
     def test_fail_blocked_and_forced_acceptance_remain_distinct(self) -> None:
         self._result("FAIL")

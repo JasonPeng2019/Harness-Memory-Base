@@ -14,7 +14,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from orchestrator_harness import bootstrap, memory_handoff
+from orchestrator_harness import bootstrap, controller, memory_handoff
+from orchestrator_harness.records import atomic_write_json
 from memory_harness import context, contracts, runtime, store
 
 
@@ -46,7 +47,8 @@ def _task_card(
 
 
 def _finalized_lane1_fixture(
-    card: dict, plan: dict, worktree: Path, *, run_id: str = "run-1"
+    card: dict, plan: dict, worktree: Path, *, run_id: str = "run-1",
+    optional_items: list[dict] | None = None,
 ) -> SimpleNamespace:
     """A real Lane 1 finalized record for the explicit test dispatch target."""
 
@@ -60,7 +62,7 @@ def _finalized_lane1_fixture(
         {"id": "checkpoint", "kind": "checkpoint", "content": card["memory_handoff"]["checkpoint"]},
         {"id": "security", "kind": "security", "content": contracts.FINAL_CONTEXT_SECURITY},
     ]
-    optional = [
+    optional = optional_items if optional_items is not None else [
         {"id": "case-1", "kind": "experience", "origin": "reviewed", "content": "prior failure"}
     ]
     omitted = ["case-2"]
@@ -80,7 +82,11 @@ def _finalized_lane1_fixture(
         recipient="worker:lane-1",
         mandatory_content=mandatory,
         optional_items=optional,
-        omitted=omitted,
+        omitted=[] if optional_items is not None else omitted,
+        source_recheck=(lambda item: contracts.make_final_source_recheck(
+            item=item, status="eligible", observed_revision_id=item["revision_id"],
+            observed_content_digest=contracts.sha256_hex(item["content"]),
+        )) if optional_items is not None else None,
     )
 
 
@@ -264,6 +270,91 @@ class MemoryHandoffSeamTests(unittest.TestCase):
                 base_commit="base-1",
             )
         self.assertFalse(store_path.exists())
+
+    def test_two_source_final_context_reaches_worker_input_and_result_capture(self) -> None:
+        sources = [
+            {"id": "everos-item", "kind": "procedure", "origin": "everos_generated_skill",
+             "source_id": "everos-skill-id", "revision_id": "everos-r1", "freshness": "live",
+             "content": {"guidance": "EVEROS_MVP_MARKER"}},
+            {"id": "atlas-item", "kind": "procedure", "origin": "atlas_trusted_procedure",
+             "source_id": "atlas-procedure-id", "revision_id": "atlas-r1", "freshness": "live",
+             "content": {"guidance": "ATLAS_MVP_MARKER"}},
+        ]
+        finalized = _finalized_lane1_fixture(
+            self.card, self.plan, self.worktree, optional_items=sources,
+        )
+        self.assertEqual(2, len(finalized.context["optional_content"]))
+        _record_domain_fixture(self.worktree, finalized)
+        memory_store = store.MemoryStore(memory_handoff.memory_paths(self.worktree)[0])
+        memory_store.initialize()
+        try:
+            memory_store.record_decision(contracts.make_decision(self.card, self.plan))
+        finally:
+            memory_store.close()
+        workspace = self.worktree / ".agent-workspace"
+        workspace.mkdir(exist_ok=True)
+        atomic_write_json(workspace / "task-card.json", self.card)
+        with patch.object(memory_handoff, "_prepare_memory_outcome", return_value=finalized):
+            envelope = memory_handoff.prepare_bootstrap_envelope(
+                task_card=self.card, lane_id="lane-1", run_id="run-1",
+                worktree_path=self.worktree, base_commit="base-1",
+            )
+        assert envelope is not None
+        for field, expected in (
+            ("task", self.card["task"]), ("plan_id", self.plan["plan_id"]),
+            ("decision_id", finalized.context["decision_id"]),
+            ("base_commit", "base-1"), ("run_id", "run-1"),
+            ("recipient", "worker:lane-1"),
+        ):
+            self.assertEqual(expected, envelope[field], field)
+        bootstrap._write_worker_prompt(self.worktree, self.card, managed=False)
+        invocation = bootstrap._write_invocation(
+            self.worktree, lane_id="lane-1", run_id="run-1", provider_id="codex",
+            model="test-model", launch_config={"reasoning_effort": "high"},
+            exclusive_resources=[], memory_envelope=envelope,
+        )
+        lane = {"lane_id": "lane-1", "run_id": "run-1", "worktree_path": str(self.worktree),
+                "provider": invocation["provider"], "memory_plan_state": "execution_accepted",
+                "result_path": str(self.worktree / "RESULT.json")}
+        self.assertEqual("codex", invocation["provider"]["id"])
+        self.assertEqual("test-model", lane["provider"]["model"])
+        with patch.dict(controller.os.environ, {
+            "USERPROFILE": str(self.root), "CODEX_HOME": str(self.root / "codex-home"),
+        }, clear=True):
+            self.assertEqual(invocation["dispatch_binding"], controller._validate_enhanced_dispatch(lane, invocation))
+        prompt = (workspace / "worker-prompt.md").read_text(encoding="utf-8")
+        for source in sources:
+            descriptor = next(item for item in envelope["delivery_trace"]["context_delivered"]
+                              if item["id"] == source["id"])
+            self.assertIn(source["source_id"], prompt)
+            self.assertIn(source["revision_id"], prompt)
+            self.assertIn(descriptor["content_digest"], prompt)
+            self.assertIn(source["content"]["guidance"], prompt)
+        self.assertNotIn("control credential", prompt.lower())
+        calls = []
+        def worker(_intent: dict) -> dict:
+            calls.append(prompt)
+            result = {"schema": "result/v1", "lane_id": "lane-1", "run_id": "run-1",
+                      "outcome": "PASS", "summary": "in-process marker transport",
+                      "evidence": [marker for marker in (
+                          "EVEROS_MVP_MARKER", "ATLAS_MVP_MARKER"
+                      ) if marker in prompt],
+                      "completed_at": "2026-09-26T00:00:00Z"}
+            result["content_hash"] = contracts.content_hash(result)
+            atomic_write_json(self.worktree / "RESULT.json", result)
+            return {"invocation_id": "in-process-worker", "pid": 17, "creation_time": "deterministic"}
+        delivered = memory_handoff.dispatch(
+            worktree_path=self.worktree, envelope=envelope, launcher=worker,
+        )
+        replay = memory_handoff.dispatch(
+            worktree_path=self.worktree, envelope=envelope,
+            launcher=lambda _intent: self.fail("duplicate worker intent"),
+        )
+        self.assertEqual(delivered["operation_id"], replay["operation_id"])
+        self.assertEqual(1, len(calls))
+        state, result = controller._validate_result(lane)
+        self.assertEqual("valid", state)
+        self.assertEqual(["EVEROS_MVP_MARKER", "ATLAS_MVP_MARKER"], result["evidence"])
 
     def test_changed_task_or_base_is_rejected_at_launch(self) -> None:
         envelope = memory_handoff.prepare_bootstrap_envelope(
