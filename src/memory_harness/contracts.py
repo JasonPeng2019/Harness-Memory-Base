@@ -33,6 +33,7 @@ FINAL_CONTEXT_SECURITY = {
 OPERATION_SCHEMA = "memory-operation/v1"
 OUTCOME_SCHEMA = "memory-outcome/v1"
 NATIVE_TERMINAL_EVIDENCE_SCHEMA = "native-terminal-evidence/v1"
+REJECTED_NATIVE_ATTEMPT_SCHEMA = "rejected-native-attempt/v1"
 REVIEW_RECEIPT_SCHEMA = "memory-review-receipt/v1"
 REVIEWED_TRAJECTORY_SCHEMA = "reviewed-trajectory/v1"
 EXPERIENCE_INGESTION_SCHEMA = "reviewed-experience-ingestion/v1"
@@ -1223,6 +1224,32 @@ def validate_native_terminal_evidence(evidence: Mapping[str, Any]) -> None:
             raise ContractError("ordinary result cannot carry UNKNOWN proof")
         if acceptance["approval"] == "ACCEPTED" and status != "PASS" and (not isinstance(acceptance.get("force_accept_reason"), str) or not acceptance["force_accept_reason"].strip()):
             raise ContractError("forced acceptance reason missing")
+
+
+def make_rejected_native_attempt(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """Identify one exact ROOT-rejected native review without fixing quality."""
+    validate_native_terminal_evidence(evidence)
+    if evidence["acceptance"]["approval"] != "REJECTED":
+        raise ContractError("rejected native attempt requires ROOT REJECTED")
+    operation = evidence["dispatch"]["operation"]
+    record = {
+        "schema": REJECTED_NATIVE_ATTEMPT_SCHEMA,
+        "rejected_attempt_id": sha256_hex({
+            "decision_id": evidence["decision_id"],
+            "operation_id": operation["operation_id"],
+            "evidence_digest": evidence["content_hash"],
+        }),
+        "decision_id": evidence["decision_id"],
+        "operation_id": operation["operation_id"],
+        "run_id": evidence["run_id"],
+        "result_digest": evidence["result"]["content_hash"],
+        "review_digest": evidence["review"]["content_hash"],
+        "acceptance_digest": evidence["acceptance"]["content_hash"],
+        "evidence_digest": evidence["content_hash"],
+        "terminal_evidence": dict(evidence),
+    }
+    record["content_hash"] = content_hash(record)
+    return record
 
 
 def normalize_experience_scope(scope: Mapping[str, Any]) -> dict[str, str]:
@@ -4182,6 +4209,7 @@ __all__ = [
     "OPERATION_SCHEMA",
     "OUTCOME_SCHEMA",
     "NATIVE_TERMINAL_EVIDENCE_SCHEMA",
+    "REJECTED_NATIVE_ATTEMPT_SCHEMA",
     "REVIEW_RECEIPT_SCHEMA",
     "REVIEWED_TRAJECTORY_SCHEMA",
     "EXPERIENCE_INGESTION_SCHEMA",
@@ -4232,6 +4260,7 @@ __all__ = [
     "make_outcome",
     "validate_outcome",
     "validate_native_terminal_evidence",
+    "make_rejected_native_attempt",
     "normalize_experience_scope",
     "make_review_receipt",
     "validate_review_receipt",

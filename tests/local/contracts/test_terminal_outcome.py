@@ -16,7 +16,11 @@ from memory_harness import config, context, contracts, runtime, store
 
 class TerminalOutcomeTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
+        # SQLite WAL cleanup needs a local filesystem on NFS-backed runners.
+        local_tmp = Path("/dev/shm")
+        self.temporary = tempfile.TemporaryDirectory(
+            dir=local_tmp if local_tmp.is_dir() and local_tmp.exists() else None
+        )
         self.root = Path(self.temporary.name)
         self.state = store.MemoryStore(self.root / "state.sqlite3")
         self.state.initialize()
@@ -135,12 +139,193 @@ class TerminalOutcomeTests(unittest.TestCase):
         bundle["content_hash"] = contracts.content_hash(bundle)
         return bundle
 
+    @staticmethod
+    def exceptionally_accept(evidence: dict) -> dict:
+        evidence["acceptance"]["approval"] = "ACCEPTED"
+        evidence["acceptance"]["force_accept_reason"] = "ROOT exception"
+        evidence["acceptance"]["content_hash"] = contracts.content_hash(evidence["acceptance"])
+        evidence["content_hash"] = contracts.content_hash(evidence)
+        return evidence
+
     def test_exact_observed_native_chain_fixes_pass(self) -> None:
         self.observe()
         outcome = self.runtime.record_terminal_outcome(self.bundle())
         self.assertEqual("PASS", outcome["status"])
         self.assertEqual("ACCEPTED", outcome["acceptance_status"])
         self.assertFalse(outcome["exceptional_acceptance"])
+
+    def next_run(self, run_id: str, *, recipient: str = "worker:lane-1") -> None:
+        self.run_id = run_id
+        self.final = context.finalize_context(
+            task_card=self.card, plan=self.plan,
+            decision_id=self.decision["decision_id"], lane_id=self.lane_id,
+            run_id=run_id, worktree_path=str(self.root / "worktree"),
+            base_commit="base-1", strategy="standard",
+            configuration=self.configuration, checkpoint="checkpoint-1",
+            execution_role="worker", invocation_target="harness:worker",
+            recipient=recipient,
+            mandatory_content=self.final.envelope["mandatory_content"],
+            limits=config.resolve_limits({"context_char_limit": 4000}),
+        )
+        self.state.record_final_context(
+            self.final.context, envelope_digest=self.final.envelope["content_hash"],
+        )
+
+    def test_rejected_attempt_authorizes_one_corrected_run_and_final_quality(self) -> None:
+        self.observe()
+        first = self.bundle(status="FAIL")
+        with self.assertRaisesRegex(store.OutcomeConflictError, "ROOT ACCEPTED"):
+            self.runtime.record_terminal_outcome(first)
+        rejected = self.runtime.record_rejected_native_attempt(first)
+        self.assertEqual(rejected, self.runtime.record_rejected_native_attempt(first))
+        self.assertEqual(first, rejected["terminal_evidence"])
+        with self.assertRaises(store.StoreError):
+            self.state.get_outcome(self.decision["decision_id"])
+
+        self.next_run("run-2")
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(self.final.envelope)
+        intent = self.runtime.record_dispatch_intent(
+            self.final.envelope,
+            supersedes_rejected_attempt_id=rejected["rejected_attempt_id"],
+        )
+        self.assertEqual(rejected["rejected_attempt_id"], intent["supersedes_rejected_attempt_id"])
+        self.assertEqual(intent, self.runtime.record_dispatch_intent(
+            self.final.envelope,
+            supersedes_rejected_attempt_id=rejected["rejected_attempt_id"],
+        ))
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(
+                self.final.envelope, supersedes_rejected_attempt_id="different-attempt",
+            )
+        self.runtime.record_observed_dispatch(self.final.envelope, self.native_receipt())
+        second = self.bundle(status="BLOCKED")
+        rejected_second = self.runtime.record_rejected_native_attempt(second)
+        self.assertNotEqual(rejected["rejected_attempt_id"], rejected_second["rejected_attempt_id"])
+        self.next_run("run-3")
+        self.runtime.record_dispatch_intent(
+            self.final.envelope,
+            supersedes_rejected_attempt_id=rejected_second["rejected_attempt_id"],
+        )
+        self.runtime.record_observed_dispatch(self.final.envelope, self.native_receipt())
+        fixed = self.runtime.record_terminal_outcome(self.bundle())
+        self.assertEqual("PASS", fixed["status"])
+        self.assertEqual("ACCEPTED", fixed["acceptance_status"])
+        self.assertEqual(rejected, self.state.get_rejected_native_attempt(rejected["rejected_attempt_id"]))
+        self.assertEqual(rejected_second, self.state.get_rejected_native_attempt(rejected_second["rejected_attempt_id"]))
+        self.assertNotIn("effect_status", fixed)
+        self.assertEqual(rejected, self.runtime.record_rejected_native_attempt(first))
+
+    def test_rejection_replay_conflict_and_restart_are_atomic(self) -> None:
+        self.observe()
+        original = self.bundle(status="FAIL")
+        self.state.close()
+        self.state = store.MemoryStore(self.root / "state.sqlite3")
+        self.state.initialize()
+        self.runtime = runtime.MemoryRuntime(self.state)
+        with self.assertRaises(store.StoreError):
+            self.state.get_outcome(self.decision["decision_id"])
+        attempt = self.runtime.record_rejected_native_attempt(original)
+        self.state.close()
+        self.state = store.MemoryStore(self.root / "state.sqlite3")
+        self.state.initialize()
+        self.runtime = runtime.MemoryRuntime(self.state)
+        self.assertEqual(attempt, self.runtime.record_rejected_native_attempt(original))
+        contradiction = deepcopy(original)
+        contradiction["review"]["commit"] = "different"
+        contradiction["review"]["content_hash"] = contracts.content_hash(contradiction["review"])
+        contradiction["acceptance"]["commit"] = "different"
+        contradiction["acceptance"]["review_ref"] = contradiction["review"]["content_hash"]
+        contradiction["acceptance"]["content_hash"] = contracts.content_hash(contradiction["acceptance"])
+        contradiction["content_hash"] = contracts.content_hash(contradiction)
+        with self.assertRaises(store.OutcomeConflictError):
+            self.runtime.record_rejected_native_attempt(contradiction)
+        accepted_same_run = deepcopy(original)
+        accepted_same_run["acceptance"]["approval"] = "ACCEPTED"
+        accepted_same_run["acceptance"]["force_accept_reason"] = "late override"
+        accepted_same_run["acceptance"]["content_hash"] = contracts.content_hash(
+            accepted_same_run["acceptance"]
+        )
+        accepted_same_run["content_hash"] = contracts.content_hash(accepted_same_run)
+        with self.assertRaises(store.OutcomeConflictError):
+            self.runtime.record_terminal_outcome(accepted_same_run)
+        self.assertEqual(attempt, self.state.get_rejected_native_attempt(attempt["rejected_attempt_id"]))
+        with self.assertRaises(store.StoreError):
+            self.state.get_outcome(self.decision["decision_id"])
+
+    def test_correction_requires_latest_exact_rejected_attempt_and_one_use(self) -> None:
+        self.observe()
+        first = self.runtime.record_rejected_native_attempt(self.bundle(status="FAIL"))
+        self.next_run("run-2")
+        for wrong in ("unknown-attempt", None):
+            with self.subTest(wrong=wrong), self.assertRaises(store.OperationConflictError):
+                self.runtime.record_dispatch_intent(
+                    self.final.envelope, supersedes_rejected_attempt_id=wrong,
+                )
+        self.runtime.record_dispatch_intent(
+            self.final.envelope, supersedes_rejected_attempt_id=first["rejected_attempt_id"],
+        )
+        self.runtime.record_observed_dispatch(self.final.envelope, self.native_receipt())
+        self.next_run("run-3")
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(
+                self.final.envelope, supersedes_rejected_attempt_id=first["rejected_attempt_id"],
+            )
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(self.final.envelope)
+
+    def test_accepted_run_cannot_authorize_a_new_same_decision_dispatch(self) -> None:
+        self.observe()
+        accepted = self.bundle()
+        self.runtime.record_terminal_outcome(accepted)
+        with self.assertRaises(contracts.ContractError):
+            self.runtime.record_rejected_native_attempt(accepted)
+        self.next_run("run-2")
+        for attempt_id in (None, "invented-id"):
+            with self.subTest(attempt_id=attempt_id), self.assertRaises(store.OperationConflictError):
+                self.runtime.record_dispatch_intent(
+                    self.final.envelope, supersedes_rejected_attempt_id=attempt_id,
+                )
+
+    def test_unreviewed_pending_ambiguous_and_wrong_recipient_stay_blocked(self) -> None:
+        self.observe()
+        self.next_run("run-2")
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(self.final.envelope)
+        # A caller cannot turn a delivered but unreviewed run into authority.
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(
+                self.final.envelope, supersedes_rejected_attempt_id="caller-assertion",
+            )
+
+        self.prepare_case(plan_id="plan-pending", run_id="pending", lane_id="lane-pending")
+        self.runtime.record_dispatch_intent(self.final.envelope)
+        self.next_run("pending-2")
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(self.final.envelope)
+
+        self.prepare_case(plan_id="plan-ambiguous", run_id="ambiguous", lane_id="lane-ambiguous")
+        self.runtime.record_dispatch_intent(self.final.envelope)
+        self.runtime.mark_dispatch_ambiguous(self.final.envelope)
+        self.next_run("ambiguous-2")
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(self.final.envelope)
+
+        self.prepare_case(plan_id="plan-recipient", run_id="recipient-1", lane_id="lane-recipient")
+        self.observe()
+        rejected = self.runtime.record_rejected_native_attempt(self.bundle(status="FAIL"))
+        self.next_run("recipient-2", recipient="worker:someone-else")
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(
+                self.final.envelope,
+                supersedes_rejected_attempt_id=rejected["rejected_attempt_id"],
+            )
+        self.prepare_case(plan_id="other-plan", run_id="other-run", lane_id="other-lane")
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(
+                self.final.envelope,
+                supersedes_rejected_attempt_id=rejected["rejected_attempt_id"],
+            )
 
     def test_quality_statuses_and_exceptional_acceptance_stay_distinct(self) -> None:
         for status in ("PASS", "FAIL", "BLOCKED"):
@@ -282,7 +467,9 @@ class TerminalOutcomeTests(unittest.TestCase):
         self.assertEqual(original_operation, self.state.get_operation(original_operation["operation_id"]))
         self.prepare_case(plan_id="unrelated", run_id="run-2", lane_id="lane-2")
         self.observe()
-        other = self.runtime.record_terminal_outcome(self.bundle(status="BLOCKED"))
+        other = self.runtime.record_terminal_outcome(
+            self.exceptionally_accept(self.bundle(status="BLOCKED"))
+        )
         self.assertEqual("BLOCKED", other["status"])
         self.assertEqual(fixed, self.state.get_outcome(fixed["decision_id"]))
 
@@ -293,7 +480,8 @@ class TerminalOutcomeTests(unittest.TestCase):
                           supersedes="plan-1")
         self.observe()
         corrected = self.runtime.record_terminal_outcome(
-            self.bundle(status="FAIL"), supersedes_outcome_id=old["outcome_id"],
+            self.exceptionally_accept(self.bundle(status="FAIL")),
+            supersedes_outcome_id=old["outcome_id"],
         )
         self.assertEqual(old["outcome_id"], corrected["supersedes_outcome_id"])
         self.assertEqual("PASS", self.state.get_outcome(old["decision_id"])["status"])

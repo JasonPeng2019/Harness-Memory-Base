@@ -153,10 +153,14 @@ class MemoryRuntime:
         )
         return self.store.record_operation(delivered)
 
-    def record_dispatch_intent(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
+    def record_dispatch_intent(
+        self, envelope: Mapping[str, Any], *,
+        supersedes_rejected_attempt_id: str | None = None,
+    ) -> dict[str, Any]:
         """Claim the exact durable final context before the native launcher runs.
 
-        A replay or conflicting decision/lane owner raises DispatchAmbiguityError.
+        A corrected intent's exact authorization replay returns its existing row;
+        ordinary duplicate intents remain ambiguous to the caller.
         This operation alone never means that a controller was spawned.
         """
 
@@ -164,8 +168,12 @@ class MemoryRuntime:
 
         if envelope.get("schema") != contracts.FINAL_ENVELOPE_SCHEMA:
             raise RuntimeError("split native dispatch requires a finalized envelope")
-        existing, created = self.store.create_dispatch_intent(envelope)
+        existing, created = self.store.create_dispatch_intent(
+            envelope, supersedes_rejected_attempt_id=supersedes_rejected_attempt_id,
+        )
         if not created:
+            if supersedes_rejected_attempt_id is not None:
+                return existing
             raise DispatchAmbiguityError(
                 f"{existing['status']} dispatch already exists; "
                 "reconcile it before any new launch"
@@ -341,6 +349,12 @@ class MemoryRuntime:
         return self.store.record_terminal_outcome(
             outcome, evidence, supersedes_outcome_id=supersedes_outcome_id,
         )
+
+    def record_rejected_native_attempt(
+        self, native_terminal_evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Retain one exact ROOT-rejected native run for explicit correction."""
+        return self.store.record_rejected_native_attempt(native_terminal_evidence)
 
     # -- STEP-04 preparation, finalization, and safe dispatch ---------------
 
