@@ -1768,6 +1768,199 @@ class MemoryStore:
             self._live_effect_claims.pop(operation_id, None)
         return self.get_effect_operation(operation_id)
 
+    def settle_external_experience_ingestion(
+        self, operation_id: str, ingestion_id: str, *, claim_id: str,
+        claim_generation: int, mode: str, reason: str | None = None,
+        ingestion_uncertain: bool = False, evidence: Mapping[str, Any] | None = None,
+        case_receipts: tuple[Mapping[str, Any], ...] = (),
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        """Settle one claimed EverOS effect and its ingestion in one transaction.
+
+        ``uncertain`` is a voluntary issuing-handle transition; ``acknowledged``
+        accepts an exact readback from either handle. Dispositions are
+        ``uncertain``, ``already_uncertain``, ``confirmed``, and
+        ``already_confirmed``. A confirmed peer wins over a late uncertainty.
+        """
+        if mode not in ("uncertain", "acknowledged"):
+            raise contracts.ContractError("unknown experience settlement mode")
+        if (not isinstance(claim_id, str) or not claim_id or
+                type(claim_generation) is not int or claim_generation <= 0):
+            raise OperationConflictError("settlement requires an exact claim and generation")
+        if mode == "uncertain" and (not isinstance(reason, str) or not reason):
+            raise contracts.ContractError("uncertainty needs a reason")
+        connection = self._require_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = self.get_effect_operation(operation_id)
+            ingestion = self.get_experience_ingestion(ingestion_id)
+            if (operation["outcome_id"] is not None or
+                    operation["kind"] != "experience_ingestion" or
+                    operation["source_id"] != ingestion["trajectory_id"] or
+                    operation["active_claim_id"] != claim_id or
+                    operation["claim_generation"] != claim_generation or
+                    operation["claimant_record"] is None or
+                    operation["claimant_digest"] != contracts.sha256_hex(operation["claimant_record"]) or
+                    claim_id != contracts.sha256_hex({
+                        "operation_id": operation_id, "claim_generation": claim_generation,
+                        "claimant_digest": operation["claimant_digest"],
+                    })):
+                raise OperationConflictError("experience settlement claim or source differs")
+            trajectory = self.get_reviewed_trajectory(ingestion["trajectory_id"])
+            self._durable_review_receipt_for_trajectory(trajectory)
+            expected_scope_key = contracts.sha256_hex({
+                "scope": trajectory["scope"], "destination": ingestion["destination"],
+            })
+            decision = self.get_decision(trajectory["decision_id"])
+            payload = operation["payload_record"]
+            if (operation["operation_id"] != contracts.external_effect_operation_id(
+                    trajectory["trajectory_id"], "experience_ingestion", expected_scope_key) or
+                    operation["source_digest"] != contracts.sha256_hex(trajectory) or
+                    operation["source_record"] != trajectory or
+                    operation["scope_key"] != expected_scope_key or
+                    ingestion["scope"] != trajectory["scope"] or
+                    ingestion["scope_digest"] != trajectory["scope_digest"] or
+                    not isinstance(payload, Mapping) or
+                    operation["payload_digest"] != contracts.sha256_hex(payload) or
+                    ingestion["payload_digest"] != operation["payload_digest"] or
+                    payload.get("session_id") != ingestion["session_id"] or
+                    payload.get("app_id") != trajectory["scope"]["application"] or
+                    payload.get("project_id") != trajectory["scope"]["project"] or
+                    not isinstance(payload.get("messages"), list) or
+                    not payload["messages"] or
+                    any(not isinstance(message, Mapping) or
+                            message.get("sender_id") != trajectory["scope"]["owner"]
+                            for message in payload["messages"]) or
+                    operation["configuration"] != decision["configuration"] or
+                    operation["configuration_digest"] != contracts.sha256_hex(decision["configuration"]) or
+                    not effect_submission_enabled(operation["configuration"], "experience_ingestion") or
+                    operation["adapter_operation_id"] not in (None, ingestion_id) or
+                    operation["adapter_payload_digest"] not in (None, ingestion["payload_digest"])):
+                raise OperationConflictError("experience settlement identity differs")
+
+            normalized = [dict(receipt) for receipt in case_receipts]
+            if mode == "acknowledged" or evidence is not None or normalized:
+                expected_evidence = {key: operation[key] for key in (
+                    "operation_id", "kind", "scope_key", "source_digest",
+                    "payload_digest", "configuration_digest",
+                )}
+                proof = evidence.get("adapter_proof") if isinstance(evidence, Mapping) else None
+                if (not isinstance(evidence, Mapping) or
+                        any(evidence.get(key) != value for key, value in expected_evidence.items()) or
+                        not isinstance(proof, Mapping) or
+                        proof.get("session_id") != ingestion["session_id"] or
+                        proof.get("scope") != trajectory["scope"] or
+                        not normalized):
+                    raise OperationConflictError("experience readback is not exact")
+                case_ids = []
+                for receipt in normalized:
+                    try:
+                        contracts.validate_case_receipt(receipt)
+                    except contracts.ContractError as exc:
+                        raise OperationConflictError("invalid experience case receipt") from exc
+                    if (receipt["ingestion_id"] != ingestion_id or
+                            receipt["trajectory_id"] != trajectory["trajectory_id"] or
+                            receipt["scope"] != trajectory["scope"] or
+                            receipt["scope_digest"] != trajectory["scope_digest"] or
+                            receipt["review_receipt_id"] != trajectory["review_receipt_id"] or
+                            receipt["review_receipt_digest"] != trajectory["review_receipt_digest"] or
+                            receipt["source_case"].get("session_id") != ingestion["session_id"]):
+                        raise OperationConflictError("experience case receipt provenance differs")
+                    case_ids.append(receipt["case_id"])
+                if (len(case_ids) != len(set(case_ids)) or
+                        proof.get("case_ids") != sorted(case_ids)):
+                    raise OperationConflictError("experience readback case proof is incomplete")
+            if operation["status"] == "confirmed":
+                if (ingestion["status"] != "confirmed" or
+                        operation["adapter_operation_id"] != ingestion_id or
+                        operation["acknowledgement"] != {
+                            "ingestion_id": ingestion_id,
+                            "payload_digest": ingestion["payload_digest"],
+                            "case_receipts": [self.get_case_receipt(trajectory["scope"], case_id)
+                                              for case_id in ingestion["case_ids"]],
+                        } or
+                        (evidence is not None and operation["reconciliation"] != dict(evidence)) or
+                        (normalized and sorted(normalized, key=lambda item: item["case_id"]) !=
+                         operation["acknowledgement"]["case_receipts"])):
+                    raise OperationConflictError("confirmed experience settlement differs")
+                return operation, ingestion, "already_confirmed"
+            if operation["status"] not in ("in_flight", "uncertain") or ingestion["status"] not in ("pending", "uncertain"):
+                raise OperationConflictError("experience settlement has no active submission")
+            if mode == "uncertain":
+                self._require_live_effect_claim(operation, claim_id)
+                if operation["status"] == "uncertain" and operation["uncertainty"] != reason:
+                    raise OperationConflictError("uncertainty reason conflicts")
+                if ingestion["status"] == "uncertain" and ingestion["error"] != reason:
+                    raise OperationConflictError("ingestion uncertainty reason conflicts")
+                if ingestion_uncertain and ingestion["status"] == "pending":
+                    updated = dict(ingestion, status="uncertain", error=reason,
+                                   version=ingestion["version"] + 1)
+                    updated["content_hash"] = contracts.content_hash(updated)
+                    contracts.validate_experience_ingestion(updated)
+                    connection.execute(
+                        "UPDATE experience_ingestions SET status='uncertain', error=?, version=?, "
+                        "content_hash=?, updated_at=? WHERE ingestion_id=?",
+                        (reason, updated["version"], updated["content_hash"],
+                         contracts.utc_now(), ingestion_id),
+                    )
+                changed = operation["status"] != "uncertain" or operation["adapter_operation_id"] is None
+                if changed:
+                    connection.execute(
+                        "UPDATE effect_operations SET status='uncertain', uncertainty=?, "
+                        "adapter_operation_id=?, adapter_payload_digest=?, version=version+1, "
+                        "updated_at=? WHERE operation_id=?",
+                        (reason, ingestion_id, ingestion["payload_digest"],
+                         contracts.utc_now(), operation_id),
+                    )
+                return (self.get_effect_operation(operation_id),
+                        self.get_experience_ingestion(ingestion_id),
+                        "uncertain" if changed or (ingestion_uncertain and ingestion["status"] == "pending")
+                        else "already_uncertain")
+
+            for receipt in normalized:
+                prior = connection.execute(
+                    "SELECT * FROM experience_case_receipts WHERE case_id=? AND scope_digest=?",
+                    (receipt["case_id"], receipt["scope_digest"]),
+                ).fetchone()
+                if prior is not None:
+                    if self._case_receipt_from_row(prior) != receipt:
+                        raise OperationConflictError("experience case receipt conflicts")
+                    continue
+                connection.execute(
+                    "INSERT INTO experience_case_receipts (case_receipt_id, case_id, trajectory_id, "
+                    "ingestion_id, scope_digest, scope, review_receipt_id, review_receipt_digest, "
+                    "source_case, source_case_digest, created_at, content_hash) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (receipt["case_receipt_id"], receipt["case_id"], receipt["trajectory_id"],
+                     receipt["ingestion_id"], receipt["scope_digest"],
+                     json.dumps(receipt["scope"], sort_keys=True), receipt["review_receipt_id"],
+                     receipt["review_receipt_digest"],
+                     json.dumps(receipt["source_case"], sort_keys=True),
+                     receipt["source_case_digest"], receipt["created_at"], receipt["content_hash"]),
+                )
+            updated = dict(ingestion, status="confirmed", case_ids=sorted(case_ids),
+                           error=None, version=ingestion["version"] + 1)
+            updated["content_hash"] = contracts.content_hash(updated)
+            contracts.validate_experience_ingestion(updated)
+            connection.execute(
+                "UPDATE experience_ingestions SET status='confirmed', case_ids=?, error=NULL, "
+                "version=?, content_hash=?, updated_at=? WHERE ingestion_id=?",
+                (json.dumps(updated["case_ids"], sort_keys=True), updated["version"],
+                 updated["content_hash"], contracts.utc_now(), ingestion_id),
+            )
+            acknowledgement = {"ingestion_id": ingestion_id,
+                               "payload_digest": ingestion["payload_digest"],
+                               "case_receipts": sorted(normalized, key=lambda item: item["case_id"])}
+            connection.execute(
+                "UPDATE effect_operations SET status='confirmed', adapter_operation_id=?, "
+                "adapter_payload_digest=?, acknowledgement=?, reconciliation=?, uncertainty=NULL, "
+                "version=version+1, updated_at=? WHERE operation_id=?",
+                (ingestion_id, ingestion["payload_digest"], self._serialize_record(acknowledgement),
+                 self._serialize_record(dict(evidence)), contracts.utc_now(), operation_id),
+            )
+            self._bridge_experience_ingestion_in_transaction(updated)
+            return (self.get_effect_operation(operation_id),
+                    self.get_experience_ingestion(ingestion_id), "confirmed")
+
     def bind_effect_source(
         self, operation_id: str, source_id: str, source_record: Mapping[str, Any]
     ) -> dict[str, Any]:

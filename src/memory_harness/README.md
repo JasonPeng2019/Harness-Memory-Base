@@ -172,6 +172,24 @@ start a fresh Python process, configure that root before import, then load its
 surface.  The dependency-light local suite honestly skips the real EverOS
 integration when this optional installation is absent.
 
+For a claimant-aware, source-owned EverOS ingestion, settle the effect and
+ingestion through `MemoryStore.settle_external_experience_ingestion(operation_id,
+ingestion_id, *, claim_id, claim_generation, mode, reason=None,
+ingestion_uncertain=False, evidence=None, case_receipts=())`. The returned
+`(operation, ingestion, disposition)` is the durable pair. `mode="uncertain"`
+requires the issuing store handle and a reason; `ingestion_uncertain=True`
+marks both rows uncertain, while the default leaves a pending ingestion for
+readback. Its dispositions are `uncertain` or `already_uncertain`.
+`mode="acknowledged"` accepts an exact active claim from a readback peer. Pass
+operation-bound evidence with `adapter_proof` containing the original session,
+scope, and complete sorted case IDs, plus all matching case receipts. It
+confirms the effect, ingestion, receipts, and local bridge together, returning
+`confirmed`. Exact confirmed replay, including a late uncertainty after peer
+confirmation, returns `already_confirmed` without changing versions. A wrong
+claim, incomplete proof, or conflicting receipt raises `OperationConflictError`
+without a partial settlement. This API does not record STEP-11 usage receipts;
+the caller records an authentic native usage receipt separately.
+
 Generated EverOS skills remain proposed historical candidates.  Approval is
 deny-by-default: `ReviewedExperienceService` requires a configured
 `TrustedApprovalVerifier` to authenticate the exact durable candidate, issuer,
