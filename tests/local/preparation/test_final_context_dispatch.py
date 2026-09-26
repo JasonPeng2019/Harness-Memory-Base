@@ -1608,12 +1608,12 @@ class FinalContextDispatchTests(unittest.TestCase):
                 final.envelope,
                 {"invocation_id": "controller:8:now", "pid": 8, "creation_time": "now"},
             )
-        outcome = memory_runtime.record_outcome(
-            decision_id=self.decision_id, plan_id=self.accepted["plan_id"],
-            plan_digest=self.accepted["content_hash"], status="PASS",
-            evidence_digest="evidence", linked_run_id="run-1",
-        )
-        self.assertEqual("run-1", outcome["linked_run_id"])
+        with self.assertRaisesRegex(store.OperationConflictError, "native terminal evidence"):
+            memory_runtime.record_outcome(
+                decision_id=self.decision_id, plan_id=self.accepted["plan_id"],
+                plan_digest=self.accepted["content_hash"], status="PASS",
+                evidence_digest="evidence", linked_run_id="run-1",
+            )
 
     def test_ambiguous_and_terminal_pre_spawn_states(self) -> None:
         final = self._finalize()

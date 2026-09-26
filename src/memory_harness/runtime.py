@@ -316,6 +316,32 @@ class MemoryRuntime:
         )
         return self.store.record_outcome(outcome)
 
+    def record_terminal_outcome(
+        self, native_terminal_evidence: Mapping[str, Any], *,
+        supersedes_outcome_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Fix quality from lane 2's complete retained enhanced-parent bundle.
+
+        Acceptance is stored as a separate fact; a forced acceptance cannot
+        turn FAIL, BLOCKED, or terminal UNKNOWN into quality PASS.
+        """
+        contracts.validate_native_terminal_evidence(native_terminal_evidence)
+        evidence = native_terminal_evidence
+        decision = evidence["decision"]
+        plan = evidence["accepted_plan"]
+        outcome = contracts.make_outcome(
+            decision_id=decision["decision_id"], plan_id=plan["plan_id"],
+            plan_digest=plan["content_hash"],
+            status=evidence["review"]["review_outcome"],
+            evidence_digest=evidence["content_hash"], linked_run_id=evidence["run_id"],
+            task_card_digest=evidence["task_card"]["content_hash"],
+            objective_id=evidence["objective_id"],
+            observed_at=evidence["review"]["reviewed_at"],
+        )
+        return self.store.record_terminal_outcome(
+            outcome, evidence, supersedes_outcome_id=supersedes_outcome_id,
+        )
+
     # -- STEP-04 preparation, finalization, and safe dispatch ---------------
 
     def prepare_with_memory(self, **kwargs: Any) -> Any:

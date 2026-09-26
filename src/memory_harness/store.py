@@ -101,6 +101,15 @@ _SCHEMA = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS native_outcomes (
+        outcome_id TEXT PRIMARY KEY REFERENCES outcomes(outcome_id),
+        terminal_evidence TEXT NOT NULL,
+        acceptance_status TEXT NOT NULL,
+        exceptional_acceptance INTEGER NOT NULL,
+        supersedes_outcome_id TEXT REFERENCES outcomes(outcome_id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS review_receipts (
         review_receipt_id TEXT PRIMARY KEY,
         outcome_id TEXT NOT NULL UNIQUE REFERENCES outcomes(outcome_id),
@@ -996,28 +1005,12 @@ class MemoryStore:
         return results
 
     def record_outcome(self, outcome: Mapping[str, Any]) -> dict[str, Any]:
+        """Legacy/generic fixation; finalized enhanced decisions need native evidence."""
         contracts.validate_outcome(outcome)
         connection = self._require_connection()
         decision_id = str(outcome["decision_id"])
         if self.get_final_context_for_decision(decision_id) is not None:
-            rows = connection.execute(
-                "SELECT dispatch_bindings.envelope_record FROM operations "
-                "JOIN dispatch_bindings USING(operation_id) "
-                "WHERE operations.decision_id=? AND operations.run_id=? "
-                "AND operations.kind='dispatch' AND operations.status='delivered'",
-                (decision_id, outcome["linked_run_id"]),
-            ).fetchall()
-            exact = False
-            for row in rows:
-                envelope = json.loads(row["envelope_record"])
-                self._validate_final_dispatch_binding(envelope, current=False)
-                if all(envelope.get(field) == outcome.get(field) for field in (
-                    "decision_id", "task_card_digest", "objective_id", "plan_id", "plan_digest"
-                )):
-                    exact = True
-                    break
-            if not exact:
-                raise OperationConflictError("finalized outcome requires its exact observed dispatch")
+            raise OperationConflictError("finalized outcome requires exact native terminal evidence")
         existing_row = connection.execute(
             "SELECT * FROM outcomes WHERE decision_id = ?", (decision_id,)
         ).fetchone()
@@ -1056,6 +1049,103 @@ class MemoryStore:
             )
         return self.get_outcome(decision_id)
 
+    def record_terminal_outcome(
+        self, outcome: Mapping[str, Any], evidence: Mapping[str, Any], *,
+        supersedes_outcome_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically join an observed dispatch and fix one immutable quality row."""
+        contracts.validate_outcome(outcome)
+        contracts.validate_native_terminal_evidence(evidence)
+        connection = self._require_connection()
+        decision_id = str(outcome["decision_id"])
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            decision = self.get_decision(decision_id)
+            if any(decision.get(key) != value for key, value in evidence["decision"].items() if key != "schema"):
+                raise OutcomeConflictError("terminal decision differs from durable decision")
+            final_context = self.get_final_context_for_decision(decision_id)
+            if final_context != evidence["final_context"]:
+                raise OutcomeConflictError("terminal final context differs from durable context")
+            dispatch = evidence["dispatch"]
+            context_row = connection.execute(
+                "SELECT envelope_digest FROM final_contexts WHERE context_id=?",
+                (final_context["context_id"],),
+            ).fetchone()
+            if context_row is None or context_row["envelope_digest"] != dispatch["envelope_digest"]:
+                raise OutcomeConflictError("terminal dispatch does not own the durable final context")
+            incoming_operation = dispatch["operation"]
+            row = connection.execute(
+                "SELECT * FROM operations WHERE operation_id=?",
+                (incoming_operation["operation_id"],),
+            ).fetchone()
+            if row is None:
+                raise OperationConflictError("terminal outcome has no observed native dispatch")
+            durable_operation = self._operation_from_row(row)
+            if any(durable_operation.get(key) != value for key, value in incoming_operation.items()):
+                raise OperationConflictError("terminal native dispatch differs from durable observation")
+            binding = connection.execute(
+                "SELECT * FROM dispatch_bindings WHERE operation_id=?",
+                (incoming_operation["operation_id"],),
+            ).fetchone()
+            if binding is not None:
+                if json.loads(binding["envelope_record"]) != dispatch["envelope"] or not binding["native_receipt_required"]:
+                    raise OperationConflictError("terminal dispatch lacks exact native intent binding")
+            elif dispatch["envelope"].get("schema") != contracts.ENVELOPE_SCHEMA:
+                raise OperationConflictError("terminal finalized dispatch lacks exact native intent binding")
+            if (outcome["evidence_digest"] != evidence["content_hash"] or
+                    outcome["status"] != evidence["review"]["review_outcome"] or
+                    outcome["linked_run_id"] != evidence["run_id"]):
+                raise OutcomeConflictError("terminal outcome differs from its evidence")
+            existing = connection.execute(
+                "SELECT * FROM outcomes WHERE decision_id=?", (decision_id,),
+            ).fetchone()
+            if existing is not None:
+                native = connection.execute(
+                    "SELECT * FROM native_outcomes WHERE outcome_id=?",
+                    (existing["outcome_id"],),
+                ).fetchone()
+                if (existing["outcome_id"] == outcome["outcome_id"] and native is not None
+                        and json.loads(native["terminal_evidence"]) == dict(evidence)
+                        and native["supersedes_outcome_id"] == supersedes_outcome_id):
+                    return self.get_outcome(decision_id)
+                raise OutcomeConflictError("terminal outcome conflict for decision " + decision_id)
+            if supersedes_outcome_id is not None:
+                predecessor = connection.execute(
+                    "SELECT * FROM outcomes WHERE outcome_id=?", (supersedes_outcome_id,),
+                ).fetchone()
+                if predecessor is None or predecessor["decision_id"] == decision_id:
+                    raise OutcomeConflictError("supersession requires a distinct fixed predecessor")
+                old_native = connection.execute(
+                    "SELECT terminal_evidence FROM native_outcomes WHERE outcome_id=?",
+                    (supersedes_outcome_id,),
+                ).fetchone()
+                if old_native is None:
+                    raise OutcomeConflictError("supersession requires a native predecessor")
+                old_evidence = json.loads(old_native["terminal_evidence"])
+                if (predecessor["objective_id"] != outcome["objective_id"] or
+                        evidence["accepted_plan"].get("supersedes") != predecessor["plan_id"] or
+                        evidence["task_card"].get("task") != old_evidence["task_card"].get("task") or
+                        evidence["task_card"].get("base_commit") != old_evidence["task_card"].get("base_commit")):
+                    raise OutcomeConflictError("supersession requires an explicit linked accepted plan for the same task")
+            connection.execute(
+                "INSERT INTO outcomes (outcome_id, decision_id, task_card_digest, objective_id, "
+                "plan_id, plan_digest, status, evidence_digest, linked_run_id, observed_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (outcome["outcome_id"], decision_id, outcome["task_card_digest"],
+                 outcome["objective_id"], outcome["plan_id"], outcome["plan_digest"],
+                 outcome["status"], outcome["evidence_digest"], outcome["linked_run_id"],
+                 outcome["observed_at"], outcome["observed_at"]),
+            )
+            acceptance = evidence["acceptance"]
+            exceptional = bool(acceptance.get("force_accept_reason"))
+            connection.execute(
+                "INSERT INTO native_outcomes (outcome_id, terminal_evidence, acceptance_status, "
+                "exceptional_acceptance, supersedes_outcome_id) VALUES (?, ?, ?, ?, ?)",
+                (outcome["outcome_id"], self._serialize_record(evidence),
+                 acceptance["approval"], int(exceptional), supersedes_outcome_id),
+            )
+        return self.get_outcome(decision_id)
+
     def get_outcome(self, decision_id: str) -> dict[str, Any]:
         connection = self._require_connection()
         row = connection.execute(
@@ -1063,7 +1153,18 @@ class MemoryStore:
         ).fetchone()
         if row is None:
             raise StoreError(f"outcome not found for decision: {decision_id}")
-        return dict(row)
+        outcome = dict(row)
+        native = connection.execute(
+            "SELECT * FROM native_outcomes WHERE outcome_id=?", (outcome["outcome_id"],),
+        ).fetchone()
+        if native is not None:
+            outcome.update({
+                "terminal_evidence": json.loads(native["terminal_evidence"]),
+                "acceptance_status": native["acceptance_status"],
+                "exceptional_acceptance": bool(native["exceptional_acceptance"]),
+                "supersedes_outcome_id": native["supersedes_outcome_id"],
+            })
+        return outcome
 
     def record_review_receipt(self, review_receipt: Mapping[str, Any]) -> dict[str, Any]:
         """Persist the exact ROOT receipt that authorizes a later trajectory.
