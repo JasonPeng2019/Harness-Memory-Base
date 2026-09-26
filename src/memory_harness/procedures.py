@@ -85,20 +85,34 @@ class TrustedProcedureService:
         network_resolution: NetworkResolution | Mapping[str, Any] | None,
         shared_publication_enabled: bool,
         effects: list[dict[str, Any]],
-        legacy_operations: list[dict[str, Any]],
+        operations: list[dict[str, Any]],
+        publication: Mapping[str, Any] | None = None,
     ) -> bool:
         """Admit new task work, or exact-only recovery of one submitted effect.
 
-        The returned value permits a new claim. A submitted uncertain effect may
-        be read while off, but absence must not turn that read into a retry.
+        The returned value permits a new claim. Submitted or confirmed effects
+        with unfinished local acknowledgement may be read while off; absence
+        must not turn that read into a retry.
         """
         new_work_allowed = (atlas.atlas_task_network_allowed(network_resolution)
                             and shared_publication_enabled)
         submitted = (len(effects) == 1 and effects[0]["status"] in {"uncertain", "in_flight"})
-        legacy_submitted = (not effects and len(legacy_operations) == 1
-                            and legacy_operations[0]["kind"] == "publication"
-                            and legacy_operations[0]["status"] in {"ambiguous", "remote_committed"})
-        if not new_work_allowed and not (submitted or legacy_submitted):
+        unresolved = {"intent", "ambiguous", "remote_committed"}
+        local_states = unresolved | {"acknowledged"}
+        confirmed_local = (
+            len(effects) == 1 and effects[0]["status"] == "confirmed"
+            and publication is not None and len(operations) == 1
+            and operations[0]["kind"] == "publication"
+            and operations[0]["payload_id"] == effects[0]["source_id"]
+            and publication["publication_id"] == effects[0]["source_id"]
+            and publication["status"] in local_states
+            and operations[0]["status"] in local_states
+            and (publication["status"] in unresolved or operations[0]["status"] in unresolved)
+        )
+        legacy_submitted = (not effects and len(operations) == 1
+                            and operations[0]["kind"] == "publication"
+                            and operations[0]["status"] in {"ambiguous", "remote_committed"})
+        if not new_work_allowed and not (submitted or confirmed_local or legacy_submitted):
             TrustedProcedureService._require_task_network(network_resolution)
             raise ProcedureIneligibleError("shared publication feature is off")
         return new_work_allowed
@@ -724,11 +738,18 @@ class TrustedProcedureService:
             prior_effects = [row for row in self.store.list_effect_operations()
                 if row["outcome_id"] is None and row["kind"] == "procedure_publication"
                 and row["source_id"] == publication["publication_id"]]
-            legacy_operations = (self.store.list_procedure_remote_operations(
-                payload_id=publication["publication_id"]) if not prior_effects else [])
+            operations = self.store.list_procedure_remote_operations(
+                payload_id=publication["publication_id"])
+            stored_publication = None
+            if len(prior_effects) == 1 and prior_effects[0]["status"] == "confirmed":
+                try:
+                    stored_publication = self.store.get_procedure_publication(
+                        publication["publication_id"])
+                except StoreError:
+                    pass
             new_work_allowed = self._publication_admission(
                 network_resolution, shared_publication_enabled,
-                prior_effects, legacy_operations)
+                prior_effects, operations, stored_publication)
             if wants_governance:
                 if (captured_config is None or current_config is None or atlas_scope is None
                         or claimant is None):
@@ -1095,7 +1116,7 @@ class TrustedProcedureService:
             if operation["kind"] == "publication"
         ]
         self._publication_admission(network_resolution, shared_publication_enabled,
-                                    effects, operations if not effects else [])
+                                    effects, operations, publication)
         if effects:
             effect = effects[0]
             scope = effect["payload_record"]["atlas_scope"]

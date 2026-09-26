@@ -393,6 +393,64 @@ class AtlasExternalReconciliationTests(unittest.TestCase):
         self.assertEqual({"shared_publication": True}, confirmed["configuration"])
         self.assertEqual(1, self.adapter.publication_writes)
 
+    def test_confirmed_effect_with_local_ack_outage_recovers_while_restricted(self) -> None:
+        self.adapter.lose_ack = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        original = self.memory_store.list_effect_operations()[0]
+        original_read = self.adapter.exact_read
+        reads = 0
+
+        def fail_second_read(publication_id: str):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                raise atlas.AtlasProcedureError("synthetic post-confirm exact-read outage")
+            return original_read(publication_id)
+
+        self.adapter.exact_read = fail_second_read  # type: ignore[method-assign]
+        restricted = config.resolve_network_mode("restricted_local")
+        with self.assertRaises(atlas.AtlasProcedureError):
+            self._governed_publish(current_on=False, network_resolution=restricted,
+                                   shared_publication_enabled=False)
+        self.assertEqual(2, reads)
+        confirmed = self.memory_store.get_effect_operation(original["operation_id"])
+        self.assertEqual("confirmed", confirmed["status"])
+        self.assertEqual("ambiguous", self.memory_store.list_procedure_publications()[0]["status"])
+        self.assertEqual("ambiguous", self.memory_store.list_procedure_remote_operations(
+            payload_id=original["source_id"])[0]["status"])
+        self.assertEqual(1, self.adapter.publication_writes)
+
+        before_retry = len(self.collection.events)
+        recovered = self._governed_publish(current_on=False, network_resolution=restricted,
+                                           shared_publication_enabled=False)
+        self.assertEqual("acknowledged", recovered["status"])
+        self.assertEqual("acknowledged", self.memory_store.list_procedure_remote_operations(
+            payload_id=original["source_id"])[0]["status"])
+        retained = self.memory_store.get_effect_operation(original["operation_id"])
+        self.assertEqual(original["operation_id"], retained["operation_id"])
+        self.assertEqual(original["active_claim_id"], retained["active_claim_id"])
+        self.assertEqual(original["claim_generation"], retained["claim_generation"])
+        self.assertEqual({"shared_publication": True}, retained["configuration"])
+        self.assertEqual(1, self.adapter.publication_writes)
+        self.assertEqual(3, reads)
+        self.assertTrue(self.collection.events[before_retry:])
+        self.assertTrue(all(event == "read" for event, _ in self.collection.events[before_retry:]))
+
+    def test_confirmed_complete_publication_denies_restricted_retry_without_adapter_calls(self) -> None:
+        publication = self._governed_publish()
+        before = list(self.collection.events)
+        restricted = config.resolve_network_mode("restricted_local")
+        with self.assertRaises(procedures.ProcedureNetworkDeniedError):
+            self._governed_publish(current_on=False, network_resolution=restricted,
+                                   shared_publication_enabled=False)
+        with self.assertRaises(procedures.ProcedureNetworkDeniedError):
+            self.service.reconcile_publication(
+                publication["publication_id"], self.adapter,
+                network_resolution=restricted, shared_publication_enabled=False)
+        self.assertEqual(before, self.collection.events)
+        self.assertEqual(1, self.adapter.publication_writes)
+
     def test_off_reconcile_exactly_confirms_submitted_uncertainty(self) -> None:
         self.adapter.lose_ack = True
         with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
