@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
-from memory_harness import config, contracts, store
+from memory_harness import config, contracts, experience, store
 from tests.local.experience import test_ingestion_and_trust as fixture_module
 
 
@@ -24,12 +24,7 @@ class AtomicExperienceSettlementTests(unittest.TestCase):
         self.peer.initialize()
         self.session = "session-1"
         self.destination = "everos"
-        self.payload = {
-            "session_id": self.session,
-            "app_id": self.trajectory["scope"]["application"],
-            "project_id": self.trajectory["scope"]["project"],
-            "messages": [{"sender_id": self.trajectory["scope"]["owner"], "content": "reviewed"}],
-        }
+        self.payload = self.make_payload()
         self.operation, _ = self.owner.create_external_effect_operation(
             kind="experience_ingestion",
             scope_key=contracts.sha256_hex({"scope": self.trajectory["scope"],
@@ -61,6 +56,14 @@ class AtomicExperienceSettlementTests(unittest.TestCase):
         self.evidence["adapter_proof"] = {
             "session_id": self.session, "scope": self.trajectory["scope"],
             "case_ids": [self.receipt["case_id"]],
+        }
+
+    def make_payload(self) -> dict:
+        return {
+            "session_id": self.session,
+            "app_id": self.trajectory["scope"]["application"],
+            "project_id": self.trajectory["scope"]["project"],
+            "messages": [{"sender_id": self.trajectory["scope"]["owner"], "content": "reviewed"}],
         }
 
     def tearDown(self) -> None:
@@ -253,6 +256,115 @@ class AtomicExperienceSettlementTests(unittest.TestCase):
                         case_receipts=(self.receipt,))
         self.assertEqual(effect, self.owner.get_effect_operation(self.operation["operation_id"]))
         self.assertEqual(ingestion, self.owner.get_experience_ingestion(self.ingestion["ingestion_id"]))
+
+
+class PublicAdapterExperienceSettlementTests(AtomicExperienceSettlementTests):
+    def make_payload(self) -> dict:
+        surface = fixture_module._FakeEverOS()
+        scope = self.fixture.scope
+        base_root = self.fixture.root / "everos"
+        adapter = experience.EverOSAdapter(
+            scope=scope,
+            base_root=base_root,
+            surface=experience.EverOSPublicSurface.from_object(
+                surface,
+                memory_root=experience.EverOSAdapter.memory_root_for_scope(base_root, scope),
+                resolve_memory_root=lambda: experience.EverOSAdapter.memory_root_for_scope(
+                    base_root, scope
+                ),
+            ),
+            privacy_policy=self.fixture.policy,
+        )
+        self.destination = adapter.destination
+        self.session = adapter.session_id_for(self.trajectory["trajectory_id"])
+        payload = adapter.add_payload(self.trajectory, session_id=self.session)
+        mutator = getattr(self, "payload_mutator", None)
+        return mutator(payload) if mutator is not None else payload
+
+    def test_public_adapter_payload_settles_exact_durable_pair(self) -> None:
+        scope = self.trajectory["scope"]
+        self.assertEqual(
+            "mh-app-" + contracts.sha256_hex({"value": scope["application"]})[:32],
+            self.payload["app_id"],
+        )
+        self.assertEqual(
+            "mh-project-" + contracts.sha256_hex({"value": scope["project"]})[:32],
+            self.payload["project_id"],
+        )
+        self.assertEqual(
+            "mh-owner-" + contracts.sha256_hex({"value": scope["owner"]})[:32],
+            self.payload["messages"][0]["sender_id"],
+        )
+        self.assertEqual(self.operation["payload_digest"], self.ingestion["payload_digest"])
+        effect, ingestion, disposition = self.settle(
+            self.owner, "uncertain", reason="response lost", ingestion_uncertain=True,
+        )
+        self.assertEqual(("uncertain", "uncertain", "uncertain"),
+                         (effect["status"], ingestion["status"], disposition))
+        effect, ingestion, disposition = self.settle(
+            self.peer, "acknowledged", evidence=self.evidence, case_receipts=(self.receipt,),
+        )
+        self.assertEqual(("confirmed", "confirmed", "confirmed"),
+                         (effect["status"], ingestion["status"], disposition))
+        self.assertEqual(contracts.sha256_hex(self.payload), effect["payload_digest"])
+        self.assertEqual(self.receipt, self.peer.get_case_receipt(scope, "case-1"))
+
+    def test_wrong_or_mixed_payload_identities_leave_claim_and_ingestion_unchanged(self) -> None:
+        scope = self.trajectory["scope"]
+
+        def altered(**fields: str):
+            def mutate(payload: dict) -> dict:
+                payload.update(fields)
+                return payload
+            return mutate
+
+        def sender(value: str):
+            def mutate(payload: dict) -> dict:
+                payload["messages"][0]["sender_id"] = value
+                return payload
+            return mutate
+
+        def mixed_messages(payload: dict) -> dict:
+            payload["messages"].append({**payload["messages"][0], "sender_id": scope["owner"]})
+            return payload
+
+        def wrong_raw_owner(payload: dict) -> dict:
+            payload.update(app_id=scope["application"], project_id=scope["project"])
+            payload["messages"][0]["sender_id"] = "wrong"
+            return payload
+
+        other_hash = contracts.sha256_hex({"value": "other"})[:32]
+        cases = (
+            ("wrong raw app", altered(app_id="wrong", project_id=scope["project"])),
+            ("wrong raw project", altered(app_id=scope["application"], project_id="wrong")),
+            ("wrong raw owner", wrong_raw_owner),
+            ("wrong transport app", altered(app_id="mh-app-" + other_hash)),
+            ("wrong transport project", altered(project_id="mh-project-" + other_hash)),
+            ("wrong transport owner", sender("mh-owner-" + other_hash)),
+            ("mixed app", altered(app_id=scope["application"])),
+            ("mixed project", altered(project_id=scope["project"])),
+            ("mixed owner", sender(scope["owner"])),
+            ("mixed messages", mixed_messages),
+            ("wrong session", altered(session_id="other")),
+        )
+        for name, mutator in cases:
+            with self.subTest(name=name):
+                attempt = type(self)()
+                attempt.payload_mutator = mutator
+                attempt.setUp()
+                try:
+                    before = (attempt.owner.get_effect_operation(attempt.operation["operation_id"]),
+                              attempt.owner.get_experience_ingestion(attempt.ingestion["ingestion_id"]))
+                    with self.assertRaisesRegex(store.OperationConflictError,
+                                                "experience settlement identity differs"):
+                        attempt.settle(attempt.owner, "uncertain", reason="response lost",
+                                       ingestion_uncertain=True)
+                    self.assertEqual(before, (
+                        attempt.owner.get_effect_operation(attempt.operation["operation_id"]),
+                        attempt.owner.get_experience_ingestion(attempt.ingestion["ingestion_id"]),
+                    ))
+                finally:
+                    attempt.tearDown()
 
 
 if __name__ == "__main__":
