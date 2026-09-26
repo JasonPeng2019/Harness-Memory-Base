@@ -189,6 +189,10 @@ confirmation, returns `already_confirmed` without changing versions. A wrong
 claim, incomplete proof, or conflicting receipt raises `OperationConflictError`
 without a partial settlement. This API does not record STEP-11 usage receipts;
 the caller records an authentic native usage receipt separately.
+The retained payload may use either the exact reviewed scope labels or the
+public EverOS adapter's matching `mh-app-`, `mh-project-`, and `mh-owner-`
+transport IDs; all three fields must use the same form. The transport suffix
+is the first 32 hex characters of `sha256_hex({"value": raw_scope_label})`.
 
 Generated EverOS skills remain proposed historical candidates.  Approval is
 deny-by-default: `ReviewedExperienceService` requires a configured

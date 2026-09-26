@@ -1812,6 +1812,22 @@ class MemoryStore:
             })
             decision = self.get_decision(trajectory["decision_id"])
             payload = operation["payload_record"]
+            scope = trajectory["scope"]
+            transport_ids = {
+                field: f"mh-{prefix}-{contracts.sha256_hex({'value': scope[field]})[:32]}"
+                for field, prefix in (("application", "app"), ("project", "project"),
+                                      ("owner", "owner"))
+            }
+            expected_owner = None
+            if isinstance(payload, Mapping):
+                if (payload.get("app_id"), payload.get("project_id")) == (
+                    scope["application"], scope["project"]
+                ):
+                    expected_owner = scope["owner"]
+                elif (payload.get("app_id"), payload.get("project_id")) == (
+                    transport_ids["application"], transport_ids["project"]
+                ):
+                    expected_owner = transport_ids["owner"]
             if (operation["operation_id"] != contracts.external_effect_operation_id(
                     trajectory["trajectory_id"], "experience_ingestion", expected_scope_key) or
                     operation["source_digest"] != contracts.sha256_hex(trajectory) or
@@ -1823,12 +1839,11 @@ class MemoryStore:
                     operation["payload_digest"] != contracts.sha256_hex(payload) or
                     ingestion["payload_digest"] != operation["payload_digest"] or
                     payload.get("session_id") != ingestion["session_id"] or
-                    payload.get("app_id") != trajectory["scope"]["application"] or
-                    payload.get("project_id") != trajectory["scope"]["project"] or
+                    expected_owner is None or
                     not isinstance(payload.get("messages"), list) or
                     not payload["messages"] or
                     any(not isinstance(message, Mapping) or
-                            message.get("sender_id") != trajectory["scope"]["owner"]
+                            message.get("sender_id") != expected_owner
                             for message in payload["messages"]) or
                     operation["configuration"] != decision["configuration"] or
                     operation["configuration_digest"] != contracts.sha256_hex(decision["configuration"]) or
