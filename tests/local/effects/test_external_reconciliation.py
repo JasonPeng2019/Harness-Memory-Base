@@ -49,6 +49,211 @@ class ExternalReconciliationTests(unittest.TestCase):
         evidence.update(changes)
         return evidence
 
+    @staticmethod
+    def _claimant(invocation: str, pid: int, created: str) -> dict:
+        record = {"schema": "external-effect-claimant/v1", "native_invocation_id": invocation,
+                  "pid": pid, "process_created_at": created}
+        record["content_hash"] = contracts.content_hash(record)
+        return record
+
+    @staticmethod
+    def _fence(operation: dict, **changes: object) -> dict:
+        record = {"schema": "external-effect-claim-fence/v1",
+                  "operation_id": operation["operation_id"],
+                  "claim_id": operation["active_claim_id"],
+                  "claim_generation": operation["claim_generation"],
+                  "claimant_digest": operation["claimant_digest"],
+                  "claimant": operation["claimant_record"],
+                  "terminated": True}
+        record.update(changes)
+        record["content_hash"] = contracts.content_hash(record)
+        return record
+
+    def test_claim_fence_restart_absence_retry_and_stale_claim(self) -> None:
+        intent = self._create()
+        identity = intent["operation_id"]
+        claimant_a = self._claimant("native-A", 1101, "2026-09-26T09:00:00Z")
+        claimant_b = self._claimant("native-B", 1102, "2026-09-26T09:05:00Z")
+        claimed_a = self.state.claim_effect_operation(
+            identity, current_config=config.MemoryConfig(), claimant=claimant_a,
+        )
+        claim_a = claimed_a["active_claim_id"]
+        self.assertEqual(1, claimed_a["claim_generation"])
+        self.assertEqual(claimant_a, claimed_a["claimant_record"])
+        self.assertEqual(contracts.sha256_hex(claimant_a), claimed_a["claimant_digest"])
+        proof = self._fence(claimed_a)
+        self.state.close()
+        self.state = store.MemoryStore(Path(self.directory.name) / "effects.sqlite3")
+        self.state.initialize()
+        self.assertEqual("in_flight", self.state.get_effect_operation(identity)["status"])
+        with self.assertRaises(store.OperationConflictError):
+            self.state.reconcile_external_effect_operation(
+                identity, evidence=self._evidence(intent, readback_complete=True), result="absent",
+                claim_id=claim_a,
+            )
+        with self.assertRaises(store.OperationConflictError):
+            self.state.isolate_external_effect_claim(identity, claim_a, proof)
+        with self.assertRaises(store.OperationConflictError):
+            self.state.claim_effect_operation(
+                identity, current_config=config.MemoryConfig(), claimant=claimant_b,
+            )
+
+        calls = []
+        def verifier(stored: dict, evidence: dict) -> bool:
+            calls.append((stored, evidence))
+            return stored == claimant_a and evidence == proof
+
+        self.state.close()
+        self.state = store.MemoryStore(
+            Path(self.directory.name) / "effects.sqlite3", external_claim_fence_verifier=verifier,
+        )
+        self.state.initialize()
+        isolated = self.state.isolate_external_effect_claim(identity, claim_a, proof)
+        self.assertEqual("uncertain", isolated["status"])
+        self.assertEqual(proof, isolated["fence_evidence"])
+        self.assertEqual([(claimant_a, proof)], calls)
+        self.state.close()
+        self.state = store.MemoryStore(Path(self.directory.name) / "effects.sqlite3")
+        self.state.initialize()
+        self.assertEqual(isolated, self.state.isolate_external_effect_claim(identity, claim_a, proof))
+        absent = self.state.reconcile_external_effect_operation(
+            identity, evidence=self._evidence(intent, readback_complete=True), result="absent",
+            claim_id=claim_a,
+        )
+        self.assertEqual("pending", absent["status"])
+        self.assertEqual(intent["configuration_digest"], absent["configuration_digest"])
+        claimed_b = self.state.claim_effect_operation(
+            identity, current_config=config.MemoryConfig(), claimant=claimant_b,
+        )
+        self.assertEqual(2, claimed_b["claim_generation"])
+        self.assertNotEqual(claim_a, claimed_b["active_claim_id"])
+        with self.assertRaises(store.OperationConflictError):
+            self.state.mark_effect_uncertain(identity, "stale", claim_id=claim_a)
+        with self.assertRaises(store.OperationConflictError):
+            self.state.confirm_effect_operation(identity, self._evidence(intent), claim_id=claim_a)
+        with self.assertRaises(store.OperationConflictError):
+            self.state.isolate_external_effect_claim(identity, claim_a, proof)
+        confirmed = self.state.confirm_effect_operation(
+            identity, self._evidence(intent), claim_id=claimed_b["active_claim_id"],
+        )
+        self.assertEqual("confirmed", confirmed["status"])
+        self.assertEqual(2, confirmed["claim_generation"])
+
+    def test_claim_fence_verifier_identity_and_off_gate(self) -> None:
+        intent = self._create()
+        identity = intent["operation_id"]
+        claimant = self._claimant("native-A", 2201, "created-A")
+        claimed = self.state.claim_effect_operation(
+            identity, current_config=config.MemoryConfig(), claimant=claimant,
+        )
+        proof = self._fence(claimed)
+        self.state.close()
+        database = Path(self.directory.name) / "effects.sqlite3"
+        for verifier in (lambda *_: False, lambda *_: (_ for _ in ()).throw(RuntimeError("query failed"))):
+            self.state = store.MemoryStore(database, external_claim_fence_verifier=verifier)
+            self.state.initialize()
+            before = self.state.get_effect_operation(identity)
+            with self.assertRaises(store.OperationConflictError):
+                self.state.isolate_external_effect_claim(identity, claimed["active_claim_id"], proof)
+            self.assertEqual(before, self.state.get_effect_operation(identity))
+            self.state.close()
+        seen = []
+        self.state = store.MemoryStore(
+            database, external_claim_fence_verifier=lambda stored, evidence:
+            seen.append((stored, evidence)) or True,
+        )
+        self.state.initialize()
+        wrongs = (
+            self._fence(claimed, claimant={**claimant, "pid": 2202}),
+            self._fence(claimed, claimant={**claimant, "process_created_at": "reused-PID"}),
+            self._fence(claimed, claimant={**claimant, "native_invocation_id": "wrong"}),
+            self._fence(claimed, claim_id="wrong"),
+            self._fence(claimed, operation_id="wrong"),
+            self._fence(claimed, terminated=False),
+            {**proof, "content_hash": "wrong"},
+        )
+        for wrong in wrongs:
+            with self.subTest(wrong=wrong):
+                before = self.state.get_effect_operation(identity)
+                with self.assertRaises(store.OperationConflictError):
+                    self.state.isolate_external_effect_claim(identity, claimed["active_claim_id"], wrong)
+                self.assertEqual(before, self.state.get_effect_operation(identity))
+        self.assertEqual([], seen)
+        with self.assertRaises(store.OperationConflictError):
+            self.state.isolate_external_effect_claim(identity, "wrong", proof)
+        with self.assertRaises(store.OperationConflictError):
+            self.state.mark_effect_uncertain(identity, "response lost")
+        with self.assertRaises(store.OperationConflictError):
+            self.state.mark_effect_uncertain(
+                identity, "response lost", claim_id=claimed["active_claim_id"],
+            )
+        with self.assertRaises(store.OperationConflictError):
+            self.state.reconcile_external_effect_operation(
+                identity, evidence=self._evidence(intent, readback_complete=True),
+                result="absent", claim_id=claimed["active_claim_id"],
+            )
+        with self.assertRaises(store.OperationConflictError):
+            self.state.confirm_effect_operation(identity, self._evidence(intent))
+        off = config.resolve_config({"shared_publication": False})
+        self.assertEqual("pending_off", self.state.external_effect_off_state(identity, current_config=off))
+        isolated = self.state.isolate_external_effect_claim(identity, claimed["active_claim_id"], proof)
+        self.assertEqual("uncertain", isolated["status"])
+        with self.assertRaises(store.OperationConflictError):
+            self.state.isolate_external_effect_claim(identity, claimed["active_claim_id"],
+                                                    self._fence(claimed, extra="conflict"))
+        self.state.reconcile_external_effect_operation(
+            identity, evidence=self._evidence(intent, readback_complete=True), result="absent",
+            claim_id=claimed["active_claim_id"],
+        )
+        self.assertEqual("off", self.state.external_effect_off_state(identity, current_config=off))
+        with self.assertRaisesRegex(store.OperationConflictError, "off"):
+            self.state.claim_effect_operation(
+                identity, current_config=off, claimant=self._claimant("native-B", 2202, "created-B"),
+            )
+        self.assertEqual(1, self.state.get_effect_operation(identity)["claim_generation"])
+
+    def test_claimant_aware_duplicate_and_concurrent_claims_keep_one_owner(self) -> None:
+        intent = self._create()
+        identity = intent["operation_id"]
+        claimants = (self._claimant("native-A", 3301, "created-A"),
+                     self._claimant("native-B", 3302, "created-B"))
+        for bad in ({**claimants[0], "pid": 0},
+                    {**claimants[0], "process_created_at": ""},
+                    {**claimants[0], "content_hash": "wrong"}):
+            with self.assertRaises(contracts.ContractError):
+                self.state.claim_effect_operation(
+                    identity, current_config=config.MemoryConfig(), claimant=bad,
+                )
+        self.assertEqual("pending", self.state.get_effect_operation(identity)["status"])
+        barrier = threading.Barrier(2)
+
+        def claim(claimant: dict) -> str:
+            peer = store.MemoryStore(Path(self.directory.name) / "effects.sqlite3")
+            peer.initialize()
+            try:
+                barrier.wait(timeout=5)
+                try:
+                    return peer.claim_effect_operation(
+                        identity, current_config=config.MemoryConfig(), claimant=claimant,
+                    )["active_claim_id"]
+                except store.OperationConflictError:
+                    return "conflict"
+            finally:
+                peer.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(claim, claimants))
+        self.assertEqual(1, results.count("conflict"))
+        claimed = self.state.get_effect_operation(identity)
+        self.assertIn(claimed["active_claim_id"], results)
+        self.assertEqual(1, claimed["claim_generation"])
+        for claimant in claimants:
+            with self.assertRaises(store.OperationConflictError):
+                self.state.claim_effect_operation(
+                    identity, current_config=config.MemoryConfig(), claimant=claimant,
+                )
+        self.assertEqual(claimed, self.state.get_effect_operation(identity))
+
     def test_lost_ack_requires_exact_reconciliation_before_retry(self) -> None:
         intent = self._create()
         _, created = self.state.create_external_effect_operation(

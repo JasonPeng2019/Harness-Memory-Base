@@ -9,7 +9,7 @@ import sqlite3
 from dataclasses import asdict
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from . import contracts
 from .config import MemoryConfig, effect_submission_enabled, resolve_config
@@ -137,6 +137,11 @@ _SCHEMA = [
         acknowledgement TEXT,
         reconciliation TEXT,
         uncertainty TEXT,
+        claim_generation INTEGER NOT NULL DEFAULT 0,
+        active_claim_id TEXT,
+        claimant_record TEXT,
+        claimant_digest TEXT,
+        fence_evidence TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(outcome_id, kind, scope_key)
@@ -506,8 +511,14 @@ _SCHEMA = [
 class MemoryStore:
     """A minimal durable store with explicit outcome conflict semantics."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self, path: str | Path, *,
+        external_claim_fence_verifier: Callable[[Mapping[str, Any], Mapping[str, Any]], bool] | None = None,
+    ) -> None:
+        if external_claim_fence_verifier is not None and not callable(external_claim_fence_verifier):
+            raise TypeError("external claim fence verifier must be callable")
         self.path = Path(path)
+        self._external_claim_fence_verifier = external_claim_fence_verifier
         self.connection: sqlite3.Connection | None = None
         self._opened_path: Path | None = None
 
@@ -567,6 +578,11 @@ class MemoryStore:
                 self._ensure_column("effect_operations", "adapter_operation_id", "TEXT")
                 self._ensure_column("effect_operations", "adapter_payload_digest", "TEXT")
                 self._ensure_column("effect_operations", "reconciliation", "TEXT")
+                self._ensure_column("effect_operations", "claim_generation", "INTEGER NOT NULL DEFAULT 0")
+                self._ensure_column("effect_operations", "active_claim_id", "TEXT")
+                self._ensure_column("effect_operations", "claimant_record", "TEXT")
+                self._ensure_column("effect_operations", "claimant_digest", "TEXT")
+                self._ensure_column("effect_operations", "fence_evidence", "TEXT")
                 self._migrate_external_effect_columns()
                 self._migrate_local_effect_intents()
         except sqlite3.Error as exc:
@@ -1493,7 +1509,8 @@ class MemoryStore:
     @staticmethod
     def _effect_from_row(row: sqlite3.Row) -> dict[str, Any]:
         record = dict(row)
-        for field in ("source_record", "payload_record", "configuration", "acknowledgement", "reconciliation"):
+        for field in ("source_record", "payload_record", "configuration", "acknowledgement",
+                      "reconciliation", "claimant_record", "fence_evidence"):
             if record[field] is not None:
                 record[field] = json.loads(record[field])
         record["schema"] = contracts.EFFECT_OPERATION_SCHEMA
@@ -1603,8 +1620,89 @@ class MemoryStore:
             return "on"
         return "pending_off" if operation["status"] in ("in_flight", "uncertain") else "off"
 
+    @staticmethod
+    def _require_effect_claim(operation: Mapping[str, Any], claim_id: str | None) -> None:
+        if operation["outcome_id"] is None and claim_id != operation["active_claim_id"]:
+            raise OperationConflictError("external effect requires its exact active claim ID")
+
+    @staticmethod
+    def _validate_external_claimant(claimant: Mapping[str, Any]) -> None:
+        if (not isinstance(claimant, Mapping) or
+                set(claimant) != {"schema", "native_invocation_id", "pid",
+                                  "process_created_at", "content_hash"} or
+                not isinstance(claimant.get("native_invocation_id"), str) or
+                not claimant["native_invocation_id"].strip() or
+                type(claimant.get("pid")) is not int or claimant["pid"] <= 0 or
+                not isinstance(claimant.get("process_created_at"), str) or
+                not claimant["process_created_at"].strip()):
+            raise contracts.ContractError("external claimant needs exact native invocation and PID creation identity")
+        contracts.validate_record(claimant, "external-effect-claimant/v1")
+
+    def isolate_external_effect_claim(
+        self, operation_id: str, claim_id: str, fence_evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Isolate a stopped source-owned claimant using a constructor-bound verifier.
+
+        This only makes the effect uncertain. The adapter must separately read the
+        remote exact state and reconcile absence or same-ID idempotency before retry.
+        The verifier receives the stored claimant and exact fence evidence and must
+        return ``True`` after checking native PID plus process-creation termination.
+        Evidence is a content-hashed ``external-effect-claim-fence/v1`` record with
+        operation_id, claim_id, claim_generation, claimant_digest, the exact
+        claimant record, and ``terminated: true``; it may carry verifier proof.
+        """
+        connection = self._require_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = self.get_effect_operation(operation_id)
+            claimant = operation["claimant_record"]
+            if (operation["outcome_id"] is not None or not isinstance(claim_id, str) or
+                    not claim_id or claim_id != operation["active_claim_id"] or
+                    claimant is None):
+                raise OperationConflictError("external claim isolation requires its exact active claimant")
+            expected = {
+                "operation_id": operation_id, "claim_id": claim_id,
+                "claim_generation": operation["claim_generation"],
+                "claimant_digest": operation["claimant_digest"],
+            }
+            if (not isinstance(fence_evidence, Mapping) or
+                    any(fence_evidence.get(key) != value for key, value in expected.items()) or
+                    type(fence_evidence.get("claim_generation")) is not int or
+                    fence_evidence.get("terminated") is not True or
+                    fence_evidence.get("claimant_digest") != contracts.sha256_hex(claimant) or
+                    contracts.canonical_json(fence_evidence.get("claimant")) !=
+                    contracts.canonical_json(claimant)):
+                raise OperationConflictError("external claim fence identity conflicts")
+            try:
+                contracts.validate_record(fence_evidence, "external-effect-claim-fence/v1")
+            except contracts.ContractError as exc:
+                raise OperationConflictError("external claim fence record is invalid") from exc
+            if operation["fence_evidence"] is not None:
+                if operation["fence_evidence"] != dict(fence_evidence):
+                    raise OperationConflictError("external claim fence replay conflicts")
+                return operation
+            if operation["status"] != "in_flight":
+                raise OperationConflictError("only the current in-flight claim can be isolated")
+            verifier = self._external_claim_fence_verifier
+            if verifier is None:
+                raise OperationConflictError("trusted external claim fence verifier is unavailable")
+            try:
+                verified = verifier(claimant, fence_evidence)
+            except Exception as exc:
+                raise OperationConflictError("trusted external claim fence verification failed") from exc
+            if verified is not True:
+                raise OperationConflictError("trusted external claim fence was not proven")
+            connection.execute(
+                "UPDATE effect_operations SET status='uncertain', uncertainty=?, fence_evidence=?, "
+                "version=version+1, updated_at=? WHERE operation_id=?",
+                ("claimant isolated; remote effect unresolved",
+                 self._serialize_record(fence_evidence), contracts.utc_now(), operation_id),
+            )
+        return self.get_effect_operation(operation_id)
+
     def reconcile_external_effect_operation(
         self, operation_id: str, *, evidence: Mapping[str, Any], result: str,
+        claim_id: str | None = None,
     ) -> dict[str, Any]:
         """Record exact readback or demonstrated idempotency under the original ID.
 
@@ -1621,6 +1719,7 @@ class MemoryStore:
             operation = self.get_effect_operation(operation_id)
             if operation["outcome_id"] is not None:
                 raise OperationConflictError("operation is not source-owned")
+            self._require_effect_claim(operation, claim_id)
             expected = {key: operation[key] for key in (
                 "operation_id", "kind", "scope_key", "source_digest", "payload_digest",
                 "configuration_digest",
@@ -1763,17 +1862,30 @@ class MemoryStore:
         return self.get_effect_operation(operation_id)
 
     def claim_effect_operation(
-        self, operation_id: str, *, current_config: Mapping[str, Any] | MemoryConfig
+        self, operation_id: str, *, current_config: Mapping[str, Any] | MemoryConfig,
+        claimant: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Claim pending work or a proved same-ID retry; off blocks either claim.
 
         A new submission consumes an absence proof, so a later lost acknowledgement
         cannot reuse that proof as permission for another retry.
+        Source-owned callers may supply a content-bound native claimant identity;
+        the returned active_claim_id must accompany later mutation/reconciliation.
+        The ``external-effect-claimant/v1`` record contains native_invocation_id,
+        positive pid, process_created_at, and content_hash. The creation value is
+        an opaque exact identity supplied by the trusted native composition.
         """
+        if claimant is not None:
+            self._validate_external_claimant(claimant)
         connection = self._require_connection()
         with connection:
             connection.execute("BEGIN IMMEDIATE")
             operation = self.get_effect_operation(operation_id)
+            if claimant is not None and operation["outcome_id"] is not None:
+                raise OperationConflictError("claimant-aware claims require a source-owned operation")
+            if (claimant is None and operation["outcome_id"] is None and
+                    operation["claim_generation"] > 0):
+                raise OperationConflictError("source-owned retry requires a new exact claimant")
             if not effect_submission_enabled(current_config, operation["kind"]):
                 raise OperationConflictError("current effective feature is off")
             if operation["outcome_id"] is not None and operation["kind"] == "experience_ingestion" and (
@@ -1788,21 +1900,37 @@ class MemoryStore:
             )
             if operation["status"] != "pending" and not idempotent_retry:
                 raise OperationConflictError("effect is not pending; reconcile existing claim")
+            generation = operation["claim_generation"] + 1 if claimant is not None else 0
+            claimant_digest = contracts.sha256_hex(claimant) if claimant is not None else None
+            claim_id = (contracts.sha256_hex({"operation_id": operation_id,
+                                              "claim_generation": generation,
+                                              "claimant_digest": claimant_digest})
+                        if claimant is not None else None)
             connection.execute(
                 "UPDATE effect_operations SET status='in_flight', "
                 "reconciliation=CASE WHEN outcome_id IS NULL AND status='pending' "
-                "THEN NULL ELSE reconciliation END, version=version+1, updated_at=? "
-                "WHERE operation_id=?", (contracts.utc_now(), operation_id),
+                "THEN NULL ELSE reconciliation END, claim_generation=?, active_claim_id=?, "
+                "claimant_record=?, claimant_digest=?, fence_evidence=NULL, "
+                "version=version+1, updated_at=? WHERE operation_id=?",
+                (generation, claim_id,
+                 self._serialize_record(claimant) if claimant is not None else None,
+                 claimant_digest, contracts.utc_now(), operation_id),
             )
         return self.get_effect_operation(operation_id)
 
-    def mark_effect_uncertain(self, operation_id: str, reason: str) -> dict[str, Any]:
+    def mark_effect_uncertain(
+        self, operation_id: str, reason: str, *, claim_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Mark legacy ambiguity; claimant-aware in-flight work needs trusted isolation."""
         if not isinstance(reason, str) or not reason:
             raise contracts.ContractError("uncertainty needs a reason")
         connection = self._require_connection()
         with connection:
             connection.execute("BEGIN IMMEDIATE")
             operation = self.get_effect_operation(operation_id)
+            self._require_effect_claim(operation, claim_id)
+            if operation["status"] == "in_flight" and operation["active_claim_id"] is not None:
+                raise OperationConflictError("claimant-aware in-flight effect requires trusted isolation")
             if operation["status"] not in ("in_flight", "uncertain"):
                 raise OperationConflictError("only an in-flight effect can become uncertain")
             if operation["status"] == "uncertain" and operation["uncertainty"] != reason:
@@ -1815,13 +1943,15 @@ class MemoryStore:
         return self.get_effect_operation(operation_id)
 
     def confirm_effect_operation(
-        self, operation_id: str, acknowledgement: Mapping[str, Any]
+        self, operation_id: str, acknowledgement: Mapping[str, Any], *,
+        claim_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(acknowledgement, Mapping) or not acknowledgement:
             raise contracts.ContractError("confirmation requires an exact acknowledgement")
         if self.get_effect_operation(operation_id)["outcome_id"] is None:
             return self.reconcile_external_effect_operation(
                 operation_id, evidence=acknowledgement, result="acknowledged",
+                claim_id=claim_id,
             )
         connection = self._require_connection()
         with connection:
