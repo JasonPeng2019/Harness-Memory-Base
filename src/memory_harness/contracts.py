@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from .privacy import PrivacyPolicy, guard_mandatory
+from .config import NetworkResolution, NETWORK_MODES, NETWORK_CONTEXT_FIELDS
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
 # The explicit worker-environment boundary a task card may declare.  A
@@ -3521,6 +3522,34 @@ def classify_current_plan(
     return state
 
 
+def network_resolution_record(resolution: NetworkResolution) -> dict[str, Any]:
+    """JSON-safe public preparation form of a per-objective resolution."""
+    return {
+        "requested_mode": resolution.requested_mode,
+        "effective_mode": resolution.effective_mode,
+        "enforcement_sources": list(resolution.enforcement_sources),
+        "disclosed_limits": list(resolution.disclosed_limits),
+        "input_evidence": dict(resolution.input_evidence),
+        "context": dict(resolution.context),
+        "verification_result": resolution.verification_result,
+    }
+
+
+def preparation_network_resolution(preparation: Mapping[str, Any]) -> dict[str, Any]:
+    """Read rich facts or project an old row without changing its stored bytes."""
+    validate_preparation(preparation)
+    if "network_resolution" in preparation:
+        return dict(preparation["network_resolution"])
+    mode = preparation["network_mode"]
+    return {
+        "requested_mode": mode,
+        "effective_mode": mode,
+        "enforcement_sources": ["legacy_captured_mode"],
+        "disclosed_limits": ["legacy row has no captured network enforcement proof"],
+        "input_evidence": {},
+    }
+
+
 def make_preparation(
     *,
     task_card: Mapping[str, Any],
@@ -3535,6 +3564,7 @@ def make_preparation(
     requested_strategy: str,
     configuration: Mapping[str, Any],
     network_mode: str,
+    network_resolution: Mapping[str, Any] | None = None,
     budget_source: str,
     remaining_seconds: float | None,
     execution_reserve_seconds: float,
@@ -3620,6 +3650,10 @@ def make_preparation(
         "status": status,
         "created_at": created_at or utc_now(),
     }
+    if network_resolution is not None:
+        record["network_resolution"] = _normalize_json_object(
+            network_resolution, "network_resolution"
+        )
     record["content_hash"] = content_hash(record)
     validate_preparation(record)
     return record
@@ -3655,6 +3689,80 @@ def validate_preparation(record: Mapping[str, Any]) -> None:
         raise ContractError("preparation strategy does not match its configuration")
     if record["configuration_digest"] != sha256_hex(configuration):
         raise ContractError("preparation configuration digest mismatch")
+    if "network_resolution" in record:
+        resolution = record["network_resolution"]
+        if not isinstance(resolution, Mapping) or set(resolution) != {
+            "requested_mode", "effective_mode", "enforcement_sources",
+            "disclosed_limits", "input_evidence", "context", "verification_result",
+        }:
+            raise ContractError("network resolution fields are invalid")
+        context = resolution["context"]
+        expected_context = {key: record[key] for key in (
+            "objective_id", "task_card_digest", "plan_id", "plan_digest",
+            "decision_id", "route", "plan_state",
+        )}
+        if not isinstance(context, Mapping) or set(context) != NETWORK_CONTEXT_FIELDS or dict(context) != expected_context:
+            raise ContractError("network resolution context conflicts with preparation")
+        requested = resolution["requested_mode"]
+        effective = resolution["effective_mode"]
+        sources = resolution["enforcement_sources"]
+        limits = resolution["disclosed_limits"]
+        evidence = resolution["input_evidence"]
+        verified = resolution["verification_result"]
+        if (requested not in NETWORK_MODES or effective not in NETWORK_MODES
+                or not isinstance(sources, list) or not all(isinstance(x, str) for x in sources)
+                or not isinstance(limits, list) or not all(isinstance(x, str) for x in limits)
+                or not isinstance(evidence, Mapping)):
+            raise ContractError("network resolution is invalid")
+        allowed_effective = {
+            "normal": "normal", "soft_guardrail_network": "soft_guardrail_network",
+            "restricted_local": "restricted_local", "atlas_memory_only": "soft_guardrail_network",
+        }
+        if effective != "atlas_memory_only" and effective != allowed_effective[requested]:
+            raise ContractError("network resolution requested/effective modes conflict")
+        if effective != "atlas_memory_only":
+            expected_sources = (
+                ["legacy_normal_compatibility"] if requested == "normal" else
+                ["service_entry_policy_required"] if requested == "restricted_local" else
+                ["requested_soft_guardrail_policy"]
+            )
+            if sources != expected_sources:
+                raise ContractError("network resolution enforcement source is invalid")
+            if effective == "soft_guardrail_network" and not any(
+                "shell egress" in limit for limit in limits
+            ):
+                raise ContractError("soft network resolution omits shell-egress limit")
+            if requested == "atlas_memory_only" and not any(
+                "missing or unverified" in limit for limit in limits
+            ):
+                raise ContractError("downgraded network resolution omits proof limit")
+        if effective == "atlas_memory_only":
+            payload = evidence.get("launched_payload")
+            block = evidence.get("unrelated_destination_block")
+            if (requested != "atlas_memory_only" or not isinstance(payload, Mapping)
+                    or not isinstance(block, Mapping) or payload.get("verified") is not True
+                    or block.get("blocked") is not True or block.get("independent") is not True
+                    or block.get("source_kind") != "independent_network_boundary"
+                    or not isinstance(payload.get("evidence_id"), str)
+                    or not isinstance(block.get("evidence_id"), str)
+                    or not payload["evidence_id"] or not block["evidence_id"]
+                    or verified is not True and not (
+                        isinstance(verified, Mapping) and set(verified) == {
+                            "context", "launched_payload", "unrelated_destination_block",
+                        } and verified["context"] == context
+                        and verified["launched_payload"] == payload
+                        and verified["unrelated_destination_block"] == block
+                    ) or sources != [
+                        f"verified_launched_payload:{payload['evidence_id']}",
+                        f"independent_egress_block:{block['evidence_id']}",
+                    ]):
+                raise ContractError("network resolution lacks captured verified proof")
+        elif (verified is not None or any(source.startswith((
+                "verified_launched_payload:", "independent_egress_block:"
+        )) for source in sources)):
+            raise ContractError("unverified network resolution claims verified enforcement")
+        if record["network_mode"] != effective:
+            raise ContractError("network resolution conflicts with captured effective mode")
     if record.get("supersedes") is not None:
         _require_nonempty_str(record["supersedes"], "supersedes")
         if record["supersedes"] == record["preparation_id"]:
