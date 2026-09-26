@@ -1329,6 +1329,166 @@ class FinalContextDispatchTests(unittest.TestCase):
 
     # -- durable, at-most-once dispatch ------------------------------------
 
+    def test_intent_requires_durable_exact_final_context_and_decision(self) -> None:
+        final = self._finalize()
+        memory_runtime = runtime.MemoryRuntime(self.memory_store)
+        with self.assertRaises(ValueError):
+            memory_runtime.record_dispatch_intent(final.envelope)
+        self.memory_store.record_final_context(final.context, envelope_digest=final.envelope["content_hash"])
+        generic = deepcopy(final.envelope)
+        for field in ("final_context", "final_context_id", "final_context_integrity", "task",
+                      "plan_revision", "accepted_by", "checkpoint", "execution_role",
+                      "invocation_target", "recipient", "delivery_trace"):
+            generic.pop(field)
+        generic["schema"] = contracts.ENVELOPE_SCHEMA
+        generic["content_hash"] = contracts.content_hash(generic)
+        with self.assertRaises(store.OperationConflictError):
+            self.memory_store.create_operation(contracts.make_operation(kind="dispatch", envelope=generic))
+        wrong = deepcopy(final.envelope)
+        wrong["lane_id"] = "another-lane"
+        wrong["content_hash"] = contracts.content_hash(wrong)
+        with self.assertRaises(ValueError):
+            memory_runtime.record_dispatch_intent(wrong)
+        proposed = deepcopy(final.envelope)
+        proposed["plan_state"] = "proposed"
+        proposed["content_hash"] = contracts.content_hash(proposed)
+        with self.assertRaises(ValueError):
+            memory_runtime.record_dispatch_intent(proposed)
+        newer = self._finalize(checkpoint="checkpoint-2", mandatory_content=[
+            {**item, "content": "checkpoint-2"} if item["id"] == "checkpoint" else item
+            for item in final.envelope["mandatory_content"]
+        ])
+        self.memory_store.record_final_context(newer.context, envelope_digest=newer.envelope["content_hash"])
+        with self.assertRaises(ValueError):
+            memory_runtime.record_dispatch_intent(final.envelope)
+        intent = memory_runtime.record_dispatch_intent(newer.envelope)
+        self.assertEqual("pending", intent["status"])
+        self.assertIsNone(intent["observed_invocation"])
+        with self.assertRaises(runtime.DispatchAmbiguityError):
+            memory_runtime.record_dispatch_intent(newer.envelope)
+
+    def test_observation_requires_intent_and_exact_receipt(self) -> None:
+        final = self._finalize()
+        self.memory_store.record_final_context(final.context, envelope_digest=final.envelope["content_hash"])
+        memory_runtime = runtime.MemoryRuntime(self.memory_store)
+        receipt = {"invocation_id": "controller:7:now", "pid": 7, "creation_time": "now"}
+        bare_operation = contracts.make_operation(
+            kind="dispatch", envelope=final.envelope, status="delivered",
+            observed_invocation=receipt,
+        )
+        with self.assertRaises(store.OperationConflictError):
+            self.memory_store.record_operation(bare_operation)
+        with self.assertRaises(store.OperationConflictError):
+            memory_runtime.record_observed_dispatch(final.envelope, receipt)
+        memory_runtime.record_dispatch_intent(final.envelope)
+        with self.assertRaises(ValueError):
+            self.memory_store.record_operation(contracts.make_operation(
+                kind="dispatch", envelope=final.envelope, status="delivered",
+                observed_invocation={"invocation_id": "invented"},
+            ))
+        copied = deepcopy(final.envelope)
+        copied["lane_id"] = "copied-lane"
+        with self.assertRaises(store.OperationConflictError):
+            memory_runtime.record_observed_dispatch(copied, receipt)
+        with self.assertRaises(ValueError):
+            memory_runtime.record_observed_dispatch(final.envelope, {"invocation_id": "invented"})
+        observed = self.memory_store.record_operation(bare_operation)
+        self.assertEqual("delivered", observed["status"])
+        self.assertEqual(receipt, observed["observed_invocation"])
+        self.assertEqual(observed["operation_id"], memory_runtime.record_observed_dispatch(final.envelope, receipt)["operation_id"])
+        with self.assertRaises(store.OperationConflictError):
+            memory_runtime.record_observed_dispatch(
+                final.envelope,
+                {"invocation_id": "controller:8:now", "pid": 8, "creation_time": "now"},
+            )
+        outcome = memory_runtime.record_outcome(
+            decision_id=self.decision_id, plan_id=self.accepted["plan_id"],
+            plan_digest=self.accepted["content_hash"], status="PASS",
+            evidence_digest="evidence", linked_run_id="run-1",
+        )
+        self.assertEqual("run-1", outcome["linked_run_id"])
+
+    def test_ambiguous_and_terminal_pre_spawn_states(self) -> None:
+        final = self._finalize()
+        self.memory_store.record_final_context(final.context, envelope_digest=final.envelope["content_hash"])
+        memory_runtime = runtime.MemoryRuntime(self.memory_store)
+        memory_runtime.record_dispatch_intent(final.envelope)
+        memory_runtime.mark_dispatch_ambiguous(final.envelope)
+        conflicting = self._finalize(run_id="run-2")
+        self.memory_store.record_final_context(conflicting.context, envelope_digest=conflicting.envelope["content_hash"])
+        with self.assertRaises(store.OperationConflictError):
+            memory_runtime.record_dispatch_intent(conflicting.envelope)
+        other_plan = contracts.make_plan(
+            plan_id="other-plan", objective_id="other-objective", route="ordinary",
+            state="accepted", accepted_by="ROOT", content={"steps": ["other"]},
+        )
+        other_card = contracts.make_task_card(
+            task="Other work", base_commit="base-1",
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id="other-objective", route="ordinary", plan=other_plan,
+            ),
+        )
+        other_decision = contracts.make_decision(other_card, other_plan, configuration=self.configuration)
+        self.memory_store.record_decision(other_decision)
+        other = self._finalize(
+            task_card=other_card, plan=other_plan, decision_id=other_decision["decision_id"],
+            run_id="other-run", mandatory_content=[
+                {**item, "content": "Other work"} if item["id"] == "task" else
+                {**item, "content": other_plan["content"]} if item["id"] == "accepted-plan" else item
+                for item in final.envelope["mandatory_content"]
+            ],
+        )
+        self.memory_store.record_final_context(other.context, envelope_digest=other.envelope["content_hash"])
+        with self.assertRaises(store.OperationConflictError):
+            memory_runtime.record_dispatch_intent(other.envelope)
+        with self.assertRaises(ValueError):
+            memory_runtime.reconcile_ambiguous_dispatch(final.envelope, {"invocation_id": "invented"})
+        receipt = {"invocation_id": "controller:7:now", "pid": 7, "creation_time": "now"}
+        observed = memory_runtime.reconcile_ambiguous_dispatch(final.envelope, receipt)
+        self.assertEqual("delivered", observed["status"])
+
+    def test_failed_and_abandoned_intents_cannot_observe_or_support_outcome(self) -> None:
+        for terminal in ("failed_pre_spawn", "abandoned"):
+            with self.subTest(terminal=terminal):
+                plan = contracts.make_plan(
+                    plan_id=f"plan-{terminal}", objective_id=f"objective-{terminal}",
+                    route="ordinary", state="accepted", accepted_by="ROOT",
+                    content={"steps": ["inspect", "verify"]},
+                )
+                card = contracts.make_task_card(
+                    task="Repair the regression", base_commit="base-1",
+                    memory_handoff=contracts.make_memory_handoff(
+                        objective_id=f"objective-{terminal}", route="ordinary", plan=plan,
+                    ),
+                )
+                decision = contracts.make_decision(card, plan, configuration=self.configuration)
+                self.memory_store.record_decision(decision)
+                final = self._finalize(task_card=card, plan=plan,
+                                       decision_id=decision["decision_id"], run_id=terminal)
+                self.memory_store.record_final_context(final.context, envelope_digest=final.envelope["content_hash"])
+                memory_runtime = runtime.MemoryRuntime(self.memory_store)
+                memory_runtime.record_dispatch_intent(final.envelope)
+                if terminal == "failed_pre_spawn":
+                    memory_runtime.mark_dispatch_pre_spawn_failed(final.envelope)
+                else:
+                    memory_runtime.abandon_dispatch_intent(final.envelope)
+                receipt = {"invocation_id": "controller:7:now", "pid": 7, "creation_time": "now"}
+                with self.assertRaises(store.OperationConflictError):
+                    memory_runtime.record_observed_dispatch(final.envelope, receipt)
+                with self.assertRaises(ValueError):
+                    memory_runtime.record_outcome(
+                        decision_id=decision["decision_id"], plan_id=plan["plan_id"],
+                        plan_digest=plan["content_hash"], status="PASS",
+                        evidence_digest="evidence", linked_run_id=terminal,
+                    )
+                with self.assertRaises(store.OperationConflictError):
+                    self.memory_store.record_outcome(contracts.make_outcome(
+                        decision_id=decision["decision_id"], plan_id=plan["plan_id"],
+                        plan_digest=plan["content_hash"], status="PASS",
+                        evidence_digest="evidence", linked_run_id=terminal,
+                        task_card_digest=card["content_hash"], objective_id=plan["objective_id"],
+                    ))
+
     def test_dispatch_validates_target_and_launches_once(self) -> None:
         finalized = self._finalize()
         memory_runtime = runtime.MemoryRuntime(self.memory_store)

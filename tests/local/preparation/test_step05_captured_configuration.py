@@ -537,6 +537,12 @@ class CapturedConfigurationTests(unittest.TestCase):
                 "run_id": "run-1",
             }, status="delivered", observed_invocation={"receipt": "delivered"},
         )
+        self.state.create_operation(contracts.make_operation(
+            kind="dispatch", envelope={
+                "content_hash": "delivered-envelope", "decision_id": standalone["decision_id"],
+                "run_id": "run-1",
+            },
+        ))
         self.state.record_operation(operation)
         outcome = contracts.make_outcome(
             decision_id=standalone["decision_id"], plan_id=self.plan["plan_id"],

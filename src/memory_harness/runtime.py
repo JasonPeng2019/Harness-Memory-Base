@@ -118,7 +118,10 @@ class MemoryRuntime:
             envelope=envelope,
             status="pending",
         )
-        existing, created = self.store.create_operation(operation)
+        if envelope.get("schema") == contracts.FINAL_ENVELOPE_SCHEMA:
+            existing, created = self.store.create_dispatch_intent(envelope, native_receipt_required=False)
+        else:
+            existing, created = self.store.create_operation(operation)
         if not created:
             if existing["status"] == "delivered":
                 return existing
@@ -151,22 +154,53 @@ class MemoryRuntime:
         return self.store.record_operation(delivered)
 
     def record_dispatch_intent(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
-        """Persist one launch intent for callers that use the existing launcher."""
+        """Claim the exact durable final context before the native launcher runs.
+
+        A replay or conflicting decision/lane owner raises DispatchAmbiguityError.
+        This operation alone never means that a controller was spawned.
+        """
 
         guard_mandatory(envelope, self._dispatch_privacy_policy(envelope))
 
-        operation = contracts.make_operation(
-            kind="dispatch",
-            envelope=envelope,
-            status="pending",
-        )
-        existing, created = self.store.create_operation(operation)
+        if envelope.get("schema") != contracts.FINAL_ENVELOPE_SCHEMA:
+            raise RuntimeError("split native dispatch requires a finalized envelope")
+        existing, created = self.store.create_dispatch_intent(envelope)
         if not created:
             raise DispatchAmbiguityError(
                 f"{existing['status']} dispatch already exists; "
                 "reconcile it before any new launch"
             )
         return existing
+
+    def record_observed_dispatch(
+        self, envelope: Mapping[str, Any], native_receipt: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Join a spawned controller's exact native receipt to its prior intent."""
+        if envelope.get("schema") == contracts.FINAL_ENVELOPE_SCHEMA:
+            self.store._validate_native_receipt(native_receipt)
+        operation = contracts.make_operation(
+            kind="dispatch", envelope=envelope, status="delivered",
+            observed_invocation=native_receipt,
+        )
+        return self.store.record_operation(operation)
+
+    def mark_dispatch_ambiguous(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
+        """Mark a lost native acknowledgement; ownership stays reserved."""
+        return self.store.record_operation(contracts.make_operation(
+            kind="dispatch", envelope=envelope, status="ambiguous",
+        ))
+
+    def mark_dispatch_pre_spawn_failed(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
+        """Close an intent only when native spawn is proven not to have begun."""
+        return self.store.record_operation(contracts.make_operation(
+            kind="dispatch", envelope=envelope, status="failed_pre_spawn",
+        ))
+
+    def abandon_dispatch_intent(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
+        """Close a pre-dispatch intent with no invocation or outcome."""
+        return self.store.record_operation(contracts.make_operation(
+            kind="dispatch", envelope=envelope, status="abandoned",
+        ))
 
     def _dispatch_privacy_policy(self, envelope: Mapping[str, Any]) -> PrivacyPolicy:
         """Use only provenance already persisted by the trusted finalizer."""
@@ -203,25 +237,22 @@ class MemoryRuntime:
         invocation_id = observed_invocation.get("invocation_id")
         if not isinstance(invocation_id, str) or not invocation_id:
             raise RuntimeError("observed harness invocation requires an invocation_id")
+        if envelope.get("schema") == contracts.FINAL_ENVELOPE_SCHEMA:
+            self.store._validate_native_receipt(observed_invocation)
         operation = contracts.make_operation(
             kind="dispatch",
             envelope=envelope,
             status="ambiguous",
         )
-        existing = self._try_get_operation(operation["operation_id"])
-        if existing is None:
+        try:
+            existing = self.store.get_operation(operation["operation_id"])
+        except StoreError:
             raise DispatchAmbiguityError("no ambiguous dispatch exists to reconcile")
         if existing["status"] == "delivered":
             return existing
         if existing["status"] != "ambiguous":
             raise DispatchAmbiguityError("dispatch is not in an ambiguous state")
-        delivered = contracts.make_operation(
-            kind="dispatch",
-            envelope=envelope,
-            status="delivered",
-            observed_invocation=observed_invocation,
-        )
-        return self.store.record_operation(delivered)
+        return self.record_observed_dispatch(envelope, observed_invocation)
 
     def omit_optional_content(
         self, envelope: Mapping[str, Any], item_id: str
@@ -359,6 +390,7 @@ class MemoryRuntime:
             )
         except Exception as exc:
             raise RuntimeError(f"finalized dispatch does not match its target: {exc}") from exc
+        self.store.record_final_context(context, envelope_digest=envelope["content_hash"])
         return self.dispatch(envelope, launcher)
 
     def record_apc_child_operation(self, child_operation: Mapping[str, Any]) -> dict[str, Any]:
