@@ -80,6 +80,29 @@ class TrustedProcedureService:
         if not atlas.atlas_task_network_allowed(network_resolution):
             raise ProcedureNetworkDeniedError("effective restricted_local forbids Atlas task work")
 
+    @staticmethod
+    def _publication_admission(
+        network_resolution: NetworkResolution | Mapping[str, Any] | None,
+        shared_publication_enabled: bool,
+        effects: list[dict[str, Any]],
+        legacy_operations: list[dict[str, Any]],
+    ) -> bool:
+        """Admit new task work, or exact-only recovery of one submitted effect.
+
+        The returned value permits a new claim. A submitted uncertain effect may
+        be read while off, but absence must not turn that read into a retry.
+        """
+        new_work_allowed = (atlas.atlas_task_network_allowed(network_resolution)
+                            and shared_publication_enabled)
+        submitted = (len(effects) == 1 and effects[0]["status"] in {"uncertain", "in_flight"})
+        legacy_submitted = (not effects and len(legacy_operations) == 1
+                            and legacy_operations[0]["kind"] == "publication"
+                            and legacy_operations[0]["status"] in {"ambiguous", "remote_committed"})
+        if not new_work_allowed and not (submitted or legacy_submitted):
+            TrustedProcedureService._require_task_network(network_resolution)
+            raise ProcedureIneligibleError("shared publication feature is off")
+        return new_work_allowed
+
     def record_approved_revision(
         self,
         procedure: Mapping[str, Any],
@@ -678,9 +701,6 @@ class TrustedProcedureService:
         verified by the store's constructor-bound verifier.
         """
 
-        self._require_task_network(network_resolution)
-        if not shared_publication_enabled:
-            raise ProcedureIneligibleError("shared publication feature is off")
         self._require_trusted_issuer(approval.get("issuer"))
         try:
             publication = contracts.make_procedure_publication(
@@ -704,6 +724,11 @@ class TrustedProcedureService:
             prior_effects = [row for row in self.store.list_effect_operations()
                 if row["outcome_id"] is None and row["kind"] == "procedure_publication"
                 and row["source_id"] == publication["publication_id"]]
+            legacy_operations = (self.store.list_procedure_remote_operations(
+                payload_id=publication["publication_id"]) if not prior_effects else [])
+            new_work_allowed = self._publication_admission(
+                network_resolution, shared_publication_enabled,
+                prior_effects, legacy_operations)
             if wants_governance:
                 if (captured_config is None or current_config is None or atlas_scope is None
                         or claimant is None):
@@ -790,12 +815,17 @@ class TrustedProcedureService:
                 publication, operation, designation, adapter,
                 captured_config=captured_config, current_config=current_config,
                 atlas_scope=atlas_scope, claimant=claimant, claim_fence=claim_fence,
+                new_work_allowed=new_work_allowed,
             )
-        self.publish_designation(designation, adapter)
+        if new_work_allowed:
+            self.publish_designation(designation, adapter)
         if publication["status"] in {"ambiguous", "remote_committed"} or operation[
             "status"
         ] in {"ambiguous", "remote_committed"}:
-            reconciled = self.reconcile_publication(publication["publication_id"], adapter)
+            reconciled = self.reconcile_publication(
+                publication["publication_id"], adapter,
+                network_resolution=network_resolution,
+                shared_publication_enabled=shared_publication_enabled)
             if reconciled["status"] == "acknowledged":
                 return reconciled
             raise ProcedureRemoteAmbiguityError(
@@ -901,6 +931,7 @@ class TrustedProcedureService:
         atlas_scope: Mapping[str, Any],
         claimant: Mapping[str, Any],
         claim_fence: Mapping[str, Any] | None,
+        new_work_allowed: bool,
     ) -> dict[str, Any]:
         scope = dict(atlas_scope)
         scope_key = contracts.sha256_hex(scope)
@@ -1010,6 +1041,8 @@ class TrustedProcedureService:
             return self.reconcile_publication(str(publication["publication_id"]), adapter)
         if effect["status"] != "pending":
             raise ProcedureIneligibleError("governed publication is not pending")
+        if not new_work_allowed:
+            raise ProcedureIneligibleError("new shared publication work is off")
         # The current gate is checked before any new non-safety remote work.
         if not effect_submission_enabled(current_config, "procedure_publication"):
             raise ProcedureIneligibleError("current shared publication feature is off")
@@ -1048,10 +1081,6 @@ class TrustedProcedureService:
     ) -> dict[str, Any]:
         """Resolve a lost acknowledgement through exact read, never blind replay."""
 
-        self._require_task_network(network_resolution)
-        if not shared_publication_enabled:
-            raise ProcedureIneligibleError("shared publication feature is off")
-
         publication = self.store.get_procedure_publication(publication_id)
         effects = [
             row for row in self.store.list_effect_operations()
@@ -1060,6 +1089,13 @@ class TrustedProcedureService:
         ]
         if len(effects) > 1:
             raise ProcedureError("publication has conflicting governed scopes")
+        operations = [
+            operation
+            for operation in self.store.list_procedure_remote_operations(payload_id=publication_id)
+            if operation["kind"] == "publication"
+        ]
+        self._publication_admission(network_resolution, shared_publication_enabled,
+                                    effects, operations if not effects else [])
         if effects:
             effect = effects[0]
             scope = effect["payload_record"]["atlas_scope"]
@@ -1113,11 +1149,6 @@ class TrustedProcedureService:
                     raise ProcedureIneligibleError(
                         "local lifecycle fenced publication acknowledgement"
                     )
-        operations = [
-            operation
-            for operation in self.store.list_procedure_remote_operations(payload_id=publication_id)
-            if operation["kind"] == "publication"
-        ]
         if len(operations) != 1:
             raise ProcedureError("publication has no unique stable remote operation")
         operation = operations[0]
