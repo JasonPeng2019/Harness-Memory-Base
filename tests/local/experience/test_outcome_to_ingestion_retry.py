@@ -302,6 +302,38 @@ class OutcomeToIngestionRetryTests(unittest.TestCase):
         self.assertIn("parser repair failed", evidence[0]["content"])
         self.assertNotIn(SECRET, str(evidence))
 
+    def test_legacy_confirmed_case_retains_two_distinct_skills(self) -> None:
+        trajectory = self._capture()
+        surface = _EverOSSurface()
+        adapter = self._adapter(surface)
+        pending = asyncio.run(self.service.extract_trajectory(trajectory["trajectory_id"], adapter))
+        surface.case_results = [self._case(adapter, pending["session_id"])]
+        self.assertEqual("confirmed", asyncio.run(self.service.reconcile_extraction(
+            trajectory["trajectory_id"], adapter
+        ))["status"])
+        skills = [
+            {
+                "id": skill_id, "agent_id": adapter.everos_owner_id,
+                "app_id": adapter.everos_application_id,
+                "project_id": adapter.everos_project_id,
+                "content": content, "source_case_ids": ["retry-case-1"],
+            }
+            for skill_id, content in (
+                ("legacy-skill-a", "Investigate the parser."),
+                ("legacy-skill-b", "Check the parser lock."),
+            )
+        ]
+        candidates = [self.service.resolve_generated_skill_candidate(skill, adapter) for skill in skills]
+        self.assertNotEqual(candidates[0]["candidate_id"], candidates[1]["candidate_id"])
+        self.assertEqual(
+            {candidate["candidate_id"] for candidate in candidates},
+            {item["candidate_id"] for skill in skills for item in
+             self.memory_store.read_generated_skill_candidates_for_scope(skill["id"], self.scope.to_record())},
+        )
+        self.assertEqual(candidates, [
+            self.service.resolve_generated_skill_candidate(skill, adapter) for skill in skills
+        ])
+
 
 class JoinedNativeEffectTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -519,10 +551,135 @@ class JoinedNativeEffectTests(unittest.TestCase):
         effect = self.case.state.get_effect_operation(operation_id)
         self.assertEqual("proposed", candidate["state"])
         self.assertEqual("confirmed", effect["status"])
-        self.assertEqual(candidate["candidate_id"], effect["acknowledgement"]["candidate_id"])
+        self.assertEqual(
+            {"source_trajectory_id": trajectory["trajectory_id"]},
+            effect["payload_record"],
+        )
+        self.assertEqual(effect["payload_record"], effect["acknowledgement"])
         self.assertEqual(trajectory, effect["source_record"])
         self.assertEqual(candidate, service.resolve_generated_skill_candidate(skill, adapter))
         self.assertEqual("confirmed", self.case.state.get_effect_operation(operation_id)["status"])
+
+    def test_two_generated_skills_share_fixed_native_outcome_effect(self) -> None:
+        outcome, trajectory, scope, service = self._native()
+        surface = _EverOSSurface()
+        adapter = self._adapter(scope, surface)
+        pending = asyncio.run(service.extract_trajectory(trajectory["trajectory_id"], adapter))
+        surface.case_results = [
+            OutcomeToIngestionRetryTests._case(adapter, pending["session_id"])
+        ]
+        self.assertEqual("confirmed", asyncio.run(service.reconcile_extraction(
+            trajectory["trajectory_id"], adapter
+        ))["status"])
+        receipt = self.case.state.get_case_receipt(scope.to_record(), "retry-case-1")
+        original_outcome = self.case.state.get_outcome(outcome["decision_id"])
+        original_trajectory = service.get_trajectory(trajectory["trajectory_id"])
+        skills = [
+            {
+                "id": skill_id, "agent_id": adapter.everos_owner_id,
+                "app_id": adapter.everos_application_id,
+                "project_id": adapter.everos_project_id,
+                "content": content, "source_case_ids": ["retry-case-1"],
+            }
+            for skill_id, content in (
+                ("native-skill-a", "Investigate the parser."),
+                ("native-skill-b", "Check the parser lock."),
+            )
+        ]
+        operation_id = contracts.effect_operation_id(outcome["outcome_id"], "generated_skill_creation")
+        first = service.resolve_generated_skill_candidate(skills[0], adapter)
+        first_effect = self.case.state.get_effect_operation(operation_id)
+        for switch in ("experience_write", "generated_skill_creation"):
+            self.assertIsNone(service.resolve_generated_skill_candidate(
+                skills[1], adapter, current_config=config.resolve_config({switch: False})
+            ))
+        self.assertEqual([], self.case.state.read_generated_skill_candidates_for_scope(
+            skills[1]["id"], scope.to_record()
+        ))
+        self.assertEqual(first_effect, self.case.state.get_effect_operation(operation_id))
+        second = service.resolve_generated_skill_candidate(skills[1], adapter)
+        effect = self.case.state.get_effect_operation(operation_id)
+        self.assertEqual("confirmed", effect["status"])
+        self.assertEqual(first_effect, effect)
+        self.assertEqual(
+            {"source_trajectory_id": trajectory["trajectory_id"]}, effect["payload_record"]
+        )
+        self.assertEqual(first_effect["payload_record"], effect["payload_record"])
+        self.assertEqual(first_effect["acknowledgement"], effect["acknowledgement"])
+        self.assertEqual(trajectory, effect["source_record"])
+        self.assertEqual(1, len([
+            item for item in self.case.state.list_effect_operations(outcome["outcome_id"])
+            if item["kind"] == "generated_skill_creation"
+        ]))
+        self.assertNotEqual(first["candidate_id"], second["candidate_id"])
+        for skill, candidate in zip(skills, (first, second)):
+            self.assertEqual("proposed", candidate["state"])
+            self.assertEqual([{
+                "case_id": "retry-case-1",
+                "case_receipt_id": receipt["case_receipt_id"],
+                "trajectory_id": trajectory["trajectory_id"],
+                "review_receipt_id": trajectory["review_receipt_id"],
+                "review_receipt_digest": trajectory["review_receipt_digest"],
+            }], candidate["source_cases"])
+            self.assertEqual(contracts.make_generated_skill_candidate(
+                scope=scope.to_record(), skill_id=skill["id"],
+                content=skill["content"], source_cases=candidate["source_cases"],
+            )["candidate_id"], candidate["candidate_id"])
+            self.assertEqual(candidate, self.case.state.get_generated_skill_candidate(
+                candidate["candidate_id"]
+            ))
+            self.assertEqual(candidate, service.resolve_generated_skill_candidate(skill, adapter))
+        self.assertEqual(original_outcome, self.case.state.get_outcome(outcome["decision_id"]))
+        self.assertEqual(original_trajectory, service.get_trajectory(trajectory["trajectory_id"]))
+
+    def test_old_candidate_specific_effect_recovers_then_accepts_another_skill(self) -> None:
+        outcome, trajectory, scope, service = self._native()
+        surface = _EverOSSurface()
+        adapter = self._adapter(scope, surface)
+        pending = asyncio.run(service.extract_trajectory(trajectory["trajectory_id"], adapter))
+        surface.case_results = [OutcomeToIngestionRetryTests._case(adapter, pending["session_id"])]
+        asyncio.run(service.reconcile_extraction(trajectory["trajectory_id"], adapter))
+        receipt = self.case.state.get_case_receipt(scope.to_record(), "retry-case-1")
+        source = [{
+            "case_id": receipt["case_id"],
+            "case_receipt_id": receipt["case_receipt_id"],
+            "trajectory_id": trajectory["trajectory_id"],
+            "review_receipt_id": trajectory["review_receipt_id"],
+            "review_receipt_digest": trajectory["review_receipt_digest"],
+        }]
+        first = contracts.make_generated_skill_candidate(
+            scope=scope.to_record(), skill_id="old-skill", content="Check the parser.",
+            source_cases=source,
+        )
+        operation_id = contracts.effect_operation_id(outcome["outcome_id"], "generated_skill_creation")
+        self.case.state.bind_effect_source(operation_id, trajectory["trajectory_id"], trajectory)
+        self.case.state.bind_effect_payload(operation_id, {
+            key: first[key] for key in
+            ("candidate_id", "skill_id", "content_digest", "source_cases", "metadata")
+        })
+        self.case.state.claim_effect_operation(operation_id, current_config=config.MemoryConfig())
+        first_skill = {
+            "id": "old-skill", "agent_id": adapter.everos_owner_id,
+            "app_id": adapter.everos_application_id,
+            "project_id": adapter.everos_project_id,
+            "content": "Check the parser.", "source_case_ids": ["retry-case-1"],
+        }
+        self.assertEqual(first["candidate_id"], service.resolve_generated_skill_candidate(
+            first_skill, adapter
+        )["candidate_id"])
+        original_effect = self.case.state.get_effect_operation(operation_id)
+        self.assertEqual({"candidate_id": first["candidate_id"]}, original_effect["acknowledgement"])
+        skill = {
+            "id": "new-skill", "agent_id": adapter.everos_owner_id,
+            "app_id": adapter.everos_application_id,
+            "project_id": adapter.everos_project_id,
+            "content": "Investigate parser history.", "source_case_ids": ["retry-case-1"],
+        }
+        second = service.resolve_generated_skill_candidate(skill, adapter)
+        self.assertNotEqual(first["candidate_id"], second["candidate_id"])
+        self.assertEqual("proposed", second["state"])
+        self.assertEqual(original_effect, self.case.state.get_effect_operation(operation_id))
+        self.assertEqual(second, service.resolve_generated_skill_candidate(skill, adapter))
 
 
 if __name__ == "__main__":

@@ -1061,7 +1061,7 @@ class ReviewedExperienceService:
         effective = current_config or config.MemoryConfig()
         if not config.effect_submission_enabled(effective, "generated_skill_creation"):
             return None
-        operations: list[str] = []
+        operations: dict[str, str] = {}
         for trajectory in trajectories.values():
             captured = self.store.get_decision(trajectory["decision_id"])["configuration"]
             if not config.effect_submission_enabled(captured, "generated_skill_creation"):
@@ -1073,17 +1073,31 @@ class ReviewedExperienceService:
                 self.store.get_effect_operation(operation_id)
             except StoreError:
                 continue  # Accepted legacy outcomes have no effect operation.
-            if operation_id not in operations:
-                operations.append(operation_id)
+            operations[operation_id] = trajectory["trajectory_id"]
             self.store.bind_effect_source(
                 operation_id, trajectory["trajectory_id"], trajectory
             )
-        payload = {
+        candidate_payload = {
             key: candidate[key]
             for key in ("candidate_id", "skill_id", "content_digest", "source_cases", "metadata")
         }
-        for operation_id in operations:
+        acknowledgements: dict[str, dict[str, str]] = {}
+        for operation_id, trajectory_id in operations.items():
+            operation = self.store.get_effect_operation(operation_id)
+            if operation["status"] == "confirmed":
+                # Existing stores may retain the old, candidate-specific payload.
+                # A confirmed outcome slot cannot be rebound for another skill.
+                continue
+            # The effect belongs to the reviewed outcome. Exact generated skill
+            # identities and provenance live in the candidate store below.
+            payload = {"source_trajectory_id": trajectory_id}
+            acknowledgement = payload
+            if operation["payload_record"] == candidate_payload:
+                # Finish an in-flight operation created by an earlier version.
+                payload = candidate_payload
+                acknowledgement = {"candidate_id": candidate["candidate_id"]}
             operation = self.store.bind_effect_payload(operation_id, payload)
+            acknowledgements[operation_id] = acknowledgement
             if operation["status"] == "pending":
                 try:
                     self.store.claim_effect_operation(operation_id, current_config=effective)
@@ -1093,10 +1107,8 @@ class ReviewedExperienceService:
                     ):
                         raise
         persisted = self.store.record_generated_skill_candidate(candidate)
-        for operation_id in operations:
-            self.store.confirm_effect_operation(
-                operation_id, {"candidate_id": persisted["candidate_id"]}
-            )
+        for operation_id, acknowledgement in acknowledgements.items():
+            self.store.confirm_effect_operation(operation_id, acknowledgement)
         return persisted
 
     def approve_generated_skill(
