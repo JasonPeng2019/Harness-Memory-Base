@@ -569,6 +569,7 @@ class PreparationService:
         invocation_target: str | None = None,
         recipient: str | None = None,
         finalize: bool = False,
+        required_sources: frozenset[tuple[str, str, str]] = frozenset(),
     ) -> PreparationOutcome:
         contracts.validate_task_card(task_card)
         if network_mode is not None or network_evidence is not None:
@@ -665,6 +666,7 @@ class PreparationService:
                 optional_items=(),
                 omitted=["optional-memory-unavailable", *supplied_optional],
                 freshness_check=freshness_check,
+                required_sources=required_sources,
             )
 
         proposed_deadline = absolute_deadline
@@ -1014,6 +1016,7 @@ class PreparationService:
             freshness_check=freshness_check,
             stores=stores,
             objective=objective,
+            required_sources=required_sources,
         )
 
 
@@ -2130,6 +2133,7 @@ class PreparationService:
         omitted: Iterable[str | Mapping[str, Any]] = (),
         stores: Sequence[SearchStore] = (),
         objective: Mapping[str, Any] | None = None,
+        required_sources: frozenset[tuple[str, str, str]] = frozenset(),
     ) -> PreparationOutcome:
         if not all((lane_id, run_id, worktree_path, base_commit)):
             raise PreparationError(
@@ -2189,6 +2193,21 @@ class PreparationService:
             freshness_check=freshness_check,
             source_owner_recheck=source_recheck,
         )
+        if required_sources:
+            trace = finalized.context["delivery_trace"]
+            delivered_ids = {entry["id"] for entry in trace["context_delivered"]}
+            delivered = {
+                tuple(entry["provenance"].get(key) for key in (
+                    "source_id", "logical_id", "revision_id",
+                ))
+                for entry in trace["selected"] if entry["id"] in delivered_ids
+            }
+            missing = required_sources - delivered
+            if missing:
+                raise PreparationError(
+                    "plan-required source identity was not delivered on resume; ROOT must replan: "
+                    + ", ".join(sorted(source for source, _, _ in missing))
+                )
         if self.store is not None:
             self.store.record_final_context(
                 finalized.context, envelope_digest=finalized.envelope["content_hash"]

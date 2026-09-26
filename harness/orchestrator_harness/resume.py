@@ -337,13 +337,15 @@ def run_resume(
             base_commit=str(task_card.get("base_commit") or "HEAD"),
         )
         supersession = None
+        required_sources: frozenset[tuple[str, str, str]] = frozenset()
         if current_memory_state == "execution_accepted":
             prior_envelope = memory_handoff.load_envelope(worktree)
             assert prior_envelope is not None
+            prior_context = memory_handoff.load_final_context(
+                worktree_path=worktree, envelope=prior_envelope,
+            )
+            required_sources = memory_handoff.required_resume_sources(prior_context)
             if not search_stores:
-                prior_context = memory_handoff.load_final_context(
-                    worktree_path=worktree, envelope=prior_envelope,
-                )
                 if prior_context["optional_content"]:
                     raise memory_handoff.MemoryHandoffError(
                         "selected optional content requires live search stores for resume"
@@ -480,6 +482,7 @@ def run_resume(
             worktree_path=worktree,
             base_commit=str(task_card.get("base_commit") or "HEAD"),
             search_stores=search_stores,
+            required_sources=required_sources,
         )
         if memory.pending_plan:
             update_lane(

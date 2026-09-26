@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -152,6 +154,57 @@ class BootstrapSearchStoreTests(_CoherentFixture, unittest.TestCase):
                 )
         self.assertEqual(2, len(self.everos.fake.search_calls))
         self.assertEqual(2, len(self.vector_store.calls))
+
+    def test_resume_refuses_lost_plan_required_source_before_replacing_handoff(self) -> None:
+        for withdrawn in ("store", "publication"):
+            with self.subTest(withdrawn=withdrawn):
+                lane_id = f"resume-withdrawn-{withdrawn}"
+                prepared, worktree = self._bootstrap(
+                    lane_id=lane_id, card=self.card,
+                    search_stores=(self.everos_store, self.atlas_store),
+                )
+                self.assertTrue(prepared["ok"], prepared)
+                self.harness.make_resumable(lane_id)
+                envelope = memory_handoff.load_envelope(worktree)
+                context = memory_handoff.load_final_context(
+                    worktree_path=worktree, envelope=envelope,
+                )
+                self.assertEqual(2, len(context["optional_content"]))
+                store_path, envelope_path = memory_handoff.memory_paths(worktree)
+                watched = (
+                    envelope_path,
+                    worktree / ".agent-workspace/worker-prompt.md",
+                    worktree / ".agent-workspace/invocation.json",
+                    self.harness.runtime / "epochs" / self.harness.EPOCH
+                    / "lanes" / lane_id / "lane.json",
+                )
+                before = {path: path.read_bytes() for path in watched}
+                with closing(sqlite3.connect(store_path)) as db:
+                    count_before = db.execute("SELECT count(*) FROM final_contexts").fetchone()[0]
+
+                if withdrawn == "store":
+                    stores = (self.everos_store,)
+                else:
+                    self.vector_store.publication_ids.remove(self.publication["publication_id"])
+                    stores = (self.everos_store, self.atlas_store)
+                recovered = self._resume(lane_id=lane_id, search_stores=stores)
+                self.assertFalse(recovered["ok"], recovered)
+                self.assertNotEqual("RESUME_OK", recovered["code"])
+                self.assertIn("atlas-shared-procedures", recovered["summary"])
+                self.assertEqual(before, {path: path.read_bytes() for path in watched})
+                with closing(sqlite3.connect(store_path)) as db:
+                    self.assertEqual(
+                        count_before,
+                        db.execute("SELECT count(*) FROM final_contexts").fetchone()[0],
+                    )
+                self.assertEqual(
+                    context,
+                    memory_handoff.load_final_context(
+                        worktree_path=worktree, envelope=envelope,
+                    ),
+                )
+                if withdrawn == "publication":
+                    self.vector_store.publication_ids.append(self.publication["publication_id"])
 
     def test_accepted_standard_bootstrap_delivers_both_trusted_sources(self) -> None:
         credential = "SEARCH_STORE_CREDENTIAL_MUST_STAY_IN_PROCESS"
