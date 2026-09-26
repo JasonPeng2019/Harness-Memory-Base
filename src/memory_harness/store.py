@@ -82,7 +82,8 @@ _SCHEMA = [
         operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id),
         lane_id TEXT NOT NULL,
         envelope_record TEXT NOT NULL,
-        native_receipt_required INTEGER NOT NULL
+        native_receipt_required INTEGER NOT NULL,
+        supersedes_rejected_attempt_id TEXT
     )
     """,
     """
@@ -98,6 +99,35 @@ _SCHEMA = [
         linked_run_id TEXT NOT NULL,
         observed_at TEXT NOT NULL,
         created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS native_outcomes (
+        outcome_id TEXT PRIMARY KEY REFERENCES outcomes(outcome_id),
+        terminal_evidence TEXT NOT NULL,
+        acceptance_status TEXT NOT NULL,
+        exceptional_acceptance INTEGER NOT NULL,
+        supersedes_outcome_id TEXT REFERENCES outcomes(outcome_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS rejected_native_attempts (
+        rejected_attempt_id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL REFERENCES decisions(decision_id),
+        operation_id TEXT NOT NULL UNIQUE REFERENCES operations(operation_id),
+        run_id TEXT NOT NULL,
+        result_digest TEXT NOT NULL,
+        review_digest TEXT NOT NULL,
+        acceptance_digest TEXT NOT NULL,
+        evidence_digest TEXT NOT NULL,
+        record TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS rejected_authorizations (
+        rejected_attempt_id TEXT PRIMARY KEY REFERENCES rejected_native_attempts(rejected_attempt_id),
+        operation_id TEXT NOT NULL UNIQUE REFERENCES operations(operation_id),
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'spent'))
     )
     """,
     """
@@ -449,10 +479,16 @@ class MemoryStore:
             self.connection.execute("PRAGMA foreign_keys=ON")
             self.connection.execute("PRAGMA journal_mode=WAL")
             with self.connection:
+                self.connection.execute("BEGIN IMMEDIATE")
+                authorization_table_existed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rejected_authorizations'"
+                ).fetchone() is not None
                 for statement in _SCHEMA:
                     self.connection.execute(statement)
                 self._ensure_column("operations", "envelope_digest", "TEXT")
                 self._ensure_column("operations", "run_id", "TEXT")
+                self._ensure_column("dispatch_bindings", "supersedes_rejected_attempt_id", "TEXT")
+                self._migrate_dispatch_authorizations(authorization_table_existed)
                 self._ensure_column("outcomes", "task_card_digest", "TEXT")
                 self._ensure_column("outcomes", "objective_id", "TEXT")
                 self._ensure_column("decisions", "configuration", "TEXT")
@@ -490,6 +526,46 @@ class MemoryStore:
         }
         if column not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    def _migrate_dispatch_authorizations(self, authorization_table_existed: bool) -> None:
+        connection = self._require_connection()
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='dispatch_bindings'"
+        ).fetchone()["sql"]
+        old_index = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' "
+            "AND name='dispatch_rejected_authorization'"
+        ).fetchone()
+        if old_index is not None and "CREATE UNIQUE INDEX" in old_index["sql"].upper():
+            connection.execute("DROP INDEX dispatch_rejected_authorization")
+        if "SUPERSEDES_REJECTED_ATTEMPT_ID TEXT UNIQUE" in definition.upper():
+            connection.execute(
+                "CREATE TABLE dispatch_bindings_migrated ("
+                "operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id), "
+                "lane_id TEXT NOT NULL, envelope_record TEXT NOT NULL, "
+                "native_receipt_required INTEGER NOT NULL, "
+                "supersedes_rejected_attempt_id TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO dispatch_bindings_migrated SELECT operation_id, lane_id, "
+                "envelope_record, native_receipt_required, supersedes_rejected_attempt_id "
+                "FROM dispatch_bindings"
+            )
+            connection.execute("DROP TABLE dispatch_bindings")
+            connection.execute("ALTER TABLE dispatch_bindings_migrated RENAME TO dispatch_bindings")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS dispatch_rejected_authorization "
+            "ON dispatch_bindings(supersedes_rejected_attempt_id)"
+        )
+        if not authorization_table_existed:
+            connection.execute(
+                "INSERT INTO rejected_authorizations (rejected_attempt_id, operation_id, state) "
+                "SELECT b.supersedes_rejected_attempt_id, b.operation_id, "
+                "CASE WHEN o.status='delivered' THEN 'spent' ELSE 'reserved' END "
+                "FROM dispatch_bindings b JOIN operations o USING(operation_id) "
+                "WHERE b.supersedes_rejected_attempt_id IS NOT NULL "
+                "AND o.status!='failed_pre_spawn'"
+            )
 
     def close(self) -> None:
         if self.connection is not None:
@@ -825,6 +901,23 @@ class MemoryStore:
             )
             if cursor.rowcount != 1:
                 raise OperationConflictError("dispatch operation changed during transition")
+            if binding is not None and binding["supersedes_rejected_attempt_id"] is not None:
+                if operation["status"] == "failed_pre_spawn":
+                    authorization = connection.execute(
+                        "DELETE FROM rejected_authorizations WHERE rejected_attempt_id=? "
+                        "AND operation_id=? AND state='reserved'",
+                        (binding["supersedes_rejected_attempt_id"], operation_id),
+                    )
+                elif operation["status"] == "delivered":
+                    authorization = connection.execute(
+                        "UPDATE rejected_authorizations SET state='spent' "
+                        "WHERE rejected_attempt_id=? AND operation_id=? AND state='reserved'",
+                        (binding["supersedes_rejected_attempt_id"], operation_id),
+                    )
+                else:
+                    authorization = None
+                if authorization is not None and authorization.rowcount != 1:
+                    raise OperationConflictError("rejected authorization owner changed")
         return self.get_operation(str(operation["operation_id"]))
 
     @staticmethod
@@ -880,7 +973,8 @@ class MemoryStore:
             raise ValueError("dispatch delivery or role does not match final context")
 
     def create_dispatch_intent(
-        self, envelope: Mapping[str, Any], *, native_receipt_required: bool = True
+        self, envelope: Mapping[str, Any], *, native_receipt_required: bool = True,
+        supersedes_rejected_attempt_id: str | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Atomically claim an exact final envelope before native spawn."""
         operation = contracts.make_operation(kind="dispatch", envelope=envelope)
@@ -888,21 +982,76 @@ class MemoryStore:
         with connection:
             connection.execute("BEGIN IMMEDIATE")
             self._validate_final_dispatch_binding(envelope)
+            if supersedes_rejected_attempt_id is not None and (
+                not isinstance(supersedes_rejected_attempt_id, str) or not supersedes_rejected_attempt_id
+            ):
+                raise OperationConflictError("rejected attempt ID must be nonempty")
+            existing_binding = connection.execute(
+                "SELECT * FROM dispatch_bindings WHERE operation_id=?",
+                (operation["operation_id"],),
+            ).fetchone()
+            if existing_binding is not None:
+                if (json.loads(existing_binding["envelope_record"]) != dict(envelope)
+                        or existing_binding["supersedes_rejected_attempt_id"] != supersedes_rejected_attempt_id):
+                    raise OperationConflictError("dispatch intent identity or authorization conflict")
+                return self.get_operation(operation["operation_id"]), False
             conflicts = connection.execute(
-                "SELECT operations.*, dispatch_bindings.lane_id FROM operations "
+                "SELECT operations.*, operations.rowid AS sequence, dispatch_bindings.lane_id FROM operations "
                 "LEFT JOIN dispatch_bindings USING(operation_id) "
                 "WHERE decision_id=? OR dispatch_bindings.lane_id=?",
                 (envelope["decision_id"], envelope["lane_id"]),
             ).fetchall()
+            prior_delivered = [row for row in conflicts if row["decision_id"] == envelope["decision_id"]
+                               and row["kind"] == "dispatch" and row["status"] == "delivered"]
+            if supersedes_rejected_attempt_id is not None:
+                attempt_row = connection.execute(
+                    "SELECT record FROM rejected_native_attempts WHERE rejected_attempt_id=?",
+                    (supersedes_rejected_attempt_id,),
+                ).fetchone()
+                if attempt_row is None or not prior_delivered:
+                    raise OperationConflictError("rejected attempt authorization is missing")
+                attempt = json.loads(attempt_row["record"])
+                latest = max(prior_delivered, key=lambda row: row["sequence"])
+                old_envelope = attempt["terminal_evidence"]["dispatch"]["envelope"]
+                same = ("decision_id", "task_card_digest", "objective_id", "plan_id",
+                        "plan_digest", "base_commit", "recipient", "route", "lane_id")
+                if (attempt["decision_id"] != envelope["decision_id"]
+                        or attempt["operation_id"] != latest["operation_id"]
+                        or any(row["run_id"] == envelope["run_id"] for row in conflicts
+                               if row["decision_id"] == envelope["decision_id"])
+                        or old_envelope["final_context_id"] == envelope["final_context_id"]
+                        or any(old_envelope[key] != envelope[key] for key in same)
+                        or connection.execute(
+                            "SELECT 1 FROM rejected_authorizations WHERE rejected_attempt_id=?",
+                            (supersedes_rejected_attempt_id,),
+                        ).fetchone() is not None
+                        or connection.execute(
+                            "SELECT 1 FROM outcomes WHERE decision_id=?", (envelope["decision_id"],)
+                        ).fetchone() is not None):
+                    raise OperationConflictError("rejected attempt does not authorize this corrected run")
+                for prior in prior_delivered:
+                    if connection.execute(
+                        "SELECT 1 FROM rejected_native_attempts WHERE operation_id=?",
+                        (prior["operation_id"],),
+                    ).fetchone() is None:
+                        raise OperationConflictError("prior delivered run has no ROOT-rejected attempt")
+            elif prior_delivered:
+                raise OperationConflictError("delivered dispatch requires an explicit rejected attempt")
             for row in conflicts:
                 if row["kind"] != "dispatch":
                     continue
                 if row["operation_id"] == operation["operation_id"]:
                     continue
-                if (row["status"] in ("pending", "ambiguous") or
+                if (row["status"] in ("pending", "ambiguous", "abandoned") or
                         (row["decision_id"] == envelope["decision_id"] and
-                         row["status"] != "failed_pre_spawn")):
+                         row["status"] != "failed_pre_spawn" and
+                         supersedes_rejected_attempt_id is None)):
                     raise OperationConflictError("conflicting dispatch owns the decision or lane")
+            if supersedes_rejected_attempt_id is not None and any(
+                row["decision_id"] == envelope["decision_id"] and
+                row["status"] not in ("failed_pre_spawn", "delivered") for row in conflicts
+            ):
+                raise OperationConflictError("prior dispatch remains unresolved")
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO operations
                 (operation_id, decision_id, envelope_digest, run_id, kind, status,
@@ -914,11 +1063,18 @@ class MemoryStore:
             if cursor.rowcount == 1:
                 connection.execute(
                     "INSERT INTO dispatch_bindings "
-                    "(operation_id, lane_id, envelope_record, native_receipt_required) "
-                    "VALUES (?, ?, ?, ?)",
+                    "(operation_id, lane_id, envelope_record, native_receipt_required, "
+                    "supersedes_rejected_attempt_id) VALUES (?, ?, ?, ?, ?)",
                     (operation["operation_id"], envelope["lane_id"],
-                     self._serialize_record(envelope), int(native_receipt_required)),
+                     self._serialize_record(envelope), int(native_receipt_required),
+                     supersedes_rejected_attempt_id),
                 )
+                if supersedes_rejected_attempt_id is not None:
+                    connection.execute(
+                        "INSERT INTO rejected_authorizations "
+                        "(rejected_attempt_id, operation_id, state) VALUES (?, ?, 'reserved')",
+                        (supersedes_rejected_attempt_id, operation["operation_id"]),
+                    )
         existing = self.get_operation(operation["operation_id"])
         if existing.get("envelope_record") != dict(envelope):
             raise OperationConflictError("dispatch intent identity conflict")
@@ -974,6 +1130,7 @@ class MemoryStore:
                 "lane_id": binding["lane_id"],
                 "envelope_record": json.loads(binding["envelope_record"]),
                 "native_receipt_required": binding["native_receipt_required"],
+                "supersedes_rejected_attempt_id": binding["supersedes_rejected_attempt_id"],
             })
         return result
 
@@ -996,28 +1153,12 @@ class MemoryStore:
         return results
 
     def record_outcome(self, outcome: Mapping[str, Any]) -> dict[str, Any]:
+        """Legacy/generic fixation; finalized enhanced decisions need native evidence."""
         contracts.validate_outcome(outcome)
         connection = self._require_connection()
         decision_id = str(outcome["decision_id"])
         if self.get_final_context_for_decision(decision_id) is not None:
-            rows = connection.execute(
-                "SELECT dispatch_bindings.envelope_record FROM operations "
-                "JOIN dispatch_bindings USING(operation_id) "
-                "WHERE operations.decision_id=? AND operations.run_id=? "
-                "AND operations.kind='dispatch' AND operations.status='delivered'",
-                (decision_id, outcome["linked_run_id"]),
-            ).fetchall()
-            exact = False
-            for row in rows:
-                envelope = json.loads(row["envelope_record"])
-                self._validate_final_dispatch_binding(envelope, current=False)
-                if all(envelope.get(field) == outcome.get(field) for field in (
-                    "decision_id", "task_card_digest", "objective_id", "plan_id", "plan_digest"
-                )):
-                    exact = True
-                    break
-            if not exact:
-                raise OperationConflictError("finalized outcome requires its exact observed dispatch")
+            raise OperationConflictError("finalized outcome requires exact native terminal evidence")
         existing_row = connection.execute(
             "SELECT * FROM outcomes WHERE decision_id = ?", (decision_id,)
         ).fetchone()
@@ -1056,6 +1197,155 @@ class MemoryStore:
             )
         return self.get_outcome(decision_id)
 
+    def _validate_native_terminal_join(self, evidence: Mapping[str, Any]) -> None:
+        """Compare a validated bundle to immutable decision, context and observation."""
+        connection = self._require_connection()
+        decision_id = str(evidence["decision_id"])
+        decision = self.get_decision(decision_id)
+        if any(decision.get(key) != value for key, value in evidence["decision"].items() if key != "schema"):
+            raise OutcomeConflictError("terminal decision differs from durable decision")
+        final_context = self.get_final_context_for_decision(decision_id)
+        if final_context != evidence["final_context"]:
+            raise OutcomeConflictError("terminal final context differs from durable context")
+        dispatch = evidence["dispatch"]
+        context_row = connection.execute(
+            "SELECT envelope_digest FROM final_contexts WHERE context_id=?",
+            (final_context["context_id"],),
+        ).fetchone()
+        if context_row is None or context_row["envelope_digest"] != dispatch["envelope_digest"]:
+            raise OutcomeConflictError("terminal dispatch does not own the durable final context")
+        incoming_operation = dispatch["operation"]
+        row = connection.execute(
+            "SELECT * FROM operations WHERE operation_id=?",
+            (incoming_operation["operation_id"],),
+        ).fetchone()
+        if row is None:
+            raise OperationConflictError("terminal outcome has no observed native dispatch")
+        durable_operation = self._operation_from_row(row)
+        if any(durable_operation.get(key) != value for key, value in incoming_operation.items()):
+            raise OperationConflictError("terminal native dispatch differs from durable observation")
+        binding = connection.execute(
+            "SELECT * FROM dispatch_bindings WHERE operation_id=?",
+            (incoming_operation["operation_id"],),
+        ).fetchone()
+        if binding is not None:
+            if json.loads(binding["envelope_record"]) != dispatch["envelope"] or not binding["native_receipt_required"]:
+                raise OperationConflictError("terminal dispatch lacks exact native intent binding")
+        elif dispatch["envelope"].get("schema") != contracts.ENVELOPE_SCHEMA:
+            raise OperationConflictError("terminal finalized dispatch lacks exact native intent binding")
+
+    def record_rejected_native_attempt(self, evidence: Mapping[str, Any]) -> dict[str, Any]:
+        """Retain an exact ROOT-rejected run without consuming its quality slot."""
+        attempt = contracts.make_rejected_native_attempt(evidence)
+        connection = self._require_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT record FROM rejected_native_attempts WHERE operation_id=?",
+                (attempt["operation_id"],),
+            ).fetchone()
+            if existing is not None:
+                if json.loads(existing["record"]) == attempt:
+                    return attempt
+                raise OutcomeConflictError("rejected native attempt contradicts retained operation evidence")
+            self._validate_native_terminal_join(evidence)
+            if connection.execute(
+                "SELECT 1 FROM outcomes WHERE decision_id=?", (attempt["decision_id"],)
+            ).fetchone() is not None:
+                raise OutcomeConflictError("fixed quality outcome already owns decision")
+            connection.execute(
+                "INSERT INTO rejected_native_attempts (rejected_attempt_id, decision_id, "
+                "operation_id, run_id, result_digest, review_digest, acceptance_digest, "
+                "evidence_digest, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (attempt["rejected_attempt_id"], attempt["decision_id"],
+                 attempt["operation_id"], attempt["run_id"], attempt["result_digest"],
+                 attempt["review_digest"], attempt["acceptance_digest"],
+                 attempt["evidence_digest"], self._serialize_record(attempt)),
+            )
+        return attempt
+
+    def get_rejected_native_attempt(self, rejected_attempt_id: str) -> dict[str, Any]:
+        row = self._require_connection().execute(
+            "SELECT record FROM rejected_native_attempts WHERE rejected_attempt_id=?",
+            (rejected_attempt_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"rejected native attempt not found: {rejected_attempt_id}")
+        return json.loads(row["record"])
+
+    def record_terminal_outcome(
+        self, outcome: Mapping[str, Any], evidence: Mapping[str, Any], *,
+        supersedes_outcome_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically join an observed ROOT-accepted dispatch and fix quality."""
+        contracts.validate_outcome(outcome)
+        contracts.validate_native_terminal_evidence(evidence)
+        if evidence["acceptance"]["approval"] != "ACCEPTED":
+            raise OutcomeConflictError("terminal outcome requires ROOT ACCEPTED")
+        connection = self._require_connection()
+        decision_id = str(outcome["decision_id"])
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_native_terminal_join(evidence)
+            if connection.execute(
+                "SELECT 1 FROM rejected_native_attempts WHERE operation_id=?",
+                (evidence["dispatch"]["operation"]["operation_id"],),
+            ).fetchone() is not None:
+                raise OutcomeConflictError("ROOT-rejected run cannot fix quality")
+            if (outcome["evidence_digest"] != evidence["content_hash"] or
+                    outcome["status"] != evidence["review"]["review_outcome"] or
+                    outcome["linked_run_id"] != evidence["run_id"]):
+                raise OutcomeConflictError("terminal outcome differs from its evidence")
+            existing = connection.execute(
+                "SELECT * FROM outcomes WHERE decision_id=?", (decision_id,),
+            ).fetchone()
+            if existing is not None:
+                native = connection.execute(
+                    "SELECT * FROM native_outcomes WHERE outcome_id=?",
+                    (existing["outcome_id"],),
+                ).fetchone()
+                if (existing["outcome_id"] == outcome["outcome_id"] and native is not None
+                        and json.loads(native["terminal_evidence"]) == dict(evidence)
+                        and native["supersedes_outcome_id"] == supersedes_outcome_id):
+                    return self.get_outcome(decision_id)
+                raise OutcomeConflictError("terminal outcome conflict for decision " + decision_id)
+            if supersedes_outcome_id is not None:
+                predecessor = connection.execute(
+                    "SELECT * FROM outcomes WHERE outcome_id=?", (supersedes_outcome_id,),
+                ).fetchone()
+                if predecessor is None or predecessor["decision_id"] == decision_id:
+                    raise OutcomeConflictError("supersession requires a distinct fixed predecessor")
+                old_native = connection.execute(
+                    "SELECT terminal_evidence FROM native_outcomes WHERE outcome_id=?",
+                    (supersedes_outcome_id,),
+                ).fetchone()
+                if old_native is None:
+                    raise OutcomeConflictError("supersession requires a native predecessor")
+                old_evidence = json.loads(old_native["terminal_evidence"])
+                if (predecessor["objective_id"] != outcome["objective_id"] or
+                        evidence["accepted_plan"].get("supersedes") != predecessor["plan_id"] or
+                        evidence["task_card"].get("task") != old_evidence["task_card"].get("task") or
+                        evidence["task_card"].get("base_commit") != old_evidence["task_card"].get("base_commit")):
+                    raise OutcomeConflictError("supersession requires an explicit linked accepted plan for the same task")
+            connection.execute(
+                "INSERT INTO outcomes (outcome_id, decision_id, task_card_digest, objective_id, "
+                "plan_id, plan_digest, status, evidence_digest, linked_run_id, observed_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (outcome["outcome_id"], decision_id, outcome["task_card_digest"],
+                 outcome["objective_id"], outcome["plan_id"], outcome["plan_digest"],
+                 outcome["status"], outcome["evidence_digest"], outcome["linked_run_id"],
+                 outcome["observed_at"], outcome["observed_at"]),
+            )
+            acceptance = evidence["acceptance"]
+            exceptional = bool(acceptance.get("force_accept_reason"))
+            connection.execute(
+                "INSERT INTO native_outcomes (outcome_id, terminal_evidence, acceptance_status, "
+                "exceptional_acceptance, supersedes_outcome_id) VALUES (?, ?, ?, ?, ?)",
+                (outcome["outcome_id"], self._serialize_record(evidence),
+                 acceptance["approval"], int(exceptional), supersedes_outcome_id),
+            )
+        return self.get_outcome(decision_id)
+
     def get_outcome(self, decision_id: str) -> dict[str, Any]:
         connection = self._require_connection()
         row = connection.execute(
@@ -1063,7 +1353,18 @@ class MemoryStore:
         ).fetchone()
         if row is None:
             raise StoreError(f"outcome not found for decision: {decision_id}")
-        return dict(row)
+        outcome = dict(row)
+        native = connection.execute(
+            "SELECT * FROM native_outcomes WHERE outcome_id=?", (outcome["outcome_id"],),
+        ).fetchone()
+        if native is not None:
+            outcome.update({
+                "terminal_evidence": json.loads(native["terminal_evidence"]),
+                "acceptance_status": native["acceptance_status"],
+                "exceptional_acceptance": bool(native["exceptional_acceptance"]),
+                "supersedes_outcome_id": native["supersedes_outcome_id"],
+            })
+        return outcome
 
     def record_review_receipt(self, review_receipt: Mapping[str, Any]) -> dict[str, Any]:
         """Persist the exact ROOT receipt that authorizes a later trajectory.

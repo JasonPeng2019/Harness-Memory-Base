@@ -32,6 +32,8 @@ FINAL_CONTEXT_SECURITY = {
 }
 OPERATION_SCHEMA = "memory-operation/v1"
 OUTCOME_SCHEMA = "memory-outcome/v1"
+NATIVE_TERMINAL_EVIDENCE_SCHEMA = "native-terminal-evidence/v1"
+REJECTED_NATIVE_ATTEMPT_SCHEMA = "rejected-native-attempt/v1"
 REVIEW_RECEIPT_SCHEMA = "memory-review-receipt/v1"
 REVIEWED_TRAJECTORY_SCHEMA = "reviewed-trajectory/v1"
 EXPERIENCE_INGESTION_SCHEMA = "reviewed-experience-ingestion/v1"
@@ -1021,6 +1023,7 @@ def make_outcome(
     linked_run_id: str,
     task_card_digest: str,
     objective_id: str,
+    observed_at: str | None = None,
 ) -> dict[str, Any]:
     decision = _require_nonempty_str(decision_id, "decision_id")
     plan = _require_nonempty_str(plan_id, "plan_id")
@@ -1055,7 +1058,7 @@ def make_outcome(
         "linked_run_id": run,
         "task_card_digest": task_digest,
         "objective_id": objective,
-        "observed_at": utc_now(),
+        "observed_at": observed_at or utc_now(),
     }
     record["content_hash"] = content_hash(record)
     validate_outcome(record)
@@ -1071,6 +1074,182 @@ def validate_outcome(record: Mapping[str, Any]) -> None:
         _require_nonempty_str(record.get(field), field)
     if record["status"] not in OUTCOME_STATUSES:
         raise ContractError(f"unknown outcome status: {record['status']!r}")
+
+
+def validate_native_terminal_evidence(evidence: Mapping[str, Any]) -> None:
+    """Validate lane 2's retained enhanced-parent bundle before local fixation.
+
+    The store separately compares its dispatch against the durable observation.
+    """
+    validate_record(evidence, NATIVE_TERMINAL_EVIDENCE_SCHEMA)
+    for field in ("epoch_id", "lane_id", "run_id", "objective_id", "decision_id"):
+        _require_nonempty_str(evidence.get(field), field)
+    card, plan, decision = (evidence.get(key) for key in
+                            ("task_card", "accepted_plan", "decision"))
+    if not all(isinstance(record, Mapping) for record in (card, plan, decision)):
+        raise ContractError("terminal task, plan, or decision missing")
+    validate_task_plan_binding(card, plan)
+    validate_decision(decision)
+    handoff = card.get("memory_handoff")
+    if not isinstance(handoff, Mapping) or handoff.get("plan_state") != "execution_accepted":
+        raise ContractError("terminal evidence is not an accepted enhanced parent")
+    if handoff.get("plan") != plan or plan.get("state") != "accepted":
+        raise ContractError("terminal evidence accepted plan mismatch")
+    for field, expected in (
+        ("decision_id", decision["decision_id"]),
+        ("objective_id", plan["objective_id"]),
+    ):
+        if evidence[field] != expected:
+            raise ContractError(f"terminal evidence {field} mismatch")
+    for field, expected in (
+        ("task_card_digest", card["content_hash"]), ("objective_id", plan["objective_id"]),
+        ("route", plan["route"]), ("plan_id", plan["plan_id"]),
+        ("plan_state", "accepted"), ("plan_digest", plan["content_hash"]),
+        ("state", "prepared"),
+    ):
+        if decision.get(field) != expected:
+            raise ContractError(f"terminal decision {field} mismatch")
+    expected_decision = make_decision(card, plan, strategy=decision["strategy"],
+                                      configuration=decision["configuration"])
+    if decision["decision_id"] != expected_decision["decision_id"]:
+        raise ContractError("terminal decision identity mismatch")
+    configuration = evidence.get("configuration")
+    if configuration != decision["configuration"] or evidence.get("configuration_digest") != decision["configuration_digest"]:
+        raise ContractError("terminal configuration mismatch")
+    dispatch = evidence.get("dispatch")
+    if not isinstance(dispatch, Mapping):
+        raise ContractError("terminal dispatch missing")
+    envelope = dispatch.get("envelope")
+    context = evidence.get("final_context")
+    if not isinstance(envelope, Mapping):
+        raise ContractError("terminal dispatch envelope missing")
+    validate_envelope(
+        envelope, task_card=card, plan=plan, lane_id=evidence["lane_id"],
+        run_id=evidence["run_id"], base_commit=card["base_commit"],
+        worktree_path=envelope.get("worktree_path"), decision_id=decision["decision_id"],
+    )
+    validate_finalized_context(context)
+    if envelope.get("schema") == FINAL_ENVELOPE_SCHEMA and context != envelope["final_context"]:
+        raise ContractError("terminal final context differs from dispatch envelope")
+    for field in ("lane_id", "run_id", "decision_id", "task_card_digest", "objective_id",
+                  "route", "plan_id", "plan_digest", "base_commit", "worktree_path",
+                  "strategy", "configuration_digest"):
+        if context.get(field) != envelope.get(field):
+            raise ContractError(f"terminal final context {field} mismatch")
+    if context.get("configuration") != configuration or envelope.get("configuration") != configuration:
+        raise ContractError("terminal final context or configuration mismatch")
+    operation = dispatch.get("operation")
+    observed = dispatch.get("observed_invocation")
+    if not isinstance(operation, Mapping) or not isinstance(observed, Mapping):
+        raise ContractError("terminal native invocation missing")
+    if set(operation) != {
+        "operation_id", "decision_id", "envelope_digest", "run_id", "kind",
+        "status", "observed_invocation", "created_at", "updated_at",
+    }:
+        raise ContractError("terminal native operation fields invalid")
+    _require_nonempty_str(operation["created_at"], "native operation created_at")
+    _require_nonempty_str(operation["updated_at"], "native operation updated_at")
+    if dispatch.get("operation_digest") != sha256_hex(operation):
+        raise ContractError("terminal dispatch operation digest mismatch")
+    if dispatch.get("envelope_digest") != envelope["content_hash"]:
+        raise ContractError("terminal dispatch envelope digest mismatch")
+    for field, expected in (
+        ("operation_id", sha256_hex({"kind": "dispatch", "envelope_digest": envelope["content_hash"]})),
+        ("decision_id", decision["decision_id"]), ("envelope_digest", envelope["content_hash"]),
+        ("run_id", evidence["run_id"]), ("kind", "dispatch"), ("status", "delivered"),
+        ("observed_invocation", observed),
+    ):
+        if operation.get(field) != expected:
+            raise ContractError(f"terminal dispatch {field} mismatch")
+    pid, creation = observed.get("pid"), observed.get("creation_time")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1 or not isinstance(creation, str) or not creation or observed.get("invocation_id") != f"controller:{pid}:{creation}":
+        raise ContractError("terminal native invocation identity invalid")
+    for field, expected in (
+        ("task_card_digest", card["content_hash"]), ("decision_id", decision["decision_id"]),
+        ("plan_id", plan["plan_id"]), ("plan_digest", plan["content_hash"]),
+        ("envelope_digest", envelope["content_hash"]), ("lane_id", evidence["lane_id"]),
+        ("run_id", evidence["run_id"]), ("base_commit", card["base_commit"]),
+        ("route", plan["route"]), ("configuration_digest", decision["configuration_digest"]),
+        ("context_id", context["context_id"]), ("context_digest", context["content_hash"]),
+    ):
+        if observed.get(field) != expected:
+            raise ContractError(f"terminal native observation {field} mismatch")
+    review, acceptance, result = (evidence.get(key) for key in ("review", "acceptance", "result"))
+    validate_record(review, "completion-review/v1")
+    validate_record(acceptance, "orchestrator-acceptance/v1")
+    if acceptance.get("accepted_by") != "ROOT" or acceptance.get("approval") not in {"ACCEPTED", "REJECTED"} or acceptance.get("review_ref") != review["content_hash"]:
+        raise ContractError("terminal ROOT acceptance or review link invalid")
+    card_id = str(card.get("card_id") or card.get("id") or card["content_hash"])
+    for field, expected in (
+        ("lane_id", evidence["lane_id"]), ("run_id", evidence["run_id"]),
+        ("task_card_id", card_id), ("task_card_hash", card["content_hash"]),
+    ):
+        if review.get(field) != expected or acceptance.get(field) != expected:
+            raise ContractError(f"terminal review/acceptance {field} mismatch")
+    for field in ("result_id", "result_hash", "commit"):
+        if review.get(field) != acceptance.get(field):
+            raise ContractError(f"terminal review/acceptance {field} mismatch")
+    _require_nonempty_str(review.get("commit"), "review commit")
+    _require_nonempty_str(review.get("reviewed_at"), "reviewed_at")
+    if acceptance.get("decided_at") != review["reviewed_at"]:
+        raise ContractError("terminal acceptance time differs from review")
+    status = review.get("review_outcome")
+    if status == "UNKNOWN":
+        proof = evidence.get("terminal_proof")
+        if result is not None or review.get("result_id") is not None or review.get("result_hash") is not None:
+            raise ContractError("UNKNOWN cannot carry a result")
+        if acceptance["approval"] != "ACCEPTED" or not isinstance(acceptance.get("force_accept_reason"), str) or not acceptance["force_accept_reason"].strip():
+            raise ContractError("UNKNOWN requires exceptional ROOT acceptance")
+        if not isinstance(proof, Mapping) or any((
+            proof.get("schema") != "controller-status/v1",
+            proof.get("lane_id") != evidence["lane_id"], proof.get("run_id") != evidence["run_id"],
+            proof.get("controller_state") != "exited",
+            not isinstance(proof.get("provider_state"), Mapping) or proof["provider_state"].get("state") != "exited",
+            proof.get("result_state") not in {"absent", "invalid"},
+            proof.get("recorded_status") != "provider_exited_no_result", proof.get("cleanup_proven") is not True,
+        )):
+            raise ContractError("UNKNOWN lacks terminal native no-result proof")
+        digest = sha256_hex(proof)
+        if review.get("terminal_proof_digest") != digest or acceptance.get("terminal_proof_digest") != digest:
+            raise ContractError("UNKNOWN proof digest mismatch")
+    else:
+        if status not in {"PASS", "FAIL", "BLOCKED"}:
+            raise ContractError("terminal review status invalid")
+        validate_record(result, "result/v1")
+        if result.get("lane_id") != evidence["lane_id"] or result.get("run_id") != evidence["run_id"] or result.get("outcome") not in {"PASS", "FAIL", "BLOCKED"}:
+            raise ContractError("terminal result mismatch")
+        if review.get("result_id") != evidence["run_id"] or review.get("result_hash") != result["content_hash"] or evidence.get("terminal_proof") is not None:
+            raise ContractError("terminal result/review link mismatch")
+        if "terminal_proof_digest" in review or "terminal_proof_digest" in acceptance:
+            raise ContractError("ordinary result cannot carry UNKNOWN proof")
+        if acceptance["approval"] == "ACCEPTED" and status != "PASS" and (not isinstance(acceptance.get("force_accept_reason"), str) or not acceptance["force_accept_reason"].strip()):
+            raise ContractError("forced acceptance reason missing")
+
+
+def make_rejected_native_attempt(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """Identify one exact ROOT-rejected native review without fixing quality."""
+    validate_native_terminal_evidence(evidence)
+    if evidence["acceptance"]["approval"] != "REJECTED":
+        raise ContractError("rejected native attempt requires ROOT REJECTED")
+    operation = evidence["dispatch"]["operation"]
+    record = {
+        "schema": REJECTED_NATIVE_ATTEMPT_SCHEMA,
+        "rejected_attempt_id": sha256_hex({
+            "decision_id": evidence["decision_id"],
+            "operation_id": operation["operation_id"],
+            "evidence_digest": evidence["content_hash"],
+        }),
+        "decision_id": evidence["decision_id"],
+        "operation_id": operation["operation_id"],
+        "run_id": evidence["run_id"],
+        "result_digest": evidence["result"]["content_hash"],
+        "review_digest": evidence["review"]["content_hash"],
+        "acceptance_digest": evidence["acceptance"]["content_hash"],
+        "evidence_digest": evidence["content_hash"],
+        "terminal_evidence": dict(evidence),
+    }
+    record["content_hash"] = content_hash(record)
+    return record
 
 
 def normalize_experience_scope(scope: Mapping[str, Any]) -> dict[str, str]:
@@ -4029,6 +4208,8 @@ __all__ = [
     "FINAL_ENVELOPE_SCHEMA",
     "OPERATION_SCHEMA",
     "OUTCOME_SCHEMA",
+    "NATIVE_TERMINAL_EVIDENCE_SCHEMA",
+    "REJECTED_NATIVE_ATTEMPT_SCHEMA",
     "REVIEW_RECEIPT_SCHEMA",
     "REVIEWED_TRAJECTORY_SCHEMA",
     "EXPERIENCE_INGESTION_SCHEMA",
@@ -4078,6 +4259,8 @@ __all__ = [
     "validate_operation",
     "make_outcome",
     "validate_outcome",
+    "validate_native_terminal_evidence",
+    "make_rejected_native_attempt",
     "normalize_experience_scope",
     "make_review_receipt",
     "validate_review_receipt",
