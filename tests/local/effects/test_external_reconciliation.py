@@ -208,6 +208,98 @@ class ExternalReconciliationTests(unittest.TestCase):
                     action()
                 self.assertEqual(claimed_b, self.state.get_effect_operation(identity))
 
+    def test_claimant_handle_authority_and_crash_recovery_matrix(self) -> None:
+        database = Path(self.directory.name) / "effects.sqlite3"
+        for scenario in ("live_peer", "reopened_same", "reopened_fresh"):
+            with self.subTest(scenario=scenario):
+                intent = self._create(scope_key=scenario)
+                identity = intent["operation_id"]
+                claimed_a = self.state.claim_effect_operation(
+                    identity, current_config=config.MemoryConfig(),
+                    claimant=self._claimant(f"native-A-{scenario}", 4401, "created-A"),
+                )
+                claim_a = claimed_a["active_claim_id"]
+                self.assertEqual({identity: claim_a}, self.state._live_effect_claims)
+                with self.assertRaises(store.OperationConflictError):
+                    self.state.claim_effect_operation(
+                        identity, current_config=config.MemoryConfig(),
+                        claimant=self._claimant(f"native-B-{scenario}", 4402, "created-B"),
+                    )
+                self.assertEqual({identity: claim_a}, self.state._live_effect_claims)
+                if scenario == "live_peer":
+                    peer = store.MemoryStore(database)
+                    peer.initialize()
+                elif scenario == "reopened_same":
+                    self.state.close()
+                    self.state.initialize()
+                    peer = self.state
+                else:
+                    self.state.close()
+                    self.state = store.MemoryStore(database)
+                    self.state.initialize()
+                    peer = self.state
+                if scenario != "live_peer":
+                    self.assertEqual({}, peer._live_effect_claims)
+                try:
+                    if peer is not self.state:
+                        self.assertEqual({}, peer._live_effect_claims)
+                    persisted_id = peer.get_effect_operation(identity)["active_claim_id"]
+                    self.assertEqual(claim_a, persisted_id)
+                    with self.assertRaises(store.OperationConflictError):
+                        peer.mark_effect_uncertain(identity, "peer lost acknowledgement", claim_id=persisted_id)
+                    self.assertEqual(claimed_a, peer.get_effect_operation(identity))
+                    if peer is not self.state:
+                        self.assertEqual({}, peer._live_effect_claims)
+                    with self.assertRaises(store.OperationConflictError):
+                        peer.reconcile_external_effect_operation(
+                            identity, evidence=self._evidence(intent, readback_complete=True),
+                            result="absent", claim_id=persisted_id,
+                        )
+                    with self.assertRaises(store.OperationConflictError):
+                        peer.claim_effect_operation(
+                            identity, current_config=config.MemoryConfig(),
+                            claimant=self._claimant(f"native-B-{scenario}", 4402, "created-B"),
+                        )
+                    self.assertEqual(claimed_a, peer.get_effect_operation(identity))
+                finally:
+                    if peer is not self.state:
+                        peer.close()
+
+                if scenario == "live_peer":
+                    uncertain = self.state.mark_effect_uncertain(
+                        identity, "acknowledgement lost", claim_id=claim_a,
+                    )
+                    self.assertEqual("uncertain", uncertain["status"])
+                    self.assertEqual({}, self.state._live_effect_claims)
+                else:
+                    proof = self._fence(claimed_a)
+                    self.state.close()
+                    self.state = store.MemoryStore(
+                        database, external_claim_fence_verifier=lambda stored, evidence:
+                        stored == claimed_a["claimant_record"] and evidence == proof,
+                    )
+                    self.state.initialize()
+                    uncertain = self.state.isolate_external_effect_claim(identity, claim_a, proof)
+                    self.assertEqual("uncertain", uncertain["status"])
+                self.state.reconcile_external_effect_operation(
+                    identity, evidence=self._evidence(intent, readback_complete=True),
+                    result="absent", claim_id=claim_a,
+                )
+                claimed_b = self.state.claim_effect_operation(
+                    identity, current_config=config.MemoryConfig(),
+                    claimant=self._claimant(f"native-B-{scenario}", 4402, "created-B"),
+                )
+                self.assertEqual(2, claimed_b["claim_generation"])
+                self.assertEqual({identity: claimed_b["active_claim_id"]},
+                                 self.state._live_effect_claims)
+                with self.assertRaises(store.OperationConflictError):
+                    self.state.mark_effect_uncertain(identity, "stale", claim_id=claim_a)
+                self.state.reconcile_external_effect_operation(
+                    identity, evidence=self._evidence(intent), result="acknowledged",
+                    claim_id=claimed_b["active_claim_id"],
+                )
+                self.assertEqual({}, self.state._live_effect_claims)
+
     def test_active_claim_idempotency_proof_preserves_uncertainty_until_retry(self) -> None:
         intent = self._create()
         identity = intent["operation_id"]

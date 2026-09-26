@@ -521,6 +521,7 @@ class MemoryStore:
         self._external_claim_fence_verifier = external_claim_fence_verifier
         self.connection: sqlite3.Connection | None = None
         self._opened_path: Path | None = None
+        self._live_effect_claims: dict[str, str] = {}
 
     def __enter__(self) -> "MemoryStore":
         self.initialize()
@@ -532,6 +533,7 @@ class MemoryStore:
     def initialize(self) -> None:
         if self.connection is not None:
             return
+        self._live_effect_claims.clear()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self.connection = sqlite3.connect(str(self.path), timeout=30.0)
@@ -688,6 +690,7 @@ class MemoryStore:
             )
 
     def close(self) -> None:
+        self._live_effect_claims.clear()
         if self.connection is not None:
             self.connection.close()
             self.connection = None
@@ -1625,6 +1628,11 @@ class MemoryStore:
         if operation["outcome_id"] is None and claim_id != operation["active_claim_id"]:
             raise OperationConflictError("external effect requires its exact active claim ID")
 
+    def _require_live_effect_claim(self, operation: Mapping[str, Any], claim_id: str | None) -> None:
+        self._require_effect_claim(operation, claim_id)
+        if self._live_effect_claims.get(operation["operation_id"]) != claim_id:
+            raise OperationConflictError("external effect requires its issuing claimant handle")
+
     @staticmethod
     def _validate_external_claimant(claimant: Mapping[str, Any]) -> None:
         if (not isinstance(claimant, Mapping) or
@@ -1698,6 +1706,7 @@ class MemoryStore:
                 ("claimant isolated; remote effect unresolved",
                  self._serialize_record(fence_evidence), contracts.utc_now(), operation_id),
             )
+        self._live_effect_claims.pop(operation_id, None)
         return self.get_effect_operation(operation_id)
 
     def reconcile_external_effect_operation(
@@ -1755,6 +1764,8 @@ class MemoryStore:
                  operation["uncertainty"] if status == "uncertain" else None,
                  contracts.utc_now(), operation_id),
             )
+        if status in ("pending", "confirmed"):
+            self._live_effect_claims.pop(operation_id, None)
         return self.get_effect_operation(operation_id)
 
     def bind_effect_source(
@@ -1916,6 +1927,9 @@ class MemoryStore:
                  self._serialize_record(claimant) if claimant is not None else None,
                  claimant_digest, contracts.utc_now(), operation_id),
             )
+        self._live_effect_claims.pop(operation_id, None)
+        if claim_id is not None:
+            self._live_effect_claims[operation_id] = claim_id
         return self.get_effect_operation(operation_id)
 
     def mark_effect_uncertain(
@@ -1931,6 +1945,8 @@ class MemoryStore:
             self._require_effect_claim(operation, claim_id)
             if operation["status"] not in ("in_flight", "uncertain"):
                 raise OperationConflictError("only an in-flight effect can become uncertain")
+            if operation["status"] == "in_flight" and operation["claimant_record"] is not None:
+                self._require_live_effect_claim(operation, claim_id)
             if operation["status"] == "uncertain" and operation["uncertainty"] != reason:
                 raise OperationConflictError("uncertainty reason conflicts")
             connection.execute(
@@ -1938,6 +1954,7 @@ class MemoryStore:
                 "updated_at=? WHERE operation_id=? AND status='in_flight'",
                 (reason, contracts.utc_now(), operation_id),
             )
+        self._live_effect_claims.pop(operation_id, None)
         return self.get_effect_operation(operation_id)
 
     def confirm_effect_operation(
