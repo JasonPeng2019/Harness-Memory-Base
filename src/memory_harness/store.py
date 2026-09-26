@@ -4902,7 +4902,7 @@ class MemoryStore:
                 raise NativeUsageConflictError("receipt has no known started invocation")
             start = json.loads(row["record"])
             for field in ("source", "invocation_id", "objective_id", "decision_id",
-                          "maintenance_operation_id", "stage", "category", "window_id", "binding"):
+                          "maintenance_operation_id", "stage", "category", "window_id"):
                 if receipt[field] != start[field]:
                     raise NativeUsageConflictError(f"native usage receipt conflicts on {field}")
             connection.execute(
@@ -4936,27 +4936,44 @@ class MemoryStore:
             "SELECT record FROM native_usage_receipts WHERE source=? AND invocation_id=? ORDER BY receipt_id",
             (source, invocation_id),
         ).fetchall()
-        measures: dict[str, dict[str, Any]] = {}
-        modes: dict[str, str] = {}
+        measures_by_source: dict[tuple[str, str], dict[str, Any]] = {}
+        modes: dict[tuple[str, str], str] = {}
+        effective_binding = dict(start["binding"])
         complete = False
         for item in rows:
             receipt = json.loads(item["record"])
             contracts.validate_native_usage_receipt(receipt)
+            for name, value in receipt["binding"].items():
+                if value is not None:
+                    if effective_binding[name] is not None and effective_binding[name] != value:
+                        raise NativeUsageConflictError(f"native usage receipt conflicts on binding {name}")
+                    effective_binding[name] = value
             complete = complete or receipt["complete"]
             for name, measure in receipt["measures"].items():
-                inclusion = ("included" if measure["included_in_total"] is True else
-                             "excluded" if measure["included_in_total"] is False else "unknown")
-                key = f"{name}|{measure['unit']}|{inclusion}"
-                previous_mode = modes.setdefault(key, receipt["mode"])
+                source_key = (name, measure["unit"])
+                previous_mode = modes.setdefault(source_key, receipt["mode"])
                 if previous_mode != receipt["mode"]:
                     raise NativeUsageConflictError("mixed cumulative and incremental native measure")
-                previous = measures.get(key)
+                previous = measures_by_source.get(source_key)
                 value = measure["value"]
                 if previous is not None:
+                    old_inclusion = previous["included_in_total"]
+                    new_inclusion = measure["included_in_total"]
+                    if (old_inclusion is not None and new_inclusion is not None
+                            and old_inclusion != new_inclusion):
+                        raise NativeUsageConflictError("native measure total inclusion conflicts")
                     value = (max(previous["value"], value) if receipt["mode"] == "cumulative"
                              else previous["value"] + value)
-                measures[key] = {**measure, "value": value}
+                    if new_inclusion is None:
+                        measure = {**measure, "included_in_total": old_inclusion}
+                measures_by_source[source_key] = {**measure, "value": value}
+        measures: dict[str, dict[str, Any]] = {}
+        for (name, unit), measure in measures_by_source.items():
+            inclusion = ("included" if measure["included_in_total"] is True else
+                         "excluded" if measure["included_in_total"] is False else "unknown")
+            measures[f"{name}|{unit}|{inclusion}"] = measure
         return {**start, "coverage": "complete" if complete and measures else "incomplete",
+                "effective_binding": effective_binding,
                 "measures": measures, "receipt_count": len(rows)}
 
     def list_native_usage(
@@ -4979,11 +4996,13 @@ class MemoryStore:
         self, *, objective_id: str | None = None,
         maintenance_operation_id: str | None = None,
     ) -> dict[str, Any]:
-        """Sum only compatible measures once per call within one owner."""
+        """Sum compatible measures and qualify each by coverage of all started calls."""
         usages = self.list_native_usage(
             objective_id=objective_id, maintenance_operation_id=maintenance_operation_id)
         total: dict[str, dict[str, Any]] = {}
         categories: dict[str, dict[str, Any]] = {}
+        measure_counts: dict[str, int] = {}
+        category_measure_counts: dict[str, dict[str, int]] = {}
         incomplete = []
         for usage in usages:
             category = categories.setdefault(usage["category"], {"invocations": 0, "measures": {}})
@@ -4995,8 +5014,23 @@ class MemoryStore:
                 current["value"] += measure["value"]
                 in_category = category["measures"].setdefault(key, {**measure, "value": 0})
                 in_category["value"] += measure["value"]
+                if usage["coverage"] == "complete":
+                    measure_counts[key] = measure_counts.get(key, 0) + 1
+                    counts = category_measure_counts.setdefault(usage["category"], {})
+                    counts[key] = counts.get(key, 0) + 1
+        for name, category in categories.items():
+            counts = category_measure_counts.get(name, {})
+            category["measure_coverage"] = {
+                key: "complete" if counts.get(key, 0) == category["invocations"] else "incomplete"
+                for key in category["measures"]
+            }
         return {"invocations": len(usages), "by_category": categories,
-                "measures": total, "incomplete_invocations": incomplete,
+                "measures": total,
+                "measure_coverage": {
+                    key: "complete" if measure_counts.get(key, 0) == len(usages) else "incomplete"
+                    for key in total
+                },
+                "incomplete_invocations": incomplete,
                 "coverage": "incomplete" if incomplete else "complete"}
 
 

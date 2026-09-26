@@ -193,6 +193,73 @@ class NativeUsageTests(unittest.TestCase):
         self.assertEqual(3, summary["measures"]["cost|EUR|unknown"]["value"])
         self.assertEqual(0, self.state.aggregate_native_usage(objective_id="objective-a")["invocations"])
 
+    def test_late_native_binding_refines_projection_without_changing_start(self) -> None:
+        start = contracts.make_native_usage_start(
+            source="provider:codex", invocation_id="late-binding",
+            objective_id="objective-a", decision_id=None, maintenance_operation_id=None,
+            stage="execution", category="inner_candidate", window_id="run-a",
+            binding={"requested": "model-a", "resolved": "model-a", "native": None},
+        )
+        self.state.start_native_usage(start)
+        self.state.close()
+        self.state = store.MemoryStore(self.path)
+        self.state.initialize()
+        receipt = self.receipt("late-binding", "final", 7)
+        usage = self.state.record_native_usage_receipt(receipt)
+        self.assertEqual("complete", usage["coverage"])
+        self.assertEqual(start["binding"], usage["binding"])
+        self.assertEqual(start["content_hash"], usage["content_hash"])
+        self.assertEqual("model-a", usage["effective_binding"]["native"])
+        self.assertEqual(7, usage["measures"]["input|tokens|included"]["value"])
+        self.assertEqual(usage, self.state.record_native_usage_receipt(receipt))
+        self.assertEqual(usage, self.state.start_native_usage(start))
+        with self.assertRaises(store.NativeUsageConflictError):
+            self.state.record_native_usage_receipt(self.receipt(
+                "late-binding", "contradiction", 9,
+                binding={"requested": "model-a", "resolved": "model-a", "native": "model-b"}))
+        self.assertEqual(usage, self.state.get_native_usage("provider:codex", "late-binding"))
+
+    def test_aggregate_cost_coverage_exposes_unpriced_complete_call(self) -> None:
+        self.start("token-only")
+        self.state.record_native_usage_receipt(self.receipt("token-only", "final", 8))
+        self.start("priced")
+        self.state.record_native_usage_receipt(self.receipt(
+            "priced", "final", 0,
+            measures={"cost": {"value": 1.25, "unit": "USD", "included_in_total": None}}))
+        aggregate = self.state.aggregate_native_usage(objective_id="objective-a")
+        self.assertEqual("complete", aggregate["coverage"])
+        self.assertEqual(1.25, aggregate["measures"]["cost|USD|unknown"]["value"])
+        self.assertEqual("incomplete", aggregate["measure_coverage"]["cost|USD|unknown"])
+        self.assertEqual("incomplete", aggregate["by_category"]["inner_candidate"]
+                         ["measure_coverage"]["cost|USD|unknown"])
+        self.state.record_native_usage_receipt(self.receipt(
+            "token-only", "late-cost", 0,
+            measures={"cost": {"value": 0.5, "unit": "USD", "included_in_total": None}}))
+        aggregate = self.state.aggregate_native_usage(objective_id="objective-a")
+        self.assertEqual(1.75, aggregate["measures"]["cost|USD|unknown"]["value"])
+        self.assertEqual("complete", aggregate["measure_coverage"]["cost|USD|unknown"])
+
+    def test_cumulative_inclusion_refines_one_measure_and_rejects_contradiction(self) -> None:
+        self.start("inclusion")
+        self.state.record_native_usage_receipt(self.receipt(
+            "inclusion", "partial", 0, complete=False,
+            measures={"output": {"value": 3, "unit": "tokens", "included_in_total": None}}))
+        usage = self.state.record_native_usage_receipt(self.receipt(
+            "inclusion", "final", 0,
+            measures={"output": {"value": 7, "unit": "tokens", "included_in_total": True}}))
+        self.assertEqual({"output|tokens|included"}, set(usage["measures"]))
+        self.assertEqual(7, usage["measures"]["output|tokens|included"]["value"])
+        with self.assertRaises(store.NativeUsageConflictError):
+            self.state.record_native_usage_receipt(self.receipt(
+                "inclusion", "contradiction", 0,
+                measures={"output": {"value": 8, "unit": "tokens", "included_in_total": False}}))
+        self.assertEqual(2, self.state.get_native_usage("provider:codex", "inclusion")["receipt_count"])
+        self.state.record_native_usage_receipt(self.receipt(
+            "inclusion", "other-unit", 0,
+            measures={"output": {"value": 2, "unit": "vectors", "included_in_total": False}}))
+        self.assertEqual({"output|tokens|included", "output|vectors|excluded"},
+                         set(self.state.get_native_usage("provider:codex", "inclusion")["measures"]))
+
 
 if __name__ == "__main__":
     unittest.main()
