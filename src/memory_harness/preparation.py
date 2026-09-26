@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -1402,6 +1403,29 @@ class PreparationService:
         # An admitted recipe receives its full configured maximum.
         return self.limits.stage_seconds_for(strategy)
 
+    def _search_policy_context(
+        self, preparation: Mapping[str, Any] | None, route: str,
+    ) -> dict[str, str] | None:
+        """Attribute a query only to an exact preparation in this MemoryStore."""
+
+        if self.store is None or preparation is None:
+            return None
+        preparation_id = preparation.get("preparation_id")
+        if (not isinstance(preparation_id, str)
+                or re.fullmatch(r"[0-9a-f]{64}", preparation_id) is None):
+            return None
+        try:
+            durable = self.store.get_preparation(preparation_id)
+        except StoreError:
+            return None
+        if durable != preparation or durable["route"] != route:
+            return None
+        return {
+            "schema": "memory-search-policy-context/v1",
+            "preparation_id": durable["preparation_id"],
+            "preparation_digest": durable["content_hash"],
+        }
+
     def _run_search(
         self,
         *,
@@ -1418,6 +1442,7 @@ class PreparationService:
     ) -> dict[str, Any]:
         enabled: list[SearchStore] = []
         attempts: list[dict[str, Any]] = []
+        policy_context = self._search_policy_context(preparation, route)
         for store in stores:
             flag = {
                 "historical_evidence": config.experience_read,
@@ -1482,6 +1507,9 @@ class PreparationService:
                 # Template selection never runs when an accepted or candidate
                 # plan has precedence.
                 flag = False
+            if flag and self.store is not None and store.requires_network and policy_context is None:
+                flag = False
+                disabled_reason = "network store has no safe durable policy context"
             if not flag:
                 attempts.append(
                     {
@@ -1557,6 +1585,7 @@ class PreparationService:
                 route=route,
                 stage_seconds=stage_allowance,
                 rounds=rounds,
+                policy_context=policy_context,
             )
             trace = contracts.make_search_trace(
                 preparation_id=preparation["preparation_id"],
@@ -2222,14 +2251,18 @@ class PreparationService:
         else:
             logical_remaining = 0.0
         real_deadline = time.monotonic() + logical_remaining
+        policy_context = self._search_policy_context(preparation, route)
         if objective is not None:
-            query = safe_query_payload({
+            query_fields = {
                 "representation": {key: objective[key] for key in (
                     "model", "dimensions", "metric", "sanitizer_version"
                 )},
                 "tokens": templates.bounded_token_projection(objective.get("tokens", [])),
                 "route": route,
-            }, self.privacy_policy)
+            }
+            if policy_context is not None:
+                query_fields["policy_context"] = policy_context
+            query = safe_query_payload(query_fields, self.privacy_policy)
         else:
             query = None
 
@@ -2359,6 +2392,8 @@ class PreparationService:
             provenance = candidate.get("provenance") if candidate else None
             store_id = provenance[0].get("store_id") if isinstance(provenance, list) and provenance else None
             store = None if store_id in ambiguous_stores else by_store.get(store_id)
+            if store is not None and store.requires_network and self.store is not None and policy_context is None:
+                return contracts.make_final_source_recheck(item=item, status="unavailable")
             if store is not None and query is not None and time.monotonic() < real_deadline:
                 deadline = min(real_deadline, time.monotonic() + self.limits.store_seconds)
                 try:
