@@ -18,6 +18,7 @@ another.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -188,6 +189,7 @@ class BoundedSearch:
         route: str,
         stage_seconds: float,
         rounds: int,
+        policy_context: Mapping[str, str] | None = None,
     ) -> SearchResult:
         if not isinstance(objective, Mapping):
             raise SearchError("objective representation must be an object")
@@ -195,6 +197,18 @@ class BoundedSearch:
             raise SearchError(f"unknown route: {route!r}")
         if stage_seconds < 0:
             raise SearchError("stage allowance must not be negative")
+        if policy_context is not None:
+            if not isinstance(policy_context, Mapping) or set(policy_context) != {
+                "schema", "preparation_id", "preparation_digest",
+            }:
+                raise SearchError("policy context must have exactly the three opaque fields")
+            if (policy_context["schema"] != "memory-search-policy-context/v1"
+                    or not isinstance(policy_context["preparation_id"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", policy_context["preparation_id"]) is None
+                    or not isinstance(policy_context["preparation_digest"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", policy_context["preparation_digest"]) is None):
+                raise SearchError("policy context identity or digest is invalid")
+            policy_context = dict(policy_context)
         enabled_kinds = {store.kind for store in stores}
         capacity = {
             kind: self.limits.capacity_for(kind) for kind in enabled_kinds
@@ -231,6 +245,7 @@ class BoundedSearch:
                     store,
                     objective=objective,
                     route=route,
+                    policy_context=policy_context,
                     slice_deadline=slice_deadline,
                     attempt_limit=self._attempt_limit(capacity[store.kind]),
                 )
@@ -400,6 +415,7 @@ class BoundedSearch:
         *,
         objective: Mapping[str, Any],
         route: str,
+        policy_context: Mapping[str, str] | None,
         slice_deadline: float,
         attempt_limit: int,
     ) -> dict[str, Any]:
@@ -415,16 +431,14 @@ class BoundedSearch:
         if slice_deadline - time.monotonic() < self.limits.minimum_optional_slice_seconds:
             entry["reason"] = "no remaining time inside the enclosing stage bound"
             return entry
-        query = safe_query_payload(
-            {
-                "representation": {key: objective[key] for key in ("model", "dimensions", "metric", "sanitizer_version")},
-                "tokens": templates.bounded_token_projection(
-                    objective.get("tokens", [])
-                ),
-                "route": route,
-            },
-            self.privacy_policy,
-        )
+        query_fields = {
+            "representation": {key: objective[key] for key in ("model", "dimensions", "metric", "sanitizer_version")},
+            "tokens": templates.bounded_token_projection(objective.get("tokens", [])),
+            "route": route,
+        }
+        if policy_context is not None:
+            query_fields["policy_context"] = dict(policy_context)
+        query = safe_query_payload(query_fields, self.privacy_policy)
         entry["status"] = "attempted"
         started = self.clock()
         # The injected logical clock still owns logical budget semantics, but

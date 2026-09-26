@@ -109,6 +109,22 @@ before optional work; recover the mandatory state or supply a genuinely new
 task/plan identity for a new decision. The first decision and preparation are
 claimed together in one SQLite transaction.
 
+For a SearchStore queried from an exact durable preparation, both the initial
+bounded search and final live source recheck include an additive
+`policy_context` with exactly `schema="memory-search-policy-context/v1"`,
+`preparation_id`, and `preparation_digest` (the preparation's `content_hash`).
+`BoundedSearch.run(..., policy_context=None)` and store-free preparation omit
+this field; existing callbacks may ignore it. Supplied contexts have a closed
+three-field shape, a lowercase 64-hex preparation ID, and a lowercase 64-hex
+digest. A persisted preparation with an unsafe custom ID cannot call a network
+store without safe attribution. The field is an opaque pointer, not permission.
+A governed store must read that exact preparation from the
+same `MemoryStore`, validate the full record and content hash, check its rich
+network resolution and context, and compare the query route before allowing
+task-path work. Missing or mismatched attribution must not be treated as an
+authorized network profile. Query payloads do not carry raw task, objective,
+or plan IDs, configuration, deadlines, full preparations, or credentials.
+
 `context.finalize_context` renders mandatory task/accepted-plan state first,
 packs whole eligible optional items inside the configured allowance, rechecks
 plan-affecting freshness, and binds one integrity over the actual task,

@@ -581,6 +581,168 @@ class BoundedPreparationTests(unittest.TestCase):
         self.assertNotIn("super-secret-value", contracts.canonical_json(captured).decode("utf-8"))
         self.assertEqual("no_optional_memory", outcome.trace["outcome"])
 
+    def test_durable_policy_context_reaches_initial_search_and_live_recheck(self) -> None:
+        raw_objective_id = "raw-objective-id-731"
+        secret = "super-secret-value"
+        accepted = contracts.make_plan(
+            plan_id="raw-plan-id-514", objective_id=raw_objective_id,
+            route="ordinary", state="accepted", accepted_by="ROOT",
+            content={"steps": ["execute"]},
+        )
+        card = contracts.make_task_card(
+            task="Fix the regression failure in the parser test",
+            base_commit="base-1",
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id=raw_objective_id, route="ordinary", plan=accepted,
+                checkpoint="checkpoint-1",
+            ),
+        )
+        policy = privacy.PrivacyPolicy(known_secrets=(secret,))
+        service = preparation.PreparationService(
+            store=self.memory_store, limits=self.limits,
+            privacy_policy=policy, clock=self.clock,
+        )
+        queries: list[dict] = []
+        source = search.SearchStore(
+            store_id="everos", kind="historical_evidence",
+            query=lambda query: queries.append(query) or [self._evidence()],
+        )
+        mandatory = [
+            {"id": "task", "kind": "task", "content": card["task"]},
+            {"id": "accepted-plan", "kind": "accepted-plan", "content": accepted["content"]},
+            {"id": "base", "kind": "base", "content": "base-1"},
+            {"id": "route", "kind": "route", "content": "ordinary"},
+            {"id": "checkpoint", "kind": "checkpoint", "content": "checkpoint-1"},
+            {"id": "security", "kind": "security", "content": contracts.FINAL_CONTEXT_SECURITY},
+        ]
+        outcome = service.prepare(
+            task_card=card, plan=accepted, objective_id=raw_objective_id,
+            route="ordinary", failure_context=f"regression {secret}",
+            stores=[source], finalize=True, mandatory_content=mandatory,
+            lane_id="lane-1", run_id="run-1", worktree_path=str(self.root),
+            base_commit="base-1", checkpoint="checkpoint-1",
+            execution_role="worker", invocation_target="harness:worker",
+            recipient="worker:lane-1",
+        )
+        self.assertTrue(outcome.dispatchable)
+        self.assertEqual(1, len(outcome.context["optional_items"]))
+        self.assertEqual(2, len(queries))
+        self.assertEqual(queries[0], queries[1])
+        durable = self.memory_store.get_preparation(outcome.preparation["preparation_id"])
+        expected_context = {
+            "schema": "memory-search-policy-context/v1",
+            "preparation_id": durable["preparation_id"],
+            "preparation_digest": durable["content_hash"],
+        }
+        for query in queries:
+            self.assertEqual(
+                {"representation", "tokens", "route", "policy_context"}, set(query)
+            )
+            self.assertEqual(expected_context, query["policy_context"])
+            self.assertEqual("ordinary", query["route"])
+            self.assertEqual(
+                {"model", "dimensions", "metric", "sanitizer_version"},
+                set(query["representation"]),
+            )
+            self.assertIsInstance(query["tokens"], list)
+            serialized = contracts.canonical_json(query).decode("utf-8")
+            for forbidden in (
+                card["task"], raw_objective_id, accepted["plan_id"], secret,
+                durable["decision_id"], durable["configuration_digest"],
+                str(durable["deadline_monotonic"]), "deadline_monotonic",
+                "network_resolution", "configuration",
+            ):
+                self.assertNotIn(forbidden, serialized)
+
+    def test_direct_search_without_durable_preparation_keeps_legacy_query(self) -> None:
+        queries: list[dict] = []
+        source = search.SearchStore(
+            store_id="legacy", kind="historical_evidence",
+            query=lambda query: queries.append(query) or [],
+        )
+        search.BoundedSearch(limits=self.limits).run(
+            objective=representation(self.limits, ["regression"]),
+            stores=[source], route="ordinary", stage_seconds=5.0, rounds=1,
+        )
+        self.assertEqual(1, len(queries))
+        self.assertEqual({"representation", "tokens", "route"}, set(queries[0]))
+
+    def test_direct_search_rejects_unclosed_policy_context_before_store_call(self) -> None:
+        queries: list[dict] = []
+        source = search.SearchStore(
+            store_id="legacy", kind="historical_evidence",
+            query=lambda query: queries.append(query) or [],
+        )
+        valid = {
+            "schema": "memory-search-policy-context/v1",
+            "preparation_id": "b" * 64,
+            "preparation_digest": "a" * 64,
+        }
+        for invalid in (
+            {**valid, "objective_id": "raw-objective-id-731"},
+            {**valid, "configuration": {"credential": "super-secret-value"}},
+            {**valid, "preparation_digest": "changed"},
+            {**valid, "schema": "other"},
+            {**valid, "preparation_id": ""},
+            {**valid, "preparation_id": "raw-objective-id-731"},
+            {**valid, "preparation_id": "B" * 64},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(search.SearchError):
+                search.BoundedSearch(limits=self.limits).run(
+                    objective=representation(self.limits, ["regression"]),
+                    stores=[source], route="ordinary", stage_seconds=5.0,
+                    rounds=1, policy_context=invalid,
+                )
+        self.assertEqual([], queries)
+
+    def test_unsafe_durable_preparation_id_suppresses_network_search_and_recheck(self) -> None:
+        first = self._prepare()
+        custom = dict(first.preparation)
+        custom["preparation_id"] = "raw-secret-preparation-id"
+        custom["attempt"] = 2
+        custom["content_hash"] = contracts.content_hash(custom)
+        custom = self.memory_store.record_preparation(custom)
+        local_queries: list[dict] = []
+        network_queries: list[dict] = []
+        local = search.SearchStore(
+            store_id="local", kind="historical_evidence",
+            query=lambda query: local_queries.append(query) or [],
+        )
+        network = search.SearchStore(
+            store_id="remote", kind="historical_evidence", requires_network=True,
+            query=lambda query: network_queries.append(query) or [],
+        )
+        result = self.service._run_search(
+            preparation=custom,
+            objective=self.service._canonical_objective(
+                self.card, "objective-1", "ordinary", None,
+            ),
+            route="ordinary", strategy=custom["strategy"],
+            stores=[network, local], stage_allowance=custom["stage_allowance_seconds"],
+            accepted_precedence=False, config=self.service._captured_config(custom),
+            network_mode=custom["network_mode"],
+        )
+        attempts = {entry["store_id"]: entry for entry in result["trace"]["attempts"]}
+        self.assertEqual("disabled", attempts["remote"]["status"])
+        self.assertIn("policy context", attempts["remote"]["reason"])
+        self.assertEqual([], network_queries)
+        self.assertEqual(1, len(local_queries))
+        self.assertNotIn("policy_context", local_queries[0])
+        self.assertNotIn(custom["preparation_id"], contracts.canonical_json(local_queries).decode())
+        self.assertEqual(custom, self.memory_store.get_preparation(custom["preparation_id"]))
+        recheck = self.service._source_rechecker(
+            selected=[{"candidate_id": "case-1", "provenance": [{"store_id": "remote"}]}],
+            stores=[network], objective=self.service._canonical_objective(
+                self.card, "objective-1", "ordinary", None,
+            ), preparation=custom, route="ordinary",
+        )
+        observation = recheck({
+            "id": "case-1", "source_id": "remote", "revision_id": "r1",
+            "content": {"summary": "prior"},
+        })
+        self.assertEqual("unavailable", observation["status"])
+        self.assertEqual([], network_queries)
+
 
 if __name__ == "__main__":
     unittest.main()
