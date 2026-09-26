@@ -10,7 +10,7 @@ PID, worktree, or amendment/hash record.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import memory_handoff, processes, terminal_evidence
 from .bootstrap import (
@@ -211,6 +211,7 @@ def run_resume(
     lane_id: str,
     resume_task_card: str,
     rationale: str | None = None,
+    search_stores: Sequence[Any] = (),
 ) -> dict[str, Any]:
     """Execute ``resume-lane`` and return the structured result."""
     try:
@@ -339,6 +340,14 @@ def run_resume(
         if current_memory_state == "execution_accepted":
             prior_envelope = memory_handoff.load_envelope(worktree)
             assert prior_envelope is not None
+            if not search_stores:
+                prior_context = memory_handoff.load_final_context(
+                    worktree_path=worktree, envelope=prior_envelope,
+                )
+                if prior_context["optional_content"]:
+                    raise memory_handoff.MemoryHandoffError(
+                        "selected optional content requires live search stores for resume"
+                    )
             prior_operation = memory_handoff.get_dispatch_operation(
                 worktree_path=worktree, envelope=prior_envelope
             )
@@ -470,6 +479,7 @@ def run_resume(
             run_id=run_id,
             worktree_path=worktree,
             base_commit=str(task_card.get("base_commit") or "HEAD"),
+            search_stores=search_stores,
         )
         if memory.pending_plan:
             update_lane(
