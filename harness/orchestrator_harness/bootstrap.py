@@ -867,6 +867,15 @@ def run_bootstrap(
             worktree_path=worktree_path,
             base_commit=base_commit,
         )
+        if memory.envelope is not None:
+            network = memory_handoff.captured_network_resolution(
+                worktree_path=worktree_path, envelope=memory.envelope,
+                task_card=task_card,
+            )
+            if network["effective_mode"] != "normal":
+                from .provider_network_payload import install_soft_controls
+
+                install_soft_controls(provider, worktree_path)
 
         def publish_lane(lane: dict[str, Any]) -> None:
             """Persist one prepared-or-pending lane record and declare it active."""

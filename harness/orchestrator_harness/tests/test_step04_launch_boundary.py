@@ -23,6 +23,7 @@ import unittest
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[3]
 SRC = ROOT / "src"
@@ -135,7 +136,7 @@ class LaunchBoundaryFixture:
 
     EPOCH = "epoch-1"
 
-    def __init__(self) -> None:
+    def __init__(self, *, include_qwen: bool = False) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.harness = self.root / "harness"
@@ -195,6 +196,17 @@ class LaunchBoundaryFixture:
             self.harness / "adapters" / "codex" / "root" / ".codex" / "root.txt",
             "root payload\n",
         )
+        if include_qwen:
+            shutil.copytree(
+                ROOT / "harness" / "adapters" / "qwen-code",
+                self.harness / "adapters" / "qwen-code",
+            )
+            qwen_binding = self.harness / "orchestrator_harness/provider_adapters/qwen-code/launcher_binding.py"
+            qwen_binding.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(
+                ROOT / "harness/orchestrator_harness/provider_adapters/qwen-code/launcher_binding.py",
+                qwen_binding,
+            )
         self.runtime = self.root_workspace / ".harness-runtime"
         for source, relative in setup._plan_active_cache(self.harness):
             target = self.runtime / "super-cache" / relative
@@ -217,7 +229,7 @@ class LaunchBoundaryFixture:
 
     # -- real entry points -------------------------------------------------
 
-    def run_bootstrap(self, *, lane_id: str, card: dict) -> tuple[dict, Path]:
+    def run_bootstrap(self, *, lane_id: str, card: dict, provider: str = "codex") -> tuple[dict, Path]:
         task_card_path = self.root / f"{lane_id}-task-card.json"
         self.write_json(task_card_path, card)
         worktree = self.runtime / "worktrees" / self.EPOCH / lane_id
@@ -241,9 +253,9 @@ class LaunchBoundaryFixture:
         ):
             result = bootstrap.run_bootstrap(
                 lane_id=lane_id,
-                provider="codex",
+                provider=provider,
                 model="test-model",
-                launch_config=dict(self.launch_config),
+                launch_config=dict(self.launch_config) if provider == "codex" else {},
                 exclusive_resources=[],
                 task_card_path=str(task_card_path),
             )
@@ -500,6 +512,103 @@ class Step04BootstrapBoundaryTests(unittest.TestCase):
         finally:
             memory_store.close()
 
+    def test_captured_soft_profile_reaches_the_actual_provider_spawn(self) -> None:
+        card, _ = accepted_card(configuration={"network_profile": "soft_guardrail_network"})
+        result, worktree = self.fixture.run_bootstrap(lane_id="network-soft", card=card)
+        self.assertTrue(result["ok"], result)
+        lane = self.fixture.lane_record("network-soft")
+        envelope = memory_handoff.load_envelope(worktree)
+        memory_store = self.fixture.open_store(worktree)
+        try:
+            captured = memory_store.list_captured_preparations(envelope["decision_id"])
+        finally:
+            memory_store.close()
+        self.assertEqual("soft_guardrail_network", captured[0]["network_resolution"]["requested_mode"])
+        self.assertEqual("soft_guardrail_network", captured[0]["network_mode"])
+
+        invocation = json.loads((worktree / ".agent-workspace/invocation.json").read_text())
+        binding = SimpleNamespace(
+            PROVIDER_ID="codex",
+            build_argv=lambda **_kwargs: ["codex", "exec", "-"],
+        )
+        prompt = worktree / ".agent-workspace/worker-prompt.md"
+        with patch.object(processes, "spawn_provider", side_effect=RuntimeError("stop at spawn")) as spawn:
+            with self.assertRaises(controller.ControllerError):
+                controller._run_provider(
+                    self.fixture.runtime, self.fixture.EPOCH, lane, invocation, binding, prompt,
+                )
+        self.assertIn('web_search="disabled"', spawn.call_args.args[0])
+        self.assertEqual("soft_guardrail_network", lane["_network_payload"]["effective_profile"])
+        status = json.loads(Path(lane["controller_status_path"]).read_text())
+        self.assertEqual(spawn.call_args.args[0], status["network_payload"]["inspected_argv"])
+        self.assertEqual("inspected_not_started", status["network_payload"]["payload_state"])
+        self.assertIsNone(status["network_payload"]["native_forbidden_call_count"])
+        self.assertFalse(status["network_payload"]["independent_egress_proven_for_launch"])
+        child = MagicMock(pid=71)
+        child.take_job_handle.return_value = object()
+        boundary = MagicMock(root_creation_time="created-71", root_pid=71)
+        boundary.process_group_id = None
+        boundary.session_id = None
+        boundary.record.return_value = {}
+        boundary.observe.side_effect = RuntimeError("stop after spawn")
+        with (
+            patch.object(processes, "spawn_provider", return_value=child) as spawned,
+            patch.object(processes.ProcessBoundary, "for_process", return_value=boundary),
+        ):
+            with self.assertRaises(RuntimeError):
+                controller._run_provider(
+                    self.fixture.runtime, self.fixture.EPOCH, lane, invocation, binding, prompt,
+                )
+        status = json.loads(Path(lane["controller_status_path"]).read_text())
+        self.assertEqual("spawned", status["network_payload"]["payload_state"])
+        self.assertEqual(spawned.call_args.args[0], status["network_payload"]["spawned_argv"])
+
+    def test_atlas_request_downgrades_and_discloses_uncovered_egress(self) -> None:
+        card, _ = accepted_card(configuration={"network_profile": "atlas_memory_only"})
+        result, worktree = self.fixture.run_bootstrap(lane_id="network-atlas", card=card)
+        self.assertTrue(result["ok"], result)
+        lane = self.fixture.lane_record("network-atlas")
+        envelope = memory_handoff.load_envelope(worktree)
+        captured = memory_handoff.captured_network_resolution(
+            worktree_path=worktree, envelope=envelope, task_card=card,
+        )
+        self.assertEqual("atlas_memory_only", captured["requested_mode"])
+        self.assertEqual("soft_guardrail_network", captured["effective_mode"])
+        invocation = json.loads((worktree / ".agent-workspace/invocation.json").read_text())
+        binding = SimpleNamespace(PROVIDER_ID="codex", build_argv=lambda **_kwargs: ["codex", "exec", "-"])
+        prompt = worktree / ".agent-workspace/worker-prompt.md"
+        with patch.object(processes, "spawn_provider", side_effect=RuntimeError("stop at spawn")) as spawn:
+            with self.assertRaises(controller.ControllerError):
+                controller._run_provider(self.fixture.runtime, self.fixture.EPOCH, lane, invocation, binding, prompt)
+        self.assertIn('web_search="disabled"', spawn.call_args.args[0])
+        facts = lane["_network_payload"]
+        self.assertEqual("atlas_memory_only", facts["requested_profile"])
+        self.assertEqual("soft_guardrail_network", facts["captured_effective_mode"])
+        self.assertEqual("soft_guardrail_network", facts["effective_profile"])
+        self.assertTrue(facts["shell_egress_possible"])
+        self.assertIn("MCP", " ".join(facts["uncontrolled_surfaces"]))
+
+    def test_missing_captured_resolution_refuses_provider_before_spawn(self) -> None:
+        card, _ = accepted_card(configuration={"network_profile": "soft_guardrail_network"})
+        result, worktree = self.fixture.run_bootstrap(lane_id="network-missing", card=card)
+        self.assertTrue(result["ok"], result)
+        self.fixture.memory_paths(worktree)[0].unlink()
+        lane = self.fixture.lane_record("network-missing")
+        invocation = json.loads((worktree / ".agent-workspace/invocation.json").read_text())
+        binding = SimpleNamespace(PROVIDER_ID="codex", build_argv=lambda **_kwargs: ["codex", "exec", "-"])
+        prompt = worktree / ".agent-workspace/worker-prompt.md"
+        with patch.object(processes, "spawn_provider") as spawn:
+            with self.assertRaises(controller.ControllerError) as raised:
+                controller._run_provider(self.fixture.runtime, self.fixture.EPOCH, lane, invocation, binding, prompt)
+        self.assertTrue(raised.exception.no_provider_started)
+        spawn.assert_not_called()
+
+    def test_invalid_root_profile_does_not_prepare_a_dispatchable_lane(self) -> None:
+        card, _ = accepted_card(configuration={"network_profile": "unsupported"})
+        result, _ = self.fixture.run_bootstrap(lane_id="network-invalid", card=card)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("invalid network_profile", result["summary"])
+
     def test_legacy_card_keeps_the_ordinary_path_without_memory(self) -> None:
         card = legacy_card()
         result, worktree = self.fixture.run_bootstrap(lane_id="legacy-lane", card=card)
@@ -554,6 +663,49 @@ class Step04BootstrapBoundaryTests(unittest.TestCase):
             {launch.LAUNCH_PLAN_PENDING, launch.LAUNCH_INVOCATION_INVALID},
         )
         spawn.assert_not_called()
+
+
+class Step13QwenNetworkBootstrapTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = LaunchBoundaryFixture(include_qwen=True)
+        self.addCleanup(self.fixture.close)
+
+    def test_installed_qwen_settings_and_spawn_vector_are_checked(self) -> None:
+        card, _ = accepted_card(configuration={"network_profile": "soft_guardrail_network"})
+        prepared, worktree = self.fixture.run_bootstrap(
+            lane_id="qwen-network", card=card, provider="qwen-code",
+        )
+        self.assertTrue(prepared["ok"], prepared)
+        settings_path = worktree / ".qwen/settings.json"
+        settings = json.loads(settings_path.read_text())
+        self.assertFalse(settings["tools"]["webSearch"]["enabled"])
+        self.assertTrue({"web_search", "web_fetch"} <= set(settings["permissions"]["deny"]))
+        lane = self.fixture.lane_record("qwen-network")
+        invocation = json.loads((worktree / ".agent-workspace/invocation.json").read_text())
+        prompt = worktree / ".agent-workspace/worker-prompt.md"
+        binding = SimpleNamespace(PROVIDER_ID="qwen-code", build_argv=lambda **_kwargs: ["qwen", "--model", "test-model"])
+        from orchestrator_harness import provider_network_payload
+
+        with (
+            patch.object(provider_network_payload, "_qwen_cli_supports_deny", return_value=True),
+            patch.object(processes, "spawn_provider", side_effect=RuntimeError("stop at spawn")) as spawn,
+        ):
+            with self.assertRaises(controller.ControllerError):
+                controller._run_provider(
+                    self.fixture.runtime, self.fixture.EPOCH, lane, invocation, binding, prompt,
+                )
+        self.assertEqual(["--exclude-tools", "web_search,web_fetch"], spawn.call_args.args[0][-2:])
+        self.assertEqual(spawn.call_args.args[0], lane["_network_payload"]["inspected_argv"])
+
+        settings["tools"]["webSearch"]["enabled"] = True
+        settings_path.write_text(json.dumps(settings))
+        with patch.object(processes, "spawn_provider") as refused:
+            with self.assertRaises(controller.ControllerError) as raised:
+                controller._run_provider(
+                    self.fixture.runtime, self.fixture.EPOCH, lane, invocation, binding, prompt,
+                )
+        self.assertTrue(raised.exception.no_provider_started)
+        refused.assert_not_called()
 
 
 class Step04LaunchBoundaryTests(unittest.TestCase):
@@ -1608,6 +1760,28 @@ class Step04ResumeBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = LaunchBoundaryFixture()
         self.addCleanup(self.fixture.close)
+
+    def test_resume_keeps_the_captured_soft_profile_at_spawn(self) -> None:
+        card, _ = accepted_card(configuration={"network_profile": "soft_guardrail_network"})
+        prepared, worktree = self.fixture.run_bootstrap(lane_id="network-resume", card=card)
+        self.assertTrue(prepared["ok"], prepared)
+        self.fixture.make_resumable("network-resume")
+        resumed = self.fixture.run_resume(lane_id="network-resume", card=card)
+        self.assertTrue(resumed["ok"], resumed)
+        lane = self.fixture.lane_record("network-resume")
+        envelope = memory_handoff.load_envelope(worktree)
+        captured = memory_handoff.captured_network_resolution(
+            worktree_path=worktree, envelope=envelope, task_card=card,
+        )
+        self.assertEqual("soft_guardrail_network", captured["requested_mode"])
+        invocation = json.loads((worktree / ".agent-workspace/invocation.json").read_text())
+        binding = SimpleNamespace(PROVIDER_ID="codex", build_argv=lambda **_kwargs: ["codex", "exec", "resume", "-"])
+        prompt = worktree / ".agent-workspace/worker-prompt.md"
+        with patch.object(processes, "spawn_provider", side_effect=RuntimeError("stop at spawn")) as spawn:
+            with self.assertRaises(controller.ControllerError):
+                controller._run_provider(self.fixture.runtime, self.fixture.EPOCH, lane, invocation, binding, prompt)
+        self.assertIn('web_search="disabled"', spawn.call_args.args[0])
+        self.assertEqual("soft_guardrail_network", lane["_network_payload"]["effective_profile"])
 
     def test_resume_of_candidate_review_is_pending_plan(self) -> None:
         card, _ = candidate_card()

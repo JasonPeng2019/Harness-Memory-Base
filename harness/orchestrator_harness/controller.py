@@ -454,7 +454,6 @@ def _run_provider(
     *,
     attempt_number: int = 1,
     resume: bool | None = None,
-    requested_network_profile: str | None = None,
 ) -> ProviderExecution:
     """Start the provider, stream output, and return its exact process boundary."""
     worktree = Path(lane["worktree_path"])
@@ -480,27 +479,50 @@ def _run_provider(
         session_id=session_id,
         resume=resume,
     )
-    if requested_network_profile is not None:
+    network_facts: dict[str, Any] | None = None
+    if lane.get("memory_plan_state") == "execution_accepted":
         from .provider_network_payload import resolve_launch
 
         try:
-            argv, network_facts = resolve_launch(
-                binding.PROVIDER_ID, worktree, argv, requested_network_profile,
+            card = read_json(worktree / ".agent-workspace" / "task-card.json")
+            envelope = memory_handoff.load_envelope(worktree)
+            if envelope is None:
+                raise memory_handoff.MemoryHandoffError("accepted network envelope is missing")
+            network = memory_handoff.captured_network_resolution(
+                worktree_path=worktree, envelope=envelope, task_card=card,
             )
-        except ValueError as exc:
+            requested_network_profile = network["requested_mode"]
+            if network["effective_mode"] != "normal":
+                argv, network_facts = resolve_launch(
+                    binding.PROVIDER_ID, worktree, argv, requested_network_profile,
+                )
+                network_facts["captured_effective_mode"] = network["effective_mode"]
+                network_facts["captured_requested_mode"] = network["requested_mode"]
+                network_facts["captured_enforcement_sources"] = network["enforcement_sources"]
+                network_facts["captured_disclosed_limits"] = network["disclosed_limits"]
+                network_facts["captured_context"] = network.get("context", {})
+                network_facts["inspected_argv"] = list(argv)
+                network_facts["payload_state"] = "inspected_not_started"
+                network_facts["independent_egress_proven_for_launch"] = False
+                network_facts["native_forbidden_call_count"] = None
+            else:
+                network_facts = None
+        except (OSError, ValueError, memory_handoff.MemoryHandoffError) as exc:
             raise ControllerError(
                 LAUNCH_INVOCATION_INVALID, str(exc), no_provider_started=True,
             ) from exc
-        lane["_network_payload"] = network_facts
-        _append_event(lane, "provider_network_payload", json.dumps(network_facts, sort_keys=True))
-        if network_facts["effective_profile"] == "uncontrolled_network":
-            raise ControllerError(
-                LAUNCH_PROVIDER_START_FAILED,
-                network_facts["reason"],
-                no_provider_started=True,
-            )
+        if network_facts is not None:
+            lane["_network_payload"] = network_facts
+            if lane.get("controller_status_path"):
+                _write_status(lane, {"network_payload": network_facts})
+            _append_event(lane, "provider_network_payload", json.dumps(network_facts, sort_keys=True))
+            if network_facts["effective_profile"] == "uncontrolled_network":
+                raise ControllerError(
+                    LAUNCH_PROVIDER_START_FAILED,
+                    network_facts["reason"],
+                    no_provider_started=True,
+                )
     lane["_attempt_argv"] = list(argv)
-    _append_event(lane, "provider_started", " ".join(argv))
     pre_spawn_offset: int = 0
     with prompt_path.open("r", encoding="utf-8") as prompt_handle, \
          transcript_path.open("a", encoding="utf-8") as transcript_handle, \
@@ -515,13 +537,13 @@ def _run_provider(
                 stdout=transcript_handle,
                 stderr=stderr_handle,
             )
-            lane["_attempt_started"] = True
         except Exception as exc:
             raise ControllerError(
                 LAUNCH_PROVIDER_START_FAILED,
                 f"provider process was not created: {exc}",
                 no_provider_started=True,
             ) from exc
+        lane["_attempt_started"] = True
     boundary: processes.ProcessBoundary | None = None
     try:
         take_job_handle = getattr(child, "take_job_handle", None)
@@ -544,6 +566,13 @@ def _run_provider(
                 LAUNCH_PROVIDER_START_FAILED,
                 "cannot record provider process identity",
             )
+        if network_facts is not None:
+            network_facts["payload_state"] = "spawned"
+            network_facts["spawned_argv"] = list(argv)
+            if lane.get("controller_status_path"):
+                _write_status(lane, {"network_payload": network_facts})
+            _append_event(lane, "provider_network_payload", json.dumps(network_facts, sort_keys=True))
+        _append_event(lane, "provider_started", " ".join(argv))
         if os.name == "nt":
             # The record is durable before the suspended provider is allowed to
             # execute. The provider was already a Job member when native

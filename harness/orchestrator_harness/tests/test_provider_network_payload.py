@@ -46,6 +46,23 @@ class ProviderNetworkPayloadTests(unittest.TestCase):
             session_id="session-1" if resume else None, resume=resume,
         )
 
+    def captured_controller_profile(self, profile: str):
+        """Fixture the already captured record at the private spawn boundary."""
+        from contextlib import ExitStack
+
+        stack = ExitStack()
+        stack.enter_context(patch.object(controller.memory_handoff, "load_envelope", return_value={"decision_id": "decision-1"}))
+        stack.enter_context(patch.object(
+            controller.memory_handoff, "captured_network_resolution",
+            return_value={
+                "requested_mode": profile,
+                "effective_mode": "soft_guardrail_network",
+                "enforcement_sources": ["requested_soft_guardrail_policy"],
+                "disclosed_limits": ["shell egress remains possible"],
+            },
+        ))
+        return stack
+
     def test_soft_native_controls_are_in_spawn_payload_on_first_and_resume(self):
         for provider in CONFIGS:
             with self.subTest(provider=provider):
@@ -147,19 +164,20 @@ class ProviderNetworkPayloadTests(unittest.TestCase):
         workspace.mkdir()
         prompt = workspace / "worker-prompt.md"
         prompt.write_text("work", encoding="utf-8")
+        (workspace / "task-card.json").write_text("{}", encoding="utf-8")
         lane = {
             "worktree_path": str(self.worktree), "run_id": "run-1",
+            "memory_plan_state": "execution_accepted",
             "controller_events_path": str(workspace / "controller.events.jsonl"),
             "last_message_path": str(workspace / "last-message.txt"),
         }
         for provider, expected in (("codex", 'web_search="disabled"'), ("claude-code", "--disallowedTools")):
             with self.subTest(provider=provider):
                 invocation = {"provider": {"model": "test-model", "launch_config": CONFIGS[provider]}}
-                with patch.object(controller.processes, "spawn_provider", side_effect=RuntimeError("stop at spawn")) as spawn:
+                with self.captured_controller_profile("soft_guardrail_network"), patch.object(controller.processes, "spawn_provider", side_effect=RuntimeError("stop at spawn")) as spawn:
                     with self.assertRaises(controller.ControllerError):
                         controller._run_provider(
                             self.worktree, "epoch-1", lane, invocation, binding(provider), prompt,
-                            requested_network_profile="soft_guardrail_network",
                         )
                 self.assertIn(expected, spawn.call_args.args[0])
                 self.assertEqual(lane["_network_payload"]["effective_profile"], "soft_guardrail_network")
@@ -169,8 +187,10 @@ class ProviderNetworkPayloadTests(unittest.TestCase):
         workspace.mkdir()
         prompt = workspace / "worker-prompt.md"
         prompt.write_text("work", encoding="utf-8")
+        (workspace / "task-card.json").write_text("{}", encoding="utf-8")
         lane = {
             "worktree_path": str(self.worktree), "run_id": "run-1",
+            "memory_plan_state": "execution_accepted",
             "controller_events_path": str(workspace / "controller.events.jsonl"),
             "last_message_path": str(workspace / "last-message.txt"),
         }
@@ -183,11 +203,10 @@ class ProviderNetworkPayloadTests(unittest.TestCase):
                     settings = json.loads(path.read_text())
                     settings["tools"]["webSearch"]["enabled"] = True
                     path.write_text(json.dumps(settings))
-                with patch.object(controller.processes, "spawn_provider") as spawn:
+                with self.captured_controller_profile("soft_guardrail_network"), patch.object(controller.processes, "spawn_provider") as spawn:
                     with self.assertRaises(controller.ControllerError):
                         controller._run_provider(
                             self.worktree, "epoch-1", lane, invocation, binding("qwen-code"), prompt,
-                            requested_network_profile="soft_guardrail_network",
                         )
                 spawn.assert_not_called()
                 self.assertEqual(lane["_network_payload"]["effective_profile"], "uncontrolled_network")
@@ -197,6 +216,7 @@ class ProviderNetworkPayloadTests(unittest.TestCase):
         workspace.mkdir()
         prompt = workspace / "worker-prompt.md"
         prompt.write_text("work", encoding="utf-8")
+        (workspace / "task-card.json").write_text("{}", encoding="utf-8")
         path = self.worktree / ".qwen/settings.json"
         for installation in ("plain", "managed"):
             with self.subTest(installation=installation):
@@ -207,15 +227,15 @@ class ProviderNetworkPayloadTests(unittest.TestCase):
                 provider_network_payload.install_soft_controls("qwen-code", self.worktree)
                 lane = {
                     "worktree_path": str(self.worktree), "run_id": "run-1",
+                    "memory_plan_state": "execution_accepted",
                     "controller_events_path": str(workspace / "controller.events.jsonl"),
                     "last_message_path": str(workspace / "last-message.txt"),
                 }
                 invocation = {"provider": {"model": "test-model", "launch_config": {}}}
-                with patch.object(controller.processes, "spawn_provider", side_effect=RuntimeError("stop at spawn")) as spawn:
+                with self.captured_controller_profile("soft_guardrail_network"), patch.object(controller.processes, "spawn_provider", side_effect=RuntimeError("stop at spawn")) as spawn:
                     with self.assertRaises(controller.ControllerError):
                         controller._run_provider(
                             self.worktree, "epoch-1", lane, invocation, binding("qwen-code"), prompt,
-                            requested_network_profile="soft_guardrail_network",
                         )
                 self.assertEqual(spawn.call_args.kwargs["cwd"], str(self.worktree))
                 self.assertEqual(spawn.call_args.args[0][-2:], ["--exclude-tools", "web_search,web_fetch"])
@@ -348,23 +368,27 @@ class ProviderNetworkPayloadTests(unittest.TestCase):
         workspace.mkdir()
         prompt = workspace / "worker-prompt.md"
         prompt.write_text("work")
+        (workspace / "task-card.json").write_text("{}")
         invocation = {"provider": {"model": "test-model", "launch_config": CONFIGS["codex"]}}
-        for profile in ("invalid", False, 7, 1.5, [], {}):
-            with self.subTest(controller_profile=profile):
-                lane = {
-                    "worktree_path": str(self.worktree), "run_id": "run-1",
-                    "controller_events_path": str(workspace / "controller.events.jsonl"),
-                    "last_message_path": str(workspace / "last-message.txt"),
-                }
-                with patch.object(controller.processes, "spawn_provider") as spawn:
-                    with self.assertRaises(controller.ControllerError) as raised:
-                        controller._run_provider(
-                            self.worktree, "epoch-1", lane, invocation, binding("codex"), prompt,
-                            requested_network_profile=profile,
-                        )
-                self.assertEqual(raised.exception.code, controller.LAUNCH_INVOCATION_INVALID)
-                self.assertTrue(raised.exception.no_provider_started)
-                spawn.assert_not_called()
+        lane = {
+            "worktree_path": str(self.worktree), "run_id": "run-1",
+            "memory_plan_state": "execution_accepted",
+            "controller_events_path": str(workspace / "controller.events.jsonl"),
+            "last_message_path": str(workspace / "last-message.txt"),
+        }
+        with (
+            patch.object(controller.memory_handoff, "load_envelope", return_value={"decision_id": "decision-1"}),
+            patch.object(controller.memory_handoff, "captured_network_resolution",
+                         side_effect=controller.memory_handoff.MemoryHandoffError("captured profile invalid")),
+            patch.object(controller.processes, "spawn_provider") as spawn,
+        ):
+            with self.assertRaises(controller.ControllerError) as raised:
+                controller._run_provider(
+                    self.worktree, "epoch-1", lane, invocation, binding("codex"), prompt,
+                )
+        self.assertEqual(raised.exception.code, controller.LAUNCH_INVOCATION_INVALID)
+        self.assertTrue(raised.exception.no_provider_started)
+        spawn.assert_not_called()
 
 
 if __name__ == "__main__":
