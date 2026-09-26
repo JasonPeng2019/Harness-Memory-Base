@@ -13,7 +13,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
-from everos_fixture import CONTENT, MARKER, EverOSFixture
+from tests.local.mvp.everos_fixture import CONTENT, MARKER, EverOSFixture
 
 from memory_harness import (
     contracts,
@@ -116,21 +116,20 @@ class EverOSStoredSkillSearchTests(_LineageFixture):
     def test_real_public_skill_search_requires_exact_current_durable_join(self) -> None:
         try:
             from everos.config import load_settings
-            from everos.core.persistence import MemoryRoot
             from everos.infra.persistence import index
-            from everos.infra.persistence.markdown import AgentSkillFrontmatter, AgentSkillWriter
-            from everos.memory.cascade.handlers.agent_skill import AgentSkillHandler
-            from everos.memory.cascade.handlers.base import HandlerDeps
-            from everos.component.tokenizer import build_tokenizer
         except ModuleNotFoundError as exc:
             self.skipTest(f"vendored EverOS runtime unavailable: {exc.name}")
 
         candidate, _, procedure = self.fixture.stage_lineage(approve=False)
-        self.fixture.memory_root.mkdir(parents=True, exist_ok=True)
-        (self.fixture.memory_root / "ome.toml").write_text("# isolated MVP test\n", encoding="utf-8")
         with patch.dict(os.environ, {"EVEROS_ROOT": str(self.fixture.memory_root)}):
             load_settings.cache_clear()
             try:
+                skill_path = asyncio.run(self.fixture.seed_stored_skill(
+                    candidate, include_foreign_scope_hits=True
+                ))
+                self.assertEqual("SKILL.md", skill_path.name)
+                self.assertTrue(skill_path.is_file())
+                asyncio.run(index.startup())
                 surface = experience.load_vendored_everos_public_surface(
                     memory_root=self.fixture.memory_root
                 )
@@ -139,44 +138,6 @@ class EverOSStoredSkillSearchTests(_LineageFixture):
                     privacy_policy=self.policy,
                 )
 
-                async def seed_stored_skills() -> None:
-                    await index.startup()
-                    root = MemoryRoot.resolve()
-                    writer = AgentSkillWriter(root)
-                    handler = AgentSkillHandler(
-                        HandlerDeps(memory_root=root, tokenizer=build_tokenizer())
-                    )
-
-                    async def add(owner: str, name: str, app: str, project: str) -> None:
-                        frontmatter = AgentSkillFrontmatter(
-                            id=f"skill_{name}", agent_id=owner, name=name,
-                            description="Inspect parser lock evidence before recovery.",
-                            confidence=0.8, maturity_score=0.6,
-                            source_case_ids=["mvp-case"],
-                        )
-                        path = await writer.write_main(
-                            owner, name, frontmatter=frontmatter, body=CONTENT,
-                            app_id=app, project_id=project,
-                        )
-                        outcome = await handler.handle_added_or_modified(
-                            path.relative_to(root.root).as_posix()
-                        )
-                        self.assertEqual(1, outcome.upserted)
-
-                    await add(
-                        adapter.everos_owner_id, "parser_lock_mvp",
-                        adapter.everos_application_id, adapter.everos_project_id,
-                    )
-                    await add(
-                        adapter.everos_owner_id + "-foreign", "foreign_owner_mvp",
-                        adapter.everos_application_id, adapter.everos_project_id,
-                    )
-                    await add(
-                        adapter.everos_owner_id, "foreign_project_mvp",
-                        adapter.everos_application_id, adapter.everos_project_id + "-foreign",
-                    )
-
-                asyncio.run(seed_stored_skills())
                 hits = asyncio.run(adapter.search_skill_candidates(
                     query="parser lock evidence recovery", top_k=20
                 ))
