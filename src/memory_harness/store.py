@@ -78,6 +78,14 @@ _SCHEMA = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS dispatch_bindings (
+        operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id),
+        lane_id TEXT NOT NULL,
+        envelope_record TEXT NOT NULL,
+        native_receipt_required INTEGER NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS outcomes (
         outcome_id TEXT PRIMARY KEY,
         decision_id TEXT NOT NULL UNIQUE REFERENCES decisions(decision_id),
@@ -762,73 +770,178 @@ class MemoryStore:
             raise StoreError(f"cannot check decision identifier: {exc}") from exc
 
     def record_operation(self, operation: Mapping[str, Any]) -> dict[str, Any]:
+        """Advance an existing intent; observation can never create one."""
         contracts.validate_operation(operation)
         connection = self._require_connection()
         operation_id = str(operation["operation_id"])
         existing_row = connection.execute(
             "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
         ).fetchone()
-        if existing_row is not None:
-            existing = self._operation_from_row(existing_row)
-            for field in ("decision_id", "kind", "envelope_digest", "run_id"):
-                if existing[field] != operation[field]:
-                    raise OperationConflictError(
-                        f"operation identity conflict for {operation_id}: {field} differs"
-                    )
-            if (
-                existing["status"] == operation["status"]
-                and existing["observed_invocation"] == operation.get("observed_invocation")
-            ):
-                return existing
-            allowed = {
-                ("pending", "ambiguous"),
-                ("pending", "delivered"),
-                ("ambiguous", "delivered"),
-            }
-            if (existing["status"], operation["status"]) not in allowed:
+        if existing_row is None:
+            raise OperationConflictError("dispatch observation requires a matching prior intent")
+        existing = self._operation_from_row(existing_row)
+        binding = connection.execute(
+            "SELECT * FROM dispatch_bindings WHERE operation_id=?", (operation_id,)
+        ).fetchone()
+        if binding is not None:
+            bound_envelope = json.loads(binding["envelope_record"])
+            if operation.get("envelope_record") != bound_envelope:
+                raise OperationConflictError("dispatch transition envelope differs from its exact intent")
+            self._validate_final_dispatch_binding(bound_envelope, current=False)
+        elif operation.get("envelope_record") is not None:
+            raise OperationConflictError("finalized dispatch has no exact intent binding")
+        if operation["status"] == "delivered" and binding is not None and binding["native_receipt_required"]:
+            self._validate_native_receipt(operation.get("observed_invocation"))
+        for field in ("decision_id", "kind", "envelope_digest", "run_id"):
+            if existing[field] != operation[field]:
                 raise OperationConflictError(
-                    f"operation {operation_id} cannot transition from "
-                    f"{existing['status']!r} to {operation['status']!r}"
+                    f"operation identity conflict for {operation_id}: {field} differs"
                 )
+        if (
+            existing["status"] == operation["status"]
+            and existing["observed_invocation"] == operation.get("observed_invocation")
+        ):
+            return self.get_operation(operation_id)
+        allowed = {
+            ("pending", "ambiguous"),
+            ("pending", "delivered"),
+            ("ambiguous", "delivered"),
+            ("pending", "failed_pre_spawn"),
+            ("pending", "abandoned"),
+        }
+        if (existing["status"], operation["status"]) not in allowed:
+            raise OperationConflictError(
+                f"operation {operation_id} cannot transition from "
+                f"{existing['status']!r} to {operation['status']!r}"
+            )
         observed = operation.get("observed_invocation")
         observed_json = json.dumps(observed, sort_keys=True) if observed is not None else None
-        values = (
-            operation["operation_id"],
-            operation["decision_id"],
-            operation["envelope_digest"],
-            operation["run_id"],
-            operation["kind"],
-            operation["status"],
-            observed_json,
-            operation["created_at"],
-            operation["created_at"],
-        )
         with connection:
-            connection.execute(
-                """
-                INSERT INTO operations (
-                    operation_id, decision_id, envelope_digest, run_id,
-                    kind, status, observed_invocation,
-                    created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(operation_id) DO UPDATE SET
-                    status=excluded.status,
-                    observed_invocation=excluded.observed_invocation,
-                    updated_at=excluded.updated_at
-                """,
-                values,
+            cursor = connection.execute(
+                "UPDATE operations SET status=?, observed_invocation=?, updated_at=? "
+                "WHERE operation_id=? AND status=?",
+                (operation["status"], observed_json, operation["created_at"],
+                 operation_id, existing["status"]),
             )
+            if cursor.rowcount != 1:
+                raise OperationConflictError("dispatch operation changed during transition")
         return self.get_operation(str(operation["operation_id"]))
+
+    @staticmethod
+    def _validate_native_receipt(receipt: Any) -> None:
+        if not isinstance(receipt, Mapping):
+            raise ValueError("native receipt must be an object")
+        pid = receipt.get("pid")
+        creation = receipt.get("creation_time")
+        if (not isinstance(pid, int) or isinstance(pid, bool) or pid < 1
+                or not isinstance(creation, str) or not creation
+                or receipt.get("invocation_id") != f"controller:{pid}:{creation}"):
+            raise ValueError("native receipt must identify the exact controller process")
+
+    def _validate_final_dispatch_binding(self, envelope: Mapping[str, Any], *, current: bool = True) -> None:
+        """Check the durable accepted decision and latest exact finalized packet."""
+        contracts.validate_record(envelope, contracts.FINAL_ENVELOPE_SCHEMA)
+        context = envelope.get("final_context")
+        contracts.validate_finalized_context(context)
+        if envelope.get("plan_state") != "accepted" or context.get("accepted_by") != "ROOT":
+            raise ValueError("dispatch requires a ROOT-accepted plan")
+        decision = self.get_decision(str(envelope["decision_id"]))
+        for field in ("task_card_digest", "objective_id", "route", "plan_id", "plan_digest",
+                      "strategy", "configuration_digest"):
+            if envelope.get(field) != decision.get(field):
+                raise ValueError(f"dispatch {field} does not match its durable decision")
+        if (decision["plan_state"] != "accepted" or decision["state"] == "abandoned"
+                or envelope.get("configuration") != decision["configuration"]):
+            raise ValueError("dispatch decision is not accepted and active")
+        if current:
+            latest = self.get_final_context_for_decision(str(envelope["decision_id"]))
+            if latest is None or latest != context:
+                raise ValueError("dispatch final context is missing or stale")
+        row = self._require_connection().execute(
+            "SELECT envelope_digest FROM final_contexts WHERE context_id=?",
+            (context["context_id"],),
+        ).fetchone()
+        if row is None or row["envelope_digest"] != envelope["content_hash"]:
+            raise ValueError("dispatch envelope does not match its durable final context")
+        if (envelope.get("final_context_id") != context["context_id"]
+                or envelope.get("final_context_integrity") != context["integrity"]
+                or envelope.get("final_context") != context):
+            raise ValueError("dispatch context identity mismatch")
+        for field in ("lane_id", "run_id", "decision_id", "task", "task_card_digest",
+                      "objective_id", "route", "plan_id", "plan_digest", "plan_revision",
+                      "accepted_by", "base_commit", "worktree_path", "strategy",
+                      "configuration", "configuration_digest", "mandatory_content",
+                      "optional_content", "mandatory_digest", "optional_digest", "checkpoint",
+                      "execution_role", "invocation_target", "recipient", "delivery_trace"):
+            if envelope.get(field) != context.get(field):
+                raise ValueError(f"dispatch {field} does not match final context")
+        if (envelope.get("delivery", {}).get("omitted") != context.get("omitted")
+                or context.get("execution_role") != "worker"):
+            raise ValueError("dispatch delivery or role does not match final context")
+
+    def create_dispatch_intent(
+        self, envelope: Mapping[str, Any], *, native_receipt_required: bool = True
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically claim an exact final envelope before native spawn."""
+        operation = contracts.make_operation(kind="dispatch", envelope=envelope)
+        connection = self._require_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._validate_final_dispatch_binding(envelope)
+            conflicts = connection.execute(
+                "SELECT operations.*, dispatch_bindings.lane_id FROM operations "
+                "LEFT JOIN dispatch_bindings USING(operation_id) "
+                "WHERE decision_id=? OR dispatch_bindings.lane_id=?",
+                (envelope["decision_id"], envelope["lane_id"]),
+            ).fetchall()
+            for row in conflicts:
+                if row["kind"] != "dispatch":
+                    continue
+                if row["operation_id"] == operation["operation_id"]:
+                    continue
+                if (row["status"] in ("pending", "ambiguous") or
+                        (row["decision_id"] == envelope["decision_id"] and
+                         row["status"] != "failed_pre_spawn")):
+                    raise OperationConflictError("conflicting dispatch owns the decision or lane")
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO operations
+                (operation_id, decision_id, envelope_digest, run_id, kind, status,
+                 observed_invocation, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'dispatch', 'pending', NULL, ?, ?)""",
+                (operation["operation_id"], operation["decision_id"], operation["envelope_digest"],
+                 operation["run_id"], operation["created_at"], operation["created_at"]),
+            )
+            if cursor.rowcount == 1:
+                connection.execute(
+                    "INSERT INTO dispatch_bindings "
+                    "(operation_id, lane_id, envelope_record, native_receipt_required) "
+                    "VALUES (?, ?, ?, ?)",
+                    (operation["operation_id"], envelope["lane_id"],
+                     self._serialize_record(envelope), int(native_receipt_required)),
+                )
+        existing = self.get_operation(operation["operation_id"])
+        if existing.get("envelope_record") != dict(envelope):
+            raise OperationConflictError("dispatch intent identity conflict")
+        return existing, cursor.rowcount == 1
 
     def create_operation(self, operation: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
         """Create an intent exactly once and report whether this call created it."""
 
         contracts.validate_operation(operation)
+        if operation["status"] != "pending" or operation.get("observed_invocation") is not None:
+            raise OperationConflictError("only a pending intent may be created")
+        if operation.get("envelope_record") is not None:
+            raise OperationConflictError("finalized dispatch requires exact final intent creation")
         connection = self._require_connection()
         observed = operation.get("observed_invocation")
         observed_json = json.dumps(observed, sort_keys=True) if observed is not None else None
         with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM final_contexts WHERE decision_id=? LIMIT 1",
+                (operation["decision_id"],),
+            ).fetchone() is not None:
+                raise OperationConflictError("finalized decision requires exact final dispatch intent")
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO operations (
@@ -852,7 +965,17 @@ class MemoryStore:
         ).fetchone()
         if row is None:
             raise StoreError(f"operation not found: {operation_id}")
-        return self._operation_from_row(row)
+        result = self._operation_from_row(row)
+        binding = connection.execute(
+            "SELECT * FROM dispatch_bindings WHERE operation_id=?", (operation_id,)
+        ).fetchone()
+        if binding is not None:
+            result.update({
+                "lane_id": binding["lane_id"],
+                "envelope_record": json.loads(binding["envelope_record"]),
+                "native_receipt_required": binding["native_receipt_required"],
+            })
+        return result
 
     @staticmethod
     def _operation_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -876,6 +999,25 @@ class MemoryStore:
         contracts.validate_outcome(outcome)
         connection = self._require_connection()
         decision_id = str(outcome["decision_id"])
+        if self.get_final_context_for_decision(decision_id) is not None:
+            rows = connection.execute(
+                "SELECT dispatch_bindings.envelope_record FROM operations "
+                "JOIN dispatch_bindings USING(operation_id) "
+                "WHERE operations.decision_id=? AND operations.run_id=? "
+                "AND operations.kind='dispatch' AND operations.status='delivered'",
+                (decision_id, outcome["linked_run_id"]),
+            ).fetchall()
+            exact = False
+            for row in rows:
+                envelope = json.loads(row["envelope_record"])
+                self._validate_final_dispatch_binding(envelope, current=False)
+                if all(envelope.get(field) == outcome.get(field) for field in (
+                    "decision_id", "task_card_digest", "objective_id", "plan_id", "plan_digest"
+                )):
+                    exact = True
+                    break
+            if not exact:
+                raise OperationConflictError("finalized outcome requires its exact observed dispatch")
         existing_row = connection.execute(
             "SELECT * FROM outcomes WHERE decision_id = ?", (decision_id,)
         ).fetchone()

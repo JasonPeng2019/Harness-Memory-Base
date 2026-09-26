@@ -56,7 +56,7 @@ APC_RESULT_SCHEMA = "apc-result/v1"
 PLAN_STATES = frozenset({"candidate", "accepted", "proposed", "fresh"})
 ROUTES = frozenset({"ordinary", "problem_focused", "deeper"})
 OUTCOME_STATUSES = frozenset({"PASS", "FAIL", "BLOCKED", "UNKNOWN"})
-OPERATION_STATUSES = frozenset({"pending", "ambiguous", "delivered"})
+OPERATION_STATUSES = frozenset({"pending", "ambiguous", "delivered", "failed_pre_spawn", "abandoned"})
 REVIEW_STATES = frozenset({"reviewed", "accepted"})
 REVIEWED_TRAJECTORY_STATUSES = frozenset({"reviewed_success", "reviewed_failure"})
 GENERATED_SKILL_STATES = frozenset({"proposed"})
@@ -968,6 +968,8 @@ def make_operation(
         "observed_invocation": dict(observed_invocation) if observed_invocation is not None else None,
         "created_at": utc_now(),
     }
+    if envelope.get("schema") == FINAL_ENVELOPE_SCHEMA:
+        record["envelope_record"] = dict(envelope)
     record["content_hash"] = content_hash(record)
     validate_operation(record)
     return record
@@ -979,10 +981,14 @@ def validate_operation(record: Mapping[str, Any]) -> None:
         _require_nonempty_str(record.get(field), field)
     if record["status"] not in OPERATION_STATUSES:
         raise ContractError(f"unknown operation status: {record['status']!r}")
+    if record["status"] in {"failed_pre_spawn", "abandoned"} and record["kind"] != "dispatch":
+        raise ContractError("pre-spawn terminal status belongs only to dispatch")
     if record["status"] == "delivered" and record.get("observed_invocation") is None:
         raise ContractError("delivered operation requires an observed invocation")
     if record.get("observed_invocation") is not None and not isinstance(record["observed_invocation"], Mapping):
         raise ContractError("observed_invocation must be an object or null")
+    if "envelope_record" in record and not isinstance(record["envelope_record"], Mapping):
+        raise ContractError("operation envelope binding must be an object")
 
 
 def make_outcome(
