@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import contracts
+from .config import MemoryConfig, effect_submission_enabled
 
 
 class StoreError(RuntimeError):
@@ -108,6 +109,31 @@ _SCHEMA = [
         acceptance_status TEXT NOT NULL,
         exceptional_acceptance INTEGER NOT NULL,
         supersedes_outcome_id TEXT REFERENCES outcomes(outcome_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS effect_operations (
+        operation_id TEXT PRIMARY KEY,
+        outcome_id TEXT NOT NULL REFERENCES outcomes(outcome_id),
+        decision_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        source_id TEXT,
+        source_digest TEXT,
+        source_record TEXT,
+        payload_digest TEXT,
+        payload_record TEXT,
+        adapter_operation_id TEXT,
+        adapter_payload_digest TEXT,
+        configuration TEXT NOT NULL,
+        configuration_digest TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        acknowledgement TEXT,
+        uncertainty TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(outcome_id, kind, scope_key)
     )
     """,
     """
@@ -511,6 +537,9 @@ class MemoryStore:
                 )
                 self._ensure_column("review_receipts", "task_text", "TEXT")
                 self._ensure_column("review_receipts", "route", "TEXT")
+                self._ensure_column("effect_operations", "adapter_operation_id", "TEXT")
+                self._ensure_column("effect_operations", "adapter_payload_digest", "TEXT")
+                self._migrate_local_effect_intents()
         except sqlite3.Error as exc:
             if self.connection is not None:
                 self.connection.close()
@@ -526,6 +555,35 @@ class MemoryStore:
         }
         if column not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    def _migrate_local_effect_intents(self) -> None:
+        """Recover pre-STEP-09 native outcomes and already retained local evidence."""
+        connection = self._require_connection()
+        rows = connection.execute(
+            "SELECT outcomes.* FROM outcomes JOIN native_outcomes USING(outcome_id)"
+        ).fetchall()
+        for row in rows:
+            outcome = dict(row)
+            self._create_local_effect_intents(outcome, self.get_decision(outcome["decision_id"]))
+            receipt = connection.execute(
+                "SELECT review_receipt_id FROM review_receipts WHERE outcome_id=?",
+                (outcome["outcome_id"],),
+            ).fetchone()
+            if receipt is not None:
+                record = self.get_review_receipt(receipt["review_receipt_id"])
+                self._bridge_local_source_in_transaction(
+                    outcome["outcome_id"], "review_receipt", record["review_receipt_id"], record,
+                )
+            trajectory = connection.execute(
+                "SELECT trajectory_id FROM reviewed_trajectories WHERE outcome_id=?",
+                (outcome["outcome_id"],),
+            ).fetchone()
+            if trajectory is not None:
+                record = self.get_reviewed_trajectory(trajectory["trajectory_id"])
+                for kind in ("recent_evidence", "experience_ingestion", "generated_skill_creation"):
+                    self._bridge_local_source_in_transaction(
+                        outcome["outcome_id"], kind, record["trajectory_id"], record,
+                    )
 
     def _migrate_dispatch_authorizations(self, authorization_table_existed: bool) -> None:
         connection = self._require_connection()
@@ -1344,6 +1402,7 @@ class MemoryStore:
                 (outcome["outcome_id"], self._serialize_record(evidence),
                  acceptance["approval"], int(exceptional), supersedes_outcome_id),
             )
+            self._create_local_effect_intents(outcome, self.get_decision(decision_id))
         return self.get_outcome(decision_id)
 
     def get_outcome(self, decision_id: str) -> dict[str, Any]:
@@ -1365,6 +1424,226 @@ class MemoryStore:
                 "supersedes_outcome_id": native["supersedes_outcome_id"],
             })
         return outcome
+
+    def _create_local_effect_intents(
+        self, outcome: Mapping[str, Any], decision: Mapping[str, Any]
+    ) -> None:
+        """Called inside the same write transaction as native quality fixation."""
+        connection = self._require_connection()
+        captured = decision["configuration"]
+        for kind in contracts.LOCAL_EFFECT_KINDS:
+            if not effect_submission_enabled(captured, kind):
+                continue
+            operation_id = contracts.effect_operation_id(outcome["outcome_id"], kind)
+            connection.execute(
+                "INSERT OR IGNORE INTO effect_operations (operation_id, outcome_id, decision_id, "
+                "kind, scope_key, status, configuration, configuration_digest, version, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, 'outcome', 'waiting_source', ?, ?, 0, ?, ?)",
+                (operation_id, outcome["outcome_id"], decision["decision_id"], kind,
+                 self._serialize_record(captured), decision["configuration_digest"],
+                 outcome["observed_at"], outcome["observed_at"]),
+            )
+
+    @staticmethod
+    def _effect_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        record = dict(row)
+        for field in ("source_record", "payload_record", "configuration", "acknowledgement"):
+            if record[field] is not None:
+                record[field] = json.loads(record[field])
+        record["schema"] = contracts.EFFECT_OPERATION_SCHEMA
+        return record
+
+    def get_effect_operation(self, operation_id: str) -> dict[str, Any]:
+        row = self._require_connection().execute(
+            "SELECT * FROM effect_operations WHERE operation_id=?", (operation_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"effect operation not found: {operation_id}")
+        return self._effect_from_row(row)
+
+    def list_effect_operations(
+        self, outcome_id: str | None = None, *, actionable_only: bool = False
+    ) -> list[dict[str, Any]]:
+        """Return history or only work needing source, submission, or reconciliation."""
+        clauses, parameters = [], []
+        if outcome_id is not None:
+            clauses.append("outcome_id=?")
+            parameters.append(outcome_id)
+        if actionable_only:
+            clauses.append("status!='confirmed'")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self._require_connection().execute(
+            "SELECT * FROM effect_operations" + where + " ORDER BY outcome_id, kind, scope_key",
+            parameters,
+        ).fetchall()
+        return [self._effect_from_row(row) for row in rows]
+
+    def bind_effect_source(
+        self, operation_id: str, source_id: str, source_record: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Bind an exact durable local source; a different source cannot replace it."""
+        if not isinstance(source_id, str) or not source_id or not isinstance(source_record, Mapping):
+            raise contracts.ContractError("effect source requires an ID and record")
+        connection = self._require_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._bind_effect_source_in_transaction(operation_id, source_id, source_record)
+        return self.get_effect_operation(operation_id)
+
+    def _bind_effect_source_in_transaction(
+        self, operation_id: str, source_id: str, source_record: Mapping[str, Any]
+    ) -> None:
+        operation = self.get_effect_operation(operation_id)
+        self._validate_effect_source(operation, source_id, source_record)
+        digest = contracts.sha256_hex(source_record)
+        if operation["source_digest"] is not None:
+            if (operation["source_id"], operation["source_digest"]) != (source_id, digest):
+                raise OperationConflictError("effect operation has a different source")
+            return
+        status = "waiting_payload" if operation["kind"] in (
+            "experience_ingestion", "generated_skill_creation"
+        ) else "confirmed"
+        acknowledgement = ({"local_source_id": source_id, "source_digest": digest}
+                           if status == "confirmed" else None)
+        self._require_connection().execute(
+            "UPDATE effect_operations SET source_id=?, source_digest=?, source_record=?, "
+            "status=?, acknowledgement=?, version=version+1, updated_at=? WHERE operation_id=?",
+            (source_id, digest, self._serialize_record(source_record), status,
+             self._serialize_record(acknowledgement) if acknowledgement else None,
+            contracts.utc_now(), operation_id),
+        )
+
+    def _bridge_local_source_in_transaction(
+        self, outcome_id: str, kind: str, source_id: str, source_record: Mapping[str, Any]
+    ) -> None:
+        connection = self._require_connection()
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='effect_operations'"
+        ).fetchone() is None:
+            return  # Accepted pre-migration stores retain their review methods.
+        operation_id = contracts.effect_operation_id(outcome_id, kind)
+        if connection.execute(
+            "SELECT 1 FROM effect_operations WHERE operation_id=?", (operation_id,)
+        ).fetchone() is not None:
+            self._bind_effect_source_in_transaction(operation_id, source_id, source_record)
+
+    def _validate_effect_source(
+        self, operation: Mapping[str, Any], source_id: str, source_record: Mapping[str, Any]
+    ) -> None:
+        table, key = {
+            "review_receipt": ("review_receipts", "review_receipt_id"),
+            "recent_evidence": ("reviewed_trajectories", "trajectory_id"),
+            "experience_ingestion": ("reviewed_trajectories", "trajectory_id"),
+            "generated_skill_creation": ("reviewed_trajectories", "trajectory_id"),
+        }.get(operation["kind"], (None, None))
+        if table is None:
+            return  # STEP-10 source validation belongs to its source-specific adapter.
+        if source_record.get(key) != source_id or source_record.get("outcome_id") != operation["outcome_id"]:
+            raise OperationConflictError("effect source does not match fixed outcome")
+        row = self._require_connection().execute(
+            f"SELECT 1 FROM {table} WHERE {key}=? AND outcome_id=?",
+            (source_id, operation["outcome_id"]),
+        ).fetchone()
+        if row is None:
+            raise OperationConflictError("effect source is not durable for fixed outcome")
+        durable = (self.get_review_receipt(source_id) if table == "review_receipts"
+                   else self.get_reviewed_trajectory(source_id))
+        if durable != dict(source_record):
+            raise OperationConflictError("effect source differs from exact durable record")
+
+    def bind_effect_payload(
+        self, operation_id: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Retain exact adapter payload before any optional submission."""
+        if not isinstance(payload, Mapping) or not payload:
+            raise contracts.ContractError("effect payload must be a nonempty record")
+        connection = self._require_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = self.get_effect_operation(operation_id)
+            if operation["source_record"] is None:
+                raise OperationConflictError("effect source must be durable before payload")
+            if operation["kind"] in ("review_receipt", "recent_evidence"):
+                raise OperationConflictError("local evidence has no separate submission payload")
+            digest = contracts.sha256_hex(payload)
+            if (operation["adapter_payload_digest"] is not None and
+                    operation["adapter_payload_digest"] != digest):
+                raise OperationConflictError("effect payload differs from existing ingestion identity")
+            if operation["payload_digest"] is not None:
+                if operation["payload_digest"] != digest:
+                    raise OperationConflictError("effect operation has a different payload")
+                return operation
+            if operation["status"] != "waiting_payload":
+                raise OperationConflictError("effect operation cannot accept a payload in current state")
+            connection.execute(
+                "UPDATE effect_operations SET payload_digest=?, payload_record=?, status='pending', "
+                "version=version+1, updated_at=? WHERE operation_id=?",
+                (digest, self._serialize_record(payload), contracts.utc_now(), operation_id),
+            )
+        return self.get_effect_operation(operation_id)
+
+    def claim_effect_operation(
+        self, operation_id: str, *, current_config: Mapping[str, Any] | MemoryConfig
+    ) -> dict[str, Any]:
+        """One SQLite writer claims a pending submission; off blocks the claim."""
+        connection = self._require_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = self.get_effect_operation(operation_id)
+            if not effect_submission_enabled(current_config, operation["kind"]):
+                raise OperationConflictError("current effective feature is off")
+            if operation["status"] != "pending":
+                raise OperationConflictError("effect is not pending; reconcile existing claim")
+            if operation["kind"] == "experience_ingestion" and (
+                operation["adapter_operation_id"] is not None or
+                self.get_experience_ingestion_for_trajectory(operation["source_id"]) is not None
+            ):
+                raise OperationConflictError("existing experience ingestion requires exact reconciliation")
+            connection.execute(
+                "UPDATE effect_operations SET status='in_flight', version=version+1, updated_at=? "
+                "WHERE operation_id=?", (contracts.utc_now(), operation_id),
+            )
+        return self.get_effect_operation(operation_id)
+
+    def mark_effect_uncertain(self, operation_id: str, reason: str) -> dict[str, Any]:
+        if not isinstance(reason, str) or not reason:
+            raise contracts.ContractError("uncertainty needs a reason")
+        connection = self._require_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = self.get_effect_operation(operation_id)
+            if operation["status"] not in ("in_flight", "uncertain"):
+                raise OperationConflictError("only an in-flight effect can become uncertain")
+            if operation["status"] == "uncertain" and operation["uncertainty"] != reason:
+                raise OperationConflictError("uncertainty reason conflicts")
+            connection.execute(
+                "UPDATE effect_operations SET status='uncertain', uncertainty=?, version=version+1, "
+                "updated_at=? WHERE operation_id=? AND status='in_flight'",
+                (reason, contracts.utc_now(), operation_id),
+            )
+        return self.get_effect_operation(operation_id)
+
+    def confirm_effect_operation(
+        self, operation_id: str, acknowledgement: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        if not isinstance(acknowledgement, Mapping) or not acknowledgement:
+            raise contracts.ContractError("confirmation requires an exact acknowledgement")
+        connection = self._require_connection()
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = self.get_effect_operation(operation_id)
+            if operation["status"] == "confirmed":
+                if operation["acknowledgement"] != dict(acknowledgement):
+                    raise OperationConflictError("confirmed effect acknowledgement conflicts")
+                return operation
+            if operation["status"] not in ("in_flight", "uncertain"):
+                raise OperationConflictError("effect has no submission to confirm")
+            connection.execute(
+                "UPDATE effect_operations SET status='confirmed', acknowledgement=?, uncertainty=NULL, "
+                "version=version+1, updated_at=? WHERE operation_id=?",
+                (self._serialize_record(acknowledgement), contracts.utc_now(), operation_id),
+            )
+        return self.get_effect_operation(operation_id)
 
     def record_review_receipt(self, review_receipt: Mapping[str, Any]) -> dict[str, Any]:
         """Persist the exact ROOT receipt that authorizes a later trajectory.
@@ -1454,6 +1733,10 @@ class MemoryStore:
                     review_receipt["reviewed_at"],
                     review_receipt["content_hash"],
                 ),
+            )
+            self._bridge_local_source_in_transaction(
+                review_receipt["outcome_id"], "review_receipt", receipt_id,
+                self.get_review_receipt(receipt_id),
             )
         return self.get_review_receipt(receipt_id)
 
@@ -1633,6 +1916,11 @@ class MemoryStore:
                 """,
                 values,
             )
+            durable_trajectory = self.get_reviewed_trajectory(trajectory_id)
+            for kind in ("recent_evidence", "experience_ingestion", "generated_skill_creation"):
+                self._bridge_local_source_in_transaction(
+                    trajectory["outcome_id"], kind, trajectory_id, durable_trajectory,
+                )
         return self.get_reviewed_trajectory(trajectory_id)
 
     def get_reviewed_trajectory(self, trajectory_id: str) -> dict[str, Any]:
@@ -1756,6 +2044,7 @@ class MemoryStore:
                     ingestion["created_at"],
                 ),
             )
+            self._bridge_experience_ingestion_in_transaction(ingestion)
         persisted = self.get_experience_ingestion(str(ingestion["ingestion_id"]))
         if cursor.rowcount == 0:
             for field in (
@@ -1771,6 +2060,42 @@ class MemoryStore:
                         f"{ingestion['ingestion_id']}: {field} differs"
                     )
         return persisted, cursor.rowcount == 1
+
+    def _bridge_experience_ingestion_in_transaction(self, ingestion: Mapping[str, Any]) -> None:
+        """Retain the existing adapter identity without claiming payload or remote success."""
+        connection = self._require_connection()
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='effect_operations'"
+        ).fetchone() is None:
+            return
+        trajectory = connection.execute(
+            "SELECT outcome_id FROM reviewed_trajectories WHERE trajectory_id=?",
+            (ingestion["trajectory_id"],),
+        ).fetchone()
+        if trajectory is None:
+            return
+        operation_id = contracts.effect_operation_id(trajectory["outcome_id"], "experience_ingestion")
+        if connection.execute(
+            "SELECT 1 FROM effect_operations WHERE operation_id=?", (operation_id,)
+        ).fetchone() is None:
+            return  # Generic legacy outcomes have no new effect operation.
+        operation = self.get_effect_operation(operation_id)
+        if operation["source_id"] != ingestion["trajectory_id"]:
+            raise ExperienceConflictError("ingestion does not match effect source")
+        if operation["adapter_operation_id"] is not None:
+            if (operation["adapter_operation_id"] != ingestion["ingestion_id"] or
+                    operation["adapter_payload_digest"] != ingestion["payload_digest"]):
+                raise ExperienceConflictError("effect already has a different ingestion identity")
+            return
+        if (operation["payload_digest"] is not None and
+                operation["payload_digest"] != ingestion["payload_digest"]):
+            raise ExperienceConflictError("ingestion payload differs from retained effect payload")
+        connection.execute(
+            "UPDATE effect_operations SET adapter_operation_id=?, adapter_payload_digest=?, "
+            "version=version+1, updated_at=? WHERE operation_id=?",
+            (ingestion["ingestion_id"], ingestion["payload_digest"],
+             contracts.utc_now(), operation_id),
+        )
 
     def get_experience_ingestion(self, ingestion_id: str) -> dict[str, Any]:
         connection = self._require_connection()
