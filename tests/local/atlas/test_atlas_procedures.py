@@ -10,7 +10,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from memory_harness import atlas, contracts, privacy, procedures, store
+from memory_harness import atlas, config, contracts, privacy, procedures, store
 
 
 class _WriteResult:
@@ -207,6 +207,27 @@ class AtlasProcedureBoundaryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.memory_store.close()
         self.temporary.cleanup()
+
+    def test_service_entry_blocks_direct_lookup_and_designation_while_restricted(self) -> None:
+        restricted = config.resolve_network_mode("restricted_local")
+        before_reads = list(self.collection.exact_reads)
+        before_searches = list(self.vector_store.calls)
+        self.assertEqual([], self.service.resolve_atlas(
+            "parser lock recovery", receiver=self.scope, facts={"language": "python"},
+            route="ordinary", adapter=self.adapter,
+            representation=self.query_representation, network_resolution=restricted,
+        ))
+        self.assertEqual([], self.service.resolve_atlas(
+            "parser lock recovery", receiver=self.scope, facts={"language": "python"},
+            route="ordinary", adapter=self.adapter,
+            representation=self.query_representation,
+            atlas_shared_retrieval_enabled=False,
+        ))
+        with self.assertRaises(procedures.ProcedureNetworkDeniedError):
+            self.service.publish_designation(
+                self.designation, self.adapter, network_resolution=restricted)
+        self.assertEqual(before_reads, self.collection.exact_reads)
+        self.assertEqual(before_searches, self.vector_store.calls)
 
     def test_search_only_discovers_then_exact_read_revalidates_before_delivery(self) -> None:
         self.service.publish_designation(self.designation, self.adapter)
