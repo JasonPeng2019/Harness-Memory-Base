@@ -7,7 +7,9 @@ retained after that caller cleans up.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 from memory_harness import config, contracts, experience, privacy, procedures, store, templates
 
@@ -167,6 +169,63 @@ class EverOSFixture:
         if approve:
             approval = self.approve_procedure(procedure, designate=designate)
         return candidate, approval, procedure
+
+    async def seed_stored_skill(
+        self, candidate: dict, *, include_foreign_scope_hits: bool = False
+    ) -> Path:
+        """Write and index this candidate in the caller's fresh EverOS root."""
+        from everos.component.tokenizer import build_tokenizer
+        from everos.config import load_settings
+        from everos.core.persistence import MemoryRoot
+        from everos.infra.persistence import index
+        from everos.infra.persistence.markdown import AgentSkillFrontmatter, AgentSkillWriter
+        from everos.memory.cascade.handlers.agent_skill import AgentSkillHandler
+        from everos.memory.cascade.handlers.base import HandlerDeps
+
+        owner = self.case_adapter.everos_owner_id
+        app = self.case_adapter.everos_application_id
+        project = self.case_adapter.everos_project_id
+        if candidate["skill_id"] != f"{owner}_parser_lock_mvp" or candidate["scope"] != self.receiver:
+            raise AssertionError("candidate does not belong to this EverOS fixture")
+
+        self.memory_root.mkdir(parents=True, exist_ok=True)
+        (self.memory_root / "ome.toml").write_text("# isolated MVP test\n", encoding="utf-8")
+        with patch.dict(os.environ, {"EVEROS_ROOT": str(self.memory_root)}):
+            load_settings.cache_clear()
+            try:
+                await index.startup()
+                root = MemoryRoot.resolve(explicit_root=str(self.memory_root))
+                writer = AgentSkillWriter(root)
+                handler = AgentSkillHandler(
+                    HandlerDeps(memory_root=root, tokenizer=build_tokenizer())
+                )
+
+                async def add(skill_owner: str, name: str, skill_app: str, skill_project: str) -> Path:
+                    frontmatter = AgentSkillFrontmatter(
+                        id=f"skill_{name}", agent_id=skill_owner, name=name,
+                        description="Inspect parser lock evidence before recovery.",
+                        confidence=0.8, maturity_score=0.6,
+                        source_case_ids=[case["case_id"] for case in candidate["source_cases"]],
+                    )
+                    path = await writer.write_main(
+                        skill_owner, name, frontmatter=frontmatter,
+                        body=candidate["content"], app_id=skill_app, project_id=skill_project,
+                    )
+                    outcome = await handler.handle_added_or_modified(
+                        path.relative_to(root.root).as_posix()
+                    )
+                    if outcome.upserted != 1:
+                        raise AssertionError("EverOS did not index the stored skill")
+                    return path
+
+                skill_path = await add(owner, "parser_lock_mvp", app, project)
+                if include_foreign_scope_hits:
+                    await add(owner + "-foreign", "foreign_owner_mvp", app, project)
+                    await add(owner, "foreign_project_mvp", app, project + "-foreign")
+                return skill_path
+            finally:
+                await index.shutdown()
+                load_settings.cache_clear()
 
     def approve_procedure(self, procedure: dict, *, designate: bool = True) -> dict:
         approval = self.procedure_service.approve_revision(
