@@ -344,6 +344,7 @@ def _prepare_memory_outcome(
     finalize: bool,
     network_mode: str,
     search_stores: Sequence[Any] = (),
+    required_sources: frozenset[tuple[str, str, str]] = frozenset(),
 ):
     """Run one bounded preparation for the exact handoff state.
 
@@ -400,6 +401,7 @@ def _prepare_memory_outcome(
             recipient=f"worker:{lane_id}" if finalize else None,
             finalize=finalize,
             stores=search_stores,
+            required_sources=required_sources,
         )
     finally:
         memory_store.close()
@@ -438,6 +440,7 @@ def prepare_lane_memory(
     worktree_path: str | Path,
     base_commit: str,
     search_stores: Sequence[Any] = (),
+    required_sources: frozenset[tuple[str, str, str]] = frozenset(),
 ) -> "LaneMemory":
     """Run one bounded lane preparation and report its exact disposition.
 
@@ -479,6 +482,7 @@ def prepare_lane_memory(
             finalize=accepted,
             network_mode=requested_network,
             search_stores=search_stores,
+            required_sources=required_sources,
         )
         if not accepted:
             _, envelope_path = memory_paths(worktree_path)
@@ -803,6 +807,25 @@ def load_final_context(
             "the enhanced dispatch has no durable finalized context for its decision"
         )
     return dict(context)
+
+
+def required_resume_sources(context: Mapping[str, Any]) -> frozenset[tuple[str, str, str]]:
+    """Keep only plan-required sources actually delivered by the prior handoff."""
+
+    trace = context["delivery_trace"]
+    delivered = {entry["id"] for entry in trace["context_delivered"]}
+    required = set()
+    for entry in trace["selected"]:
+        if entry["id"] not in delivered or entry["provenance"].get("plan_affecting") is not True:
+            continue
+        provenance = entry["provenance"]
+        identity = tuple(provenance.get(key) for key in (
+            "source_id", "logical_id", "revision_id",
+        ))
+        if any(not isinstance(value, str) or not value for value in identity):
+            raise MemoryHandoffError("prior plan-required source has no exact identity")
+        required.add(identity)
+    return frozenset(required)
 
 
 def _open_runtime(worktree_path: str | Path):
