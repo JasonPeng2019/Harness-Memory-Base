@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -128,6 +129,37 @@ def make_fixture(scope: dict[str, str], run_token: str, *, retained: bool) -> di
     return {"procedure": procedure, "approval": approval, "representation": representation}
 
 
+def wait_for_publications_visible(
+    adapter: atlas.AtlasProcedureAdapter, *, publications: tuple[dict, dict], scope: dict[str, str]
+) -> None:
+    """Wait for acknowledged publications to enter Vector Search before eligibility proof."""
+
+    pending = {
+        publication["publication_id"]: publication["representation"]["search_text"]
+        for publication in publications
+    }
+    deadline = time.monotonic() + 60.0
+    while pending:
+        for publication_id, query in tuple(pending.items()):
+            if time.monotonic() >= deadline:
+                break
+            visible_ids = {
+                hit.publication_id for hit in adapter.discover(query, receiver=scope)
+            }
+            if time.monotonic() >= deadline:
+                break
+            if publication_id in visible_ids:
+                pending.pop(publication_id)
+        if not pending:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Atlas publications not visible within 60 seconds: {sorted(pending)}"
+            )
+        time.sleep(min(0.5, remaining))
+
+
 def prove_fixture_eligibility(
     check: unittest.TestCase,
     *,
@@ -172,6 +204,7 @@ def prove_fixture_eligibility(
     check.assertNotEqual(retained["revision_id"], revoked["revision_id"])
     check.assertNotEqual(retained["publication_id"], revoked["publication_id"])
     check.assertNotEqual(retained["representation"]["search_text"], revoked["representation"]["search_text"])
+    wait_for_publications_visible(adapter, publications=(retained, revoked), scope=scope)
 
     def resolve(query: str, receiver: dict[str, str]) -> list[dict]:
         return service.resolve_atlas(
