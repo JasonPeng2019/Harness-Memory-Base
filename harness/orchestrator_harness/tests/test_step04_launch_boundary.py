@@ -30,7 +30,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from orchestrator_harness import bootstrap, controller, launch, lanes, memory_handoff, processes, resume, setup
+from orchestrator_harness import bootstrap, controller, launch, lanes, memory_handoff, processes, resume, review, setup
+from orchestrator_harness.core import content_hash, read_json
+from orchestrator_harness.epochs import current_epoch_path, manager_queue_path, lane_record_dir
+from orchestrator_harness import manager_queue
+from orchestrator_harness.records import atomic_write_json
+from memory_harness import atlas_adapters, everos_adapters, apc
 from memory_harness import config, contracts, store
 
 
@@ -635,6 +640,64 @@ class Step04BootstrapBoundaryTests(unittest.TestCase):
         store_path, envelope_path = self.fixture.memory_paths(worktree)
         self.assertFalse(store_path.exists())
         self.assertFalse(envelope_path.exists())
+
+    def test_all_off_completes_bootstrap_terminal_review_and_managed_close(self) -> None:
+        card, _ = accepted_card(configuration={"all_features": False})
+        with (
+            patch.object(memory_handoff, "_prepare_memory_outcome") as prepare,
+            patch.object(everos_adapters, "make_everos_generated_skill_search_store") as everos,
+            patch.object(everos_adapters, "make_everos_case_search_store") as everos_cases,
+            patch.object(atlas_adapters, "make_atlas_search_store") as atlas,
+            patch.object(apc, "make_apc_request") as apc_request,
+        ):
+            prepared, worktree = self.fixture.run_bootstrap(lane_id="all-off-complete", card=card)
+            self.assertTrue(prepared["ok"], prepared)
+            lane = self.fixture.lane_record("all-off-complete")
+            self.assertNotIn("memory_plan_state", lane)
+            result = {
+                "schema": "result/v1", "lane_id": lane["lane_id"], "run_id": lane["run_id"],
+                "outcome": "PASS", "summary": "ordinary task completed", "evidence": [],
+                "completed_at": "2026-09-26T00:00:00Z",
+            }
+            result["content_hash"] = content_hash(result)
+            atomic_write_json(worktree / "RESULT.json", result)
+            self.assertEqual(("valid", result), controller._validate_result(lane))
+            lane = self.fixture.write_lane_fields("all-off-complete", lifecycle="review_pending")
+            atomic_write_json(current_epoch_path(self.fixture.runtime), {
+                "schema": "current-epoch/v1", "epoch_id": self.fixture.EPOCH, "queue_id": "queue-1",
+            })
+            atomic_write_json(manager_queue_path(self.fixture.runtime), {
+                "schema": "manager-queue/v1", "epoch_id": self.fixture.EPOCH,
+                "queue_id": "queue-1", "events": [],
+            })
+            event = manager_queue.promote_event(
+                self.fixture.runtime, event_type="COMPLETION_REVIEW_REQUIRED",
+                lane_id=lane["lane_id"], run_id=lane["run_id"], summary="review ordinary result",
+            )
+            manager_queue.acknowledge_event(self.fixture.runtime, event["event_id"])
+            with (
+                patch.object(review, "find_harness_root", return_value=self.fixture.harness),
+                patch.object(review, "_resolve_lane_managed", return_value=(self.fixture.EPOCH, lane, manager_queue.read_manager_queue(self.fixture.runtime)["events"][0])),
+                patch.object(review, "_worktree_commit", return_value="commit-1"),
+            ):
+                reviewed = review.run_completion_review(
+                    event_id=event["event_id"], lane_id=None, review_outcome="PASS",
+                    approval="ACCEPTED", review_summary="ROOT checked ordinary result",
+                    evidence=[], force_accept=False, force_reason=None,
+                )
+            self.assertTrue(reviewed["ok"], reviewed)
+            folder = lane_record_dir(self.fixture.runtime, self.fixture.EPOCH, lane["lane_id"])
+            self.assertEqual("PASS", read_json(folder / "COMPLETION_REVIEW.json")["review_outcome"])
+            self.assertEqual("ACCEPTED", read_json(folder / "ORCHESTRATOR_ACCEPTANCE.json")["approval"])
+            self.assertEqual("COMPLETE", manager_queue.read_manager_queue(self.fixture.runtime)["events"][0]["state"])
+            store_path, envelope_path = self.fixture.memory_paths(worktree)
+            self.assertFalse(store_path.exists())
+            self.assertFalse(envelope_path.exists())
+            prepare.assert_not_called()
+            everos.assert_not_called()
+            everos_cases.assert_not_called()
+            atlas.assert_not_called()
+            apc_request.assert_not_called()
 
     def test_absent_plan_lane_cannot_launch_a_worker(self) -> None:
         card, _ = absent_card()
