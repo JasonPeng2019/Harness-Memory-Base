@@ -262,6 +262,27 @@ def handoff_manifest(
     }
 
 
+def owned_atlas_identity(database: str | None, run_token: str | None) -> dict[str, str]:
+    """Derive the exact owned target from the caller's predeclared UUIDv4 token."""
+
+    if not isinstance(database, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", database):
+        raise ValueError("live Atlas database must be a nonempty simple name")
+    if (
+        not isinstance(run_token, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", run_token)
+        or uuid.UUID(hex=run_token).version != 4
+    ):
+        raise ValueError(
+            "MEMORY_HARNESS_ATLAS_RUN_TOKEN must be a canonical lowercase UUIDv4 hex token"
+        )
+    return {
+        "database": database,
+        "collection": f"trusted_procedures_{run_token}",
+        "index": f"vector_{run_token}",
+        "namespace": f"step18-live-{run_token}",
+    }
+
+
 class ManifestHandoffCleanupError(OSError):
     """The manifest exists, so its exact collection remains owned for reconciliation."""
 
@@ -322,9 +343,13 @@ class LiveAtlasTrustedProcedureTests(unittest.TestCase):
         if os.environ.get("MEMORY_HARNESS_RUN_LIVE_ATLAS") != "1":
             self.skipTest("set MEMORY_HARNESS_RUN_LIVE_ATLAS=1 for the owned live Atlas test")
         uri = os.environ.get("MEMORY_HARNESS_ATLAS_URI")
-        database = os.environ.get("MEMORY_HARNESS_ATLAS_LIVE_DATABASE")
-        if not uri or not database:
-            self.skipTest("set MEMORY_HARNESS_ATLAS_URI and MEMORY_HARNESS_ATLAS_LIVE_DATABASE")
+        run_token = os.environ.get("MEMORY_HARNESS_ATLAS_RUN_TOKEN")
+        identity = owned_atlas_identity(
+            os.environ.get("MEMORY_HARNESS_ATLAS_LIVE_DATABASE"), run_token
+        )
+        database = identity["database"]
+        if not uri:
+            self.skipTest("set MEMORY_HARNESS_ATLAS_URI")
         handoff_path = os.environ.get("MEMORY_HARNESS_ATLAS_HANDOFF_MANIFEST_PATH")
         if handoff_path == "":
             raise ValueError("handoff manifest path must be nonempty")
@@ -333,10 +358,9 @@ class LiveAtlasTrustedProcedureTests(unittest.TestCase):
         except ImportError as exc:  # pragma: no cover - environment gated
             self.skipTest(f"Atlas optional dependency unavailable: {exc.__class__.__name__}")
 
-        run_token = uuid.uuid4().hex
-        namespace = f"step18-live-{run_token}"
-        collection_name = f"trusted_procedures_{run_token}"
-        index_name = f"vector_{run_token}"
+        namespace = identity["namespace"]
+        collection_name = identity["collection"]
+        index_name = identity["index"]
         client = MongoClient(uri, serverSelectionTimeoutMS=10_000)
         collection = client[database][collection_name]
         temporary = tempfile.TemporaryDirectory()

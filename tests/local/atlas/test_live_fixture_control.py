@@ -3,9 +3,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import os
 import socket
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -165,6 +167,79 @@ class AtlasLiveHandoffControlTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.path = Path(self.temporary.name) / "atlas-manifest.json"
+
+    def test_caller_token_determines_exact_identity_before_mutation(self) -> None:
+        token = "1c2850372db24777bf0a2e72dfd341c4"
+        expected = {
+            "database": "synthetic_live",
+            "collection": f"trusted_procedures_{token}",
+            "index": f"vector_{token}",
+            "namespace": f"step18-live-{token}",
+        }
+        self.assertEqual(expected, fixture.owned_atlas_identity("synthetic_live", token))
+        self.assertEqual(expected, fixture.owned_atlas_identity("synthetic_live", token))
+        other = fixture.owned_atlas_identity(
+            "synthetic_live", "f81d4fae7dec41d0a76500a0c91e6bf6"
+        )
+        self.assertNotEqual(expected["collection"], other["collection"])
+
+    def test_opt_out_still_skips_without_identity_or_remote_setup(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(unittest.SkipTest):
+                fixture.LiveAtlasTrustedProcedureTests(
+                    "test_vector_discovery_exact_validation_and_revocation"
+                ).test_vector_discovery_exact_validation_and_revocation()
+
+    def test_opt_in_rejects_invalid_identity_before_remote_setup(self) -> None:
+        tokens = (
+            None, "", "ABC", "1c285037-2db2-4777-bf0a-2e72dfd341c4",
+            "1C2850372DB24777BF0A2E72DFD341C4",
+            "1c2850372db23777bf0a2e72dfd341c4",
+        )
+        fake_client = mock.Mock(side_effect=AssertionError("MongoClient reached"))
+        fake_pymongo = types.SimpleNamespace(MongoClient=fake_client)
+        for token in tokens:
+            with self.subTest(token=token):
+                environment = {
+                    "MEMORY_HARNESS_RUN_LIVE_ATLAS": "1",
+                    "MEMORY_HARNESS_ATLAS_URI": "mongodb://offline.invalid",
+                    "MEMORY_HARNESS_ATLAS_LIVE_DATABASE": "synthetic_live",
+                }
+                if token is not None:
+                    environment["MEMORY_HARNESS_ATLAS_RUN_TOKEN"] = token
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with mock.patch.dict(sys.modules, {"pymongo": fake_pymongo}):
+                        with self.assertRaises(ValueError):
+                            fixture.LiveAtlasTrustedProcedureTests(
+                                "test_vector_discovery_exact_validation_and_revocation"
+                            ).test_vector_discovery_exact_validation_and_revocation()
+        with mock.patch.dict(os.environ, {
+            "MEMORY_HARNESS_RUN_LIVE_ATLAS": "1",
+            "MEMORY_HARNESS_ATLAS_URI": "mongodb://offline.invalid",
+            "MEMORY_HARNESS_ATLAS_LIVE_DATABASE": "invalid.name",
+            "MEMORY_HARNESS_ATLAS_RUN_TOKEN": "1c2850372db24777bf0a2e72dfd341c4",
+        }, clear=True):
+            with mock.patch.dict(sys.modules, {"pymongo": fake_pymongo}):
+                with self.assertRaises(ValueError):
+                    fixture.LiveAtlasTrustedProcedureTests(
+                        "test_vector_discovery_exact_validation_and_revocation"
+                    ).test_vector_discovery_exact_validation_and_revocation()
+        self.assertEqual(0, fake_client.call_count)
+
+    def test_failed_action_and_failed_drop_leave_independent_exact_target(self) -> None:
+        token = "1c2850372db24777bf0a2e72dfd341c4"
+        caller_target = fixture.owned_atlas_identity("synthetic_live", token)
+        owned = _OwnedCollection()
+        action = mock.Mock(side_effect=AssertionError("action failed"))
+        with mock.patch.object(owned, "drop", side_effect=OSError("drop failed")):
+            with self.assertRaisesRegex(OSError, "drop failed"):
+                fixture.run_owned_collection(owned, action=action, manifest_path=self.path)
+        action.assert_called_once_with()
+        self.assertFalse(self.path.exists())
+        self.assertEqual(
+            {"database": "synthetic_live", "collection": f"trusted_procedures_{token}"},
+            {key: caller_target[key] for key in ("database", "collection")},
+        )
 
     def _valid_manifest(self) -> dict:
         database = store.MemoryStore(Path(self.temporary.name) / "handoff.sqlite3")
