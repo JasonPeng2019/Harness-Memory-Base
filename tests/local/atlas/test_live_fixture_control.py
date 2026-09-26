@@ -256,6 +256,27 @@ class AtlasLiveHandoffControlTests(unittest.TestCase):
         self.assertFalse(self.path.exists())
         self.assertEqual([], list(Path(self.temporary.name).glob("*.tmp")))
 
+    def test_post_link_temporary_unlink_failure_retains_exact_owned_collection(self) -> None:
+        manifest = self._valid_manifest()
+        owned = _OwnedCollection()
+        original_unlink = Path.unlink
+
+        def fail_temporary_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            if path.suffix == ".tmp":
+                self.assertTrue(self.path.exists(), "failure must occur after destination link")
+                raise OSError("temporary cleanup failed")
+            original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", fail_temporary_unlink):
+            with self.assertRaises(OSError) as raised:
+                fixture.run_owned_collection(owned, action=lambda: manifest, manifest_path=self.path)
+
+        self.assertTrue(self.path.exists())
+        self.assertEqual(0, owned.drops, f"manifest_exists={self.path.exists()}, collection_drops={owned.drops}")
+        self.assertEqual(manifest, json.loads(self.path.read_text(encoding="utf-8")))
+        self.assertEqual(self.path, raised.exception.manifest_path)
+        self.assertEqual(manifest["cleanup_target"], raised.exception.cleanup_target)
+
     def test_manifest_rejects_mismatched_owned_identity_and_representation(self) -> None:
         manifest = self._valid_manifest()
         with self.assertRaises(ValueError):

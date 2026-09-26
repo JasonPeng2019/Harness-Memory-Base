@@ -262,10 +262,23 @@ def handoff_manifest(
     }
 
 
+class ManifestHandoffCleanupError(OSError):
+    """The manifest exists, so its exact collection remains owned for reconciliation."""
+
+    def __init__(self, path: Path, cleanup_target: dict) -> None:
+        self.manifest_path = path
+        self.cleanup_target = cleanup_target
+        super().__init__(
+            f"manifest retained at {path}; reconcile owned Atlas collection "
+            f"{cleanup_target['database']}.{cleanup_target['collection']}"
+        )
+
+
 def _write_manifest_atomic(path: Path, manifest: dict) -> None:
     """Create a complete manifest only if the explicit target is still absent."""
 
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    linked = False
     try:
         with temporary.open("x", encoding="utf-8") as handle:
             json.dump(manifest, handle, sort_keys=True, separators=(",", ":"))
@@ -273,8 +286,14 @@ def _write_manifest_atomic(path: Path, manifest: dict) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.link(temporary, path)
+        linked = True
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            temporary.unlink(missing_ok=True)
+        except BaseException as exc:
+            if linked:
+                raise ManifestHandoffCleanupError(path, manifest["cleanup_target"]) from exc
+            raise
 
 
 def run_owned_collection(collection: object, *, action: object, manifest_path: Path | None) -> dict:
@@ -284,7 +303,11 @@ def run_owned_collection(collection: object, *, action: object, manifest_path: P
     try:
         manifest = action()
         if manifest_path is not None:
-            _write_manifest_atomic(manifest_path, manifest)
+            try:
+                _write_manifest_atomic(manifest_path, manifest)
+            except ManifestHandoffCleanupError:
+                retained = True
+                raise
             retained = True
         return manifest
     finally:
