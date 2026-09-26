@@ -293,6 +293,54 @@ class Step04AtlasSearchAdapterTests(unittest.TestCase):
         arguments.update(overrides)
         return atlas_adapters.make_atlas_search_store(**arguments)
 
+    def test_direct_store_query_respects_captured_restricted_and_off_gates(self) -> None:
+        self._publish()
+        payload = self._payload("parser lock recovery")
+        baseline_reads = list(self.collection.exact_reads)
+        baseline_searches = list(self.vector_store.calls)
+        restricted = self._store(network_resolution=config.resolve_network_mode(
+            "restricted_local"))
+        self.assertEqual([], list(restricted.query(payload)))
+        disabled = self._store(atlas_shared_retrieval_enabled=False)
+        self.assertEqual([], list(disabled.query(payload)))
+        self.assertEqual(baseline_reads, self.collection.exact_reads)
+        self.assertEqual(baseline_searches, self.vector_store.calls)
+        self.assertEqual(1, len(list(self._store().query(payload))))
+
+    def test_provider_downgrade_and_verified_effective_store_queries(self) -> None:
+        self._publish()
+        payload = self._payload("parser lock recovery")
+        downgraded = config.resolve_network_mode("atlas_memory_only")
+        self.assertEqual("soft_guardrail_network", downgraded.effective_mode)
+        self.assertEqual(1, len(list(self._store(
+            network_resolution=contracts.network_resolution_record(downgraded)
+        ).query(payload))))
+        evidence = {
+            "launched_payload": {"verified": True, "evidence_id": "launch-proof"},
+            "unrelated_destination_block": {
+                "blocked": True, "independent": True,
+                "source_kind": "independent_network_boundary", "evidence_id": "egress-proof",
+            },
+        }
+        context = {key: "bound-test" for key in config.NETWORK_CONTEXT_FIELDS}
+        verified = config.NetworkResolver(lambda _evidence, _context: True).resolve(
+            "atlas_memory_only", evidence=evidence, context=context)
+        self.assertEqual("atlas_memory_only", verified.effective_mode)
+        self.assertEqual(1, len(list(self._store(
+            network_resolution=verified
+        ).query(payload))))
+        legacy = {
+            "requested_mode": "atlas_memory_only", "effective_mode": "atlas_memory_only",
+            "enforcement_sources": ["legacy_captured_mode"],
+            "disclosed_limits": ["legacy row has no captured network enforcement proof"],
+            "input_evidence": {},
+        }
+        with self.assertRaises(atlas.AtlasProcedureError):
+            list(self._store(network_resolution=legacy).query(payload))
+        unverified = dict(legacy, enforcement_sources=["requested_soft_guardrail_policy"])
+        with self.assertRaises(atlas.AtlasProcedureError):
+            list(self._store(network_resolution=unverified).query(payload))
+
     def _prepare(self, stores, **overrides):
         arguments = {
             "task_card": self.card,

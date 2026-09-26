@@ -13,7 +13,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from memory_harness import atlas, contracts, privacy, procedures, store
+from memory_harness import atlas, config, contracts, privacy, procedures, store
 
 
 class _Collection:
@@ -185,6 +185,68 @@ class AtlasExternalReconciliationTests(unittest.TestCase):
             adapter=self.adapter,
         )
 
+    def test_restricted_entry_blocks_publication_and_exact_retry_without_adapter_calls(self) -> None:
+        restricted = config.resolve_network_mode("restricted_local")
+        before = list(self.collection.events)
+        with self.assertRaises(procedures.ProcedureNetworkDeniedError):
+            self.service.publish(
+                procedure=self.procedure, approval=self.approval,
+                representation=self.representation, designation=self.designation,
+                adapter=self.adapter, network_resolution=restricted,
+            )
+        self.assertEqual(before, self.collection.events)
+        self.adapter.lose_ack = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._publish()
+        pending = self.memory_store.get_procedure_publication(
+            contracts.make_procedure_publication(
+                procedure=self.procedure, approval=self.approval,
+                representation=self.representation, designation=self.designation,
+            )["publication_id"]
+        )
+        self.assertEqual("ambiguous", pending["status"])
+        before = list(self.collection.events)
+        with self.assertRaises(procedures.ProcedureNetworkDeniedError):
+            self.service.reconcile_publication(
+                pending["publication_id"], self.adapter, network_resolution=restricted,
+            )
+        self.assertEqual(before, self.collection.events)
+        self.assertEqual("ambiguous", self.memory_store.get_procedure_publication(
+            pending["publication_id"])["status"])
+        self.assertEqual("acknowledged", self.service.reconcile_publication(
+            pending["publication_id"], self.adapter)["status"])
+
+    def test_requested_atlas_only_downgrade_and_verified_effective_are_distinct(self) -> None:
+        downgraded = config.resolve_network_mode("atlas_memory_only")
+        self.assertEqual("soft_guardrail_network", downgraded.effective_mode)
+        self.assertEqual("acknowledged", self.service.publish(
+            procedure=self.procedure, approval=self.approval,
+            representation=self.representation, designation=self.designation,
+            adapter=self.adapter, network_resolution=downgraded,
+        )["status"])
+
+    def test_restricted_safety_administration_fences_locally_and_remains_pending(self) -> None:
+        restricted = config.resolve_network_mode("restricted_local")
+        before = list(self.collection.events)
+        result = self.service.withdraw_partition(
+            logical_id=self.designation["logical_id"], partition=self.partition,
+            issuer="ROOT", adapter=self.adapter, network_resolution=restricted,
+        )
+        self.assertFalse(result["managed_complete"])
+        self.assertEqual(before, self.collection.events)
+        self.assertEqual("withdrawn", self.memory_store.get_current_procedure_designation(
+            self.designation["logical_id"], self.partition)["state"])
+        before = list(self.collection.events)
+        retry = self.service.reconcile_withdrawal(
+            logical_id=self.designation["logical_id"], partition=self.partition,
+            adapter=self.adapter, network_resolution=restricted,
+        )
+        self.assertFalse(retry["managed_complete"])
+        self.assertEqual(before, self.collection.events)
+        self.assertTrue(self.service.reconcile_withdrawal(
+            logical_id=self.designation["logical_id"], partition=self.partition,
+            adapter=self.adapter)["managed_complete"])
+
     def _claimant(self, invocation: str = "native-test") -> dict:
         record = {"schema": "external-effect-claimant/v1", "native_invocation_id": invocation,
                   "pid": 4142 if invocation == "native-test" else 5153,
@@ -211,6 +273,7 @@ class AtlasExternalReconciliationTests(unittest.TestCase):
         return record
 
     def _governed_publish(self, *, current_on: bool = True,
+                          network_resolution=None,
                           claim_fence: dict | None = None,
                           invocation: str = "native-test") -> dict:
         return self.service.publish(
@@ -222,6 +285,7 @@ class AtlasExternalReconciliationTests(unittest.TestCase):
             claimant=self._claimant(invocation), claim_fence=claim_fence,
             captured_config={"shared_publication": True},
             current_config={"shared_publication": current_on},
+            network_resolution=network_resolution,
             atlas_scope={
                 "database": "procedures_test",
                 "collection": "trusted",
@@ -230,6 +294,55 @@ class AtlasExternalReconciliationTests(unittest.TestCase):
                 "recipients": self.partition["recipients"],
             },
         )
+
+    def test_governed_restricted_retry_preserves_original_effect_and_readback(self) -> None:
+        self.adapter.lose_ack = True
+        with self.assertRaises(procedures.ProcedureRemoteAmbiguityError):
+            self._governed_publish()
+        effect = [row for row in self.memory_store.list_effect_operations()
+                  if row["kind"] == "procedure_publication"][0]
+        self.assertEqual("uncertain", effect["status"])
+        before = list(self.collection.events)
+        restricted = config.resolve_network_mode("restricted_local")
+        with self.assertRaises(procedures.ProcedureNetworkDeniedError):
+            self._governed_publish(current_on=False, network_resolution=restricted)
+        self.assertEqual(before, self.collection.events)
+        retained = self.memory_store.get_effect_operation(effect["operation_id"])
+        self.assertEqual("uncertain", retained["status"])
+        self.assertEqual({"shared_publication": True}, retained["configuration"])
+        self.assertEqual("acknowledged", self._governed_publish(current_on=False)["status"])
+        self.assertEqual(1, self.adapter.publication_writes)
+
+    def test_feature_off_and_outage_are_separate_from_network_denial(self) -> None:
+        before = list(self.collection.events)
+        with self.assertRaises(procedures.ProcedureIneligibleError) as off:
+            self.service.publish(
+                procedure=self.procedure, approval=self.approval,
+                representation=self.representation, designation=self.designation,
+                adapter=self.adapter, shared_publication_enabled=False,
+            )
+        self.assertNotIsInstance(off.exception, procedures.ProcedureNetworkDeniedError)
+        self.assertEqual(before, self.collection.events)
+        self.adapter.fail_before_commit = True
+        with self.assertRaises(procedures.ProcedureError) as outage:
+            self._publish()
+        self.assertNotIsInstance(outage.exception, procedures.ProcedureNetworkDeniedError)
+        self.assertGreater(len(self.collection.events), len(before))
+
+    def test_restricted_revocation_fences_locally_without_remote_call(self) -> None:
+        before = list(self.collection.events)
+        result = self.service.revoke(
+            procedure=self.procedure, issuer="ROOT", reason="superseded",
+            adapter=self.adapter,
+            network_resolution=config.resolve_network_mode("restricted_local"),
+        )
+        self.assertFalse(result["managed_complete"])
+        self.assertEqual(before, self.collection.events)
+        self.assertTrue(self.memory_store.is_procedure_revoked(self.procedure["revision_id"]))
+        self.assertTrue(self.service.revoke(
+            procedure=self.procedure, issuer="ROOT", reason="superseded",
+            adapter=self.adapter,
+        )["managed_complete"])
 
     def test_governed_publication_persists_exact_intent_before_one_write(self) -> None:
         original_write = self.adapter.write_publication

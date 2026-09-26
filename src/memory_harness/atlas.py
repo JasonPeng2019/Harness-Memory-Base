@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 from . import contracts
+from .config import NETWORK_MODES, NetworkResolution
 from .experience import ExperienceRecord
 from .privacy import PrivacyPolicy, sanitize_payload
 
@@ -172,6 +173,41 @@ class AtlasProcedureAmbiguityError(AtlasProcedureError):
 
 class AtlasProcedureFencedError(AtlasProcedureError):
     """A newer designation, withdrawal, or revocation fenced a stale write."""
+
+
+def atlas_task_network_allowed(
+    resolution: NetworkResolution | Mapping[str, Any] | None,
+) -> bool:
+    """Consume the provider's captured effective profile without resolving it again.
+
+    ``None`` preserves callers that have no captured network profile. A rich
+    preparation record and the provider's NetworkResolution have the same
+    requested/effective meaning. The caller supplies this captured provider
+    record; this boundary cannot create or verify an egress claim. Legacy
+    callers with no captured profile retain their established behavior.
+    """
+
+    if resolution is None:
+        return True
+    requested = (resolution.requested_mode if isinstance(resolution, NetworkResolution)
+                 else resolution.get("requested_mode") if isinstance(resolution, Mapping) else None)
+    effective = (resolution.effective_mode if isinstance(resolution, NetworkResolution)
+                 else resolution.get("effective_mode") if isinstance(resolution, Mapping) else None)
+    if requested not in NETWORK_MODES or effective not in NETWORK_MODES:
+        raise AtlasProcedureError("captured network resolution is incomplete")
+    if effective == "atlas_memory_only":
+        verified = (resolution.verification_result if isinstance(resolution, NetworkResolution)
+                    else resolution.get("verification_result"))
+        if requested != "atlas_memory_only" or (
+            verified is not True and not isinstance(verified, Mapping)
+        ):
+            raise AtlasProcedureError("Atlas-only needs a provider-verified effective resolution")
+    elif requested == "atlas_memory_only":
+        if effective != "soft_guardrail_network":
+            raise AtlasProcedureError("Atlas-only downgrade must retain effective soft mode")
+    elif effective != requested:
+        raise AtlasProcedureError("captured network modes disagree")
+    return effective != "restricted_local"
 
 
 @dataclass(frozen=True)

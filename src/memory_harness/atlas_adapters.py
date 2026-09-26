@@ -48,6 +48,8 @@ def make_atlas_search_store(
     facts: Mapping[str, Any],
     route: str,
     limits: config.PreparationLimits | None = None,
+    network_resolution: config.NetworkResolution | Mapping[str, Any] | None = None,
+    atlas_shared_retrieval_enabled: bool = True,
 ) -> search.SearchStore:
     """Return the one smallest Atlas procedure store for one exact receiver.
 
@@ -98,6 +100,8 @@ def make_atlas_search_store(
             route,
             resolved_limits,
             payload,
+            network_resolution=network_resolution,
+            atlas_shared_retrieval_enabled=atlas_shared_retrieval_enabled,
         ),
         scope=receiver_record,
         freshness="live",
@@ -155,8 +159,16 @@ def _atlas_candidates(
     route: str,
     limits: config.PreparationLimits,
     payload: Any,
+    *,
+    network_resolution: config.NetworkResolution | Mapping[str, Any] | None = None,
+    atlas_shared_retrieval_enabled: bool = True,
 ) -> list[dict[str, Any]]:
     """Query the accepted service and convert only its validated deliveries."""
+
+    if not atlas_shared_retrieval_enabled or not atlas.atlas_task_network_allowed(
+        network_resolution
+    ):
+        return []
 
     query = _bounded_query(payload, route=route)
     if query is None:
@@ -180,6 +192,8 @@ def _atlas_candidates(
         route=route,
         adapter=adapter,
         representation=identity,
+        network_resolution=network_resolution,
+        atlas_shared_retrieval_enabled=atlas_shared_retrieval_enabled,
     )
     candidates: list[dict[str, Any]] = []
     for delivery in deliveries or ():

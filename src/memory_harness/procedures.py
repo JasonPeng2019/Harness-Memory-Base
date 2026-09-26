@@ -11,7 +11,7 @@ from dataclasses import asdict
 from typing import Any, Iterable, Mapping
 
 from . import atlas, contracts
-from .config import MemoryConfig, effect_submission_enabled
+from .config import MemoryConfig, NetworkResolution, effect_submission_enabled
 from .privacy import (
     PrivacyPolicy,
     RemotePayloadPrivacyError,
@@ -36,6 +36,10 @@ class ProcedureRemoteAmbiguityError(ProcedureError):
 
 class ProcedureIneligibleError(ProcedureError):
     """A discovered procedure did not pass authoritative delivery checks."""
+
+
+class ProcedureNetworkDeniedError(ProcedureIneligibleError):
+    """The captured effective profile forbids optional Atlas task work."""
 
 
 class TrustedProcedureService:
@@ -68,6 +72,13 @@ class TrustedProcedureService:
         if issuer not in self.trusted_issuers:
             raise ProcedureAuthorizationError("procedure issuer is not trusted by this deployment")
         return issuer
+
+    @staticmethod
+    def _require_task_network(
+        network_resolution: NetworkResolution | Mapping[str, Any] | None,
+    ) -> None:
+        if not atlas.atlas_task_network_allowed(network_resolution):
+            raise ProcedureNetworkDeniedError("effective restricted_local forbids Atlas task work")
 
     def record_approved_revision(
         self,
@@ -319,8 +330,15 @@ class TrustedProcedureService:
         self,
         designation: Mapping[str, Any],
         adapter: atlas.AtlasProcedureAdapter,
+        *,
+        network_resolution: NetworkResolution | Mapping[str, Any] | None = None,
+        shared_publication_enabled: bool = True,
     ) -> dict[str, Any]:
         """Durably accept a shared current designation before publication claim."""
+
+        self._require_task_network(network_resolution)
+        if not shared_publication_enabled:
+            raise ProcedureIneligibleError("shared publication feature is off")
 
         try:
             stored = self.store.get_procedure_designation(str(designation["designation_id"]))
@@ -644,6 +662,8 @@ class TrustedProcedureService:
         atlas_scope: Mapping[str, Any] | None = None,
         claimant: Mapping[str, Any] | None = None,
         claim_fence: Mapping[str, Any] | None = None,
+        network_resolution: NetworkResolution | Mapping[str, Any] | None = None,
+        shared_publication_enabled: bool = True,
     ) -> dict[str, Any]:
         """Publish after trust/privacy checks.
 
@@ -658,6 +678,9 @@ class TrustedProcedureService:
         verified by the store's constructor-bound verifier.
         """
 
+        self._require_task_network(network_resolution)
+        if not shared_publication_enabled:
+            raise ProcedureIneligibleError("shared publication feature is off")
         self._require_trusted_issuer(approval.get("issuer"))
         try:
             publication = contracts.make_procedure_publication(
@@ -1020,8 +1043,14 @@ class TrustedProcedureService:
     def reconcile_publication(
         self, publication_id: str, adapter: atlas.AtlasProcedureAdapter,
         *, claim_fence: Mapping[str, Any] | None = None,
+        network_resolution: NetworkResolution | Mapping[str, Any] | None = None,
+        shared_publication_enabled: bool = True,
     ) -> dict[str, Any]:
         """Resolve a lost acknowledgement through exact read, never blind replay."""
+
+        self._require_task_network(network_resolution)
+        if not shared_publication_enabled:
+            raise ProcedureIneligibleError("shared publication feature is off")
 
         publication = self.store.get_procedure_publication(publication_id)
         effects = [
@@ -1302,6 +1331,7 @@ class TrustedProcedureService:
         partition: Mapping[str, Any],
         issuer: str,
         adapter: atlas.AtlasProcedureAdapter,
+        network_resolution: NetworkResolution | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Withdraw one partition without revoking other authorized copies."""
 
@@ -1317,6 +1347,9 @@ class TrustedProcedureService:
             withdrawal = self.store.record_procedure_withdrawal(withdrawal)
         except (contracts.ContractError, ProcedureConflictError, StoreError) as exc:
             raise ProcedureError("could not durably fence the partition withdrawal") from exc
+        if not atlas.atlas_task_network_allowed(network_resolution):
+            return {"withdrawal": withdrawal,
+                    "managed_complete": withdrawal["partition"]["scope"] == "private"}
         return self._reconcile_withdrawal_record(withdrawal, adapter)
 
     def reconcile_withdrawal(
@@ -1325,6 +1358,7 @@ class TrustedProcedureService:
         logical_id: str,
         partition: Mapping[str, Any],
         adapter: atlas.AtlasProcedureAdapter,
+        network_resolution: NetworkResolution | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Reconcile a locally fenced withdrawal through the exact current id."""
 
@@ -1337,6 +1371,9 @@ class TrustedProcedureService:
         except contracts.ContractError as exc:
             raise ProcedureError("current withdrawal state is not valid durable evidence") from exc
         self._require_trusted_issuer(withdrawal["issuer"])
+        if not atlas.atlas_task_network_allowed(network_resolution):
+            return {"withdrawal": dict(withdrawal),
+                    "managed_complete": withdrawal["partition"]["scope"] == "private"}
         return self._reconcile_withdrawal_record(withdrawal, adapter)
 
     def revoke(
@@ -1346,6 +1383,7 @@ class TrustedProcedureService:
         issuer: str,
         reason: str,
         adapter: atlas.AtlasProcedureAdapter,
+        network_resolution: NetworkResolution | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Tombstone a revision and fence every tracked publication before completion."""
 
@@ -1374,6 +1412,12 @@ class TrustedProcedureService:
             payload_digest=revocation["content_hash"],
             partition_id=None,
         )
+        if not atlas.atlas_task_network_allowed(network_resolution):
+            return {
+                "revocation": revocation,
+                "managed_complete": False,
+                "exposures": self.store.list_procedure_exposures(revocation["revision_id"]),
+            }
         remote_ready = False
         try:
             remote = adapter.write_revocation(revocation)
@@ -1452,8 +1496,15 @@ class TrustedProcedureService:
         adapter: atlas.AtlasProcedureAdapter,
         representation: Mapping[str, Any] | None = None,
         limit: int = 8,
+        network_resolution: NetworkResolution | Mapping[str, Any] | None = None,
+        atlas_shared_retrieval_enabled: bool = True,
     ) -> list[dict[str, Any]]:
         """Discover ids through Vector Search, then exact-read every delivery candidate."""
+
+        if not atlas_shared_retrieval_enabled or not atlas.atlas_task_network_allowed(
+            network_resolution
+        ):
+            return []
 
         # Search order and duplicate physical copies are discovery artifacts,
         # not authority.  The contract permits one delivered revision per
@@ -1514,5 +1565,6 @@ __all__ = [
     "ProcedureAuthorizationError",
     "ProcedureRemoteAmbiguityError",
     "ProcedureIneligibleError",
+    "ProcedureNetworkDeniedError",
     "TrustedProcedureService",
 ]
