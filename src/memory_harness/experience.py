@@ -848,6 +848,7 @@ class ReviewedExperienceService:
         *,
         experience_write: bool = True,
         current_config: Mapping[str, Any] | config.MemoryConfig | None = None,
+        claimant: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Submit one optional EverOS extraction without unsafe replay.
 
@@ -867,6 +868,20 @@ class ReviewedExperienceService:
                 not config.effect_submission_enabled(captured, "experience_ingestion") or
                 not config.effect_submission_enabled(effective, "experience_ingestion")):
             return existing
+        if claimant is not None:
+            return await self._extract_claimed_trajectory(
+                trajectory, adapter, claimant=claimant, current_config=effective,
+            )
+        try:
+            self.store.get_effect_operation(self._external_ingestion_id(trajectory, adapter))
+        except StoreError:
+            pass
+        else:
+            if existing is None:
+                raise ExperienceError("source-owned EverOS claim has no ingestion")
+            return await self.reconcile_extraction(
+                trajectory_id, adapter, current_config=effective,
+            )
         if existing is not None:
             if existing["status"] in {"pending", "uncertain"}:
                 return await self.reconcile_extraction(
@@ -923,6 +938,137 @@ class ReviewedExperienceService:
             current_config=effective,
         )
 
+    @staticmethod
+    def _external_ingestion_id(trajectory: Mapping[str, Any], adapter: EverOSAdapter) -> str:
+        scope_key = contracts.sha256_hex({
+            "scope": trajectory["scope"], "destination": adapter.destination,
+        })
+        return contracts.external_effect_operation_id(
+            trajectory["trajectory_id"], "experience_ingestion", scope_key,
+        )
+
+    async def _extract_claimed_trajectory(
+        self, trajectory: Mapping[str, Any], adapter: EverOSAdapter, *,
+        claimant: Mapping[str, Any], current_config: Mapping[str, Any] | config.MemoryConfig,
+    ) -> dict[str, Any]:
+        """Claim the source-owned effect before one public EverOS submission."""
+        trajectory_id = trajectory["trajectory_id"]
+        session_id = adapter.session_id_for(trajectory_id)
+        payload = adapter.add_payload(trajectory, session_id=session_id)
+        captured = self.store.get_decision(trajectory["decision_id"])["configuration"]
+        operation_id = self._external_ingestion_id(trajectory, adapter)
+        ingestion = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
+        try:
+            previous = self.store.get_effect_operation(operation_id)
+        except StoreError:
+            previous = None
+        if ingestion is not None and previous is None:
+            return await self.reconcile_extraction(
+                trajectory_id, adapter, current_config=current_config,
+            )
+        operation, _ = self.store.create_external_effect_operation(
+            kind="experience_ingestion",
+            scope_key=contracts.sha256_hex({
+                "scope": trajectory["scope"], "destination": adapter.destination,
+            }),
+            source_id=trajectory_id, source_record=trajectory, payload=payload,
+            captured_config=captured, current_config=current_config,
+        )
+        if (operation["claimant_record"] is not None and
+                operation["claimant_record"] != dict(claimant)):
+            raise OperationConflictError("EverOS operation belongs to a different claimant")
+        if operation["status"] != "pending" or operation["claim_generation"] > 0:
+            if ingestion is None:
+                raise ExperienceError("claimed EverOS operation has no ingestion")
+            return await self.reconcile_extraction(
+                trajectory_id, adapter, current_config=current_config,
+            )
+        try:
+            claim = self.store.claim_effect_operation(
+                operation_id, current_config=current_config, claimant=claimant,
+            )
+        except OperationConflictError:
+            ingestion = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
+            if ingestion is None:
+                raise
+            return await self.reconcile_extraction(
+                trajectory_id, adapter, current_config=current_config,
+            )
+        intent = contracts.make_experience_ingestion(
+            trajectory=trajectory, destination=adapter.destination,
+            session_id=session_id, payload_digest=contracts.sha256_hex(payload),
+        )
+        ingestion, created = self.store.create_experience_ingestion(intent)
+        if not created:
+            raise OperationConflictError("claimed EverOS ingestion already exists")
+        usage = contracts.make_native_usage_start(
+            source="everos:memorize", invocation_id=claimant["native_invocation_id"],
+            objective_id=trajectory["objective_id"], decision_id=trajectory["decision_id"],
+            maintenance_operation_id=None, stage="experience_ingestion",
+            category="inner_candidate", window_id=trajectory["run_id"],
+            binding={"requested": None, "resolved": None, "native": None},
+        )
+        self.store.start_native_usage(usage)
+        result: Mapping[str, Any] | None = None
+        failure: Exception | None = None
+        try:
+            result = await adapter.memorize(payload)
+        except Exception as exc:
+            failure = exc
+        reason = (_safe_error(failure, self.privacy_policy) if failure is not None
+                  else "awaiting exact EverOS readback")
+        effect, settled, _ = self.store.settle_external_experience_ingestion(
+            operation_id, ingestion["ingestion_id"],
+            claim_id=claim["active_claim_id"],
+            claim_generation=claim["claim_generation"], mode="uncertain",
+            reason=reason, ingestion_uncertain=failure is not None,
+        )
+        if settled["status"] == "confirmed":
+            acknowledgement = effect["acknowledgement"]
+            _, settled, _ = self.store.settle_external_experience_ingestion(
+                operation_id, ingestion["ingestion_id"],
+                claim_id=claim["active_claim_id"],
+                claim_generation=claim["claim_generation"], mode="acknowledged",
+                evidence=effect["reconciliation"],
+                case_receipts=tuple(acknowledgement["case_receipts"]),
+            )
+        if result is not None:
+            self.record_memorize_usage_result(trajectory_id, adapter, claimant, result)
+        if settled["status"] == "confirmed":
+            return settled
+        return await self.reconcile_extraction(
+            trajectory_id, adapter, current_config=current_config,
+        )
+
+    def record_memorize_usage_result(
+        self, trajectory_id: str, adapter: EverOSAdapter,
+        claimant: Mapping[str, Any], result: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Accept an authentic source result, including one delivered late, once."""
+        operation = self.store.get_effect_operation(self._external_ingestion_id(
+            self.get_trajectory(trajectory_id), adapter,
+        ))
+        if operation["claimant_record"] != dict(claimant):
+            raise OperationConflictError("EverOS usage result has a different claimant")
+        message_count = result.get("message_count")
+        if type(message_count) is not int or message_count < 0:
+            return None
+        usage = self.store.get_native_usage("everos:memorize", claimant["native_invocation_id"])
+        receipt = contracts.make_native_usage_receipt(
+            source=usage["source"], invocation_id=usage["invocation_id"],
+            receipt_id=contracts.sha256_hex({
+                "source": usage["source"], "invocation_id": usage["invocation_id"],
+                "measure": "message_count",
+            }),
+            objective_id=usage["objective_id"], decision_id=usage["decision_id"],
+            maintenance_operation_id=None, stage=usage["stage"],
+            category=usage["category"], window_id=usage["window_id"],
+            binding=usage["binding"], mode="cumulative", complete=False,
+            measures={"messages": {"value": message_count, "unit": "messages",
+                                    "included_in_total": None}},
+        )
+        return self.store.record_native_usage_receipt(receipt)
+
     async def reconcile_extraction(
         self,
         trajectory_id: str,
@@ -938,14 +1084,26 @@ class ReviewedExperienceService:
         ingestion = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
         effective = current_config or config.MemoryConfig()
         captured = self.store.get_decision(trajectory["decision_id"])["configuration"]
+        try:
+            source_operation = self.store.get_effect_operation(
+                self._external_ingestion_id(trajectory, adapter)
+            )
+        except StoreError:
+            source_operation = None
         if (not experience_write or
                 not config.effect_submission_enabled(captured, "experience_ingestion") or
-                not config.effect_submission_enabled(effective, "experience_ingestion")):
+                (not config.effect_submission_enabled(effective, "experience_ingestion") and
+                 (source_operation is None or source_operation["status"] not in
+                  {"in_flight", "uncertain", "confirmed"}))):
             return ingestion
         if ingestion is None:
             raise ExperienceError("no reviewed-experience ingestion exists to reconcile")
         if ingestion["status"] == "confirmed":
             return ingestion
+        if source_operation is not None and (
+            adapter.surface.get is None or adapter.surface.make_get_request is None
+        ):
+            return ingestion  # Ranked search cannot prove a claimed mutation.
         try:
             source_cases = await adapter.readback_cases(
                 session_id=ingestion["session_id"], query=trajectory["task_text"]
@@ -970,9 +1128,26 @@ class ReviewedExperienceService:
         if not receipts:
             return ingestion
         try:
+            if source_operation is not None:
+                evidence = {key: source_operation[key] for key in (
+                    "operation_id", "kind", "scope_key", "source_digest",
+                    "payload_digest", "configuration_digest",
+                )}
+                evidence["adapter_proof"] = {
+                    "session_id": ingestion["session_id"],
+                    "scope": adapter.scope.to_record(),
+                    "case_ids": sorted(receipt["case_id"] for receipt in receipts),
+                }
+                _, settled, _ = self.store.settle_external_experience_ingestion(
+                    source_operation["operation_id"], ingestion["ingestion_id"],
+                    claim_id=source_operation["active_claim_id"],
+                    claim_generation=source_operation["claim_generation"],
+                    mode="acknowledged", evidence=evidence,
+                    case_receipts=tuple(receipts),
+                )
+                return settled
             return self.store.confirm_experience_ingestion(
-                ingestion["ingestion_id"],
-                receipts,
+                ingestion["ingestion_id"], receipts,
                 expected_version=ingestion["version"],
             )
         except ExperienceConflictError:
