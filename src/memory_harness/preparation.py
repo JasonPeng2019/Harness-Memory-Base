@@ -24,6 +24,7 @@ from .config import (
     PreparationLimits,
     resolve_config,
     resolve_limits,
+    resolve_network_mode,
 )
 from .privacy import PrivacyPolicy, safe_query_payload, sanitize_text
 from .search import BoundedSearch, SearchStore
@@ -386,9 +387,10 @@ class PreparationService:
     def _logical_owner(
         self, identity: Mapping[str, str], request: Mapping[str, Any] | None,
         requested: MemoryConfig, explicit_network_mode: str | None,
-    ) -> tuple[dict[str, Any] | None, MemoryConfig | None, str | None, str | None]:
+        explicit_network_evidence: Mapping[str, Any] | None,
+    ) -> tuple[dict[str, Any] | None, MemoryConfig | None, str | None, str | None, dict[str, Any] | None]:
         if self.store is None:
-            return None, None, None, None
+            return None, None, None, None, None
         try:
             decision = self.store.find_logical_decision(identity)
         except Exception as exc:
@@ -396,7 +398,7 @@ class PreparationService:
                 f"durable logical decision lookup failed; recover mandatory state: {exc}"
             ) from exc
         if decision is None:
-            return None, None, None, None
+            return None, None, None, None, None
         if any(decision.get(key) != value for key, value in identity.items()):
             raise MandatoryStateFailure(
                 "durable logical decision identity conflicts with mandatory state; "
@@ -417,7 +419,7 @@ class PreparationService:
         # row itself remains immutable. All-off still takes the inherited path.
         if not prior:
             self._standalone_config(decision, request)
-            return decision, None, None, None
+            return decision, None, None, None, None
         first = [packet for packet in prior if packet.get("attempt") == 1]
         if len(first) != 1:
             raise MandatoryStateFailure(
@@ -435,6 +437,7 @@ class PreparationService:
         )
         self._check_explicit_policy(request, normalized_request, captured)
         network_modes = set()
+        rich_resolutions: list[dict[str, Any] | None] = []
         for packet in prior:
             if not isinstance(packet, Mapping) or any(
                 packet.get(key) != value for key, value in identity.items()
@@ -472,19 +475,32 @@ class PreparationService:
                     "captured logical decision network mode is unreadable; recover mandatory state"
                 )
             network_modes.add(mode)
+            rich_resolutions.append(packet.get("network_resolution"))
         if len(network_modes) > 1:
             raise MandatoryStateFailure(
                 "captured logical decision network mode is inconsistent; recover mandatory state"
             )
         network_mode = next(iter(network_modes)) if network_modes else None
-        if (explicit_network_mode is not None and network_mode is not None
-                and explicit_network_mode != network_mode):
+        captured_resolution = rich_resolutions[0]
+        if any(item != captured_resolution for item in rich_resolutions):
+            raise MandatoryStateFailure(
+                "captured logical decision network resolution is inconsistent; recover mandatory state"
+            )
+        requested_mode = (
+            captured_resolution["requested_mode"] if captured_resolution is not None
+            else network_mode
+        )
+        if (explicit_network_mode is not None and explicit_network_mode != requested_mode
+                or explicit_network_evidence is not None and (
+                    captured_resolution is None
+                    or dict(explicit_network_evidence) != captured_resolution["input_evidence"]
+                )):
             raise MandatoryStateFailure(
                 "explicit network policy conflicts with the captured logical decision; "
                 "recover mandatory state or start a new decision"
             )
         source = prior[0].get("budget_source") if prior else None
-        return decision, captured, network_mode, source
+        return decision, captured, network_mode, source, captured_resolution
 
     # -- preparation -------------------------------------------------------
 
@@ -528,6 +544,7 @@ class PreparationService:
         route: str = "ordinary",
         request: Mapping[str, Any] | None = None,
         network_mode: str | None = None,
+        network_evidence: Mapping[str, Any] | None = None,
         deadline: float | None = None,
         unknown_time: bool = False,
         failure_context: str | None = None,
@@ -551,6 +568,12 @@ class PreparationService:
         finalize: bool = False,
     ) -> PreparationOutcome:
         contracts.validate_task_card(task_card)
+        if network_mode is not None or network_evidence is not None:
+            # Validate even on the inherited/all-off path and before optional work.
+            resolve_network_mode(
+                network_mode if network_mode is not None else "normal",
+                evidence=network_evidence,
+            )
         supplied_config = self._resolve(request)
         try:
             current_plan_state = contracts.classify_current_plan(
@@ -645,8 +668,8 @@ class PreparationService:
         proposed_budget_source = budget_source
         proposed_unknown_time = unknown_time
         for _ in range(2):
-            durable, captured, captured_network, captured_source = self._logical_owner(
-                identity, request, supplied_config, network_mode
+            durable, captured, captured_network, captured_source, captured_resolution = self._logical_owner(
+                identity, request, supplied_config, network_mode, network_evidence
             )
             standalone_policy = (
                 self._standalone_config(durable, request)
@@ -712,9 +735,16 @@ class PreparationService:
                 ownership_decision = durable
                 assert captured is not None
                 requested_config = captured
+            network_resolution = (
+                captured_resolution if captured_network is not None
+                else contracts.network_resolution_record(resolve_network_mode(
+                    network_mode if network_mode is not None else "normal",
+                    evidence=network_evidence,
+                ))
+            )
             effective_network_mode = (
                 captured_network if captured_network is not None
-                else network_mode if network_mode is not None else "normal"
+                else network_resolution["effective_mode"]
             )
             try:
                 # One decision owns one deadline. A later trusted cutoff may
@@ -774,6 +804,7 @@ class PreparationService:
                 requested_strategy=resolved_config.requested_strategy,
                 configuration=asdict(resolved_config),
                 network_mode=effective_network_mode,
+                network_resolution=network_resolution,
                 budget_source=budget_source,
                 remaining_seconds=None if unknown_time else remaining,
                 deadline_monotonic=None if unknown_time else absolute_deadline,
@@ -1187,6 +1218,7 @@ class PreparationService:
             requested_strategy=replacement_config.requested_strategy,
             configuration=asdict(replacement_config),
             network_mode=packet["network_mode"],
+            network_resolution=packet.get("network_resolution"),
             budget_source=packet["budget_source"],
             remaining_seconds=remaining_value,
             deadline_monotonic=deadline_monotonic,

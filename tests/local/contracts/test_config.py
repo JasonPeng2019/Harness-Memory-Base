@@ -69,6 +69,55 @@ class FixedConfigurationTests(unittest.TestCase):
         self.assertEqual("standard", deeper_disabled.strategy)
         self.assertIn("fallback", deeper_disabled.reason)
 
+    def test_atlas_requires_both_launched_payload_and_independent_block_proof(self) -> None:
+        evidence = {
+            "launched_payload": {"verified": True, "evidence_id": "payload-7"},
+            "unrelated_destination_block": {
+                "blocked": True, "independent": True,
+                "source_kind": "independent_network_boundary", "evidence_id": "egress-4",
+            },
+        }
+        resolved = config.resolve_network_mode("atlas_memory_only", evidence=evidence)
+        self.assertEqual("atlas_memory_only", resolved.effective_mode)
+        self.assertEqual(evidence, resolved.input_evidence)
+        self.assertIn("verified_launched_payload:payload-7", resolved.enforcement_sources)
+        self.assertIn("independent_egress_block:egress-4", resolved.enforcement_sources)
+
+        for absent in ("launched_payload", "unrelated_destination_block"):
+            with self.subTest(absent=absent):
+                weaker = config.resolve_network_mode(
+                    "atlas_memory_only", evidence={k: v for k, v in evidence.items() if k != absent}
+                )
+                self.assertEqual("soft_guardrail_network", weaker.effective_mode)
+                self.assertIn(absent, " ".join(weaker.disclosed_limits))
+                self.assertIn("shell egress", " ".join(weaker.disclosed_limits))
+
+        same_user = config.resolve_network_mode("atlas_memory_only", evidence={
+            **evidence, "unrelated_destination_block": {
+                "blocked": True, "independent": True,
+                "source_kind": "same_user_process", "evidence_id": "process-flags",
+            },
+        })
+        self.assertEqual("soft_guardrail_network", same_user.effective_mode)
+        self.assertIn("independent", " ".join(same_user.disclosed_limits))
+
+    def test_soft_restricted_and_invalid_network_requests(self) -> None:
+        soft = config.resolve_network_mode("soft_guardrail_network")
+        self.assertEqual("soft_guardrail_network", soft.effective_mode)
+        self.assertIn("shell egress", " ".join(soft.disclosed_limits))
+        self.assertNotIn("hardened", " ".join(soft.enforcement_sources))
+        restricted = config.resolve_network_mode("restricted_local")
+        self.assertEqual("restricted_local", restricted.effective_mode)
+        self.assertIn("service_entry_policy_required", restricted.enforcement_sources)
+        self.assertIn("optional Atlas task-path", " ".join(restricted.disclosed_limits))
+        for mode in ("", "unknown", "Atlas_Memory_Only", None):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                config.resolve_network_mode(mode)
+        with self.assertRaises(ValueError):
+            config.resolve_network_mode("atlas_memory_only", evidence={
+                "launched_payload": {"verified": True},
+            })
+
 
 if __name__ == "__main__":
     unittest.main()

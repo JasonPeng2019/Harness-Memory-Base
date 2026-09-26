@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from .privacy import PrivacyPolicy, guard_mandatory
+from .config import NetworkResolution, resolve_network_mode
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
 # The explicit worker-environment boundary a task card may declare.  A
@@ -3521,6 +3522,32 @@ def classify_current_plan(
     return state
 
 
+def network_resolution_record(resolution: NetworkResolution) -> dict[str, Any]:
+    """JSON-safe public preparation form of a per-objective resolution."""
+    return {
+        "requested_mode": resolution.requested_mode,
+        "effective_mode": resolution.effective_mode,
+        "enforcement_sources": list(resolution.enforcement_sources),
+        "disclosed_limits": list(resolution.disclosed_limits),
+        "input_evidence": dict(resolution.input_evidence),
+    }
+
+
+def preparation_network_resolution(preparation: Mapping[str, Any]) -> dict[str, Any]:
+    """Read rich facts or project an old row without changing its stored bytes."""
+    validate_preparation(preparation)
+    if "network_resolution" in preparation:
+        return dict(preparation["network_resolution"])
+    mode = preparation["network_mode"]
+    return {
+        "requested_mode": mode,
+        "effective_mode": mode,
+        "enforcement_sources": ["legacy_captured_mode"],
+        "disclosed_limits": ["legacy row has no captured network enforcement proof"],
+        "input_evidence": {},
+    }
+
+
 def make_preparation(
     *,
     task_card: Mapping[str, Any],
@@ -3535,6 +3562,7 @@ def make_preparation(
     requested_strategy: str,
     configuration: Mapping[str, Any],
     network_mode: str,
+    network_resolution: Mapping[str, Any] | None = None,
     budget_source: str,
     remaining_seconds: float | None,
     execution_reserve_seconds: float,
@@ -3620,6 +3648,10 @@ def make_preparation(
         "status": status,
         "created_at": created_at or utc_now(),
     }
+    if network_resolution is not None:
+        record["network_resolution"] = _normalize_json_object(
+            network_resolution, "network_resolution"
+        )
     record["content_hash"] = content_hash(record)
     validate_preparation(record)
     return record
@@ -3655,6 +3687,21 @@ def validate_preparation(record: Mapping[str, Any]) -> None:
         raise ContractError("preparation strategy does not match its configuration")
     if record["configuration_digest"] != sha256_hex(configuration):
         raise ContractError("preparation configuration digest mismatch")
+    if "network_resolution" in record:
+        resolution = record["network_resolution"]
+        if not isinstance(resolution, Mapping) or set(resolution) != {
+            "requested_mode", "effective_mode", "enforcement_sources",
+            "disclosed_limits", "input_evidence",
+        }:
+            raise ContractError("network resolution fields are invalid")
+        try:
+            expected = network_resolution_record(resolve_network_mode(
+                resolution["requested_mode"], evidence=resolution["input_evidence"]
+            ))
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ContractError(f"network resolution is invalid: {exc}") from exc
+        if dict(resolution) != expected or record["network_mode"] != expected["effective_mode"]:
+            raise ContractError("network resolution conflicts with captured effective mode")
     if record.get("supersedes") is not None:
         _require_nonempty_str(record["supersedes"], "supersedes")
         if record["supersedes"] == record["preparation_id"]:

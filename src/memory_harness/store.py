@@ -4549,6 +4549,11 @@ class MemoryStore:
             prior = self.list_preparations(str(preparation["decision_id"]))
             if prior and any(row["network_mode"] != preparation["network_mode"] for row in prior):
                 raise PreparationConflictError("captured preparation network mode changed")
+            if prior and any(
+                row.get("network_resolution") != preparation.get("network_resolution")
+                for row in prior
+            ):
+                raise PreparationConflictError("captured preparation network resolution changed")
             existing = next(
                 (row for row in prior if row["preparation_id"] == preparation["preparation_id"]),
                 None,

@@ -10,6 +10,103 @@ STANDARD = "standard"
 PROBLEM_FOCUSED = "problem_focused"
 DEEPER = "deeper"
 FIXED_STRATEGIES = frozenset({STANDARD, PROBLEM_FOCUSED, DEEPER})
+NETWORK_MODES = frozenset({
+    "normal", "soft_guardrail_network", "atlas_memory_only", "restricted_local",
+})
+
+
+@dataclass(frozen=True)
+class NetworkResolution:
+    """Per-objective claim and the exact nonsecret evidence supplied by its caller.
+
+    This is separate from MemoryConfig: network facts never enter the fixed
+    strategy configuration or its decision digest. A proof reference identifies
+    evidence held by the launch/egress owner; this resolver does not measure it.
+    """
+
+    requested_mode: str
+    effective_mode: str
+    enforcement_sources: tuple[str, ...]
+    disclosed_limits: tuple[str, ...]
+    input_evidence: dict[str, Any]
+
+
+def resolve_network_mode(
+    requested_mode: str = "normal", *, evidence: Mapping[str, Any] | None = None,
+) -> NetworkResolution:
+    """Resolve one requested profile from lane-2 supplied proof references.
+
+    ``evidence`` accepts ``launched_payload`` with ``verified`` and
+    ``evidence_id``, and ``unrelated_destination_block`` with ``blocked``,
+    ``independent``, ``source_kind``, and ``evidence_id``. Positive facts need a nonempty opaque
+    evidence ID. The caller must supply nonsecret IDs, never credentials.
+    """
+    if not isinstance(requested_mode, str) or requested_mode not in NETWORK_MODES:
+        raise ValueError("unsupported network mode")
+    if evidence is None:
+        evidence = {}
+    if not isinstance(evidence, Mapping) or set(evidence) - {
+        "launched_payload", "unrelated_destination_block",
+    }:
+        raise ValueError("network evidence has unsupported fields")
+    normalized: dict[str, Any] = {}
+    fields_by_kind = {
+        "launched_payload": {"verified"},
+        "unrelated_destination_block": {"blocked", "independent", "source_kind"},
+    }
+    for kind, facts in evidence.items():
+        if not isinstance(facts, Mapping) or set(facts) != fields_by_kind[kind] | {"evidence_id"}:
+            raise ValueError(f"{kind} evidence fields are incomplete")
+        boolean_fields = fields_by_kind[kind] - {"source_kind"}
+        if any(not isinstance(facts[name], bool) for name in boolean_fields):
+            raise ValueError(f"{kind} evidence facts must be boolean")
+        if kind == "unrelated_destination_block" and facts["source_kind"] not in (
+            "independent_network_boundary", "same_user_process",
+        ):
+            raise ValueError("unrelated_destination_block source_kind is invalid")
+        evidence_id = facts["evidence_id"]
+        if not isinstance(evidence_id, str) or not evidence_id.strip():
+            raise ValueError(f"{kind} evidence_id must be a nonempty string")
+        normalized[kind] = dict(facts)
+
+    if requested_mode == "restricted_local":
+        return NetworkResolution(
+            requested_mode, requested_mode, ("service_entry_policy_required",),
+            ("optional Atlas task-path work requires service-entry blocking; "
+             "authorized safety administration may remain pending",), normalized,
+        )
+    if requested_mode == "normal":
+        return NetworkResolution(
+            requested_mode, requested_mode, ("legacy_normal_compatibility",),
+            ("no network restriction is claimed",), normalized,
+        )
+    sources = ["requested_soft_guardrail_policy"]
+    limits = [
+        "native general web/fetch/search suppression requires lane-2 launched-payload application",
+        "shell egress remains possible; no hardened isolation is claimed",
+    ]
+    if requested_mode == "soft_guardrail_network":
+        return NetworkResolution(requested_mode, requested_mode, tuple(sources),
+                                 tuple(limits), normalized)
+    payload = normalized.get("launched_payload")
+    block = normalized.get("unrelated_destination_block")
+    payload_ok = payload is not None and payload["verified"]
+    block_ok = (block is not None and block["blocked"] and block["independent"]
+                and block["source_kind"] == "independent_network_boundary")
+    if not payload_ok:
+        limits.append("launched_payload verification is missing")
+    if not block_ok:
+        limits.append("independent unrelated_destination_block proof is missing")
+    if not (payload_ok and block_ok):
+        return NetworkResolution(requested_mode, "soft_guardrail_network",
+                                 tuple(sources), tuple(limits), normalized)
+    return NetworkResolution(
+        requested_mode, requested_mode,
+        (f"verified_launched_payload:{payload['evidence_id']}",
+         f"independent_egress_block:{block['evidence_id']}"),
+        ("lane-2 must retain actual launched-payload and measured egress proof; "
+         "this resolution alone does not enforce isolation",), normalized,
+    )
 
 LEARNED_REQUEST_KEYS = (
     "learned_mode",
@@ -344,6 +441,9 @@ __all__ = [
     "problem_focused",
     "deeper",
     "resolve_config",
+    "NETWORK_MODES",
+    "NetworkResolution",
+    "resolve_network_mode",
     "LimitsError",
     "PreparationLimits",
     "REPRESENTATION_MODEL",

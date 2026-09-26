@@ -92,6 +92,104 @@ class CapturedConfigurationTests(unittest.TestCase):
         self.assertEqual(2, second.preparation["attempt"])
         self.assertEqual([], optional_calls)
 
+    def test_rich_network_resolution_is_captured_and_explicit_drift_rejected(self) -> None:
+        evidence = {
+            "launched_payload": {"verified": True, "evidence_id": "payload-7"},
+            "unrelated_destination_block": {
+                "blocked": True, "independent": True,
+                "source_kind": "independent_network_boundary", "evidence_id": "egress-4",
+            },
+        }
+        first = self.prepare(self.service(), network_mode="atlas_memory_only",
+                             network_evidence=evidence)
+        self.assertEqual("atlas_memory_only", first.preparation["network_mode"])
+        captured = first.preparation["network_resolution"]
+        self.assertEqual("atlas_memory_only", captured["requested_mode"])
+        self.assertEqual(evidence, captured["input_evidence"])
+        self.assertEqual(first.decision["configuration_digest"],
+                         first.preparation["configuration_digest"])
+        old_shape = dict(first.preparation)
+        old_shape.pop("network_resolution")
+        self.assertEqual(first.preparation["preparation_id"],
+                         contracts.sha256_hex({
+                             "domain": "memory-preparation/v1",
+                             "task_card_digest": old_shape["task_card_digest"],
+                             "decision_id": old_shape["decision_id"],
+                             "objective_id": old_shape["objective_id"],
+                             "route": old_shape["route"],
+                             "strategy": old_shape["strategy"],
+                             "configuration_digest": old_shape["configuration_digest"],
+                             "supersedes": old_shape["supersedes"],
+                             "attempt": old_shape["attempt"],
+                         }))
+        self.clock.value += 1
+        retry = self.prepare(self.service(), deadline=None)
+        self.assertEqual(captured, retry.preparation["network_resolution"])
+        self.assertEqual(first.decision, retry.decision)
+        for changed in (
+            {"network_mode": "soft_guardrail_network"},
+            {"network_mode": "atlas_memory_only", "network_evidence": {
+                **evidence, "unrelated_destination_block": {
+                    "blocked": True, "independent": True,
+                    "source_kind": "independent_network_boundary", "evidence_id": "egress-5",
+                },
+            }},
+        ):
+            with self.subTest(changed=changed), self.assertRaises(
+                preparation.MandatoryStateFailure
+            ):
+                self.prepare(self.service(), **changed)
+        self.assertEqual(2, len(self.state.list_preparations(first.decision["decision_id"])))
+
+    def test_legacy_normal_reopens_without_rewriting_record(self) -> None:
+        first = self.prepare(self.service(), network_mode="normal")
+        legacy = dict(first.preparation)
+        legacy.pop("network_resolution")
+        legacy["content_hash"] = contracts.content_hash(legacy)
+        self.state.connection.execute(
+            "UPDATE preparations SET record=? WHERE preparation_id=?",
+            (json.dumps(legacy, sort_keys=True), legacy["preparation_id"]),
+        )
+        self.state.connection.commit()
+        self.assertEqual("normal", contracts.preparation_network_resolution(legacy)["effective_mode"])
+        retry = self.prepare(self.service(), deadline=None)
+        self.assertEqual("normal", retry.preparation["network_mode"])
+        self.assertNotIn("network_resolution", retry.preparation)
+        self.assertEqual(legacy, self.state.get_preparation(legacy["preparation_id"]))
+
+    def test_downgraded_atlas_claim_stays_captured_on_retry_and_level_zero(self) -> None:
+        first = self.prepare(self.service(), network_mode="atlas_memory_only",
+                             network_evidence={
+                                 "launched_payload": {
+                                     "verified": True, "evidence_id": "payload-7",
+                                 },
+                             })
+        captured = first.preparation["network_resolution"]
+        self.assertEqual("atlas_memory_only", captured["requested_mode"])
+        self.assertEqual("soft_guardrail_network", captured["effective_mode"])
+        self.assertEqual("soft_guardrail_network", first.preparation["network_mode"])
+        retry = self.prepare(self.service(), deadline=None,
+                             network_mode="atlas_memory_only")
+        self.assertEqual(captured, retry.preparation["network_resolution"])
+        with self.assertRaises(preparation.MandatoryStateFailure):
+            self.prepare(self.service(), deadline=None, network_mode="atlas_memory_only",
+                         network_evidence={
+                             "launched_payload": {
+                                 "verified": True, "evidence_id": "payload-7",
+                             },
+                             "unrelated_destination_block": {
+                                 "blocked": True, "independent": True,
+                                 "source_kind": "independent_network_boundary",
+                                 "evidence_id": "egress-4",
+                             },
+                         })
+        corrected = self.service().apply_level_zero(
+            preparation=retry.preparation, decision=retry.decision,
+            task_card=self.card, plan=retry.plan, objective_id="objective-1",
+        )
+        self.assertEqual(captured, corrected.preparation["network_resolution"])
+        self.assertEqual("soft_guardrail_network", corrected.preparation["network_mode"])
+
     def test_explicit_conflicting_policy_fails_without_writes_or_optional_calls(self) -> None:
         first = self.first()
         calls: list[object] = []
