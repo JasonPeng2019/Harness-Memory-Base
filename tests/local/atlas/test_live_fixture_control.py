@@ -38,6 +38,7 @@ class _Collection:
     def __init__(self) -> None:
         self.documents: dict[str, dict] = {}
         self.reads: list[str] = []
+        self.inserted_ids: list[str] = []
 
     def find_one(self, selector: dict) -> dict | None:
         identifier = selector["_id"]
@@ -49,6 +50,7 @@ class _Collection:
         if document["_id"] in self.documents:
             raise ValueError("duplicate")
         self.documents[document["_id"]] = dict(document)
+        self.inserted_ids.append(document["_id"])
         return object()
 
     def replace_one(self, selector: dict, document: dict, *, upsert: bool = False) -> object:
@@ -80,6 +82,53 @@ class _VectorStore:
             and value.get("application") == selector["application"]
             and value.get("namespace") == selector["namespace"]
         ]
+
+
+class _LaggingVectorStore(_VectorStore):
+    def __init__(self, collection: _Collection, *, revoked_visible_after: int | None) -> None:
+        super().__init__(collection)
+        self.revoked_visible_after = revoked_visible_after
+        self.searches: dict[str, int] = {}
+        self.persistent_ids_at_first_search: set[str] | None = None
+
+    def similarity_search_with_score(self, query: str, **kwargs: object) -> list[tuple[_Document, float]]:
+        if self.persistent_ids_at_first_search is None:
+            self.persistent_ids_at_first_search = {
+                identifier for identifier, document in self.collection.documents.items()
+                if document.get("document_kind") == "trusted_procedure_publication"
+            }
+        self.searches[query] = self.searches.get(query, 0) + 1
+        visible_after = 2 if query == fixture.ELIGIBLE_QUERY else self.revoked_visible_after
+        matches = super().similarity_search_with_score(query, **kwargs)
+        if visible_after is None or self.searches[query] < visible_after:
+            return []
+        return [
+            item for item in matches
+            if self.collection.documents[item[0].id].get("search_text") == query
+        ]
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class _DroppableCollection(_Collection):
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.name = name
+        self.dropped_names: list[str] = []
+
+    def drop(self) -> None:
+        self.dropped_names.append(self.name)
 
 
 class _OwnedCollection:
@@ -128,6 +177,103 @@ class AtlasLiveRepresentationTests(unittest.TestCase):
 
 
 class AtlasLiveEligibilityControlTests(unittest.TestCase):
+    def test_visibility_waits_for_both_exact_publications_before_eligibility_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = store.MemoryStore(Path(directory) / "memory.sqlite3")
+            database.initialize()
+            try:
+                collection = _Collection()
+                vector_store = _LaggingVectorStore(collection, revoked_visible_after=3)
+                adapter = atlas.AtlasProcedureAdapter(collection=collection, vector_store=vector_store)
+                service = procedures.TrustedProcedureService(database, trusted_issuers={"ROOT"})
+                scope = {
+                    "application": "memory-harness-live-test", "project": "step18-synthetic",
+                    "namespace": "step18-live-offline", "owner": "root-live-test",
+                }
+                clock = _Clock()
+                with mock.patch.object(socket.socket, "connect", side_effect=AssertionError("network call")):
+                    with mock.patch.object(fixture, "time", types.SimpleNamespace(
+                        monotonic=clock.monotonic, sleep=clock.sleep,
+                    ), create=True):
+                        retained, revoked = fixture.prove_fixture_eligibility(
+                            self, service=service, adapter=adapter, scope=scope,
+                            run_token="1c2850372db24777bf0a2e72dfd341c4",
+                        )
+                self.assertEqual(
+                    {retained["publication_id"], revoked["publication_id"]},
+                    vector_store.persistent_ids_at_first_search,
+                )
+                self.assertGreaterEqual(vector_store.searches[fixture.ELIGIBLE_QUERY], 2)
+                self.assertGreaterEqual(vector_store.searches[fixture.REVOKED_QUERY], 3)
+                self.assertEqual([0.5, 0.5], clock.sleeps)
+                self.assertEqual(
+                    [fixture.ELIGIBLE_QUERY, fixture.REVOKED_QUERY,
+                     fixture.ELIGIBLE_QUERY, fixture.REVOKED_QUERY, fixture.REVOKED_QUERY],
+                    [call["query"] for call in vector_store.calls[:5]],
+                )
+                self.assertTrue(all(call["pre_filter"] == {
+                    "document_kind": "trusted_procedure_publication",
+                    "application": scope["application"], "namespace": scope["namespace"],
+                } for call in vector_store.calls[:5]))
+                self.assertEqual(fixture.representation_identity(), {
+                    key: retained["representation"][key]
+                    for key in atlas.ATLAS_QUERY_REPRESENTATION_IDENTITY_FIELDS
+                })
+                self.assertIn(retained["publication_id"], collection.reads)
+                self.assertIn(revoked["publication_id"], collection.reads)
+                self.assertEqual(1, collection.inserted_ids.count(retained["publication_id"]))
+                self.assertEqual(1, collection.inserted_ids.count(revoked["publication_id"]))
+            finally:
+                database.close()
+
+    def test_visibility_timeout_drops_only_owned_collection_without_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = store.MemoryStore(Path(directory) / "memory.sqlite3")
+            database.initialize()
+            try:
+                token = "1c2850372db24777bf0a2e72dfd341c4"
+                identity = fixture.owned_atlas_identity("synthetic_live", token)
+                collection = _DroppableCollection(identity["collection"])
+                vector_store = _LaggingVectorStore(collection, revoked_visible_after=None)
+                adapter = atlas.AtlasProcedureAdapter(collection=collection, vector_store=vector_store)
+                service = procedures.TrustedProcedureService(database, trusted_issuers={"ROOT"})
+                scope = {
+                    "application": "memory-harness-live-test", "project": "step18-synthetic",
+                    "namespace": identity["namespace"], "owner": "root-live-test",
+                }
+                manifest_path = Path(directory) / "atlas-manifest.json"
+                clock = _Clock()
+
+                def action() -> dict:
+                    fixture.prove_fixture_eligibility(
+                        self, service=service, adapter=adapter, scope=scope, run_token=token,
+                    )
+                    self.fail("visibility timeout must prevent manifest creation")
+
+                with mock.patch.object(socket.socket, "connect", side_effect=AssertionError("network call")):
+                    with mock.patch.object(fixture, "time", types.SimpleNamespace(
+                        monotonic=clock.monotonic, sleep=clock.sleep,
+                    ), create=True):
+                        with self.assertRaisesRegex(TimeoutError, "60 seconds") as raised:
+                            fixture.run_owned_collection(
+                                collection, action=action, manifest_path=manifest_path,
+                            )
+                revoked_ids = [
+                    identifier for identifier, document in collection.documents.items()
+                    if document.get("document_kind") == "trusted_procedure_publication"
+                    and document.get("search_text") == fixture.REVOKED_QUERY
+                ]
+                self.assertEqual(1, len(revoked_ids))
+                self.assertIn(revoked_ids[0], str(raised.exception))
+                self.assertEqual([identity["collection"]], collection.dropped_names)
+                self.assertFalse(manifest_path.exists())
+                self.assertEqual(60.0, clock.now)
+                self.assertTrue(clock.sleeps)
+                self.assertTrue(all(0 < seconds <= 0.5 for seconds in clock.sleeps))
+                self.assertEqual(1, collection.inserted_ids.count(revoked_ids[0]))
+            finally:
+                database.close()
+
     def test_two_distinct_product_records_keep_one_eligible_after_other_revoked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = store.MemoryStore(Path(directory) / "memory.sqlite3")
