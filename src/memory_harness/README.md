@@ -7,6 +7,12 @@ artifact directory and restores it into a closed `MemoryStore` at a nonexistent
 path. Supply a fixed operator authorizer at construction; it receives
 `(action, exact_scope, store_path, credential)` and must return literal `True`.
 The four scope fields are `application`, `project`, `namespace`, and `owner`.
+That grant must cover the entire exact MemoryStore file at `store_path` under
+that four-field ownership scope. The service backs up every row in that file;
+it provides no subset, partition, or multi-tenant filtering. If the authorizer
+cannot grant the whole path and scope, it must reject the call. Export checks
+the grant before reading source bytes, and restore checks it before target
+mutation.
 Per-call credentials are inputs to this fixed authorizer, never replacement
 authority. An absent, rejecting, or throwing authorizer fails closed.
 
@@ -21,13 +27,15 @@ source = MemoryStore("source/memory.sqlite3")
 source.initialize()
 manifest = service.export(source, "capture", scope=scope, credential=operator_credential)
 target = MemoryStore("fresh/memory.sqlite3")  # closed; file does not exist
-service.restore("capture", target, scope=scope, credential=operator_credential)
+result = service.restore("capture", target, scope=scope, credential=operator_credential)
+# result["capture"] has capture-time facts; result["restored"] has current readiness.
 target.initialize()
 ```
 
 The published `capture/` directory contains `state.sqlite3` and
 `manifest.json` (`snapshot/v1`). The manifest binds the exact source root,
 path, scope, capture time, store format and schema digest, database SHA-256,
+the `source.scope_boundary` value `whole_memory_store_file`,
 its own canonical content hash, completeness, dependency references/readiness,
 and pending dispatch/effect/remote-operation statuses. The whole SQLite store
 is backed up; no domain IDs, configuration digests, or operation statuses are
@@ -41,11 +49,24 @@ remote effects. A preflight failure leaves the source and target file intact.
 adds source-specific references. Protected review references and known EverOS
 and Atlas operation references are discovered from the backup. They default to
 unready. A constructor-bound `dependency_verifier(capability, reference,
-exact_scope)` may attest them; it is called at export and again at restore.
-`restore(..., required_capabilities=("local", "atlas"))` refuses an unready
-requested capability. Unresolved dependencies make the overall manifest
-`incomplete`; local-only restore may still proceed. SQLite capture does not
-prove simultaneous remote state or protected-source availability. Lane 2 must
+exact_scope)` may attest them. A capture-time claim requires its proof at export;
+restore rechecks references whose capture-time proof was ready.
+The census includes both outcome-owned and source-owned remote effects.
+`restore(..., required_capabilities=("local", "atlas"))` requires at least one
+specific Atlas reference with valid capture and current verifier proof, and
+refuses an unready requested capability before target mutation. The same rule
+applies to `experience`; an empty reference list never grants a remote
+capability. Unresolved dependencies make the capture manifest `incomplete`.
+Local-only restore may still proceed and returns `{"capture": manifest,
+"restored": {"completeness": "complete"|"incomplete", "capabilities":
+{"local": bool, "experience": bool, "atlas": bool}, "dependencies": [...]}}`.
+`capture` retains the exact capture-time facts and hash. `restored` recomputes
+each dependency's `ready` status from capture proof and the current verifier;
+its completeness is `incomplete` if any listed dependency is unavailable.
+Remote capabilities without specific references are `False` even when local
+completeness is `complete`. The artifact bytes are not rewritten. SQLite
+capture does not prove simultaneous remote state or protected-source
+availability. Lane 2 must
 bind real operator authority; lanes 3 and 4 must supply their dependency proof.
 
 `memory_harness` is the Stage-A Python package for deterministic memory- and

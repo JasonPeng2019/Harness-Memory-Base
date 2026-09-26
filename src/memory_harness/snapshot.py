@@ -5,7 +5,9 @@ Public API: ``SnapshotService(authorizer, dependency_verifier=None)`` exposes
 ``restore(artifact, target, *, scope, credential, required_capabilities=("local",))``.
 ``source`` is an initialized MemoryStore; ``target`` is a closed MemoryStore
 whose path does not exist. The constructor-bound authorizer receives
-``(action, exact_scope, store_path, credential)`` and must return literal True.
+``(action, exact_scope, store_path, credential)`` and must return literal True
+for the entire exact MemoryStore file at that path and four-field scope;
+no subset or multi-tenant filtering is performed.
 The optional bound dependency verifier receives ``(capability, reference,
 exact_scope)`` and must return literal True. Credentials and dependency refs
 are per-call data, never authority. Neither operation replays effects.
@@ -17,6 +19,11 @@ current MemoryStore SQLite schema identity. ``completeness`` is incomplete
 when a protected or remote dependency lacks verified readiness. External
 services are not captured simultaneously with SQLite; callers must arrange
 their own source-specific readiness proof before claiming those capabilities.
+Restore returns ``{"capture": manifest, "restored": {"completeness": ...,
+"capabilities": {"local": bool, "experience": bool, "atlas": bool},
+"dependencies": [...]}}``. Capture facts remain unchanged; restored readiness
+requires both capture-time and current verifier proof for each reference.
+Remote capabilities without specific references remain unavailable.
 """
 
 from __future__ import annotations
@@ -112,7 +119,7 @@ def _facts(connection: sqlite3.Connection) -> tuple[list[dict[str, Any]], dict[s
     for (identity,) in connection.execute("SELECT operation_id FROM procedure_remote_operations"):
         refs.add(("atlas", f"atlas-operation:{identity}"))
     for identity, kind in connection.execute(
-        "SELECT operation_id, kind FROM effect_operations WHERE outcome_id IS NULL"
+        "SELECT operation_id, kind FROM effect_operations"
     ):
         if kind == "procedure_publication":
             refs.add(("atlas", f"atlas-effect:{identity}"))
@@ -213,7 +220,8 @@ class SnapshotService:
             manifest: dict[str, Any] = {
                 "schema": "snapshot/v1", "store_format": "memory_harness_sqlite/v1",
                 "captured_at": datetime.now(timezone.utc).isoformat(),
-                "source": {"root": str(source_path.parent), "path": str(source_path), "scope": exact},
+                "source": {"root": str(source_path.parent), "path": str(source_path),
+                           "scope": exact, "scope_boundary": "whole_memory_store_file"},
                 "database_file": "state.sqlite3", "database_sha256": _file_digest(database),
                 "store_schema_digest": schema,
                 "completeness": "complete" if all(item["ready"] for item in readiness) else "incomplete",
@@ -259,7 +267,8 @@ class SnapshotService:
         if not isinstance(content_hash, str) or content_hash != _digest({k: v for k, v in manifest.items() if k != "content_hash"}):
             raise SnapshotError("snapshot manifest integrity mismatch")
         source = manifest.get("source")
-        if not isinstance(source, dict) or source.get("scope") != exact:
+        if (not isinstance(source, dict) or source.get("scope") != exact or
+                source.get("scope_boundary") != "whole_memory_store_file"):
             raise SnapshotError("snapshot identity scope mismatch")
         raw_source_path = source.get("path")
         if not isinstance(raw_source_path, str) or not Path(raw_source_path).is_absolute():
@@ -299,10 +308,18 @@ class SnapshotService:
         requested = set(required_capabilities)
         if not requested <= {"local", "experience", "atlas"}:
             raise SnapshotError("unknown requested capability")
-        for item in listed:
-            if item.get("capability") in requested and (item.get("ready") is not True or
-                    not self._ready(item["capability"], item["reference"], exact)):
-                raise SnapshotError("required snapshot dependency is unavailable")
+        current = [
+            {"capability": item["capability"], "reference": item["reference"],
+             "ready": item.get("ready") is True and
+             self._ready(item["capability"], item["reference"], exact)}
+            for item in listed
+        ]
+        capabilities = {"local": True}
+        for capability in ("experience", "atlas"):
+            covered = [item for item in current if item["capability"] == capability]
+            capabilities[capability] = bool(covered) and all(item["ready"] for item in covered)
+        if any(not capabilities[capability] for capability in requested):
+            raise SnapshotError("required snapshot dependency is unavailable")
         if target_path.exists():
             raise SnapshotError("target collision")
         # Copy in the destination filesystem, then publish one nonexistent file
@@ -322,4 +339,11 @@ class SnapshotService:
             raise SnapshotError("target collision") from exc
         finally:
             staged.unlink(missing_ok=True)
-        return manifest
+        return {
+            "capture": manifest,
+            "restored": {
+                "completeness": "complete" if all(item["ready"] for item in current) else "incomplete",
+                "capabilities": capabilities,
+                "dependencies": current,
+            },
+        }

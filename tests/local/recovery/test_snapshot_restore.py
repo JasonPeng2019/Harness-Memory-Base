@@ -18,6 +18,7 @@ from memory_harness import config, contracts, procedures, store
 from memory_harness.snapshot import SnapshotAuthorizationError, SnapshotError, SnapshotService
 from tests.local.procedures import test_procedure_contracts as fixture_module
 from tests.local.contracts import test_terminal_outcome as outcome_fixture
+from tests.local.effects import test_local_effect_state as local_effect_fixture
 
 
 class SnapshotRestoreTests(unittest.TestCase):
@@ -120,8 +121,12 @@ class SnapshotRestoreTests(unittest.TestCase):
         self.assertEqual("snapshot/v1", manifest["schema"])
         self.assertEqual(str(self.source.path.resolve()), manifest["source"]["path"])
         self.assertEqual(self.scope, manifest["source"]["scope"])
+        self.assertEqual("whole_memory_store_file", manifest["source"]["scope_boundary"])
         self.assertEqual("pending", manifest["pending_effects"][self.pending_id])
         self.assertEqual("uncertain", manifest["pending_effects"][self.uncertain_id])
+        for operation_id in (self.pending_id, self.uncertain_id):
+            self.assertIn({"capability": "atlas", "reference": f"atlas-effect:{operation_id}",
+                           "ready": False}, manifest["dependencies"])
         self._restore()
         self.target.initialize()
         self.assertEqual(before, self.target.read_local_current_procedures(self.partition))
@@ -209,6 +214,23 @@ class SnapshotRestoreTests(unittest.TestCase):
                 PoisonSource(), self.artifact, scope=self.scope, credential="operator",
             )
 
+    def test_authorizer_must_grant_exact_whole_store_path_and_scope_before_read(self) -> None:
+        class PoisonSource:
+            path = self.source.path
+            @property
+            def connection(self) -> object:
+                raise AssertionError("source bytes were read before authorization")
+        expected_path = self.source.path.resolve()
+        service = SnapshotService(authorizer=lambda action, scope, path, credential:
+                                  path == expected_path.with_name("another.sqlite3") and
+                                  scope == self.scope)
+        with self.assertRaises(SnapshotAuthorizationError):
+            service.export(PoisonSource(), self.artifact, scope=self.scope, credential="operator")
+        self.assertFalse(self.artifact.exists())
+        with self.assertRaises(SnapshotAuthorizationError):
+            service.restore(self.artifact, self.target, scope=self.scope, credential="operator")
+        self.assertFalse(self.target.path.exists())
+
     def test_restore_rejects_tamper_schema_dependency_scope_collision_and_live_handle(self) -> None:
         self._state()
         self._export(dependencies=[{"capability": "atlas", "reference": "atlas://partition/a"}])
@@ -259,7 +281,9 @@ class SnapshotRestoreTests(unittest.TestCase):
         )
         manifest = self._export()
         self.assertEqual("complete", manifest["completeness"])
-        self._restore(required_capabilities=("atlas",))
+        result = self._restore(required_capabilities=("atlas",))
+        self.assertEqual("complete", result["restored"]["completeness"])
+        self.assertTrue(result["restored"]["capabilities"]["atlas"])
         self.target.path.unlink()
         self.service = SnapshotService(
             authorizer=lambda action, scope, path, credential: credential == "operator",
@@ -267,6 +291,62 @@ class SnapshotRestoreTests(unittest.TestCase):
         with self.assertRaises(SnapshotError):
             self._restore(required_capabilities=("atlas",))
         self.assertFalse(self.target.path.exists())
+
+    def test_outcome_owned_remote_effects_require_proof_and_preserve_status(self) -> None:
+        fixture = local_effect_fixture.LocalEffectStateTests(
+            "test_review_evidence_survives_outage_and_payload_readiness")
+        fixture.setUp()
+        try:
+            case = fixture.case
+            case.observe()
+            outcome = case.runtime.record_terminal_outcome(case.bundle())
+            fixture._review(outcome)
+            ingestion_id = contracts.effect_operation_id(outcome["outcome_id"], "experience_ingestion")
+            skill_id = contracts.effect_operation_id(outcome["outcome_id"], "generated_skill_creation")
+            case.state.bind_effect_payload(ingestion_id, {"exact": "adapter payload"})
+            manifest = self.service.export(case.state, self.artifact, scope=self.scope,
+                                           credential="operator")
+            self.assertEqual("incomplete", manifest["completeness"])
+            for operation_id in (ingestion_id, skill_id):
+                self.assertIn({"capability": "experience", "reference": f"everos-effect:{operation_id}",
+                               "ready": False}, manifest["dependencies"])
+            self.assertEqual("pending", manifest["pending_effects"][ingestion_id])
+            with self.assertRaises(SnapshotError):
+                self._restore(required_capabilities=("experience",))
+            self.assertFalse(self.target.path.exists())
+            result = self._restore()
+            self.assertEqual("incomplete", result["restored"]["completeness"])
+            self.assertFalse(result["restored"]["capabilities"]["experience"])
+            self.target.initialize()
+            self.assertEqual(case.state.get_effect_operation(ingestion_id),
+                             self.target.get_effect_operation(ingestion_id))
+        finally:
+            fixture.tearDown()
+
+    def test_empty_reference_remote_request_is_not_vacuously_ready(self) -> None:
+        manifest = self._export()
+        self.assertEqual([], manifest["dependencies"])
+        with self.assertRaises(SnapshotError):
+            self._restore(required_capabilities=("experience",))
+        with self.assertRaises(SnapshotError):
+            self._restore(required_capabilities=("atlas",))
+        self.assertFalse(self.target.path.exists())
+
+    def test_restore_separates_capture_proof_from_current_readiness(self) -> None:
+        self.service = SnapshotService(authorizer=lambda *_: True,
+                                       dependency_verifier=lambda *_: True)
+        manifest = self._export(dependencies=[{"capability": "atlas", "reference": "atlas://partition/a"}])
+        self.assertEqual("complete", manifest["completeness"])
+        capture_bytes = (self.artifact / "manifest.json").read_bytes()
+        self.service = SnapshotService(authorizer=lambda *_: True)
+        result = self._restore()
+        self.assertEqual(manifest, result["capture"])
+        self.assertEqual("complete", result["capture"]["completeness"])
+        self.assertEqual("incomplete", result["restored"]["completeness"])
+        self.assertFalse(result["restored"]["capabilities"]["atlas"])
+        self.assertFalse(result["restored"]["dependencies"][0]["ready"])
+        self.assertEqual(capture_bytes, (self.artifact / "manifest.json").read_bytes())
+        self.assertTrue(self.target.path.exists())
 
     def test_export_binds_opened_relative_store_after_cwd_change(self) -> None:
         home = self.root / "relative"
