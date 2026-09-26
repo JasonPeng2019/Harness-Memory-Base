@@ -18,7 +18,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from memory_harness import contracts, experience, privacy, store
+from memory_harness import config, context, contracts, experience, privacy, store
+from tests.local.contracts import test_terminal_outcome as native_fixture
 
 
 SECRET = "synthetic-secret-alpha-1234567890"
@@ -300,6 +301,228 @@ class OutcomeToIngestionRetryTests(unittest.TestCase):
         self.assertEqual(trajectory["review_receipt_id"], evidence[0]["review_receipt_id"])
         self.assertIn("parser repair failed", evidence[0]["content"])
         self.assertNotIn(SECRET, str(evidence))
+
+
+class JoinedNativeEffectTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.case = native_fixture.TerminalOutcomeTests(
+            methodName="test_exact_observed_native_chain_fixes_pass"
+        )
+        self.case.setUp()
+
+    def tearDown(self) -> None:
+        self.case.tearDown()
+
+    def _native(
+        self, *, captured_config: dict | None = None
+    ) -> tuple[dict, dict, experience.ExperienceScope, experience.ReviewedExperienceService]:
+        case = self.case
+        if captured_config is not None:
+            case.configuration = captured_config
+            case.decision = contracts.make_decision(
+                case.card, case.plan, configuration=captured_config
+            )
+            case.state.record_decision(case.decision)
+            case.final = context.finalize_context(
+                task_card=case.card, plan=case.plan,
+                decision_id=case.decision["decision_id"], lane_id=case.lane_id,
+                run_id=case.run_id, worktree_path=str(case.root / "worktree"),
+                base_commit="base-1", strategy="standard",
+                configuration=captured_config, checkpoint="checkpoint-1",
+                execution_role="worker", invocation_target="harness:worker",
+                recipient="worker:lane-1",
+                mandatory_content=case.final.envelope["mandatory_content"],
+                limits=config.resolve_limits({"context_char_limit": 4000}),
+            )
+            case.state.record_final_context(
+                case.final.context, envelope_digest=case.final.envelope["content_hash"]
+            )
+        case.observe()
+        fixed = case.runtime.record_terminal_outcome(case.bundle())
+        outcome = contracts.make_outcome(
+            decision_id=fixed["decision_id"], plan_id=fixed["plan_id"],
+            plan_digest=fixed["plan_digest"], status=fixed["status"],
+            evidence_digest=fixed["evidence_digest"], linked_run_id=fixed["linked_run_id"],
+            task_card_digest=fixed["task_card_digest"], objective_id=fixed["objective_id"],
+            observed_at=fixed["observed_at"],
+        )
+        review = contracts.make_review_receipt(
+            review_id="joined-review", outcome=outcome, decision=case.decision,
+            task_card=case.card, plan=case.plan, reviewed_by="ROOT",
+            evidence_refs=("review://joined",), raw_evidence="ROOT reviewed exact native run.",
+        )
+        scope = experience.ExperienceScope(
+            application="harness", project="product", namespace="isolated", owner="root-agent"
+        )
+        service = experience.ReviewedExperienceService(case.state)
+        trajectory = service.capture(
+            task_card=case.card, plan=case.plan, decision=case.decision,
+            outcome=outcome, review_receipt=review, scope=scope,
+        )
+        return outcome, trajectory, scope, service
+
+    def _adapter(self, scope: experience.ExperienceScope, surface: _EverOSSurface) -> experience.EverOSAdapter:
+        base_root = self.case.root / "everos"
+        memory_root = experience.EverOSAdapter.memory_root_for_scope(base_root, scope)
+        return experience.EverOSAdapter(
+            scope=scope, base_root=base_root,
+            surface=experience.EverOSPublicSurface.from_object(
+                surface, memory_root=memory_root, resolve_memory_root=lambda: memory_root,
+            ),
+        )
+
+    def test_native_ingestion_claims_exact_effect_before_everos_call(self) -> None:
+        case = self.case
+        outcome, trajectory, scope, service = self._native()
+        operation_id = contracts.effect_operation_id(outcome["outcome_id"], "experience_ingestion")
+        observed = []
+
+        class Surface(_EverOSSurface):
+            async def memorize(self, payload: dict, **kwargs: object) -> dict:
+                observed.append(case.state.get_effect_operation(operation_id))
+                return await super().memorize(payload, **kwargs)
+
+        surface = Surface()
+        adapter = self._adapter(scope, surface)
+        ingestion = asyncio.run(service.extract_trajectory(trajectory["trajectory_id"], adapter))
+        self.assertEqual(1, len(surface.memorize_calls))
+        self.assertEqual("in_flight", observed[0]["status"])
+        self.assertEqual(trajectory, observed[0]["source_record"])
+        self.assertEqual(surface.memorize_calls[0], observed[0]["payload_record"])
+        self.assertEqual(ingestion["ingestion_id"], observed[0]["adapter_operation_id"])
+        search_count = len(surface.search_calls)
+        self.assertEqual(ingestion, asyncio.run(service.extract_trajectory(
+            trajectory["trajectory_id"], adapter,
+            current_config=config.resolve_config({"experience_write": False}),
+        )))
+        self.assertEqual(1, len(surface.memorize_calls))
+        self.assertEqual(search_count, len(surface.search_calls))
+
+    def test_native_lost_ack_restart_reuses_effect_and_ingestion_identity(self) -> None:
+        outcome, trajectory, scope, service = self._native()
+        surface = _EverOSSurface()
+        surface.lose_ack = True
+        adapter = self._adapter(scope, surface)
+        uncertain = asyncio.run(service.extract_trajectory(trajectory["trajectory_id"], adapter))
+        operation_id = contracts.effect_operation_id(outcome["outcome_id"], "experience_ingestion")
+        original = self.case.state.get_effect_operation(operation_id)
+        self.assertEqual("uncertain", original["status"])
+        self.assertEqual(uncertain["ingestion_id"], original["adapter_operation_id"])
+        self.assertEqual(uncertain, asyncio.run(service.extract_trajectory(
+            trajectory["trajectory_id"], adapter,
+            current_config=config.resolve_config({"experience_write": False}),
+        )))
+        self.assertEqual("uncertain", self.case.state.get_effect_operation(operation_id)["status"])
+        self.assertEqual(1, len(surface.memorize_calls))
+        self.case.state.close()
+        self.case.state = store.MemoryStore(self.case.root / "state.sqlite3")
+        self.case.state.initialize()
+        service = experience.ReviewedExperienceService(self.case.state)
+        recovery = _EverOSSurface()
+        adapter = self._adapter(scope, recovery)
+        recovery.case_results = [OutcomeToIngestionRetryTests._case(adapter, uncertain["session_id"])]
+        confirmed = asyncio.run(service.extract_trajectory(trajectory["trajectory_id"], adapter))
+        effect = self.case.state.get_effect_operation(operation_id)
+        self.assertEqual("confirmed", confirmed["status"])
+        self.assertEqual(original["operation_id"], effect["operation_id"])
+        self.assertEqual(original["payload_record"], effect["payload_record"])
+        self.assertEqual(original["adapter_operation_id"], effect["adapter_operation_id"])
+        self.assertEqual([], recovery.memorize_calls)
+        self.assertNotIn(operation_id, {
+            item["operation_id"] for item in self.case.state.list_effect_operations(
+                outcome["outcome_id"], actionable_only=True
+            )
+        })
+        self.assertEqual(trajectory, service.get_trajectory(trajectory["trajectory_id"]))
+
+    def test_current_write_off_preserves_native_local_evidence(self) -> None:
+        outcome, trajectory, scope, service = self._native()
+        surface = _EverOSSurface()
+        adapter = self._adapter(scope, surface)
+        off = config.resolve_config({"experience_write": False})
+        self.assertIsNone(asyncio.run(service.extract_trajectory(
+            trajectory["trajectory_id"], adapter, current_config=off
+        )))
+        self.assertEqual([], surface.memorize_calls)
+        self.assertIsNone(self.case.state.get_experience_ingestion_for_trajectory(
+            trajectory["trajectory_id"]
+        ))
+        effects = {effect["kind"]: effect for effect in self.case.state.list_effect_operations(
+            outcome["outcome_id"]
+        )}
+        self.assertEqual("confirmed", effects["review_receipt"]["status"])
+        self.assertEqual("confirmed", effects["recent_evidence"]["status"])
+        self.assertEqual("waiting_payload", effects["experience_ingestion"]["status"])
+        self.assertEqual(trajectory, effects["recent_evidence"]["source_record"])
+
+    def test_captured_write_off_keeps_native_review_without_optional_work(self) -> None:
+        outcome, trajectory, scope, service = self._native(captured_config={
+            "strategy": "standard", "experience_write": False,
+        })
+        surface = _EverOSSurface()
+        self.assertIsNone(asyncio.run(service.extract_trajectory(
+            trajectory["trajectory_id"], self._adapter(scope, surface)
+        )))
+        self.assertEqual([], surface.memorize_calls)
+        effects = self.case.state.list_effect_operations(outcome["outcome_id"])
+        self.assertEqual({"review_receipt", "recent_evidence"}, {
+            effect["kind"] for effect in effects
+        })
+        self.assertTrue(all(effect["status"] == "confirmed" for effect in effects))
+
+    def test_captured_generation_off_keeps_ingestion_but_no_candidate_effect(self) -> None:
+        outcome, trajectory, scope, service = self._native(captured_config={
+            "strategy": "standard", "experience_write": True,
+            "generated_skill_creation": False,
+        })
+        surface = _EverOSSurface()
+        adapter = self._adapter(scope, surface)
+        pending = asyncio.run(service.extract_trajectory(trajectory["trajectory_id"], adapter))
+        self.assertEqual("pending", pending["status"])
+        surface.case_results = [OutcomeToIngestionRetryTests._case(adapter, pending["session_id"])]
+        asyncio.run(service.reconcile_extraction(trajectory["trajectory_id"], adapter))
+        self.assertIsNone(service.resolve_generated_skill_candidate({
+            "id": "captured-off-skill", "agent_id": adapter.everos_owner_id,
+            "app_id": adapter.everos_application_id,
+            "project_id": adapter.everos_project_id,
+            "content": "Retain reviewed evidence.",
+            "source_case_ids": ["retry-case-1"],
+        }, adapter))
+        self.assertEqual({"review_receipt", "recent_evidence", "experience_ingestion"}, {
+            effect["kind"] for effect in self.case.state.list_effect_operations(outcome["outcome_id"])
+        })
+
+    def test_generated_candidate_uses_same_native_effect_and_current_off_gate(self) -> None:
+        outcome, trajectory, scope, service = self._native()
+        surface = _EverOSSurface()
+        adapter = self._adapter(scope, surface)
+        pending = asyncio.run(service.extract_trajectory(trajectory["trajectory_id"], adapter))
+        surface.case_results = [OutcomeToIngestionRetryTests._case(adapter, pending["session_id"])]
+        asyncio.run(service.reconcile_extraction(trajectory["trajectory_id"], adapter))
+        skill = {
+            "id": "joined-skill", "agent_id": adapter.everos_owner_id,
+            "app_id": adapter.everos_application_id,
+            "project_id": adapter.everos_project_id,
+            "content": "Use the reviewed parser evidence.",
+            "source_case_ids": ["retry-case-1"],
+        }
+        operation_id = contracts.effect_operation_id(outcome["outcome_id"], "generated_skill_creation")
+        off = config.resolve_config({"generated_skill_creation": False})
+        self.assertIsNone(service.resolve_generated_skill_candidate(
+            skill, adapter, current_config=off
+        ))
+        self.assertIsNone(service.resolve_generated_skill_candidate(
+            skill, adapter, current_config=config.resolve_config({"experience_write": False})
+        ))
+        self.assertEqual("waiting_payload", self.case.state.get_effect_operation(operation_id)["status"])
+        candidate = service.resolve_generated_skill_candidate(skill, adapter)
+        effect = self.case.state.get_effect_operation(operation_id)
+        self.assertEqual("proposed", candidate["state"])
+        self.assertEqual("confirmed", effect["status"])
+        self.assertEqual(candidate["candidate_id"], effect["acknowledgement"]["candidate_id"])
+        self.assertEqual(trajectory, effect["source_record"])
+        self.assertEqual(candidate, service.resolve_generated_skill_candidate(skill, adapter))
+        self.assertEqual("confirmed", self.case.state.get_effect_operation(operation_id)["status"])
 
 
 if __name__ == "__main__":

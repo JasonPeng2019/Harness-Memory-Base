@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Protocol
 
 from . import contracts
+from . import config
 from . import privacy as privacy_module
 from .privacy import PrivacyPolicy
-from .store import ExperienceConflictError, MemoryStore
+from .store import ExperienceConflictError, MemoryStore, OperationConflictError, StoreError
 
 SYNTHETIC_SECRET = "synthetic-secret-alpha-1234567890"
 
@@ -846,6 +847,7 @@ class ReviewedExperienceService:
         adapter: EverOSAdapter,
         *,
         experience_write: bool = True,
+        current_config: Mapping[str, Any] | config.MemoryConfig | None = None,
     ) -> dict[str, Any] | None:
         """Submit one optional EverOS extraction without unsafe replay.
 
@@ -859,12 +861,17 @@ class ReviewedExperienceService:
         trajectory = self.get_trajectory(trajectory_id)
         adapter.assert_scope(trajectory["scope"])
         existing = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
-        if not experience_write:
+        effective = current_config or config.MemoryConfig()
+        captured = self.store.get_decision(trajectory["decision_id"])["configuration"]
+        if (not experience_write or
+                not config.effect_submission_enabled(captured, "experience_ingestion") or
+                not config.effect_submission_enabled(effective, "experience_ingestion")):
             return existing
         if existing is not None:
             if existing["status"] in {"pending", "uncertain"}:
                 return await self.reconcile_extraction(
-                    trajectory_id, adapter, experience_write=experience_write
+                    trajectory_id, adapter, experience_write=experience_write,
+                    current_config=effective,
                 )
             return existing
         session_id = adapter.session_id_for(trajectory_id)
@@ -875,6 +882,22 @@ class ReviewedExperienceService:
             session_id=session_id,
             payload_digest=contracts.sha256_hex(payload),
         )
+        operation_id = contracts.effect_operation_id(trajectory["outcome_id"], "experience_ingestion")
+        try:
+            operation = self.store.get_effect_operation(operation_id)
+        except StoreError:
+            operation = None  # Accepted legacy outcomes have no effect operation.
+        if operation is not None:
+            self.store.bind_effect_source(operation_id, trajectory_id, trajectory)
+            operation = self.store.bind_effect_payload(operation_id, payload)
+            if operation["status"] == "pending":
+                try:
+                    self.store.claim_effect_operation(operation_id, current_config=effective)
+                except OperationConflictError:
+                    # A peer can win the claim. The ingestion insert below chooses
+                    # the sole submitter using the same durable identity.
+                    if self.store.get_effect_operation(operation_id)["status"] != "in_flight":
+                        raise
         ingestion, created = self.store.create_experience_ingestion(intent)
         if not created:
             return ingestion
@@ -896,7 +919,8 @@ class ReviewedExperienceService:
                     return latest
                 raise update_error from exc
         return await self.reconcile_extraction(
-            trajectory_id, adapter, experience_write=experience_write
+            trajectory_id, adapter, experience_write=experience_write,
+            current_config=effective,
         )
 
     async def reconcile_extraction(
@@ -905,13 +929,18 @@ class ReviewedExperienceService:
         adapter: EverOSAdapter,
         *,
         experience_write: bool = True,
+        current_config: Mapping[str, Any] | config.MemoryConfig | None = None,
     ) -> dict[str, Any] | None:
         """Confirm exact case receipts, or pause reconciliation while writing is off."""
 
         trajectory = self.get_trajectory(trajectory_id)
         adapter.assert_scope(trajectory["scope"])
         ingestion = self.store.get_experience_ingestion_for_trajectory(trajectory_id)
-        if not experience_write:
+        effective = current_config or config.MemoryConfig()
+        captured = self.store.get_decision(trajectory["decision_id"])["configuration"]
+        if (not experience_write or
+                not config.effect_submission_enabled(captured, "experience_ingestion") or
+                not config.effect_submission_enabled(effective, "experience_ingestion")):
             return ingestion
         if ingestion is None:
             raise ExperienceError("no reviewed-experience ingestion exists to reconcile")
@@ -958,6 +987,7 @@ class ReviewedExperienceService:
         adapter: EverOSAdapter,
         *,
         generated_skill_creation: bool = True,
+        current_config: Mapping[str, Any] | config.MemoryConfig | None = None,
     ) -> dict[str, Any] | None:
         """Resolve a returned EverOS skill to exact reviewed source receipts.
 
@@ -978,6 +1008,7 @@ class ReviewedExperienceService:
         if len(source_case_ids) != len(set(source_case_ids)):
             raise ProvenanceError("generated EverOS skill source case ids are ambiguous")
         sources: list[dict[str, str]] = []
+        trajectories: dict[str, dict[str, Any]] = {}
         scope = adapter.scope.to_record()
         for case_id in source_case_ids:
             try:
@@ -993,6 +1024,7 @@ class ReviewedExperienceService:
                 raise ProvenanceError("generated EverOS skill source case is not reviewed")
             if receipt["review_receipt_id"] != trajectory["review_receipt_id"]:
                 raise ProvenanceError("generated EverOS skill source receipt is inconsistent")
+            trajectories[trajectory["trajectory_id"]] = trajectory
             sources.append(
                 {
                     "case_id": case_id,
@@ -1026,7 +1058,46 @@ class ReviewedExperienceService:
             source_cases=sources,
             metadata=metadata,
         )
-        return self.store.record_generated_skill_candidate(candidate)
+        effective = current_config or config.MemoryConfig()
+        if not config.effect_submission_enabled(effective, "generated_skill_creation"):
+            return None
+        operations: list[str] = []
+        for trajectory in trajectories.values():
+            captured = self.store.get_decision(trajectory["decision_id"])["configuration"]
+            if not config.effect_submission_enabled(captured, "generated_skill_creation"):
+                return None
+            operation_id = contracts.effect_operation_id(
+                trajectory["outcome_id"], "generated_skill_creation"
+            )
+            try:
+                self.store.get_effect_operation(operation_id)
+            except StoreError:
+                continue  # Accepted legacy outcomes have no effect operation.
+            if operation_id not in operations:
+                operations.append(operation_id)
+            self.store.bind_effect_source(
+                operation_id, trajectory["trajectory_id"], trajectory
+            )
+        payload = {
+            key: candidate[key]
+            for key in ("candidate_id", "skill_id", "content_digest", "source_cases", "metadata")
+        }
+        for operation_id in operations:
+            operation = self.store.bind_effect_payload(operation_id, payload)
+            if operation["status"] == "pending":
+                try:
+                    self.store.claim_effect_operation(operation_id, current_config=effective)
+                except OperationConflictError:
+                    if self.store.get_effect_operation(operation_id)["status"] not in (
+                        "in_flight", "uncertain", "confirmed"
+                    ):
+                        raise
+        persisted = self.store.record_generated_skill_candidate(candidate)
+        for operation_id in operations:
+            self.store.confirm_effect_operation(
+                operation_id, {"candidate_id": persisted["candidate_id"]}
+            )
+        return persisted
 
     def approve_generated_skill(
         self,
