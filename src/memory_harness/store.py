@@ -83,7 +83,7 @@ _SCHEMA = [
         lane_id TEXT NOT NULL,
         envelope_record TEXT NOT NULL,
         native_receipt_required INTEGER NOT NULL,
-        supersedes_rejected_attempt_id TEXT UNIQUE
+        supersedes_rejected_attempt_id TEXT
     )
     """,
     """
@@ -121,6 +121,13 @@ _SCHEMA = [
         acceptance_digest TEXT NOT NULL,
         evidence_digest TEXT NOT NULL,
         record TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS rejected_authorizations (
+        rejected_attempt_id TEXT PRIMARY KEY REFERENCES rejected_native_attempts(rejected_attempt_id),
+        operation_id TEXT NOT NULL UNIQUE REFERENCES operations(operation_id),
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'spent'))
     )
     """,
     """
@@ -472,15 +479,16 @@ class MemoryStore:
             self.connection.execute("PRAGMA foreign_keys=ON")
             self.connection.execute("PRAGMA journal_mode=WAL")
             with self.connection:
+                self.connection.execute("BEGIN IMMEDIATE")
+                authorization_table_existed = self.connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rejected_authorizations'"
+                ).fetchone() is not None
                 for statement in _SCHEMA:
                     self.connection.execute(statement)
                 self._ensure_column("operations", "envelope_digest", "TEXT")
                 self._ensure_column("operations", "run_id", "TEXT")
                 self._ensure_column("dispatch_bindings", "supersedes_rejected_attempt_id", "TEXT")
-                self.connection.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS dispatch_rejected_authorization "
-                    "ON dispatch_bindings(supersedes_rejected_attempt_id)"
-                )
+                self._migrate_dispatch_authorizations(authorization_table_existed)
                 self._ensure_column("outcomes", "task_card_digest", "TEXT")
                 self._ensure_column("outcomes", "objective_id", "TEXT")
                 self._ensure_column("decisions", "configuration", "TEXT")
@@ -518,6 +526,46 @@ class MemoryStore:
         }
         if column not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    def _migrate_dispatch_authorizations(self, authorization_table_existed: bool) -> None:
+        connection = self._require_connection()
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='dispatch_bindings'"
+        ).fetchone()["sql"]
+        old_index = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' "
+            "AND name='dispatch_rejected_authorization'"
+        ).fetchone()
+        if old_index is not None and "CREATE UNIQUE INDEX" in old_index["sql"].upper():
+            connection.execute("DROP INDEX dispatch_rejected_authorization")
+        if "SUPERSEDES_REJECTED_ATTEMPT_ID TEXT UNIQUE" in definition.upper():
+            connection.execute(
+                "CREATE TABLE dispatch_bindings_migrated ("
+                "operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id), "
+                "lane_id TEXT NOT NULL, envelope_record TEXT NOT NULL, "
+                "native_receipt_required INTEGER NOT NULL, "
+                "supersedes_rejected_attempt_id TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO dispatch_bindings_migrated SELECT operation_id, lane_id, "
+                "envelope_record, native_receipt_required, supersedes_rejected_attempt_id "
+                "FROM dispatch_bindings"
+            )
+            connection.execute("DROP TABLE dispatch_bindings")
+            connection.execute("ALTER TABLE dispatch_bindings_migrated RENAME TO dispatch_bindings")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS dispatch_rejected_authorization "
+            "ON dispatch_bindings(supersedes_rejected_attempt_id)"
+        )
+        if not authorization_table_existed:
+            connection.execute(
+                "INSERT INTO rejected_authorizations (rejected_attempt_id, operation_id, state) "
+                "SELECT b.supersedes_rejected_attempt_id, b.operation_id, "
+                "CASE WHEN o.status='delivered' THEN 'spent' ELSE 'reserved' END "
+                "FROM dispatch_bindings b JOIN operations o USING(operation_id) "
+                "WHERE b.supersedes_rejected_attempt_id IS NOT NULL "
+                "AND o.status!='failed_pre_spawn'"
+            )
 
     def close(self) -> None:
         if self.connection is not None:
@@ -853,6 +901,23 @@ class MemoryStore:
             )
             if cursor.rowcount != 1:
                 raise OperationConflictError("dispatch operation changed during transition")
+            if binding is not None and binding["supersedes_rejected_attempt_id"] is not None:
+                if operation["status"] == "failed_pre_spawn":
+                    authorization = connection.execute(
+                        "DELETE FROM rejected_authorizations WHERE rejected_attempt_id=? "
+                        "AND operation_id=? AND state='reserved'",
+                        (binding["supersedes_rejected_attempt_id"], operation_id),
+                    )
+                elif operation["status"] == "delivered":
+                    authorization = connection.execute(
+                        "UPDATE rejected_authorizations SET state='spent' "
+                        "WHERE rejected_attempt_id=? AND operation_id=? AND state='reserved'",
+                        (binding["supersedes_rejected_attempt_id"], operation_id),
+                    )
+                else:
+                    authorization = None
+                if authorization is not None and authorization.rowcount != 1:
+                    raise OperationConflictError("rejected authorization owner changed")
         return self.get_operation(str(operation["operation_id"]))
 
     @staticmethod
@@ -957,7 +1022,7 @@ class MemoryStore:
                         or old_envelope["final_context_id"] == envelope["final_context_id"]
                         or any(old_envelope[key] != envelope[key] for key in same)
                         or connection.execute(
-                            "SELECT 1 FROM dispatch_bindings WHERE supersedes_rejected_attempt_id=?",
+                            "SELECT 1 FROM rejected_authorizations WHERE rejected_attempt_id=?",
                             (supersedes_rejected_attempt_id,),
                         ).fetchone() is not None
                         or connection.execute(
@@ -1004,6 +1069,12 @@ class MemoryStore:
                      self._serialize_record(envelope), int(native_receipt_required),
                      supersedes_rejected_attempt_id),
                 )
+                if supersedes_rejected_attempt_id is not None:
+                    connection.execute(
+                        "INSERT INTO rejected_authorizations "
+                        "(rejected_attempt_id, operation_id, state) VALUES (?, ?, 'reserved')",
+                        (supersedes_rejected_attempt_id, operation["operation_id"]),
+                    )
         existing = self.get_operation(operation["operation_id"])
         if existing.get("envelope_record") != dict(envelope):
             raise OperationConflictError("dispatch intent identity conflict")

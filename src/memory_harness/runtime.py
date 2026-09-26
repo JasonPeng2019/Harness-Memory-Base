@@ -159,8 +159,8 @@ class MemoryRuntime:
     ) -> dict[str, Any]:
         """Claim the exact durable final context before the native launcher runs.
 
-        A corrected intent's exact authorization replay returns its existing row;
-        ordinary duplicate intents remain ambiguous to the caller.
+        A replay of a pending or ambiguous intent raises visible ambiguity;
+        only the first claim permits native spawn.
         This operation alone never means that a controller was spawned.
         """
 
@@ -172,7 +172,7 @@ class MemoryRuntime:
             envelope, supersedes_rejected_attempt_id=supersedes_rejected_attempt_id,
         )
         if not created:
-            if supersedes_rejected_attempt_id is not None:
+            if existing["status"] == "delivered":
                 return existing
             raise DispatchAmbiguityError(
                 f"{existing['status']} dispatch already exists; "

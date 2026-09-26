@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 
@@ -190,10 +192,11 @@ class TerminalOutcomeTests(unittest.TestCase):
             supersedes_rejected_attempt_id=rejected["rejected_attempt_id"],
         )
         self.assertEqual(rejected["rejected_attempt_id"], intent["supersedes_rejected_attempt_id"])
-        self.assertEqual(intent, self.runtime.record_dispatch_intent(
-            self.final.envelope,
-            supersedes_rejected_attempt_id=rejected["rejected_attempt_id"],
-        ))
+        with self.assertRaises(runtime.DispatchAmbiguityError):
+            self.runtime.record_dispatch_intent(
+                self.final.envelope,
+                supersedes_rejected_attempt_id=rejected["rejected_attempt_id"],
+            )
         with self.assertRaises(store.OperationConflictError):
             self.runtime.record_dispatch_intent(
                 self.final.envelope, supersedes_rejected_attempt_id="different-attempt",
@@ -273,6 +276,176 @@ class TerminalOutcomeTests(unittest.TestCase):
             )
         with self.assertRaises(store.OperationConflictError):
             self.runtime.record_dispatch_intent(self.final.envelope)
+
+    def test_failed_pre_spawn_transfers_one_rejected_authorization_across_restart(self) -> None:
+        self.observe()
+        rejected = self.runtime.record_rejected_native_attempt(self.bundle(status="FAIL"))
+        token = rejected["rejected_attempt_id"]
+        history = []
+        for run_id in ("run-2", "run-3"):
+            self.next_run(run_id)
+            intent = self.runtime.record_dispatch_intent(
+                self.final.envelope, supersedes_rejected_attempt_id=token,
+            )
+            history.append(intent["operation_id"])
+            self.runtime.mark_dispatch_pre_spawn_failed(self.final.envelope)
+            self.state.close()
+            self.state = store.MemoryStore(self.root / "state.sqlite3")
+            self.state.initialize()
+            self.runtime = runtime.MemoryRuntime(self.state)
+        self.next_run("run-4")
+        active = self.runtime.record_dispatch_intent(
+            self.final.envelope, supersedes_rejected_attempt_id=token,
+        )
+        self.assertNotIn(active["operation_id"], history)
+        self.assertEqual(
+            ["failed_pre_spawn", "failed_pre_spawn"],
+            [self.state.get_operation(operation_id)["status"] for operation_id in history],
+        )
+        self.assertTrue(all(
+            self.state.get_operation(operation_id)["supersedes_rejected_attempt_id"] == token
+            for operation_id in history
+        ))
+        self.runtime.record_observed_dispatch(self.final.envelope, self.native_receipt())
+        self.next_run("run-5")
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(
+                self.final.envelope, supersedes_rejected_attempt_id=token,
+            )
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(self.final.envelope)
+
+    def test_corrected_pending_and_ambiguous_replay_never_grants_second_launch(self) -> None:
+        self.observe()
+        token = self.runtime.record_rejected_native_attempt(
+            self.bundle(status="FAIL")
+        )["rejected_attempt_id"]
+        self.next_run("run-2")
+        intent = self.runtime.record_dispatch_intent(
+            self.final.envelope, supersedes_rejected_attempt_id=token,
+        )
+        for status in ("pending", "ambiguous"):
+            with self.subTest(status=status), self.assertRaises(runtime.DispatchAmbiguityError):
+                self.runtime.record_dispatch_intent(
+                    self.final.envelope, supersedes_rejected_attempt_id=token,
+                )
+            self.assertEqual(status, self.state.get_operation(intent["operation_id"])["status"])
+            if status == "pending":
+                self.runtime.mark_dispatch_ambiguous(self.final.envelope)
+        self.next_run("run-3")
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(
+                self.final.envelope, supersedes_rejected_attempt_id=token,
+            )
+
+    def test_abandoned_corrected_intent_does_not_release_rejected_authorization(self) -> None:
+        self.observe()
+        token = self.runtime.record_rejected_native_attempt(
+            self.bundle(status="FAIL")
+        )["rejected_attempt_id"]
+        self.next_run("run-2")
+        self.runtime.record_dispatch_intent(
+            self.final.envelope, supersedes_rejected_attempt_id=token,
+        )
+        self.runtime.abandon_dispatch_intent(self.final.envelope)
+        self.next_run("run-3")
+        with self.assertRaises(store.OperationConflictError):
+            self.runtime.record_dispatch_intent(
+                self.final.envelope, supersedes_rejected_attempt_id=token,
+            )
+
+    def test_concurrent_corrected_claims_leave_one_active_owner(self) -> None:
+        self.observe()
+        token = self.runtime.record_rejected_native_attempt(
+            self.bundle(status="FAIL")
+        )["rejected_attempt_id"]
+        self.next_run("run-2")
+        envelope = self.final.envelope
+        path = self.root / "state.sqlite3"
+
+        def claim() -> str:
+            with store.MemoryStore(path) as state:
+                try:
+                    runtime.MemoryRuntime(state).record_dispatch_intent(
+                        envelope, supersedes_rejected_attempt_id=token,
+                    )
+                    return "created"
+                except runtime.DispatchAmbiguityError:
+                    return "owned"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: claim(), range(2)))
+        self.assertCountEqual(["created", "owned"], results)
+        rows = self.state.connection.execute(
+            "SELECT operations.status FROM dispatch_bindings JOIN operations USING(operation_id) "
+            "WHERE supersedes_rejected_attempt_id=?", (token,),
+        ).fetchall()
+        self.assertEqual(["pending"], [row["status"] for row in rows])
+
+    def test_legacy_unique_binding_migrates_without_losing_history_or_ownership(self) -> None:
+        self.observe()
+        token = self.runtime.record_rejected_native_attempt(
+            self.bundle(status="FAIL")
+        )["rejected_attempt_id"]
+        self.next_run("run-2")
+        pending = self.runtime.record_dispatch_intent(
+            self.final.envelope, supersedes_rejected_attempt_id=token,
+        )
+        self.state.close()
+        with sqlite3.connect(self.root / "state.sqlite3") as legacy:
+            legacy.execute("DROP TABLE IF EXISTS rejected_authorizations")
+            legacy.execute("DROP INDEX IF EXISTS dispatch_rejected_authorization")
+            legacy.execute(
+                "CREATE TABLE dispatch_bindings_legacy ("
+                "operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id), "
+                "lane_id TEXT NOT NULL, envelope_record TEXT NOT NULL, "
+                "native_receipt_required INTEGER NOT NULL, "
+                "supersedes_rejected_attempt_id TEXT UNIQUE)"
+            )
+            legacy.execute(
+                "INSERT INTO dispatch_bindings_legacy SELECT operation_id, lane_id, "
+                "envelope_record, native_receipt_required, supersedes_rejected_attempt_id "
+                "FROM dispatch_bindings"
+            )
+            legacy.execute("DROP TABLE dispatch_bindings")
+            legacy.execute("ALTER TABLE dispatch_bindings_legacy RENAME TO dispatch_bindings")
+            legacy.execute(
+                "CREATE UNIQUE INDEX dispatch_rejected_authorization "
+                "ON dispatch_bindings(supersedes_rejected_attempt_id)"
+            )
+        self.state = store.MemoryStore(self.root / "state.sqlite3")
+        self.state.initialize()
+        self.runtime = runtime.MemoryRuntime(self.state)
+        with self.assertRaises(runtime.DispatchAmbiguityError):
+            self.runtime.record_dispatch_intent(
+                self.final.envelope, supersedes_rejected_attempt_id=token,
+            )
+        self.runtime.mark_dispatch_pre_spawn_failed(self.final.envelope)
+        self.state.close()
+        self.state = store.MemoryStore(self.root / "state.sqlite3")
+        self.state.initialize()
+        self.runtime = runtime.MemoryRuntime(self.state)
+        self.next_run("run-3")
+        fresh = self.runtime.record_dispatch_intent(
+            self.final.envelope, supersedes_rejected_attempt_id=token,
+        )
+        self.assertEqual(token, self.state.get_operation(pending["operation_id"])[
+            "supersedes_rejected_attempt_id"
+        ])
+        self.assertNotEqual(pending["operation_id"], fresh["operation_id"])
+        indexes = self.state.connection.execute(
+            "PRAGMA index_list(dispatch_bindings)"
+        ).fetchall()
+        authorization_index_found = False
+        for index in indexes:
+            columns = [column["name"] for column in self.state.connection.execute(
+                f"PRAGMA index_info({index['name']})"
+            ).fetchall()]
+            if columns == ["supersedes_rejected_attempt_id"]:
+                authorization_index_found = True
+                self.assertFalse(index["unique"])
+        self.assertTrue(authorization_index_found)
+        self.assertEqual([], self.state.connection.execute("PRAGMA foreign_key_check").fetchall())
 
     def test_accepted_run_cannot_authorize_a_new_same_decision_dispatch(self) -> None:
         self.observe()
