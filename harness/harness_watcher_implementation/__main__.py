@@ -194,14 +194,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "status":
         state = _read(service)
-        running = bool(
-            state
-            and _same(state.get("watcher"))
-            and _same(state.get("owner"))
-            and not state.get("stop_requested")
-            and not state.get("exit_reason")
+        # Publish process truth, not requested/terminal intent.  A watcher may
+        # have recorded stop_requested or exit_reason while its exact process
+        # is still winding down (and, on Linux, before it disappears from
+        # /proc).  Callers that wait for ``running == false`` must therefore
+        # observe actual identity disappearance rather than racing a zombie or
+        # final status publication.
+        running = bool(state and _same(state.get("watcher")))
+        stopping = bool(
+            running
+            and (state.get("stop_requested") or state.get("exit_reason"))
         )
-        print(json.dumps({"running": running, "state": state}))
+        print(json.dumps({"running": running, "stopping": stopping, "state": state}))
         return 0
     if args.cmd == "stop":
         state = _read(service)

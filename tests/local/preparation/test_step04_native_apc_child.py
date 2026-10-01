@@ -112,17 +112,19 @@ class NativeChildHarness:
             self.harness / "resource-manifest.json",
             {"schema": "resource-manifest/v1", "resources": []},
         )
-        workspace = self.harness / "super-cache" / "workspace" / ".agent-workspace"
-        for name, contents in {
-            "README.md": "base workspace\n",
-            "lane-queue.py": "# lane queue\n",
-            "manager-notify.py": "# manager notify\n",
-            "result-stop-check.py": "# result stop check\n",
-        }.items():
-            self.write_text(workspace / name, contents)
-        self.write_text(
-            self.harness / "adapters" / "codex" / "super-cache" / ".codex" / "worker.txt",
-            "codex worker payload\n",
+        # Exercise the current shipped composition contract rather than a
+        # hand-maintained partial cache fixture.  The latter went stale when
+        # hook dispatch and provider-owned bindings became mandatory.
+        ignored = shutil.ignore_patterns("__pycache__", "*.pyc")
+        shutil.copytree(
+            ROOT / "harness" / "super-cache" / "workspace",
+            self.harness / "super-cache" / "workspace",
+            ignore=ignored,
+        )
+        shutil.copytree(
+            ROOT / "harness" / "adapters" / "codex",
+            self.harness / "adapters" / "codex",
+            ignore=ignored,
         )
         self.write_text(
             self.harness

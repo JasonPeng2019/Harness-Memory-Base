@@ -55,6 +55,27 @@ _LOCAL_PROCEDURE_SOURCE_KINDS = frozenset(
 # store performs a real remote SearchStore call, so the marker is only honest
 # together with ``requires_network=True``.
 _REMOTE_PROCEDURE_SOURCE_KINDS = frozenset({"everos_generated_skill"})
+RETRIEVAL_QUERY_IDENTITY_FIELDS = ("representation", "tokens", "route")
+
+
+def retrieval_query_identity(query: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the privacy-stable fields that identify a retrieval query.
+
+    ``policy_context`` is deliberately not part of retrieval identity: it is
+    an opaque, per-preparation attribution pointer that a governed store uses
+    to authorize the call.  Two exact preparations may therefore have the
+    same sanitized retrieval identity while retaining distinct durable
+    attribution.
+    """
+
+    if not isinstance(query, Mapping) or any(
+        field not in query for field in RETRIEVAL_QUERY_IDENTITY_FIELDS
+    ):
+        raise SearchError("retrieval query identity is incomplete")
+    return {
+        field: query[field]
+        for field in RETRIEVAL_QUERY_IDENTITY_FIELDS
+    }
 
 
 @dataclass(frozen=True)
@@ -431,11 +452,11 @@ class BoundedSearch:
         if slice_deadline - time.monotonic() < self.limits.minimum_optional_slice_seconds:
             entry["reason"] = "no remaining time inside the enclosing stage bound"
             return entry
-        query_fields = {
+        query_fields = retrieval_query_identity({
             "representation": {key: objective[key] for key in ("model", "dimensions", "metric", "sanitizer_version")},
             "tokens": templates.bounded_token_projection(objective.get("tokens", [])),
             "route": route,
-        }
+        })
         if policy_context is not None:
             query_fields["policy_context"] = dict(policy_context)
         query = safe_query_payload(query_fields, self.privacy_policy)

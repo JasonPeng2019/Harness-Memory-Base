@@ -107,6 +107,8 @@ python -m orchestrator_harness.operator_launch lane retire --acceptance-ref <acc
 ## Notes
 
 - Run `scan --no-write` before launch for a read-only lane-status snapshot.
+- To watch every lane's steps live, run `python -m orchestrator_harness.operator_launch view` in a
+  second terminal pane. It is read-only; press `q` to quit.
 - `send-lane-notification --lane-id <id> --prompt <assignment>` appends one assignment to a
   running managed lane.
 - `orchestrator_harness.release_checks` is the one stable-ID registry/selector for fast,

@@ -40,6 +40,22 @@ and runtime state were not replaced. This is a source refresh, not setup or a
 live-runtime upgrade: existing materialized payloads and records need STEP-01
 ownership inspection and fresh setup/bootstrap before using the new contract.
 
+## Visualizer and release repair
+
+On 2026-10-01, integrated the self-contained visualizer feature from
+`brianna-wng/MA-Harness` commit
+`b66a7958ad8d63e9370bb425cd699623e211233e` (branch tip
+`8ff5f451c4862a42dcb5ed8e2f6dd8bc1cba465a`). The branch has unrelated Git
+history, so only that feature commit was applied; older copies of current
+harness files were not allowed to replace newer product fixes.
+
+The same repair moved distribution metadata to `harness/pyproject.toml`, where
+setuptools can package the runtime module `orchestrator_harness/setup.py`
+without executing it as a build script. Wheel, source, and editable installs
+now include the harness, shared process-identity package, watcher, visualizer,
+provider bindings, release assets, and live-matrix entry scripts. The portable
+ZIP is regenerated from version-controlled product files only.
+
 ## Intentional run-blocking repairs
 
 On 2026-09-21, synchronized the user-authorized repairs through the canonical

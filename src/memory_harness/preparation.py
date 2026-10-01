@@ -559,6 +559,7 @@ class PreparationService:
         apc_cleanup: Mapping[str, Any] | None = None,
         mandatory_content: Iterable[Mapping[str, Any]] = (),
         optional_items: Iterable[Mapping[str, Any]] = (),
+        retained_context: Mapping[str, Any] | None = None,
         freshness_check: Callable[[Mapping[str, Any]], bool] | None = None,
         lane_id: str | None = None,
         run_id: str | None = None,
@@ -664,7 +665,12 @@ class PreparationService:
                 recipient=recipient,
                 mandatory_content=mandatory_content,
                 optional_items=(),
-                omitted=["optional-memory-unavailable", *supplied_optional],
+                retained_context=retained_context,
+                omitted=(
+                    ()
+                    if retained_context is not None
+                    else ["optional-memory-unavailable", *supplied_optional]
+                ),
                 freshness_check=freshness_check,
                 required_sources=required_sources,
             )
@@ -1013,6 +1019,7 @@ class PreparationService:
             recipient=recipient,
             mandatory_content=mandatory_content,
             optional_items=optional_items,
+            retained_context=retained_context,
             freshness_check=freshness_check,
             stores=stores,
             objective=objective,
@@ -2129,6 +2136,7 @@ class PreparationService:
         recipient: str | None,
         mandatory_content: Iterable[Mapping[str, Any]],
         optional_items: Iterable[Mapping[str, Any]],
+        retained_context: Mapping[str, Any] | None = None,
         freshness_check: Callable[[Mapping[str, Any]], bool] | None,
         omitted: Iterable[str | Mapping[str, Any]] = (),
         stores: Sequence[SearchStore] = (),
@@ -2186,6 +2194,7 @@ class PreparationService:
             recipient=str(recipient),
             mandatory_content=list(mandatory_content),
             optional_items=packed_optional,
+            retained_context=retained_context,
             selected_provenance=selected_provenance,
             omitted=omitted,
             privacy_policy=self.privacy_policy,
@@ -2224,7 +2233,9 @@ class PreparationService:
             envelope=finalized.envelope,
             superseded=outcome.superseded,
             reason=(
-                outcome.reason + "; mandatory-only context finalized with optional memory omitted"
+                outcome.reason + "; validated non-plan-affecting optional context retained"
+                if retained_context is not None
+                else outcome.reason + "; mandatory-only context finalized with optional memory omitted"
                 if outcome.mode == "no_memory_continuation"
                 else "the exact accepted plan was finalized into a dispatchable context"
             ),

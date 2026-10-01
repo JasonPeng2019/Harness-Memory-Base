@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,7 +17,7 @@ if str(SRC) not in sys.path:
 
 from orchestrator_harness import bootstrap, controller, memory_handoff
 from orchestrator_harness.records import atomic_write_json
-from memory_harness import context, contracts, runtime, store
+from memory_harness import config, context, contracts, runtime, store
 
 
 def _task_card(
@@ -52,8 +53,10 @@ def _finalized_lane1_fixture(
 ) -> SimpleNamespace:
     """A real Lane 1 finalized record for the explicit test dispatch target."""
 
-    configuration = {"strategy": "standard"}
-    decision_id = contracts.make_decision(card, plan)["decision_id"]
+    configuration = asdict(config.resolve_config(card["memory_handoff"].get("configuration")))
+    decision_id = contracts.make_decision(
+        card, plan, configuration=configuration,
+    )["decision_id"]
     mandatory = [
         {"id": "task", "kind": "task", "content": card["task"]},
         {"id": "accepted-plan", "kind": "accepted-plan", "content": plan["content"]},
@@ -288,7 +291,13 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         memory_store = store.MemoryStore(memory_handoff.memory_paths(self.worktree)[0])
         memory_store.initialize()
         try:
-            memory_store.record_decision(contracts.make_decision(self.card, self.plan))
+            memory_store.record_decision(contracts.make_decision(
+                self.card,
+                self.plan,
+                configuration=asdict(config.resolve_config(
+                    self.card["memory_handoff"].get("configuration")
+                )),
+            ))
         finally:
             memory_store.close()
         workspace = self.worktree / ".agent-workspace"

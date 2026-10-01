@@ -1669,3 +1669,33 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.assertTrue(_same(live))
         stale = {**live, "created_utc": str(live["created_utc"]) + "-different"}
         self.assertFalse(_same(stale))
+
+    def test_status_remains_running_during_published_stop_until_identity_is_gone(self) -> None:
+        settings.harness_watcher_active = True
+        state = {
+            "watcher": {"pid": 41, "created_utc": "created-1"},
+            "owner": {"pid": 40, "created_utc": "created-0"},
+            "stop_requested": True,
+            "exit_reason": "stop-requested",
+        }
+        with (
+            patch.object(watcher_cli, "load_config", return_value=self.config),
+            patch.object(watcher_cli, "_read", return_value=state),
+            patch.object(watcher_cli, "_same", return_value=True),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            self.assertEqual(0, watcher_cli.main(["status"]))
+        published = json.loads(stdout.getvalue())
+        self.assertTrue(published["running"])
+        self.assertTrue(published["stopping"])
+
+        with (
+            patch.object(watcher_cli, "load_config", return_value=self.config),
+            patch.object(watcher_cli, "_read", return_value=state),
+            patch.object(watcher_cli, "_same", return_value=False),
+            patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            self.assertEqual(0, watcher_cli.main(["status"]))
+        published = json.loads(stdout.getvalue())
+        self.assertFalse(published["running"])
+        self.assertFalse(published["stopping"])

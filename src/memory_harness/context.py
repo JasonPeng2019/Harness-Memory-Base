@@ -216,6 +216,7 @@ def finalize_context(
     recipient: str,
     mandatory_content: Iterable[Mapping[str, Any]],
     optional_items: Iterable[Mapping[str, Any]] = (),
+    retained_context: Mapping[str, Any] | None = None,
     selected_provenance: Mapping[str, Mapping[str, Any]] | None = None,
     omitted: Iterable[str | Mapping[str, Any]] = (),
     privacy_policy: PrivacyPolicy | None = None,
@@ -270,9 +271,98 @@ def finalize_context(
         omissions.append({**descriptor, "reason": "omitted before finalization"})
     optional: list[tuple[dict[str, Any], dict[str, Any], bool, int]] = []
     selected_by_id: dict[str, dict[str, Any]] = {}
-    for raw in optional_items:
+    supplied_optional = [dict(item) for item in optional_items]
+    if retained_context is not None:
+        if supplied_optional or selected or omissions:
+            raise OptionalItemError(
+                "retained finalized content cannot be mixed with new optional selections"
+            )
+        try:
+            contracts.validate_finalized_context(retained_context)
+        except (contracts.ContractError, TypeError, ValueError) as exc:
+            raise OptionalItemError(
+                f"retained finalized context is invalid: {exc}"
+            ) from exc
+        expected_binding = {
+            "lane_id": lane_id,
+            "decision_id": decision_id,
+            "task": task_card["task"],
+            "task_card_digest": task_card["content_hash"],
+            "objective_id": plan["objective_id"],
+            "route": plan["route"],
+            "plan_id": plan["plan_id"],
+            "plan_revision": plan["revision"],
+            "accepted_by": plan["accepted_by"],
+            "accepted_plan_content": plan["content"],
+            "plan_digest": plan["content_hash"],
+            "base_commit": base_commit,
+            "worktree_path": worktree_path,
+            "checkpoint": checkpoint,
+            "strategy": strategy,
+            "configuration": dict(configuration),
+            "execution_role": execution_role,
+            "invocation_target": invocation_target,
+            "recipient": recipient,
+        }
+        changed = [
+            field for field, expected in expected_binding.items()
+            if retained_context.get(field) != expected
+        ]
+        if changed:
+            raise OptionalItemError(
+                "retained finalized context changed binding: " + ", ".join(changed)
+            )
+        retained_trace = retained_context["delivery_trace"]
+        retained_items = {
+            entry["id"]: _normalize_optional_item(entry)
+            for entry in retained_context["optional_content"]
+        }
+        retained_selected: dict[str, tuple[int, dict[str, Any]]] = {}
+        for slot, raw_descriptor in enumerate(retained_trace["selected"]):
+            descriptor = dict(raw_descriptor)
+            item_id = descriptor["id"]
+            provenance = dict(descriptor["provenance"])
+            source = {**retained_items.get(item_id, {}), **provenance}
+            if _plan_depends_on(
+                plan,
+                source,
+                trusted_dependency=provenance.get("plan_affecting") is True,
+            ):
+                raise PlanAffectingFreshnessError(
+                    f"selected source {source.get('source_id', item_id)} revision "
+                    f"{source.get('revision_id', 'unknown')} requires a live recheck; "
+                    "ROOT must replan"
+                )
+            if worker_bound_finding(provenance, policy):
+                raise OptionalItemError(
+                    f"retained optional provenance {item_id} is no longer privacy-safe"
+                )
+            retained_selected[item_id] = (slot, descriptor)
+            selected.append(descriptor)
+            selected_by_id[item_id] = descriptor
+        for raw_omission in retained_trace["omitted"]:
+            omission = dict(raw_omission)
+            if worker_bound_finding(omission, policy):
+                raise OptionalItemError(
+                    f"retained omission {omission.get('id', '<unknown>')} is no longer privacy-safe"
+                )
+            omissions.append(omission)
+        for raw in retained_context["optional_content"]:
+            item = _normalize_optional_item(raw)
+            slot, descriptor = retained_selected[item["id"]]
+            provenance = dict(descriptor["provenance"])
+            source = {**item, **provenance}
+            if worker_bound_finding(item, policy):
+                raise OptionalItemError(
+                    f"retained optional content {item['id']} is no longer privacy-safe"
+                )
+            optional.append((item, source, False, slot))
+
+    for raw in supplied_optional:
         item = _normalize_optional_item(raw)
         item_id = item["id"]
+        if item_id in selected_by_id:
+            raise OptionalItemError("optional item ids must be unique")
         source = (selected_provenance or {}).get(item_id, {})
         if not isinstance(source, Mapping) or any(
             key in {"id", "content", "payload"} or (key in item and item[key] != value)

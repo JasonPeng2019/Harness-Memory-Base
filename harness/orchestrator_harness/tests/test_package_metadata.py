@@ -20,19 +20,21 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = REPOSITORY_ROOT / "orchestrator_harness"
-PYPROJECT_PATH = PACKAGE_ROOT / "pyproject.toml"
+PYPROJECT_PATH = REPOSITORY_ROOT / "pyproject.toml"
 
 # Every package that must be declared so all runtime modules ship in the wheel.
 REQUIRED_PACKAGES = (
     "orchestrator_harness",
     "orchestrator_harness.assets",
     "orchestrator_harness.assets.codex",
+    "orchestrator_harness.assets.release",
+    "orchestrator_harness.assets.release.examples",
+    "orchestrator_harness.assets.release.templates",
     "orchestrator_harness.assets.rules",
     "orchestrator_harness.provider_adapters",
-    "orchestrator_harness.provider_adapters.claude-code",
     "orchestrator_harness.provider_adapters.codex",
-    "orchestrator_harness.provider_adapters.qwen-code",
     "harness_common",
+    "harness_watcher_implementation",
 )
 
 # Package-owned assets that must be declared as package data.
@@ -96,10 +98,15 @@ class PackageMetadataStaticTests(unittest.TestCase):
     def test_runtime_and_build_versions_are_coherent(self) -> None:
         pyproject = _load_pyproject()
         self.assertEqual("2.0.0", pyproject["project"]["version"])
+        self.assertEqual(
+            "portable-orchestrator-harness", pyproject["project"]["name"]
+        )
         package_init = (PACKAGE_ROOT / "__init__.py").read_text(encoding="utf-8")
         self.assertIn('__version__ = "2.0.0"', package_init)
-        metadata = (PACKAGE_ROOT / "portable_orchestrator_harness.egg-info" / "PKG-INFO").read_text(encoding="utf-8")
-        self.assertIn("Version: 2.0.0", metadata)
+        self.assertFalse(
+            any(REPOSITORY_ROOT.glob("*.egg-info")),
+            "generated package metadata must not be checked into the source tree",
+        )
 
     def test_removed_candidate_modules_are_not_packaged(self) -> None:
         removed = (
@@ -127,6 +134,7 @@ class PackageMetadataStaticTests(unittest.TestCase):
                 "__pycache__" in relative.parts
                 or "tests" in relative.parts
                 or "egg-info" in relative.parts
+                or any("-" in part for part in relative.parts)
             ):
                 continue
             dotted = (
@@ -136,8 +144,14 @@ class PackageMetadataStaticTests(unittest.TestCase):
             )
             self.assertIn(dotted, declared, dotted)
         self.assertEqual(
-            "../harness_common",
+            "harness_common",
             pyproject["tool"]["setuptools"]["package-dir"]["harness_common"],
+        )
+        self.assertEqual(
+            "harness_watcher_implementation",
+            pyproject["tool"]["setuptools"]["package-dir"][
+                "harness_watcher_implementation"
+            ],
         )
 
     def test_package_data_covers_registered_bindings_and_required_assets(
@@ -168,13 +182,13 @@ class PackageMetadataStaticTests(unittest.TestCase):
         self.assertIn("examples", data_files)
         self.assertIn("release_evidence_templates", data_files)
         self.assertIn(
-            "assets/release/templates/*.md",
+            "orchestrator_harness/assets/release/templates/*.md",
             data_files["release_evidence_templates"],
         )
 
 
 class PackageWheelBuildTests(unittest.TestCase):
-    def test_wheel_includes_registered_bindings_and_required_assets(self) -> None:
+    def test_distributions_include_registered_bindings_and_required_assets(self) -> None:
         if (
             importlib.util.find_spec("setuptools") is None
             or importlib.util.find_spec("wheel") is None
@@ -186,7 +200,9 @@ class PackageWheelBuildTests(unittest.TestCase):
             temporary = Path(raw)
             source = temporary / "source"
             wheel_dir = temporary / "wheel"
+            sdist_dir = temporary / "sdist"
             wheel_dir.mkdir()
+            sdist_dir.mkdir()
             ignored = shutil.ignore_patterns(
                 "__pycache__", "*.pyc", "*.egg-info", "build", "dist"
             )
@@ -201,22 +217,35 @@ class PackageWheelBuildTests(unittest.TestCase):
             shutil.copytree(
                 REPOSITORY_ROOT / "examples", source / "examples", ignore=ignored
             )
+            shutil.copytree(
+                REPOSITORY_ROOT / "harness_watcher_implementation",
+                source / "harness_watcher_implementation",
+                ignore=ignored,
+            )
+            shutil.copy2(REPOSITORY_ROOT / "README.md", source / "README.md")
+            shutil.copy2(PYPROJECT_PATH, source / "pyproject.toml")
             previous = os.getcwd()
             try:
-                os.chdir(source / "orchestrator_harness")
-                from setuptools.build_meta import build_wheel
+                os.chdir(source)
+                from setuptools.build_meta import build_sdist, build_wheel
 
                 wheel_name = build_wheel(str(wheel_dir))
+                sdist_name = build_sdist(str(sdist_dir))
             finally:
                 os.chdir(previous)
             wheel = wheel_dir / wheel_name
+            sdist = sdist_dir / sdist_name
             self.assertTrue(wheel.is_file(), wheel)
+            self.assertTrue(sdist.is_file(), sdist)
             with zipfile.ZipFile(wheel) as archive:
                 names = set(archive.namelist())
             required_entries = (
                 "orchestrator_harness/__init__.py",
                 "orchestrator_harness/release_checks.py",
                 "orchestrator_harness/operator_launch.py",
+                "orchestrator_harness/view_state.py",
+                "orchestrator_harness/view_render.py",
+                "orchestrator_harness/view_term.py",
                 "orchestrator_harness/provider_adapters/__init__.py",
                 "orchestrator_harness/provider_adapters/codex/__init__.py",
                 "orchestrator_harness/provider_adapters/codex/launcher_binding.py",
@@ -233,10 +262,23 @@ class PackageWheelBuildTests(unittest.TestCase):
                 "orchestrator_harness/assets/release/templates/COMPLETION.md",
                 "harness_common/__init__.py",
                 "harness_common/process_identity.py",
+                "harness_watcher_implementation/__init__.py",
+                "harness_watcher_implementation/__main__.py",
+                "harness_watcher_implementation/config.example.json",
+                "harness_watcher_implementation/verdict.schema.json",
             )
             for entry in required_entries:
                 self.assertIn(entry, names, entry)
-            self.assertTrue(any(".data/data/examples/" in name for name in names))
+            for suffix in (
+                "examples/execute_matrix.py",
+                "examples/v2_live_matrix.py",
+                "examples/live_matrix_driver/build_manifests.py",
+                "examples/live_matrix_driver/validate_manifests.py",
+            ):
+                self.assertTrue(
+                    any(name.endswith(".data/data/" + suffix) for name in names),
+                    suffix,
+                )
             self.assertTrue(
                 any(".data/data/release_evidence_templates/" in name for name in names)
             )
@@ -246,6 +288,23 @@ class PackageWheelBuildTests(unittest.TestCase):
                 self.assertFalse(lowered.startswith("super-cache/"), name)
                 self.assertNotIn("harness-config.json", lowered, name)
                 self.assertNotIn("resource-manifest.json", lowered, name)
+            import tarfile
+
+            with tarfile.open(sdist, "r:gz") as archive:
+                sdist_names = set(archive.getnames())
+            prefix = sdist_name.removesuffix(".tar.gz")
+            for entry in (
+                "pyproject.toml",
+                "README.md",
+                "orchestrator_harness/setup.py",
+                "orchestrator_harness/view_term.py",
+                "harness_common/process_identity.py",
+                "harness_watcher_implementation/__main__.py",
+                "examples/execute_matrix.py",
+                "examples/live_matrix_driver/build_manifests.py",
+                "examples/live_matrix_driver/validate_manifests.py",
+            ):
+                self.assertIn(f"{prefix}/{entry}", sdist_names, entry)
 
 
 if __name__ == "__main__":

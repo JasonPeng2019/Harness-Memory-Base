@@ -3,7 +3,7 @@
 The package exposes one public launcher:
 
 ```powershell
-python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lane,manager,lease,send-lane-notification,scan,watch,health}
+python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lane,manager,lease,send-lane-notification,scan,watch,view,health}
 ```
 
 Every public command returns the structured result `{ ok, code, summary, evidence_paths,
@@ -57,7 +57,11 @@ results, operates hardware, or replaces the root orchestrator.
 
 - `resume-lane --lane-id <id> --resume-task-card <path> [--rationale <text>]` — re-run a
   stopped, unaccepted lane in its same worktree and provider session with a fresh `run_id`. It
-  never reconstructs a session, PID, or worktree.
+  never reconstructs a session, PID, or worktree. If live memory search stores are unavailable,
+  a ROOT-rejected run may retain optional content only from its validated prior finalized context,
+  with the exact delivery trace and no reinterpretation. Any source the accepted plan depends on
+  still requires a live final recheck and fails closed before lane mutation when that proof is
+  unavailable.
 
 ### `manager` — manager-queue commands (managed only)
 
@@ -78,9 +82,15 @@ results, operates hardware, or replaces the root orchestrator.
 - `send-lane-notification --lane-id <id> --prompt <text>` — append one assignment to a running
   managed lane's inbox.
 
-### `scan`, `watch`, `health`
+### `scan`, `watch`, `view`, `health`
 
 - `scan [--no-write]` — read-only lane-status snapshot.
+- `view [--once] [--ascii] [--no-color] [--refresh <seconds>]` — read-only terminal viewer. Each
+  lane is one row of seven steps: Recall, Vet, Plan, Pack (from the optional memory handoff; shown
+  as skipped for plain lanes), then Work, Review, Learn. Items that need ROOT are listed at the
+  bottom with the command to run. `↑`/`↓` select, `enter` shows lane details, `q` quits. It never
+  writes runtime records; `--once` (or a non-terminal stdout) prints one snapshot, and `--json`
+  adds the collected `state`.
 - `watch [--until-actionable] [--timeout <duration>] [--until-event <id>]` — block until an
   actionable condition exists (or the named manager event appears). Durations accept `30s`, `5m`,
   `1h`.

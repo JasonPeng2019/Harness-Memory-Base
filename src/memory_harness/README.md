@@ -124,11 +124,22 @@ network resolution and context, and compare the query route before allowing
 task-path work. Missing or mismatched attribution must not be treated as an
 authorized network profile. Query payloads do not carry raw task, objective,
 or plan IDs, configuration, deadlines, full preparations, or credentials.
+The retrieval query identity is exactly `representation`, `tokens`, and
+`route`, exposed by `search.retrieval_query_identity()`. Consequently a real
+configured secret and the literal redaction marker have the same retrieval
+identity and score. The additive `policy_context` is deliberately excluded
+from that identity because distinct durable preparations require distinct
+authorization attribution even when their sanitized searches are equivalent.
 
 `context.finalize_context` renders mandatory task/accepted-plan state first,
 packs whole eligible optional items inside the configured allowance, rechecks
 plan-affecting freshness, and binds one integrity over the actual task,
 objective, repository base, accepted plan, rendered items, and role separation.
+For a new run of the same exact decision and dispatch target, it may carry an
+already validated finalized context's non-plan-affecting optional content and
+delivery trace without rendering that content a second time. Binding changes,
+new optional selections, privacy failures, and plan-dependent sources are
+rejected; plan-dependent sources still require their live owner recheck.
 `runtime.MemoryRuntime.dispatch` (and the harness `memory_handoff` seam)
 persists launch intent before the existing product-harness launcher runs and
 records the exact observed invocation afterwards; a lost acknowledgement leaves

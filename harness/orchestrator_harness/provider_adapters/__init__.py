@@ -106,7 +106,11 @@ def usage_observation(event: dict[str, Any], provider_id: str) -> dict[str, Any]
         and event_type == "result"
         and _cost(source_cost)
     )
-    if not has_generic_usage and not model_usage and not has_cost:
+    # A syntactically present but empty/untrusted generic usage object is not
+    # an observation.  Retain a receipt only when at least one trusted native
+    # counter survives normalization, or when Claude supplies an independent
+    # model-usage/cost fact.
+    if not safe_usage and not model_usage and not has_cost:
         return None
     observation = {
         "event_type": event_type,

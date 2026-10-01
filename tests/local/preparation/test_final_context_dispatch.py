@@ -270,6 +270,51 @@ class FinalContextDispatchTests(unittest.TestCase):
             base_commit="base-1", worktree_path=str(self.worktree),
         )
 
+    def test_non_plan_optional_context_can_be_retained_without_rewrapping(self) -> None:
+        first = self._finalize(optional_items=[
+            {
+                "id": "history-1",
+                "kind": "historical_evidence",
+                "origin": "everos",
+                "revision_id": "r1",
+                "content": {"summary": "prior regression"},
+            },
+            {
+                "id": "too-large",
+                "kind": "memory",
+                "origin": "atlas",
+                "revision_id": "r2",
+                "content": "x" * 5000,
+            },
+        ])
+
+        resumed = self._finalize(
+            run_id="run-2",
+            retained_context=first.context,
+        )
+
+        self.assertEqual(first.context["optional_content"], resumed.context["optional_content"])
+        self.assertEqual(first.context["delivery_trace"], resumed.context["delivery_trace"])
+        self.assertEqual(
+            {"procedural_authority": False, "evidence": {"summary": "prior regression"}},
+            resumed.context["optional_content"][0]["content"],
+        )
+
+    def test_plan_affecting_context_cannot_be_retained_without_live_recheck(self) -> None:
+        first = self._finalize(
+            optional_items=[{
+                "id": "procedure-1",
+                "kind": "memory",
+                "origin": "atlas",
+                "revision_id": "r1",
+                "content": {"steps": ["approved guidance"]},
+            }],
+            selected_provenance={"procedure-1": {"plan_affecting": True}},
+        )
+
+        with self.assertRaisesRegex(context.PlanAffectingFreshnessError, "live recheck"):
+            self._finalize(run_id="run-2", retained_context=first.context)
+
     def test_exact_mandatory_state_and_canonical_destination_are_required(self) -> None:
         mandatory = self._finalize().envelope["mandatory_content"]
         for identifier in ("task", "accepted-plan", "base", "route", "checkpoint", "security"):

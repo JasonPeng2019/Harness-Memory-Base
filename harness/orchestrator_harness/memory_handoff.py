@@ -345,6 +345,7 @@ def _prepare_memory_outcome(
     network_mode: str,
     search_stores: Sequence[Any] = (),
     required_sources: frozenset[tuple[str, str, str]] = frozenset(),
+    retained_context: Mapping[str, Any] | None = None,
 ):
     """Run one bounded preparation for the exact handoff state.
 
@@ -402,6 +403,7 @@ def _prepare_memory_outcome(
             finalize=finalize,
             stores=search_stores,
             required_sources=required_sources,
+            retained_context=retained_context,
         )
     finally:
         memory_store.close()
@@ -441,6 +443,7 @@ def prepare_lane_memory(
     base_commit: str,
     search_stores: Sequence[Any] = (),
     required_sources: frozenset[tuple[str, str, str]] = frozenset(),
+    retained_context: Mapping[str, Any] | None = None,
 ) -> "LaneMemory":
     """Run one bounded lane preparation and report its exact disposition.
 
@@ -483,6 +486,7 @@ def prepare_lane_memory(
             network_mode=requested_network,
             search_stores=search_stores,
             required_sources=required_sources,
+            retained_context=retained_context,
         )
         if not accepted:
             _, envelope_path = memory_paths(worktree_path)

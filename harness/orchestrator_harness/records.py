@@ -22,6 +22,7 @@ from .core import canonical_json, read_json, require_schema
 _WINDOWS_REPLACE_RETRY_ERRORS = frozenset({5, 32})
 _WINDOWS_REPLACE_MAX_ATTEMPTS = 5
 _WINDOWS_REPLACE_RETRY_DELAY_SECONDS = 0.05
+_IS_WINDOWS = os.name == "nt"
 
 
 def _replace_with_retry(source: Path, target: Path) -> None:
@@ -40,7 +41,7 @@ def _replace_with_retry(source: Path, target: Path) -> None:
             error = getattr(exc, "winerror", None)
             if error is None:
                 error = getattr(exc, "errno", None)
-            if os.name != "nt" or error not in _WINDOWS_REPLACE_RETRY_ERRORS:
+            if not _IS_WINDOWS or error not in _WINDOWS_REPLACE_RETRY_ERRORS:
                 raise
             if attempt + 1 >= _WINDOWS_REPLACE_MAX_ATTEMPTS:
                 raise

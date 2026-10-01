@@ -10,6 +10,8 @@ A complete orchestration and memory system for teams of coding agents.
 - **Super-cache** — stages the shared tools, hooks, skills, and provider config
   every worker needs.
 - **Persistent monitor** — tracks processes, results, leases, and lane health.
+- **Read-only terminal visualizer** — shows Recall, Vet, Plan, Pack, Work,
+  Review, and Learn progress for every lane without mutating runtime state.
 - **Live coordination** — workers report progress or request help via queue
   notifications that ROOT answers without restarting sessions.
 - **Full result lifecycle** — evidence tied to an exact lane and run, a reviewer

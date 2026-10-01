@@ -4,6 +4,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -28,6 +29,12 @@ class AcceptedRetirementExitRaceTests(unittest.TestCase):
         )
         identity = launch.processes.process_identity(child.pid)
         self.assertIsNotNone(identity)
+        # ``lane retire`` is not the controller's parent in production.  The
+        # launcher/OS reaps that detached process independently; mirror that
+        # lifecycle here so a normally exited child does not remain a
+        # test-owned zombie and make exact identity observation disagree with
+        # the real deployment topology.
+        threading.Thread(target=child.wait, daemon=True).start()
 
         def stop_exact() -> None:
             assert identity is not None
@@ -266,6 +273,65 @@ class AcceptedRetirementExitRaceTests(unittest.TestCase):
             ),
             "an exact controller that outlives the bounded wait must fail closed",
         )
+        release_leases.assert_not_called()
+        update_lane.assert_not_called()
+
+    def test_retire_fails_closed_when_live_controller_identity_is_unavailable(
+        self,
+    ) -> None:
+        """A live PID with an unreadable creation identity is unknown, not gone."""
+
+        lane = {
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "lifecycle": "accepted",
+            "worktree_path": str(self.root / "worktree"),
+            "process": {"pid": 41, "creation_time": "controller-created"},
+        }
+        status = {
+            "schema": "controller-status/v1",
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "controller_state": "exited",
+            "recorded_status": "review_pending",
+            "provider_state": {"state": "exited"},
+            "process_boundary": {
+                "root": {"pid": 42, "creation_time": "provider-created"}
+            },
+            "cleanup_proven": True,
+        }
+        with (
+            patch.object(launch, "find_harness_root", return_value=self.root),
+            patch.object(
+                launch,
+                "load_config",
+                return_value=SimpleNamespace(
+                    runtime_root=self.runtime, root_workspace=self.root
+                ),
+            ),
+            patch.object(
+                launch,
+                "_validate_acceptance_ref",
+                return_value={"lane_id": "lane-1", "approval": "ACCEPTED"},
+            ),
+            patch.object(
+                launch, "find_active_lane", return_value=("epoch-1", lane)
+            ),
+            patch.object(launch, "_read_controller_status", return_value=status),
+            patch.object(launch.processes, "identity_matches", return_value=False),
+            patch.object(launch.processes, "process_alive", return_value=True),
+            patch.object(launch.processes, "process_identity", return_value=None),
+            patch.object(
+                launch.processes, "process_boundary_is_gone", return_value=True
+            ),
+            patch.object(launch, "_wait_for_controller_exit", return_value=False),
+            patch.object(launch, "release_leases") as release_leases,
+            patch.object(launch, "update_lane") as update_lane,
+        ):
+            result = launch.run_retire("acceptance.json")
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual("RETIRE_CLEANUP_UNPROVEN", result["code"])
         release_leases.assert_not_called()
         update_lane.assert_not_called()
 

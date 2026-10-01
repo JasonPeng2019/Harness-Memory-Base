@@ -923,8 +923,12 @@ def linux_process_snapshot() -> ProcessSnapshot:
             processes.append(query.process)
         if not query.complete:
             errors.extend(query.errors)
-        elif query.process is None:
-            errors.append(f"{entry}: process disappeared during observation")
+        # A complete targeted query with no process proves that this unrelated
+        # /proc entry exited while the inventory was being read.  Treating that
+        # ordinary race as an incomplete global snapshot permanently poisoned
+        # every ProcessBoundary that happened to observe at the same time.
+        # Contained members already captured by exact identity remain in the
+        # boundary and are checked independently during cleanup.
     return ProcessSnapshot(
         complete=not errors,
         processes=tuple(sorted(processes, key=lambda p: p.pid)),

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from orchestrator_harness import root_hook_wrapper as wrapper
@@ -84,6 +85,7 @@ class RootHookWrapperTests(unittest.TestCase):
         runtime = (self.workspace / "runtime").resolve()
         with (
             patch.dict(os.environ, {"HARNESS_EVENT_ID": "event-1"}),
+            patch.object(wrapper, "load_config", return_value=SimpleNamespace(profile="managed")),
             patch.object(wrapper, "dispatch", return_value={"decision": "ALLOW"}),
             patch.object(wrapper, "append_delivery_history") as delivery,
         ):

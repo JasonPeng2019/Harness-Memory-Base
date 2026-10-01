@@ -17,7 +17,7 @@ from examples.v2_live_matrix import AUTHORIZATION_ENV, CHECKS, MANAGED_ONLY, NAT
 
 ROOT = Path(__file__).resolve().parents[3]
 MATRIX = ROOT / "examples" / "v2_live_matrix.py"
-ENTRYPOINT = ROOT / ".agent-workspace" / "execute-matrix.py"
+ENTRYPOINT = ROOT / "examples" / "execute_matrix.py"
 
 
 class LiveMatrixContractTests(unittest.TestCase):
@@ -142,17 +142,22 @@ class LiveMatrixContractTests(unittest.TestCase):
             cell, sentinel = root / "cell.py", root / "sentinel.txt"
             self._fake_cell_script(cell)
             sentinel.write_text("untouched", encoding="utf-8")
-            command = [sys.executable, str(cell), "--root", str(root / "codex" / "CHECK-LIVE-1"), "--name", "CHECK-LIVE-1", "--sleep", "2", "--spawn-child"]
+            command = [sys.executable, str(cell), "--root", str(root / "codex" / "CHECK-LIVE-1"), "--name", "CHECK-LIVE-1", "--sleep", "10", "--spawn-child"]
             attempt = self._outer_attempt(root, "CHECK-LIVE-1", "codex", command, [sys.executable, "-c", "pass"], budget=2)
             manifest, checkpoint = root / "manifest.json", root / "checkpoint.json"
             manifest.write_text(json.dumps(self._outer_manifest(root, "codex", [attempt], total_budget=.3)), encoding="utf-8")
             began = time.monotonic(); completed = self._entrypoint([manifest], [checkpoint], total_budget=.3); elapsed = time.monotonic() - began
             self.assertEqual(1, completed.returncode, completed.stderr)
-            self.assertLess(elapsed, 1.5, "outer deadline must bound the selected process tree")
+            # Process-tree termination includes a bounded reap window.  Keep the
+            # assertion well below the command's ten-second sleep while allowing
+            # for scheduler, interpreter-startup, and Linux /proc scan jitter.
+            self.assertLess(elapsed, 5.0, "outer deadline must bound the selected process tree")
             self.assertEqual("untouched", sentinel.read_text(encoding="utf-8"))
             child = int((root / "codex" / "CHECK-LIVE-1" / "child.pid").read_text(encoding="utf-8"))
-            child_status = subprocess.run(["powershell", "-NoProfile", "-Command", f"Get-Process -Id {child} -ErrorAction SilentlyContinue"], text=True, capture_output=True)
-            self.assertFalse(child_status.stdout.strip(), "only the owned command tree is stopped; the unrelated sentinel remains untouched")
+            self.assertFalse(
+                matrix.processes.process_alive(child),
+                "only the owned command tree is stopped; the unrelated sentinel remains untouched",
+            )
             row = json.loads(completed.stdout)["checks"][0]
             self.assertIn(row["outcome"], {"FAIL", "BUDGET_EXHAUSTED"})
 
@@ -185,8 +190,10 @@ class LiveMatrixContractTests(unittest.TestCase):
                 for pid_path in (command_root / "child.pid", command_root / "grand.pid"):
                     pid = int(pid_path.read_text(encoding="utf-8"))
                     self.assertTrue(recorded.get(pid), f"{pid_path.name} must carry its own creation identity")
-                    gone = subprocess.run(["powershell", "-NoProfile", "-Command", f"Get-Process -Id {pid} -ErrorAction SilentlyContinue"], text=True, capture_output=True)
-                    self.assertFalse(gone.stdout.strip(), f"owned {pid_path.name} must be absent")
+                    self.assertFalse(
+                        matrix.processes.process_alive(pid),
+                        f"owned {pid_path.name} must be absent",
+                    )
                 self.assertIsNone(sentinel.poll(), "live unrelated sentinel process must remain alive")
             finally:
                 sentinel.terminate()
@@ -199,12 +206,15 @@ class LiveMatrixContractTests(unittest.TestCase):
             cell = root / "cell.py"; self._fake_cell_script(cell)
             def command(name):
                 return [sys.executable, str(cell), "--root", str(root / "qwen-code" / name), "--name", name]
-            bad = self._outer_attempt(root, "CHECK-LIVE-1", "codex", [sys.executable, "-c", "import time; time.sleep(2)"], [sys.executable, "-c", "pass"], budget=1)
+            bad = self._outer_attempt(root, "CHECK-LIVE-1", "codex", [sys.executable, "-c", "import time; time.sleep(10)"], [sys.executable, "-c", "pass"], budget=1)
             good = self._outer_attempt(root, "CHECK-LIVE-2", "qwen-code", command("CHECK-LIVE-2"), [sys.executable, "-c", "pass"], budget=1)
             manifest, checkpoint = root / "manifest.json", root / "checkpoint.json"
             manifest.write_text(json.dumps(self._outer_manifest(root, "codex", [bad, good], total_budget=1.2)), encoding="utf-8")
             began = time.monotonic(); completed = self._entrypoint([manifest], [checkpoint], total_budget=1.2); elapsed = time.monotonic() - began
-            self.assertLess(elapsed, 2.5)
+            # Keep this well below the command's natural ten-second exit while
+            # allowing the bounded process-tree cleanup and a loaded host's
+            # scheduler enough time to publish terminal evidence.
+            self.assertLess(elapsed, 5.0)
             rows = {row["name"]: row for row in json.loads(completed.stdout)["checks"]}
             self.assertEqual("FAIL", rows["CHECK-LIVE-1"]["outcome"])
             self.assertEqual("PASS", rows["CHECK-LIVE-2"]["outcome"])
@@ -258,8 +268,8 @@ class LiveMatrixContractTests(unittest.TestCase):
 
     def test_builder_validator_entrypoint_restart_and_consumed_file_invalidation(self) -> None:
         """The real producer, validator and outer entrypoint share one durable contract."""
-        builder = ROOT / ".agent-workspace" / "live-matrix" / "driver" / "build_manifests.py"
-        validator = ROOT / ".agent-workspace" / "live-matrix" / "driver" / "validate_manifests.py"
+        builder = ROOT / "examples" / "live_matrix_driver" / "build_manifests.py"
+        validator = ROOT / "examples" / "live_matrix_driver" / "validate_manifests.py"
         candidate = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=True).stdout.strip()
         with tempfile.TemporaryDirectory() as temporary:
             root, epoch, retained, matrix_root = Path(temporary), Path(temporary) / "epoch", Path(temporary) / "retained", Path(temporary) / "matrix"

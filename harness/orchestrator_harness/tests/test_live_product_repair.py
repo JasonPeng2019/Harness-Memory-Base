@@ -37,7 +37,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
             real_replace(source, destination)
 
         with (
-            patch.object(records.os, "name", "nt"),
+            patch.object(records, "_IS_WINDOWS", True),
             patch.object(records.os, "replace", side_effect=replace),
             patch.object(records.time, "sleep") as sleep,
         ):
@@ -52,7 +52,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         target = self.root / "record.json"
         target.write_bytes(b"old\n")
         with (
-            patch.object(records.os, "name", "nt"),
+            patch.object(records, "_IS_WINDOWS", True),
             patch.object(records.os, "replace", side_effect=_windows_error(5)) as replace,
             patch.object(records.time, "sleep") as sleep,
             self.assertRaises(OSError),
@@ -68,7 +68,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         target = self.root / "record.json"
         target.write_bytes(b"old\n")
         with (
-            patch.object(records.os, "name", "nt"),
+            patch.object(records, "_IS_WINDOWS", True),
             patch.object(records.os, "replace", side_effect=_windows_error(123)) as replace,
             patch.object(records.time, "sleep") as sleep,
             self.assertRaises(OSError),
@@ -98,7 +98,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
             real_replace(source, target)
 
         with (
-            patch.object(setup.os, "name", "nt"),
+            patch.object(records, "_IS_WINDOWS", True),
             patch.object(setup.os, "replace", side_effect=replace),
             patch.object(records.time, "sleep") as sleep,
         ):
@@ -128,7 +128,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
             real_replace(source, target)
 
         with (
-            patch.object(setup.os, "name", "nt"),
+            patch.object(records, "_IS_WINDOWS", True),
             patch.object(setup.os, "replace", side_effect=replace),
             patch.object(records.time, "sleep") as sleep,
         ):
@@ -145,7 +145,7 @@ class WindowsReplacementRetryTests(unittest.TestCase):
         staging = self.root / ".super-cache.staging"
         staging.mkdir()
         with (
-            patch.object(setup.os, "name", "nt"),
+            patch.object(records, "_IS_WINDOWS", True),
             patch.object(setup.os, "replace", side_effect=_windows_error(5)) as replace,
             patch.object(records.time, "sleep") as sleep,
             self.assertRaises(OSError),
@@ -254,6 +254,10 @@ class CleanupLifecycleRegressionTests(unittest.TestCase):
                 "process_identity",
                 return_value={"pid": 41, "creation_time": "created-1"},
             ),
+            # The mocked handle is already exited, so the corresponding exact
+            # OS identity must also be absent.  Do not let an unrelated real
+            # host PID 41 determine this synthetic race test.
+            patch.object(launch.processes, "identity_matches", return_value=False),
             patch.object(launch, "update_lane", side_effect=update),
             patch.object(launch, "_read_controller_status", return_value=status),
         ):

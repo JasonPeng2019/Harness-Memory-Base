@@ -128,18 +128,36 @@ def _wait_for_controller_exit(
     )
 
 
+def _exact_process_is_gone(pid: Any, creation: Any) -> bool:
+    """Prove one recorded process incarnation absent, retaining unknown live PIDs."""
+
+    if not isinstance(pid, int):
+        return True
+    if not isinstance(creation, str) or not creation:
+        return not processes.process_alive(pid)
+    if processes.identity_matches(pid, creation):
+        return False
+    # A live PID whose creation identity cannot currently be read is unknown,
+    # not absent.  A live PID with a different readable identity is a reused
+    # PID and therefore proves the recorded incarnation gone.
+    return not (
+        processes.process_alive(pid)
+        and processes.process_identity(pid) is None
+    )
+
+
 def _wait_for_pid_exit(
     pid: int, creation: str | None, timeout_seconds: float
 ) -> bool:
     """Wait until the exact PID-plus-creation incarnation is unobservable."""
-    if not (isinstance(pid, int) and processes.identity_matches(pid, creation)):
+    if _exact_process_is_gone(pid, creation):
         return True
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        if not processes.identity_matches(pid, creation):
+        if _exact_process_is_gone(pid, creation):
             return True
         time.sleep(RETIRE_CONTROLLER_EXIT_POLL_SECONDS)
-    return not processes.identity_matches(pid, creation)
+    return _exact_process_is_gone(pid, creation)
 
 
 def _reap_controller_and_prove_exit(
@@ -164,13 +182,18 @@ def _reap_controller_and_prove_exit(
         if not _wait_for_pid_exit(
             pid, creation, RETIRE_CONTROLLER_EXIT_WAIT_SECONDS
         ):
-            if not processes.terminate_process(pid, creation, force=True):
-                return False
+            # ``terminate_process`` cannot by itself prove a POSIX child gone:
+            # after SIGKILL the launch-owned process remains observable as a
+            # zombie until this parent consumes its wait status.  It may
+            # therefore return False even though the exact signal succeeded.
+            # Attempt only the already-verified incarnation, then always reap
+            # our handle before making the final identity observation.
+            processes.terminate_process(pid, creation, force=True)
     try:
         child.wait(timeout=RETIRE_CONTROLLER_EXIT_WAIT_SECONDS)
     except subprocess.TimeoutExpired:
         return False
-    return not processes.identity_matches(pid, creation)
+    return _exact_process_is_gone(pid, creation)
 
 
 def _declared_worker_environment(task_card: Mapping[str, Any] | None) -> str | None:
@@ -1224,7 +1247,7 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
         process = lane.get("process") or {}
         pid = process.get("pid")
         creation = process.get("creation_time")
-        controller_gone = not processes.identity_matches(pid, creation)
+        controller_gone = _exact_process_is_gone(pid, creation)
         deadline = time.monotonic() + RETIRE_CONTROLLER_EXIT_WAIT_SECONDS
         while (
             not controller_gone
@@ -1235,7 +1258,7 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
             status = _read_controller_status(lane)
             if status is None:
                 break
-            controller_gone = not processes.identity_matches(pid, creation)
+            controller_gone = _exact_process_is_gone(pid, creation)
         if (
             not controller_gone
             and (status or {}).get("controller_state") == "exited"
@@ -1253,16 +1276,7 @@ def run_retire(acceptance_ref: str) -> dict[str, Any]:
         provider_state = (status or {}).get("provider_state") or {}
         provider_pid = provider_state.get("pid")
         provider_creation = provider_state.get("creation_time")
-        provider_gone = not (
-            isinstance(provider_pid, int)
-            and (
-                processes.identity_matches(provider_pid, provider_creation)
-                or (
-                    processes.process_alive(provider_pid)
-                    and processes.process_identity(provider_pid) is None
-                )
-            )
-        )
+        provider_gone = _exact_process_is_gone(provider_pid, provider_creation)
         if not controller_gone or not cleanup_proven or not boundary_gone or not provider_gone:
             return {
                 "ok": False,

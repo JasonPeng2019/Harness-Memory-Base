@@ -1,0 +1,74 @@
+[project]
+name = "portable-orchestrator-harness"
+version = "2.0.0"
+description = "Durable event observation and lane control for parallel coding work"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Some build hosts install setuptools-scm as a global setuptools file finder.
+# This repository ships a static version; the fallback prevents that optional
+# plugin from warning when a source archive has no Git metadata.
+[tool.setuptools_scm]
+fallback_version = "2.0.0"
+
+[tool.setuptools]
+include-package-data = true
+package-dir = { orchestrator_harness = "orchestrator_harness", harness_common = "harness_common", harness_watcher_implementation = "harness_watcher_implementation" }
+packages = [
+    "orchestrator_harness",
+    "orchestrator_harness.assets",
+    "orchestrator_harness.assets.codex",
+    "orchestrator_harness.assets.release",
+    "orchestrator_harness.assets.release.examples",
+    "orchestrator_harness.assets.release.templates",
+    "orchestrator_harness.assets.rules",
+    "orchestrator_harness.provider_adapters",
+    "orchestrator_harness.provider_adapters.codex",
+    "harness_common",
+    "harness_watcher_implementation",
+]
+
+[tool.setuptools.package-data]
+orchestrator_harness = [
+    "assets/codex/bounded-exclusions.gitignore",
+    "assets/codex/*.json",
+    "assets/codex/*.py",
+    "assets/rules/*.md",
+    "assets/release/*.json",
+    "assets/release/examples/*.json",
+    "assets/release/examples/*.md",
+    "assets/release/templates/*.md",
+    "config.example.json",
+    "install_wsl_codex.ps1",
+    "provider_adapters/*/*.py",
+]
+
+harness_watcher_implementation = ["*.md", "*.json"]
+
+[tool.setuptools.data-files]
+"examples" = [
+    "examples/execute_matrix.py",
+    "examples/v2_live_matrix.py",
+    "examples/coding.invocation.example.json",
+    "examples/coding.named-lock.example.json",
+    "examples/coding.result.example.json",
+    "examples/harness.example.json",
+    "examples/watcher.diagnostic.example.json",
+    "orchestrator_harness/assets/release/examples/*.json",
+    "orchestrator_harness/assets/release/examples/*.md",
+]
+"examples/live_matrix_driver" = [
+    "examples/live_matrix_driver/build_manifests.py",
+    "examples/live_matrix_driver/validate_manifests.py",
+]
+"release_evidence_templates" = ["orchestrator_harness/assets/release/templates/*.md"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+extraPaths = [".."]
+reportImplicitRelativeImport = "none"

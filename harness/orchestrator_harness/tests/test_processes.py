@@ -21,6 +21,28 @@ from orchestrator_harness.processes import (
 
 
 class ProcessProviderTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc snapshot only")
+    def test_completed_provider_ignores_unrelated_snapshot_disappearance(self) -> None:
+        """A process reaped during /proc enumeration is a proven absence, not an error."""
+
+        created = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
+        present = ProcessInfo(10, 1, "provider", "provider", created)
+
+        def query(pid, **_kwargs):
+            return processes.ProcessQuery(True, present if pid == 10 else None)
+
+        with (
+            patch.object(processes, "_linux_boot_time", return_value=created),
+            patch.object(processes, "_linux_clock_ticks", return_value=100),
+            patch.object(processes.Path, "iterdir", return_value=[Path("/proc/10"), Path("/proc/11")]),
+            patch.object(processes, "_linux_process_query", side_effect=query),
+        ):
+            snapshot = processes.linux_process_snapshot()
+
+        self.assertTrue(snapshot.complete, snapshot.errors)
+        self.assertEqual((present,), snapshot.processes)
+        self.assertEqual((), snapshot.errors)
+
     @unittest.skipUnless(os.name == "nt", "Windows venv redirector only")
     def test_detached_venv_python_keeps_identity_and_pid(self) -> None:
         if sys.prefix == sys.base_prefix:

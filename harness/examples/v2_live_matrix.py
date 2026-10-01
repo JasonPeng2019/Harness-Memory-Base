@@ -205,8 +205,13 @@ def _run(argv: list[str], *, timeout_seconds: float | None = None) -> dict[str, 
     boundary = processes.ProcessBoundary(
         process.pid,
         identity["creation_time"] if identity is not None else None,
-        process_group_id=(None if os.name == "nt" else os.getpgid(process.pid)),
-        session_id=(None if os.name == "nt" else os.getsid(process.pid)),
+        # ``spawn_provider`` creates a new POSIX session.  Its root PID is
+        # therefore both the process-group and session identity.  Derive the
+        # values from that construction contract instead of querying a very
+        # short-lived child after spawn, when getpgid/getsid can already race
+        # with its exit.
+        process_group_id=(None if os.name == "nt" else process.pid),
+        session_id=(None if os.name == "nt" else process.pid),
         windows_job_handle=job_handle,
     )
     try:
@@ -430,7 +435,7 @@ def _schedule_coordinates(
                         row = future.result()
                     except Exception as exc:  # an ordinary coordinate exception is a row, not a collection abort
                         row = {"name": item["name"], "outcome": "ERROR", "summary": str(exc), "input_digest": item["input_digest"], "attempted_at": _now()}
-                    row["coordinate_key"] = key
+                    row["coordinate_key"] = item.get("coordinate_key", key)
                     failed = {dep: rows[dep].get("outcome") for dep in item["dependency_keys"] if rows[dep].get("outcome") not in successful}
                     if failed:
                         row["acceptance_outcome"] = "DEPENDENCY_EVIDENCE_FAILED"
@@ -453,21 +458,47 @@ def execute(manifest: dict[str, Any], checkpoint_path: Path) -> dict[str, Any]:
         raise PermissionError(f"--execute requires {AUTHORIZATION_ENV}=M09 from the authorized M09 executor")
     inputs = _digest(manifest)
     attempts, digests = _coordinates(manifest)
-    prior = {row.get("name"): row for row in _prior_rows(checkpoint_path)
+    prior_list = _prior_rows(checkpoint_path)
+    prior = {row.get("name"): row for row in prior_list
              if isinstance(row, dict) and isinstance(row.get("name"), str)}
     rows = {name: row for name, row in prior.items() if name in digests and row.get("input_digest") == digests[name]}
+    quarantined = [
+        {**row, "reuse_state": "STALE_INPUT", "reusable": False}
+        for row in prior_list
+        if isinstance(row, dict) and row.get("name") not in digests
+    ]
     by_name = {item["name"]: item for item in attempts}
     success = {"PASS", "GAP-NATIVE-MACOS", "GAP-NATIVE-LINUX"}
     maximum = int(manifest.get("maximum_qualified_coordinate_processes", 2))
     total_budget = float(manifest.get("total_budget_seconds", 0))
     coordinates = {
-        name: {**item, "coordinate_key": name, "dependency_keys": list(item.get("depends_on", [])), "input_digest": digests[name]}
+        name: {
+            **item,
+            "coordinate_key": item.get("coordinate_key", name),
+            "dependency_keys": list(item.get("depends_on", [])),
+            "input_digest": digests[name],
+        }
         for name, item in by_name.items()
     }
     _schedule_coordinates(
         coordinates, rows, total_budget=total_budget, maximum=maximum,
-        persist=lambda current: _checkpoint(checkpoint_path, inputs, [current[item["name"]] for item in attempts if item["name"] in current]),
+        persist=lambda current: _checkpoint(
+            checkpoint_path,
+            inputs,
+            [current[item["name"]] for item in attempts if item["name"] in current]
+            + quarantined,
+        ),
     )
+    final_rows = (
+        [rows[item["name"]] for item in attempts if item["name"] in rows]
+        + quarantined
+    )
+    # A no-op resume must not rewrite durable evidence (including its
+    # publication timestamp).  The scheduler already checkpoints every state
+    # transition; this final write is only needed for an otherwise-idle run
+    # that newly quarantined stale, unselected rows.
+    if final_rows != prior_list:
+        _checkpoint(checkpoint_path, inputs, final_rows)
     ordered_rows = [rows[item["name"]] for item in attempts]
     missing = sorted(set(CHECKS) - {row.get("name") for row in ordered_rows})
     outcome = "PASS" if not missing and all(row.get("outcome") in success for row in ordered_rows) else "FAIL"

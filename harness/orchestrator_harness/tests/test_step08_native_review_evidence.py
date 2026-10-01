@@ -5,11 +5,12 @@ from __future__ import annotations
 import copy
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from memory_harness import contracts, store
+from memory_harness import config as memory_config, contracts, store
 from orchestrator_harness import controller, launch, lanes, leases, manager_queue, memory_handoff, monitor, operator_launch, resume, review, terminal_evidence
 from orchestrator_harness.core import content_hash
 from orchestrator_harness.epochs import current_epoch_path, lane_record_dir, manager_queue_path, read_active_lanes, write_active_lanes
@@ -57,7 +58,13 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         memory_store = store.MemoryStore(store_path)
         memory_store.initialize()
         try:
-            memory_store.record_decision(contracts.make_decision(self.card, self.plan))
+            memory_store.record_decision(contracts.make_decision(
+                self.card,
+                self.plan,
+                configuration=asdict(memory_config.resolve_config(
+                    self.card["memory_handoff"].get("configuration")
+                )),
+            ))
         finally:
             memory_store.close()
         finalized = _finalized_lane1_fixture(self.card, self.plan, self.worktree)
@@ -262,7 +269,13 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         memory_store = store.MemoryStore(store_path)
         memory_store.initialize()
         try:
-            memory_store.record_decision(contracts.make_decision(self.card, self.plan))
+            memory_store.record_decision(contracts.make_decision(
+                self.card,
+                self.plan,
+                configuration=asdict(memory_config.resolve_config(
+                    self.card["memory_handoff"].get("configuration")
+                )),
+            ))
         finally:
             memory_store.close()
         sources = [
@@ -986,9 +999,6 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             self.lane.update(mutate(self.lane))
             return self.lane
 
-        resumed_context = _finalized_lane1_fixture(
-            self.card, self.plan, self.worktree, run_id="run-2"
-        )
         with (
             patch.object(resume, "find_harness_root", return_value=self.root),
             patch.object(resume, "load_config", return_value=SimpleNamespace(runtime_root=self.rt, profile="plain")),
@@ -997,10 +1007,21 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             patch.object(resume, "update_lane", side_effect=update_lane),
             patch.object(resume, "_live_controller", return_value=False),
             patch.object(resume, "new_id", return_value="run-2"),
-            patch.object(memory_handoff, "_prepare_memory_outcome", return_value=resumed_context),
         ):
             resumed = resume.run_resume(lane_id=self.lane_id, resume_task_card=str(resume_card))
         self.assertTrue(resumed["ok"], resumed)
+        fresh_context = memory_handoff.load_final_context(
+            worktree_path=self.worktree,
+            envelope=memory_handoff.load_envelope(self.worktree),
+        )
+        self.assertEqual(
+            self.envelope["optional_content"],
+            fresh_context["optional_content"],
+        )
+        self.assertEqual(
+            self.envelope["delivery_trace"],
+            fresh_context["delivery_trace"],
+        )
         self.assertEqual("run-2", self.lane["run_id"])
         self.assertEqual(rejected["rejected_attempt_id"], self.lane["native_supersession"]["rejected_attempt_id"])
         self.assertEqual(prior, terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id, run_id="run-1"))

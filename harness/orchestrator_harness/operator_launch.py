@@ -14,7 +14,7 @@ import json
 import sys
 from typing import Any
 
-from . import bootstrap, launch, resume, review, scan_watch, setup, shutdown
+from . import bootstrap, launch, resume, review, scan_watch, setup, shutdown, view_term
 from .config import find_harness_root, load_config, load_resource_manifest
 from .lanes import LaneError, find_active_lane
 from .leases import (
@@ -415,6 +415,12 @@ def _build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--timeout")
     watch_parser.add_argument("--until-event")
 
+    view_parser = subparsers.add_parser("view", help="read-only terminal view of every lane's steps")
+    view_parser.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    view_parser.add_argument("--no-color", action="store_true")
+    view_parser.add_argument("--ascii", action="store_true", help="use plain ASCII glyphs")
+    view_parser.add_argument("--refresh", type=float, default=2.0, help="seconds between record reads")
+
     health = subparsers.add_parser("health", help="health commands")
     health_sub = health.add_subparsers(dest="health_command", required=True)
     health_sub.add_parser("reconcile", help="rebuild active-lanes and re-derive status")
@@ -483,6 +489,13 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return scan_watch.run_scan()
     if command == "watch":
         return scan_watch.run_watch(timeout=args.timeout, until_event=args.until_event)
+    if command == "view":
+        return view_term.run_view(
+            once=args.once,
+            no_color=args.no_color,
+            ascii_only=args.ascii,
+            refresh_seconds=max(0.5, args.refresh),
+        )
     if command == "health":
         if args.health_command == "reconcile":
             return scan_watch.run_health_reconcile()

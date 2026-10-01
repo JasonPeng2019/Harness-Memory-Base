@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from memory_harness import (
     apc,
     config,
+    context,
     contracts,
     experience,
     harness_bridge,
@@ -1143,6 +1144,7 @@ class Step04ContractCorrectionTests(unittest.TestCase):
             task=self.card["task"], base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
                 objective_id="objective-1", route="ordinary", plan=accepted,
+                checkpoint="checkpoint-1",
             ),
         )
         first = self.service.prepare(
@@ -1213,6 +1215,55 @@ class Step04ContractCorrectionTests(unittest.TestCase):
         self.assertEqual([], launched)
         self.assertEqual([first.preparation], self.memory_store.list_preparations(first.decision["decision_id"]))
         self.assertEqual(outcome.context, self.memory_store.get_final_context_for_decision(first.decision["decision_id"]))
+
+    def test_remaining_failed_budget_retains_validated_non_plan_context(self) -> None:
+        card, accepted, first, service, mandatory = self._accepted_budget_finalization_state()
+        prior = context.finalize_context(
+            task_card=card,
+            plan=accepted,
+            decision_id=first.decision["decision_id"],
+            lane_id="lane-1",
+            run_id="run-1",
+            worktree_path=str(self.root),
+            base_commit="base-1",
+            strategy=first.preparation["strategy"],
+            configuration=first.preparation["configuration"],
+            checkpoint="checkpoint-1",
+            execution_role="worker",
+            invocation_target="harness:worker",
+            recipient="worker:lane-1",
+            mandatory_content=mandatory,
+            optional_items=[{
+                "id": "history-1",
+                "kind": "historical_evidence",
+                "origin": "everos",
+                "revision_id": "r1",
+                "content": {"summary": "prior regression"},
+            }],
+        )
+
+        outcome = service.prepare(
+            task_card=card,
+            plan=accepted,
+            objective_id="objective-1",
+            lane_id="lane-1",
+            run_id="run-2",
+            worktree_path=str(self.root),
+            base_commit="base-1",
+            finalize=True,
+            mandatory_content=mandatory,
+            checkpoint="checkpoint-1",
+            execution_role="worker",
+            invocation_target="harness:worker",
+            recipient="worker:lane-1",
+            retained_context=prior.context,
+        )
+
+        self.assertTrue(outcome.dispatchable)
+        self.assertEqual(prior.context["optional_content"], outcome.context["optional_content"])
+        self.assertEqual(prior.context["delivery_trace"], outcome.context["delivery_trace"])
+        self.assertIn("budget state unavailable", outcome.reason)
+        self.assertIn("optional context retained", outcome.reason)
 
     def test_remaining_failed_budget_blocks_plan_affecting_finalization(self) -> None:
         card, accepted, first, service, mandatory = self._accepted_budget_finalization_state()

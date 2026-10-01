@@ -647,9 +647,19 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
         self.assertNotIn("s3cr3t", tokens)
         self.assertNotIn("value", tokens)
         self.assertIn("redacted", tokens)
-        # Sanitizing a secret yields exactly the same bounded query as writing
-        # the redaction marker literally, so the protected token is inert.
-        self.assertEqual(redacted_query, protected_query)
+        # Sanitizing a secret yields exactly the same retrieval identity as
+        # writing the redaction marker literally, so the protected token is
+        # inert.  ``policy_context`` is deliberately excluded: it is an opaque
+        # pointer to each exact durable preparation, not part of the text/query
+        # identity, and distinct task cards must retain distinct provenance.
+        self.assertEqual(
+            search.retrieval_query_identity(redacted_query),
+            search.retrieval_query_identity(protected_query),
+        )
+        self.assertNotEqual(
+            redacted_query["policy_context"],
+            protected_query["policy_context"],
+        )
         self.assertEqual(redacted_query["tokens"], protected_query["tokens"])
 
         # The trusted comparable score is computed from that same sanitized
@@ -697,7 +707,14 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
         self.assertNotIn("s3cr3t", objective_tokens)
         self.assertNotIn("value", objective_tokens)
         self.assertIn("redacted", objective_tokens)
-        self.assertEqual(redacted_objective_query, protected_objective_query)
+        self.assertEqual(
+            search.retrieval_query_identity(redacted_objective_query),
+            search.retrieval_query_identity(protected_objective_query),
+        )
+        self.assertNotEqual(
+            redacted_objective_query["policy_context"],
+            protected_objective_query["policy_context"],
+        )
         self.assertEqual(
             redacted_objective_query["tokens"], protected_objective_query["tokens"]
         )
