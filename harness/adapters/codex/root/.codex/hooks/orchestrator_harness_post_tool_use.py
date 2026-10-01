@@ -29,6 +29,8 @@ def _worker_output() -> dict[str, object] | None:
         completed = subprocess.run(
             [
                 sys.executable,
+                "-I",
+                "-B",
                 str(helper),
                 "--boundary",
                 BOUNDARY,

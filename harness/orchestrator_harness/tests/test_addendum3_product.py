@@ -47,7 +47,7 @@ class Addendum3ProductTests(unittest.TestCase):
 
     def _lane(self) -> dict[str, object]:
         worktree = self.runtime / "worktree" / "lane-1"
-        outbox = worktree / ".agent-workspace" / "manager-notifications"
+        outbox = worktree / ".agent-workspace" / "runtime" / "manager-notifications"
         outbox.mkdir(parents=True)
         (worktree / ".agent-workspace" / "processed-notifications").mkdir()
         return {
@@ -60,7 +60,12 @@ class Addendum3ProductTests(unittest.TestCase):
 
     def test_outbox_promotes_before_archive_and_retries_to_one_event(self) -> None:
         lane = self._lane()
-        outbox = Path(str(lane["worktree_path"])) / ".agent-workspace" / "manager-notifications"
+        outbox = (
+            Path(str(lane["worktree_path"]))
+            / ".agent-workspace"
+            / "runtime"
+            / "manager-notifications"
+        )
         notice_path = outbox / "notice-1.json"
         atomic_write_json(
             notice_path,
@@ -88,7 +93,12 @@ class Addendum3ProductTests(unittest.TestCase):
 
     def test_malformed_outbox_is_retained_and_reported(self) -> None:
         lane = self._lane()
-        outbox = Path(str(lane["worktree_path"])) / ".agent-workspace" / "manager-notifications"
+        outbox = (
+            Path(str(lane["worktree_path"]))
+            / ".agent-workspace"
+            / "runtime"
+            / "manager-notifications"
+        )
         bad_path = outbox / "malformed.json"
         atomic_write_json(bad_path, ["not", "a", "notice"])
         diagnostics = monitor._consume_outbox(self.runtime, "epoch-1", lane)
@@ -793,6 +803,8 @@ class Addendum3ProductTests(unittest.TestCase):
             "stderr_path": str(workspace / "provider-stderr.txt"),
             "last_message_path": str(workspace / "last-message.txt"),
             "session": {"session_id": "saved-native-session"},
+            "codex_isolation_sha256": "a" * 64,
+            "codex_control_plane_sha256": "b" * 64,
         }
         invocation = {
             "provider": {
@@ -809,6 +821,7 @@ class Addendum3ProductTests(unittest.TestCase):
             str(prompt),
         ]
         binding = MagicMock()
+        binding.PROVIDER_ID = "codex"
         binding.build_argv.return_value = expected_argv
         binding.parse_line.return_value = None
         child = MagicMock(pid=456, returncode=0)
@@ -867,12 +880,64 @@ class Addendum3ProductTests(unittest.TestCase):
             prompt_path=str(prompt),
             session_id="saved-native-session",
             resume=True,
+            expected_isolation_sha256="a" * 64,
+            expected_control_plane_sha256="b" * 64,
         )
         spawned.assert_called_once()
-        make_boundary.assert_called_once_with(456, windows_job_handle=789)
-        child.resume.assert_called_once_with()
+        make_boundary.assert_called_once_with(
+            456,
+            windows_job_handle=789 if controller.os.name == "nt" else None,
+        )
+        if controller.os.name == "nt":
+            child.resume.assert_called_once_with()
+        else:
+            child.resume.assert_not_called()
         self.assertEqual(tuple(expected_argv), execution.argv)
         self.assertEqual("saved-native-session", execution.session_id)
+
+    def test_run_provider_marks_binding_validation_failure_as_not_started(self) -> None:
+        worktree = self.runtime / "provider-validation-worktree"
+        workspace = worktree / ".agent-workspace"
+        workspace.mkdir(parents=True)
+        prompt = workspace / "worker-prompt.md"
+        prompt.write_text("work\n", encoding="utf-8")
+        lane = {
+            "lane_id": "lane-1",
+            "run_id": "run-1",
+            "worktree_path": str(worktree),
+            "transcript_path": str(workspace / "provider-transcript.jsonl"),
+            "stderr_path": str(workspace / "provider-stderr.txt"),
+            "last_message_path": str(workspace / "last-message.txt"),
+            "session": {},
+            "codex_isolation_sha256": "a" * 64,
+            "codex_control_plane_sha256": "b" * 64,
+        }
+        invocation = {
+            "provider": {
+                "model": "model-1",
+                "launch_config": {"effort": "configured-effort"},
+            }
+        }
+        binding = MagicMock(PROVIDER_ID="codex")
+        binding.build_argv.side_effect = ValueError("control plane changed")
+
+        with (
+            patch.object(controller.processes, "spawn_provider") as spawned,
+            self.assertRaises(controller.ControllerError) as raised,
+        ):
+            controller._run_provider(
+                self.runtime,
+                "epoch-1",
+                lane,
+                invocation,
+                binding,
+                prompt,
+            )
+
+        self.assertEqual(controller.LAUNCH_INVOCATION_INVALID, raised.exception.code)
+        self.assertTrue(raised.exception.no_provider_started)
+        self.assertIn("control plane changed", str(raised.exception))
+        spawned.assert_not_called()
 
     def test_fifth_correction_succeeds_on_sixth_attempt_with_full_durable_evidence(
         self,
@@ -1381,7 +1446,7 @@ class Addendum3ProductTests(unittest.TestCase):
         workspace = worktree / ".agent-workspace"
         workspace.mkdir(parents=True)
         atomic_write_json(
-            workspace / "QUEUE.json",
+            workspace / "runtime" / "QUEUE.json",
             {
                 "schema": "lane-inbox/v1",
                 "lane_id": "lane-1",

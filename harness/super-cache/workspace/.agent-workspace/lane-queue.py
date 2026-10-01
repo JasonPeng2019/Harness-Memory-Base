@@ -2,7 +2,7 @@
 """Provider-neutral worker lane-queue helper (lane-inbox/v1).
 
 Advances one ROOT assignment in the worker inbox
-(``.agent-workspace/QUEUE.json``) through the closed state machine
+(``.agent-workspace/runtime/QUEUE.json``) through the closed state machine
 PENDING -> ACKNOWLEDGED -> COMPLETE | BLOCKED.  The worker never writes the
 manager queue; this helper only touches the worker inbox.  It prefers the
 current runtime record primitives when ``orchestrator_harness`` is
@@ -154,7 +154,7 @@ def _binding(agent_workspace: Path) -> dict[str, Any]:
 def _inbox_path(agent_workspace: Path) -> Path:
     binding = _binding(agent_workspace)
     raw = binding.get("inbox_path")
-    return Path(raw) if raw else agent_workspace / "QUEUE.json"
+    return Path(raw) if raw else agent_workspace / "runtime" / "QUEUE.json"
 
 
 def _read_inbox(path: Path) -> dict[str, Any]:

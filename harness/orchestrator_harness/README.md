@@ -131,7 +131,7 @@ unless an operator explicitly places payloads there.
   lane/run identity, outcome, summary, evidence, content hash) and exits 0/1.
 - `lane-queue.py` — advances one ROOT assignment in the worker inbox (`lane-inbox/v1`) through
   PENDING -> ACKNOWLEDGED -> COMPLETE | BLOCKED.
-- `manager-notify.py` — writes one escalation notice into `manager-notifications/` for the
+- `manager-notify.py` — writes one escalation notice into `runtime/manager-notifications/` for the
   monitor to promote into the manager queue.
 
 Bootstrap writes the authoritative worker binding with runtime paths into

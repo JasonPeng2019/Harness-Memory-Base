@@ -30,7 +30,7 @@ from .epochs import (
 )
 from .lanes import LANE_SCHEMA, write_lane
 from . import memory_handoff
-from .records import atomic_write_json
+from .records import atomic_write_bytes, atomic_write_json
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
 INVOCATION_SCHEMA = "controller-invocation/v1"
@@ -444,21 +444,126 @@ def _write_invocation(
     return invocation
 
 
-def _write_worker_binding(worktree: Path, rt: Path, lane_id: str, run_id: str) -> Path:
+def _write_worker_binding(
+    worktree: Path,
+    rt: Path,
+    lane_id: str,
+    run_id: str,
+    *,
+    managed: bool,
+) -> Path:
     agent_workspace = worktree / ".agent-workspace"
-    binding = {
+    worker_runtime = agent_workspace / "runtime"
+    binding: dict[str, Any] = {
         "schema": HOOK_BINDING_SCHEMA,
         "role": "worker",
+        "coordination": "managed" if managed else "plain",
         "lane_id": lane_id,
         "run_id": run_id,
-        "manager_queue_path": str(rt / "manager" / "QUEUE.json"),
-        "inbox_path": str(agent_workspace / "QUEUE.json"),
-        "outbox_dir": str(agent_workspace / "manager-notifications"),
         "result_path": str(worktree / "RESULT.json"),
         "result_stop_check": str(agent_workspace / "result-stop-check.py"),
     }
+    if managed:
+        binding.update(
+            {
+                "manager_queue_path": str(rt / "manager" / "QUEUE.json"),
+                "inbox_path": str(worker_runtime / "QUEUE.json"),
+                "outbox_dir": str(worker_runtime / "manager-notifications"),
+            }
+        )
     atomic_write_json(agent_workspace / "harness-hook-binding.json", binding)
     return agent_workspace / "harness-hook-binding.json"
+
+
+def _clear_codex_control_plane(worktree: Path) -> None:
+    control_root = worktree / ".codex"
+    if control_root.is_symlink() or control_root.is_file():
+        control_root.unlink()
+    elif control_root.exists():
+        shutil.rmtree(control_root)
+
+
+def _install_trusted_codex_control_plane(
+    worktree: Path, harness_root: Path, *, managed: bool
+) -> None:
+    """Replace project-authored Codex controls with shipped worker controls."""
+    source = harness_root / "adapters" / "codex" / "super-cache" / ".codex"
+    required = {
+        "config.toml",
+        "hooks.json",
+        "hooks/orchestrator_harness_post_tool_use.py",
+        "hooks/orchestrator_harness_stop.py",
+    }
+    if not source.is_dir() or any(not (source / relative).is_file() for relative in required):
+        raise BootstrapError(
+            BOOTSTRAP_ADAPTER_MISSING,
+            f"trusted Codex worker control plane is incomplete: {source}",
+        )
+    _clear_codex_control_plane(worktree)
+    destination = worktree / ".codex"
+    for item in sorted(source.rglob("*")):
+        if item.is_symlink():
+            raise BootstrapError(
+                BOOTSTRAP_ADAPTER_MISSING,
+                f"trusted Codex worker control plane contains a symlink: {item}",
+            )
+        if not item.is_file() or "__pycache__" in item.parts or item.suffix in {".pyc", ".pyo"}:
+            continue
+        relative = item.relative_to(source)
+        if not managed and relative.parts[0] in {
+            "skills",
+            "orchestrator-harness-binding.json",
+        }:
+            continue
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item, target)
+
+
+def _codex_control_plane_digest(control_root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(
+        control_root.rglob("*"),
+        key=lambda item: item.relative_to(control_root).as_posix(),
+    ):
+        if path.is_symlink():
+            raise BootstrapError(
+                BOOTSTRAP_CACHE_COLLISION,
+                f"Codex worker control plane contains a symlink: {path}",
+            )
+        if not path.is_file():
+            continue
+        relative = path.relative_to(control_root).as_posix().encode("utf-8")
+        contents = path.read_bytes()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(contents).to_bytes(8, "big"))
+        digest.update(contents)
+    return digest.hexdigest()
+
+
+def _install_trusted_worker_hook_helpers(worktree: Path, harness_root: Path) -> None:
+    source = harness_root / "super-cache" / "workspace" / ".agent-workspace"
+    destination = worktree / ".agent-workspace"
+    for name in ("hook-dispatch.py", "result-stop-check.py"):
+        source_path = source / name
+        if source_path.is_symlink() or not source_path.is_file():
+            raise BootstrapError(
+                BOOTSTRAP_CACHE_MISSING,
+                f"trusted worker hook helper is missing or unsafe: {source_path}",
+            )
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink():
+            target.unlink()
+        elif target.exists() and not target.is_file():
+            shutil.rmtree(target)
+        shutil.copy2(source_path, target)
+    cache = destination / "__pycache__"
+    if cache.is_symlink() or cache.is_file():
+        cache.unlink()
+    elif cache.exists():
+        shutil.rmtree(cache)
 
 
 def _install_managed_material(
@@ -473,6 +578,8 @@ def _install_managed_material(
     """Install the exact verified composition plus lane-specific inbox/outbox."""
     agent_workspace = worktree / ".agent-workspace"
     payload = _managed_payload(harness_root, rt, provider_id)
+    if provider_id == "codex":
+        _clear_codex_control_plane(worktree)
     payload_exclusions: list[str] = []
     if provider_id == "codex":
         config_relative = Path(".codex") / "config.toml"
@@ -526,16 +633,133 @@ def _install_managed_material(
         exclude=tuple(payload_exclusions),
         replace_if_matches=replace_if_matches,
     )
+    if provider_id == "codex":
+        _install_trusted_codex_control_plane(worktree, harness_root, managed=True)
+        _install_trusted_worker_hook_helpers(worktree, harness_root)
     inbox = {
         "schema": LANE_INBOX_SCHEMA,
         "lane_id": lane_id,
         "run_id": run_id,
         "assignments": [],
     }
-    atomic_write_json(agent_workspace / "QUEUE.json", inbox)
-    (agent_workspace / "manager-notifications").mkdir(parents=True, exist_ok=True)
-    (agent_workspace / "processed-notifications").mkdir(parents=True, exist_ok=True)
-    _write_worker_binding(worktree, rt, lane_id, run_id)
+    worker_runtime = agent_workspace / "runtime"
+    for directory in (
+        worker_runtime,
+        worker_runtime / "manager-notifications",
+        agent_workspace / "processed-notifications",
+    ):
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise BootstrapError(
+                BOOTSTRAP_CACHE_COLLISION,
+                f"worker control directory is not a real directory: {directory}",
+            )
+        directory.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(worker_runtime / "QUEUE.json", inbox)
+    _write_worker_binding(worktree, rt, lane_id, run_id, managed=True)
+
+
+def _install_codex_worker_isolation(
+    worktree: Path, harness_root: Path, root_workspace: Path
+) -> tuple[str, str]:
+    """Install the benchmark worker profile after the provider overlay."""
+    import os
+    import tomllib
+
+    config_path = worktree / ".codex" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    try:
+        parsed = tomllib.loads(existing)
+    except tomllib.TOMLDecodeError as exc:
+        raise BootstrapError(
+            BOOTSTRAP_CACHE_COLLISION, f"invalid Codex worker config: {exc}"
+        ) from exc
+    if (
+        "sandbox_mode" in parsed
+        or "default_permissions" in parsed
+        or "worker-isolated" in parsed.get("permissions", {})
+    ):
+        raise BootstrapError(
+            BOOTSTRAP_CACHE_COLLISION,
+            "Codex worker config conflicts with the required isolation profile",
+        )
+
+    root_workspace = root_workspace.resolve()
+    runs_root = root_workspace.parent
+    host_workspace = runs_root.parent
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve()
+    denied = {
+        codex_home,
+        (Path.home() / ".codex").resolve(),
+        harness_root.resolve(),
+        harness_root.resolve().parent,
+        root_workspace / ".harness-runtime" / "operator-only",
+    }
+    denied.update(
+        (host_workspace / name).resolve()
+        for name in (
+            ".secrets",
+            "benchmarks",
+            "Codex_Claude_Setup",
+            "product",
+            "results",
+        )
+    )
+    if runs_root.is_dir():
+        denied.update(
+            sibling.resolve()
+            for sibling in runs_root.iterdir()
+            if sibling.is_dir() and sibling.resolve() != root_workspace
+        )
+
+    filesystem: dict[str, str | dict[str, str]] = {
+        str(path): "deny"
+        for path in sorted(denied, key=lambda value: str(value).casefold())
+    }
+    filesystem[":workspace_roots"] = {
+        ".": "write",
+        ".codex": "read",
+        ".agent-workspace": "read",
+        ".agent-workspace/runtime/**": "write",
+    }
+
+    lines = [
+        "# Harness-owned worker read isolation; regenerated for every lane.",
+        "[permissions.worker-isolated]",
+        'extends = ":workspace"',
+        "[permissions.worker-isolated.filesystem]",
+    ]
+    lines.extend(
+        f'{json.dumps(str(path))} = "deny"'
+        for path in sorted(denied, key=lambda value: str(value).casefold())
+    )
+    lines.extend(
+        [
+            '[permissions.worker-isolated.filesystem.":workspace_roots"]',
+            '"." = "write"',
+            '".codex" = "read"',
+            '".agent-workspace" = "read"',
+            '".agent-workspace/runtime/**" = "write"',
+            "",
+        ]
+    )
+    rendered = (
+        'default_permissions = "worker-isolated"\n'
+        + existing.rstrip()
+        + "\n"
+        + "\n".join(lines)
+    )
+    atomic_write_bytes(config_path, rendered.encode("utf-8"))
+    canonical_filesystem = json.dumps(
+        filesystem,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return (
+        hashlib.sha256(canonical_filesystem).hexdigest(),
+        _codex_control_plane_digest(config_path.parent),
+    )
 
 
 def _managed_payload(harness_root: Path, rt: Path, provider_id: str) -> Path:
@@ -767,6 +991,8 @@ def run_bootstrap(
     worktree_created = False
     lane_record_written = False
     memory: memory_handoff.LaneMemory | None = None
+    codex_isolation_sha256: str | None = None
+    codex_control_plane_sha256: str | None = None
 
     def close_failed_attempt(summary: str) -> tuple[str, dict[str, Any]]:
         """Roll back attempt-created identity and report exact ownership.
@@ -839,6 +1065,13 @@ def run_bootstrap(
         _git_worktree_add(config.root_workspace, branch, worktree_path, base_commit)
         worktree_created = True
         agent_workspace = worktree_path / ".agent-workspace"
+        if agent_workspace.is_symlink() or (
+            agent_workspace.exists() and not agent_workspace.is_dir()
+        ):
+            raise BootstrapError(
+                BOOTSTRAP_CACHE_COLLISION,
+                f"worker control directory is not a real directory: {agent_workspace}",
+            )
         agent_workspace.mkdir(parents=True, exist_ok=True)
 
         managed = config.profile == "managed"
@@ -858,10 +1091,27 @@ def run_bootstrap(
                     BOOTSTRAP_CACHE_MISSING,
                     f"active workspace base missing: {base_overlay} (run harness setup first)",
                 )
+            if provider == "codex":
+                _clear_codex_control_plane(worktree_path)
             _copy_overlay(
                 base_overlay,
                 worktree_path,
                 exclude=PLAIN_EXCLUDED_HELPERS,
+            )
+            if provider == "codex":
+                _install_trusted_codex_control_plane(
+                    worktree_path, harness_root, managed=False
+                )
+                _install_trusted_worker_hook_helpers(worktree_path, harness_root)
+                _write_worker_binding(
+                    worktree_path, rt, lane_id, run_id, managed=False
+                )
+        if provider == "codex":
+            (
+                codex_isolation_sha256,
+                codex_control_plane_sha256,
+            ) = _install_codex_worker_isolation(
+                worktree_path, harness_root, config.root_workspace
             )
         receipt = {
             "schema": OVERLAY_RECEIPT_SCHEMA,
@@ -943,8 +1193,13 @@ def run_bootstrap(
             if isinstance(declared_environment, str) and declared_environment:
                 record["worker_environment"] = declared_environment
             if managed:
-                record["incoming_queue_path"] = str(agent_workspace / "QUEUE.json")
+                record["incoming_queue_path"] = str(
+                    agent_workspace / "runtime" / "QUEUE.json"
+                )
                 record["incoming_queue_command"] = str(agent_workspace / "lane-queue.py")
+            if provider == "codex":
+                record["codex_isolation_sha256"] = codex_isolation_sha256
+                record["codex_control_plane_sha256"] = codex_control_plane_sha256
             return record
 
         # An enabled enhanced handoff that is not an exact ROOT-accepted plan

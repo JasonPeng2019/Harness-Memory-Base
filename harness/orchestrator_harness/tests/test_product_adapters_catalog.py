@@ -341,9 +341,11 @@ class RegisteredBindingTests(unittest.TestCase):
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
         )
-        self.assertEqual(argv[0], "codex")
+        self.assertEqual(argv[0], codex._direct_codex_executable())
         self.assertIn("exec", argv)
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertIn("--ignore-user-config", argv)
+        self.assertIn('default_permissions="worker-isolated"', argv)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
         self.assertIn('model_reasoning_effort="high"', argv)
         self.assertIn('service_tier="flex"', argv)
         self.assertNotIn('model_reasoning_effort="medium"', argv)

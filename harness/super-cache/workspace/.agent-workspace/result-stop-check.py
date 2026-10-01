@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provider-neutral result Stop check for managed lanes (result/v1).
+"""Provider-neutral result Stop check for worker lanes (result/v1).
 
 Validates the worktree ``RESULT.json`` exactly like the controller's
 ``_validate_result``: schema, lane/run identity, the closed outcome

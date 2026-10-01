@@ -29,6 +29,8 @@ def dispatch_decision() -> dict[str, Any]:
         completed = subprocess.run(
             [
                 sys.executable,
+                "-I",
+                "-B",
                 str(helper),
                 "--boundary",
                 BOUNDARY,

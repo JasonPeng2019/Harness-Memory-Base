@@ -187,7 +187,9 @@ def _reset_worker_inbox(worktree: Path, lane_id: str, run_id: str) -> None:
         "run_id": run_id,
         "assignments": [],
     }
-    atomic_write_json(worktree / ".agent-workspace" / "QUEUE.json", inbox)
+    atomic_write_json(
+        worktree / ".agent-workspace" / "runtime" / "QUEUE.json", inbox
+    )
 
 
 def _rewrite_overlay_receipt(
@@ -575,7 +577,13 @@ def run_resume(
             raise ValueError("fresh resume invocation failed identity or hash validation")
         _rewrite_overlay_receipt(worktree, lane, run_id, managed=managed)
         if managed:
-            _write_worker_binding(worktree, rt, lane_id, run_id)
+            _write_worker_binding(
+                worktree, rt, lane_id, run_id, managed=True
+            )
+        elif lane["provider"]["id"] == "codex":
+            _write_worker_binding(
+                worktree, rt, lane_id, run_id, managed=False
+            )
         # The resume task card is a per-lane input; keep the current copy.
         atomic_write_json(worktree / ".agent-workspace" / "task-card.json", task_card)
 
@@ -600,6 +608,21 @@ def run_resume(
                 "acceptance_advancement": None,
                 "last_reported_actionable_status": None,
                 "resume_from_run_id": prior_run_id,
+                **(
+                    {
+                        "incoming_queue_path": str(
+                            worktree
+                            / ".agent-workspace"
+                            / "runtime"
+                            / "QUEUE.json"
+                        ),
+                        "incoming_queue_command": str(
+                            worktree / ".agent-workspace" / "lane-queue.py"
+                        ),
+                    }
+                    if managed
+                    else {}
+                ),
                 **(
                     {"worker_environment": declared_environment}
                     if declared_environment is not None

@@ -1,3 +1,6 @@
+# Local credentials and secrets; never committed or pushed.
+.secrets/
+
 # Disposable output from the portable agent utilities.
 .agent-runtime/
 .harness-runtime/
@@ -6,6 +9,7 @@
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
 
 # Optional local verification overrides may contain machine-specific commands.
 .agent/verify.toml

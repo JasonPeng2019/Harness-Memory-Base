@@ -13,10 +13,11 @@ worker skills call.
 - `lane-queue.py` — advances one ROOT assignment in the worker inbox
   (`lane-inbox/v1`) through PENDING -> ACKNOWLEDGED -> COMPLETE | BLOCKED.
 - `manager-notify.py` — writes one escalation notice into
-  `manager-notifications/` for the monitor to promote into the manager queue.
+  `runtime/manager-notifications/` for the monitor to promote into the manager queue.
 - `hook-dispatch.py` — decides the worker PostToolUse/Stop hook boundary from
-  the worker binding and inbox (`harness-hook-binding/v1`, `lane-inbox/v1`);
-  it never reads the manager queue and never advances assignment state.
+  the worker binding and, for managed lanes, its inbox
+  (`harness-hook-binding/v1`, `lane-inbox/v1`); plain lanes skip queue checks.
+  It never reads the manager queue and never advances assignment state.
 
 `RESULT.json` is always at the worktree root. The result checker requires a nonblank summary,
 evidence list, completed timestamp, and valid content hash; `.agent-workspace` contains the
@@ -29,7 +30,7 @@ template and control records.
   (`orchestrator_harness.records`, `orchestrator_harness.core`) when the
   package is importable and fall back to portable stdlib equivalents.
 - Helpers never write the manager queue; the worker only touches its own
-  inbox and outbox.
+  inbox and outbox under the dedicated `runtime/` subtree.
 - Bootstrap writes the authoritative worker binding with runtime paths into
   `.agent-workspace/harness-hook-binding.json`; the payload binding is the
   static template the helpers read.

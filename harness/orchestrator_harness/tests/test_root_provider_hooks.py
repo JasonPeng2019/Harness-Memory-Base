@@ -125,6 +125,10 @@ class RootProviderPayloadTests(unittest.TestCase):
                 "import json\nprint(json.dumps({'decision': 'ALLOW'}))\n",
                 encoding="utf-8",
             )
+            (agent_workspace / "json.py").write_text(
+                'raise SystemExit("worker import shadow executed")\n',
+                encoding="utf-8",
+            )
 
             for filename in (
                 "orchestrator_harness_post_tool_use.py",

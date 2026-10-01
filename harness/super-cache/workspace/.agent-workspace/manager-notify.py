@@ -2,7 +2,7 @@
 """Provider-neutral worker escalation helper.
 
 Writes one durable notice into the worker outbox
-(``.agent-workspace/manager-notifications/``).  The monitor consumes outbox
+(``.agent-workspace/runtime/manager-notifications/``).  The monitor consumes outbox
 files and promotes them into the manager queue; the worker never writes the
 manager queue directly.
 """
@@ -83,7 +83,7 @@ def _binding(agent_workspace: Path) -> dict[str, Any]:
 def _outbox_dir(agent_workspace: Path) -> Path:
     binding = _binding(agent_workspace)
     raw = binding.get("outbox_dir")
-    return Path(raw) if raw else agent_workspace / "manager-notifications"
+    return Path(raw) if raw else agent_workspace / "runtime" / "manager-notifications"
 
 
 def write_notice(

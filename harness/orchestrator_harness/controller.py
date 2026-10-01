@@ -471,14 +471,34 @@ def _run_provider(
         transcript_path.stat().st_size if transcript_path.is_file() else 0
     )
     lane["_attempt_started"] = False
-    argv = binding.build_argv(
-        model=invocation["provider"]["model"],
-        launch_config=invocation["provider"]["launch_config"],
-        worktree=str(worktree),
-        prompt_path=str(prompt_path),
-        session_id=session_id,
-        resume=resume,
-    )
+    launch_arguments: dict[str, Any] = {
+        "model": invocation["provider"]["model"],
+        "launch_config": invocation["provider"]["launch_config"],
+        "worktree": str(worktree),
+        "prompt_path": str(prompt_path),
+        "session_id": session_id,
+        "resume": resume,
+    }
+    if getattr(binding, "PROVIDER_ID", None) == "codex":
+        launch_arguments["expected_isolation_sha256"] = lane.get(
+            "codex_isolation_sha256"
+        )
+        launch_arguments["expected_control_plane_sha256"] = lane.get(
+            "codex_control_plane_sha256"
+        )
+    try:
+        argv = binding.build_argv(**launch_arguments)
+    except ControllerError:
+        raise
+    except Exception as exc:
+        # Adapter validation happens before any provider/helper process exists.
+        # Preserve that fact so the outer controller can release leases rather
+        # than treating a rejected launch vector as cleanup-unknown.
+        raise ControllerError(
+            LAUNCH_INVOCATION_INVALID,
+            f"provider launch arguments are invalid: {exc}",
+            no_provider_started=True,
+        ) from exc
     network_facts: dict[str, Any] | None = None
     if lane.get("memory_plan_state") == "execution_accepted":
         from .provider_network_payload import resolve_launch

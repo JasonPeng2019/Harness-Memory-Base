@@ -555,7 +555,7 @@ def _consume_outbox(
     """Promote outbox files before archiving them, retaining failures."""
     diagnostics: list[dict[str, Any]] = []
     workspace = Path(lane["worktree_path"]) / ".agent-workspace"
-    outbox = workspace / "manager-notifications"
+    outbox = workspace / "runtime" / "manager-notifications"
     processed = workspace / "processed-notifications"
     if not outbox.is_dir():
         return diagnostics

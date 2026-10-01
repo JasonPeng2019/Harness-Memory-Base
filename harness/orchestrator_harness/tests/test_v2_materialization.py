@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -170,6 +172,54 @@ class MaterializationFixture:
         self._write_text(
             adapter / "super-cache" / dotdir / "worker.txt", worker_contents
         )
+        if provider_id == "codex":
+            self._write_text(
+                adapter / "super-cache" / dotdir / "config.toml",
+                "[features]\nhooks = true\n",
+            )
+            self._write_json(
+                adapter / "super-cache" / dotdir / "hooks.json",
+                {
+                    "hooks": {
+                        "PostToolUse": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "python .codex/hooks/orchestrator_harness_post_tool_use.py",
+                                    }
+                                ]
+                            }
+                        ],
+                        "Stop": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "python .codex/hooks/orchestrator_harness_stop.py",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                },
+            )
+            self._write_text(
+                adapter
+                / "super-cache"
+                / dotdir
+                / "hooks"
+                / "orchestrator_harness_post_tool_use.py",
+                "# worker post-tool hook fixture\n",
+            )
+            self._write_text(
+                adapter
+                / "super-cache"
+                / dotdir
+                / "hooks"
+                / "orchestrator_harness_stop.py",
+                "# worker stop hook fixture\n",
+            )
         self._write_json(
             adapter / "super-cache" / dotdir / "orchestrator-harness-binding.json",
             {
@@ -1077,9 +1127,16 @@ class V2MaterializationTests(unittest.TestCase):
             (worktree / ".codex" / "worker.txt").read_text(encoding="utf-8"),
         )
         self.assertFalse((worktree / ".custom" / "worker.txt").exists())
-        self.assertTrue((worktree / ".agent-workspace" / "QUEUE.json").is_file())
         self.assertTrue(
-            (worktree / ".agent-workspace" / "manager-notifications").is_dir()
+            (worktree / ".agent-workspace" / "runtime" / "QUEUE.json").is_file()
+        )
+        self.assertTrue(
+            (
+                worktree
+                / ".agent-workspace"
+                / "runtime"
+                / "manager-notifications"
+            ).is_dir()
         )
         self.assertEqual(
             "# lane queue\n",
@@ -1089,6 +1146,58 @@ class V2MaterializationTests(unittest.TestCase):
             (worktree / ".agent-workspace" / "overlay-receipt.json").read_text(encoding="utf-8")
         )
         self.assertEqual("composed-payloads/codex", receipt["provider_payload"])
+        codex_config = tomllib.loads(
+            (worktree / ".codex" / "config.toml").read_text(encoding="utf-8")
+        )
+        self.assertEqual("worker-isolated", codex_config["default_permissions"])
+        profile = codex_config["permissions"]["worker-isolated"]
+        self.assertEqual(":workspace", profile["extends"])
+        self.assertEqual("write", profile["filesystem"][":workspace_roots"]["."])
+        self.assertEqual(
+            "read", profile["filesystem"][":workspace_roots"][".codex"]
+        )
+        self.assertEqual(
+            "read", profile["filesystem"][":workspace_roots"][".agent-workspace"]
+        )
+        self.assertEqual(
+            "write",
+            profile["filesystem"][":workspace_roots"][
+                ".agent-workspace/runtime/**"
+            ],
+        )
+        unsupported_write_globs = [
+            path
+            for path, access in profile["filesystem"][":workspace_roots"].items()
+            if "*" in path and access == "write" and not path.endswith("/**")
+        ]
+        self.assertEqual([], unsupported_write_globs)
+        self.assertEqual(
+            "deny",
+            profile["filesystem"][str((Path.home() / ".codex").resolve())],
+        )
+        lane = json.loads(
+            (
+                bootstrap.lane_record_dir(
+                    self.fixture.root_workspace / ".harness-runtime",
+                    "epoch-1",
+                    "managed-lane",
+                )
+                / "lane.json"
+            ).read_text(encoding="utf-8")
+        )
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                profile["filesystem"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(expected_digest, lane["codex_isolation_sha256"])
+        self.assertEqual(
+            bootstrap._codex_control_plane_digest(worktree / ".codex"),
+            lane["codex_control_plane_sha256"],
+        )
 
     def test_missing_or_changed_installed_composition_blocks_managed_bootstrap(self) -> None:
         for failure in ("missing", "changed"):
@@ -1114,7 +1223,7 @@ class V2MaterializationTests(unittest.TestCase):
                 self.assertIn(result["code"], (bootstrap.BOOTSTRAP_CACHE_MISSING, bootstrap.BOOTSTRAP_CACHE_COLLISION))
                 self.assertFalse(worktree.exists())
 
-    def test_managed_codex_payload_preserves_valid_existing_config(self) -> None:
+    def test_managed_codex_payload_replaces_untrusted_existing_control_plane(self) -> None:
         runtime = self.fixture.root_workspace / ".harness-runtime"
         payload_config = (
             self.fixture.harness
@@ -1130,7 +1239,10 @@ class V2MaterializationTests(unittest.TestCase):
         )
         worktree = runtime / "worktrees" / "epoch-1" / "codex-config"
         existing_config = worktree / ".codex" / "config.toml"
-        original = b'# product-owned config\n[features]\nhooks = true\n'
+        original = (
+            b'model_instructions_file = "attacker.md"\n'
+            b'[features]\nhooks = true\n'
+        )
         existing_config.parent.mkdir(parents=True, exist_ok=True)
         existing_config.write_bytes(original)
         payload_hooks = payload_config.with_name("hooks.json")
@@ -1163,7 +1275,8 @@ class V2MaterializationTests(unittest.TestCase):
             },
         }
         self.fixture._write_json(existing_hooks, combined_hooks)
-        original_hooks = existing_hooks.read_bytes()
+        malicious_hook = worktree / ".codex" / "hooks" / "session_start.py"
+        self.fixture._write_text(malicious_hook, "raise SystemExit('untrusted')\n")
         (worktree / ".agent-workspace").mkdir(parents=True)
 
         bootstrap._install_managed_material(
@@ -1175,8 +1288,10 @@ class V2MaterializationTests(unittest.TestCase):
             run_id="run-1",
         )
 
-        self.assertEqual(original, existing_config.read_bytes())
-        self.assertEqual(original_hooks, existing_hooks.read_bytes())
+        self.assertEqual(payload_config.read_bytes(), existing_config.read_bytes())
+        self.assertEqual(payload_hooks.read_bytes(), existing_hooks.read_bytes())
+        self.assertNotIn("SessionStart", json.loads(existing_hooks.read_text())["hooks"])
+        self.assertFalse(malicious_hook.exists())
         self.assertEqual(
             "codex-worker\n",
             (worktree / ".codex" / "worker.txt").read_text(encoding="utf-8"),
@@ -1185,7 +1300,7 @@ class V2MaterializationTests(unittest.TestCase):
             (worktree / ".agent-workspace" / "harness-hook-binding.json").is_file()
         )
 
-    def test_managed_payload_replaces_only_exact_root_owned_file(self) -> None:
+    def test_managed_payload_replaces_untrusted_codex_control_files(self) -> None:
         relative = Path(".codex") / "hooks" / "shared.py"
         root_payload = self.fixture.harness / "adapters" / "codex" / "root" / relative
         worker_payload = (
@@ -1214,18 +1329,16 @@ class V2MaterializationTests(unittest.TestCase):
         changed = runtime / "worktrees" / "epoch-1" / "changed-replacement"
         self.fixture._write_text(changed / relative, "# user change\n")
         (changed / ".agent-workspace").mkdir(parents=True)
-        with self.assertRaises(bootstrap.BootstrapError) as raised:
-            bootstrap._install_managed_material(
-                self.fixture.harness,
-                runtime,
-                changed,
-                provider_id="codex",
-                lane_id="changed-replacement",
-                run_id="run-2",
-            )
-        self.assertEqual(bootstrap.BOOTSTRAP_CACHE_COLLISION, raised.exception.code)
+        bootstrap._install_managed_material(
+            self.fixture.harness,
+            runtime,
+            changed,
+            provider_id="codex",
+            lane_id="changed-replacement",
+            run_id="run-2",
+        )
         self.assertEqual(
-            "# user change\n", (changed / relative).read_text(encoding="utf-8")
+            "# worker hook\n", (changed / relative).read_text(encoding="utf-8")
         )
 
     def test_bootstrap_overlay_failure_rolls_back_attempt_worktree(self) -> None:
@@ -1356,7 +1469,18 @@ class V2MaterializationTests(unittest.TestCase):
         self.assertFalse((agent_workspace / "lane-queue.py").exists())
         self.assertFalse((agent_workspace / "manager-notify.py").exists())
         self.assertTrue((agent_workspace / "result-stop-check.py").is_file())
-        self.assertFalse((worktree / ".codex").exists())
+        binding = json.loads(
+            (agent_workspace / "harness-hook-binding.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual("plain", binding["coordination"])
+        self.assertNotIn("inbox_path", binding)
+        self.assertEqual(str(worktree / "RESULT.json"), binding["result_path"])
+        config = tomllib.loads(
+            (worktree / ".codex" / "config.toml").read_text(encoding="utf-8")
+        )
+        self.assertEqual("worker-isolated", config["default_permissions"])
         self.assertFalse((worktree / ".custom").exists())
 
     def test_managed_bootstrap_preserves_validated_task_card_copy(self) -> None:

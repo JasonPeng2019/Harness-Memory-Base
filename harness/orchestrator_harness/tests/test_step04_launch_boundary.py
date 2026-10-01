@@ -168,11 +168,13 @@ class LaunchBoundaryFixture:
             "result-stop-check.py": "# result stop check\n",
         }.items():
             self.write_text(workspace / name, contents)
-        self.write_text(
-            self.harness / "adapters" / "codex" / "super-cache" / ".codex" / "worker.txt",
-            "codex worker payload\n",
-        )
         worker_root = self.harness / "adapters" / "codex" / "super-cache" / ".codex"
+        shutil.copytree(
+            ROOT / "harness" / "adapters" / "codex" / "super-cache" / ".codex",
+            worker_root,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        self.write_text(worker_root / "worker.txt", "codex worker payload\n")
         self.write_json(
             worker_root / "orchestrator-harness-binding.json",
             {"schema": "harness-hook-binding/v1", "role": "worker", "provider_id": "codex"},

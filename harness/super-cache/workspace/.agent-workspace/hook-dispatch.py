@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Provider-neutral worker hook dispatcher (harness-hook-binding/v1).
 
-Decides the PostToolUse and Stop hook boundaries for a managed worker lane.
-The dispatcher reads only the worker binding and its inbox; it never reads
-or writes the manager queue and never advances assignment state.  The Stop
-boundary delegates result validation to the binding's ``result_stop_check``
-helper through its existing ``check_result(agent_workspace)``.
+Decides the PostToolUse and Stop hook boundaries for managed and plain worker
+lanes. Managed lanes additionally read their inbox; plain lanes have no queue.
+The dispatcher never reads or writes the manager queue and never advances
+assignment state. The Stop boundary delegates result validation to the
+binding's ``result_stop_check`` helper through its existing
+``check_result(agent_workspace)``.
 """
 
 from __future__ import annotations
@@ -47,7 +48,10 @@ def _load_binding(agent_workspace: Path) -> tuple[dict[str, Any] | None, str | N
         return None, f"binding schema mismatch: {record.get('schema')!r}"
     if record.get("role") != "worker":
         return None, f"binding role is not worker: {record.get('role')!r}"
-    if not record.get("inbox_path"):
+    coordination = record.get("coordination", "managed")
+    if coordination not in {"managed", "plain"}:
+        return None, f"binding coordination is invalid: {coordination!r}"
+    if coordination == "managed" and not record.get("inbox_path"):
         return None, "binding inbox_path is missing"
     if not record.get("result_stop_check"):
         return None, "binding result_stop_check is missing"
@@ -114,13 +118,16 @@ def dispatch(agent_workspace: Path, boundary: str) -> dict[str, Any]:
     binding, reason = _load_binding(agent_workspace)
     if binding is None:
         return _reject(reason)
-    inbox, reason = _load_inbox(binding)
-    if inbox is None:
-        return _reject(reason)
-    assignments = inbox.get("assignments")
-    if not isinstance(assignments, list):
-        return _reject("inbox assignments is not a list")
-    unresolved = _unresolved_event_ids(assignments)
+    if binding.get("coordination", "managed") == "managed":
+        inbox, reason = _load_inbox(binding)
+        if inbox is None:
+            return _reject(reason)
+        assignments = inbox.get("assignments")
+        if not isinstance(assignments, list):
+            return _reject("inbox assignments is not a list")
+        unresolved = _unresolved_event_ids(assignments)
+    else:
+        unresolved = []
     if boundary == "post-tool-use":
         if unresolved:
             return {"decision": "NOTICE", "notice": unresolved}

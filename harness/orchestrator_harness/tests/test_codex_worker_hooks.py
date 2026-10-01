@@ -10,8 +10,13 @@ hook output contract.  This module is the test-first RED slice: the unittest
 run must fail until the wrapper files exist.
 """
 
+import hashlib
 import importlib.util
 import json
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,6 +29,7 @@ POST_TOOL_USE_WRAPPER_PATH = HOOKS_DIR / "orchestrator_harness_post_tool_use.py"
 STOP_WRAPPER_PATH = HOOKS_DIR / "orchestrator_harness_stop.py"
 AGENT_WORKSPACE = HOOKS_DIR.parents[1] / ".agent-workspace"
 HOOK_DISPATCH_PATH = AGENT_WORKSPACE / "hook-dispatch.py"
+SHARED_WORKSPACE = WORKTREE_ROOT / "super-cache" / "workspace" / ".agent-workspace"
 
 POST_TOOL_USE_BOUNDARY = "post-tool-use"
 STOP_BOUNDARY = "stop"
@@ -64,6 +70,65 @@ def _invoked_command(run):
 
 
 class CodexWorkerHooksTestCase(unittest.TestCase):
+    def test_plain_lane_hooks_allow_tools_and_require_a_valid_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worktree = Path(temp_dir) / "plain-worker"
+            shutil.copytree(SUPER_CACHE_DIR / ".codex", worktree / ".codex")
+            agent_workspace = worktree / ".agent-workspace"
+            agent_workspace.mkdir()
+            for name in ("hook-dispatch.py", "result-stop-check.py"):
+                shutil.copy2(SHARED_WORKSPACE / name, agent_workspace / name)
+            binding = {
+                "schema": "harness-hook-binding/v1",
+                "role": "worker",
+                "coordination": "plain",
+                "lane_id": "plain-lane",
+                "run_id": "plain-run",
+                "result_path": str(worktree / "RESULT.json"),
+                "result_stop_check": str(agent_workspace / "result-stop-check.py"),
+            }
+            (agent_workspace / "harness-hook-binding.json").write_text(
+                json.dumps(binding), encoding="utf-8"
+            )
+
+            def invoke(name: str) -> dict[str, object]:
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        str(worktree / ".codex" / "hooks" / name),
+                    ],
+                    cwd=worktree,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                return json.loads(completed.stdout)
+
+            self.assertEqual(
+                {}, invoke("orchestrator_harness_post_tool_use.py")
+            )
+            blocked = invoke("orchestrator_harness_stop.py")
+            self.assertEqual("block", blocked["decision"])
+            result = {
+                "schema": "result/v1",
+                "lane_id": "plain-lane",
+                "run_id": "plain-run",
+                "outcome": "PASS",
+                "summary": "plain lane completed",
+                "evidence": [],
+                "completed_at": "2026-10-01T00:00:00Z",
+            }
+            canonical = json.dumps(
+                result, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            result["content_hash"] = hashlib.sha256(canonical).hexdigest()
+            (worktree / "RESULT.json").write_text(
+                json.dumps(result), encoding="utf-8"
+            )
+            self.assertEqual({}, invoke("orchestrator_harness_stop.py"))
+
     def test_wrapper_files_exist(self):
         self.assertTrue(
             POST_TOOL_USE_WRAPPER_PATH.is_file(),
@@ -150,6 +215,7 @@ class CodexWorkerHooksTestCase(unittest.TestCase):
         self.assertEqual(decision, {"decision": "ALLOW"})
         run.assert_called_once()
         command = _invoked_command(run)
+        self.assertEqual(["-I", "-B"], command[1:3])
         self.assertIn(str(HOOK_DISPATCH_PATH), command)
         self.assertIn("--boundary", command)
         self.assertEqual(
@@ -167,6 +233,7 @@ class CodexWorkerHooksTestCase(unittest.TestCase):
         self.assertEqual(decision, {"decision": "ALLOW"})
         run.assert_called_once()
         command = _invoked_command(run)
+        self.assertEqual(["-I", "-B"], command[1:3])
         self.assertIn(str(HOOK_DISPATCH_PATH), command)
         self.assertIn("--boundary", command)
         self.assertEqual(

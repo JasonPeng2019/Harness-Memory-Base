@@ -24,6 +24,12 @@ from .records import RecordLock, atomic_write_json, read_record
 
 LANE_INBOX_SCHEMA = "lane-inbox/v1"
 
+
+def lane_inbox_path(worktree: Path) -> Path:
+    """Return the worker-writable inbox inside its dedicated runtime subtree."""
+    return Path(worktree) / ".agent-workspace" / "runtime" / "QUEUE.json"
+
+
 EVENT_TYPES = frozenset(
     {
         "COMPLETION_REVIEW_REQUIRED",
@@ -296,7 +302,7 @@ def _find_event(record: dict[str, Any], event_id: str) -> dict[str, Any] | None:
 
 
 def read_lane_inbox(worktree: Path) -> dict[str, Any]:
-    path = worktree / ".agent-workspace" / "QUEUE.json"
+    path = lane_inbox_path(worktree)
     if not path.is_file():
         raise ManagerQueueError("LANE_INBOX_MISSING", f"lane inbox missing: {path}")
     try:
@@ -306,7 +312,7 @@ def read_lane_inbox(worktree: Path) -> dict[str, Any]:
 
 
 def write_lane_inbox(worktree: Path, record: dict[str, Any]) -> None:
-    path = worktree / ".agent-workspace" / "QUEUE.json"
+    path = lane_inbox_path(worktree)
     with RecordLock(path):
         atomic_write_json(path, record)
 
@@ -316,7 +322,7 @@ def append_assignment(
 ) -> dict[str, Any]:
     """ROOT appends one PENDING assignment to a running managed lane's inbox."""
     worktree = Path(lane["worktree_path"])
-    path = worktree / ".agent-workspace" / "QUEUE.json"
+    path = lane_inbox_path(worktree)
     with RecordLock(path):
         inbox = read_lane_inbox(worktree)
         if inbox.get("run_id") != lane.get("run_id"):
