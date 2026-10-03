@@ -9,7 +9,12 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
-from .privacy import PrivacyPolicy, guard_mandatory
+from .privacy import (
+    MandatorySecretError,
+    PrivacyPolicy,
+    guard_mandatory,
+    guard_worker_task_card,
+)
 from .config import (
     CONFIGURATION_SCHEMA,
     NETWORK_CONTEXT_FIELDS,
@@ -475,6 +480,10 @@ def validate_task_card(record: Mapping[str, Any]) -> None:
             raise ContractError(f"unknown worker environment mode: {mode!r}")
     if "memory_handoff" in record:
         validate_memory_handoff(record["memory_handoff"])
+    try:
+        guard_worker_task_card(record)
+    except MandatorySecretError as exc:
+        raise ContractError(str(exc)) from exc
 
 
 def make_memory_handoff(

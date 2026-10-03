@@ -39,9 +39,14 @@ class FixedConfigurationTests(unittest.TestCase):
     def test_learned_mode_is_rejected_before_preparation(self) -> None:
         requests = [
             {"strategy": "learned"},
+            {"strategy": " Learned "},
+            {"strategy": "LEARNED-SELECTION "},
+            {"strategy": "learned-selector"},
             {"learned_mode": True},
             {"learned_selection": True},
             {"policy_load": True},
+            {"strategy": "standard", "policy": {"weights": [1]}},
+            {"strategy": "problem_focused", "policy": {"weights": [1]}},
             {"training": True},
             {"policy_update": True},
         ]
@@ -152,6 +157,15 @@ class FixedConfigurationTests(unittest.TestCase):
             config.resolve_config({}, availability={"future_feature": True})
         with self.assertRaisesRegex(ValueError, "unknown feature"):
             config.resolve_config({}, transitions={"future_feature": "stable"})
+
+    def test_unknown_requested_fields_and_misspelled_network_fail_closed(self) -> None:
+        for request, expected in (
+            ({"experince_write": False}, "unknown requested configuration field"),
+            ({"network_profiel": "restricted_local"}, "unknown requested configuration field"),
+            ({"network_profile": "restricted-lcoal"}, "unsupported network mode"),
+        ):
+            with self.subTest(request=request), self.assertRaisesRegex(ValueError, expected):
+                config.resolve_config(request)
 
     def test_direct_configuration_rejects_impossible_dependency_combinations(self) -> None:
         for changes in (

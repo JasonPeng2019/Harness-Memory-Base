@@ -497,7 +497,7 @@ class JoinedNativeEffectTests(unittest.TestCase):
         )))
         self.assertEqual([], surface.memorize_calls)
         effects = self.case.state.list_effect_operations(outcome["outcome_id"])
-        self.assertEqual({"review_receipt", "recent_evidence"}, {
+        self.assertEqual({"review_receipt"}, {
             effect["kind"] for effect in effects
         })
         self.assertTrue(all(effect["status"] == "confirmed" for effect in effects))

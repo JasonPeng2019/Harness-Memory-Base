@@ -312,7 +312,7 @@ explicit unproved NATIVE/LIVE coordinate.
 | T06 | closure=CLOSED; coordinates={LOCAL=`EXISTING-SUFFICIENT`} — `tests/local/experience/test_generated_trust.py`, `tests/local/privacy/test_privacy.py`, `tests/local/preparation/test_step04_procedure_revision_selection.py` enforce revisions, coherent compact payloads, and digest meaning. |
 | T07 | closure=CLOSED; coordinates={LOCAL=`EXISTING-SUFFICIENT`} — `tests/local/contracts/test_contracts.py`, `tests/local/experience/test_step04_generated_skill_scope_lookup.py` cover owner/project/app/namespace and recipient identity. |
 | T08 | closure=CLOSED; coordinates={LOCAL=`EXISTING-SUFFICIENT`} — `tests/local/preparation/test_step04_procedure_revision_selection.py`, `tests/local/procedures/test_atlas_external_reconciliation.py` distinguish approval/designation and fence stale acknowledgement. |
-| T09 | closure=CLOSED; coordinates={LOCAL=`EXISTING-SUFFICIENT`} — `tests/local/experience/test_generated_trust.py`, `tests/local/effects/test_external_reconciliation.py`, `tests/local/experience/test_everos_external_reconciliation.py`, `tests/local/procedures/test_atlas_external_reconciliation.py` enforce revocation/withdrawal replay fences. |
+| T09 | closure=CLOSED; coordinates={LOCAL=`NEW-LOCAL-PASS`} — `tests/local/experience/test_generated_trust.py`, `tests/local/effects/test_external_reconciliation.py`, `tests/local/experience/test_everos_external_reconciliation.py`, `tests/local/procedures/test_atlas_external_reconciliation.py` enforce revocation/withdrawal replay fences. |
 | T10 | closure=CLOSED; coordinates={LOCAL=`EXISTING-SUFFICIENT`} — `tests/local/preparation/test_reuse_planning.py`, `tests/local/preparation/test_step04_procedure_revision_selection.py` cover eligibility, predicates, conflicts, duplicates, specificity, and ties. |
 | T11 | closure=CLOSED; coordinates={LOCAL=`EXISTING-SUFFICIENT`} — `tests/local/preparation/test_final_context_dispatch.py`, `tests/local/preparation/test_step04_procedure_revision_selection.py` cover live/frozen freshness and post-search revocation. |
 | T12 | closure=CLOSED; coordinates={CONTRACT=`EXISTING-SUFFICIENT`; LOCAL=`EXISTING-SUFFICIENT`; NATIVE=`UNPROVED-PREREQUISITE`} — `tests/local/preparation/test_step04_native_apc_child.py`, `tests/local/preparation/test_step04_template_shortlist_coherence.py`, `tests/live/qualification/test_native_apc_matrix.py`. |
@@ -343,20 +343,21 @@ on the real coordinate and retain receipts. No local green suite changes that st
 
 ## 15. Verification recorded for this closure pass
 
-The 2026-10-02 working-tree candidate on the input baseline recorded:
+The 2026-10-03 independently audited repair candidate derived from baseline
+`316b909e4a9595eedee2e5a532c85036701495fd` recorded:
 
-- root product suite: **687 passed, 16 skipped**;
-- harness suite: **560 run: 548 passed, 12 skipped**, including cache-recovery, v2 acceptance, and PTY viewer tests;
+- root product suite: **804 passed, 18 skipped**;
+- harness suite: **660 run: 648 passed, 12 skipped**, including cache-recovery, v2 acceptance, and PTY viewer tests;
 - watcher suite: **104 passed** from both the product-root and harness-root working directories;
-- unified suite: all **12 categories** passed through `python scripts/run_tests.py all`, with all
-  **114 discovered test modules** assigned exactly once;
+- unified suite: all **12 categories** passed through `python scripts/run_tests.py all`, totaling
+  **1,556 passed and 30 explicitly skipped**, with all **123 discovered test modules** assigned exactly once;
 - distribution matrix: deterministic ZIP, wheel, sdist, editable install, and CPython 3.12 passed;
   CPython 3.11/3.13/3.14 skipped because those executables were absent;
-- portable archive: **1,391 files**, clean CRC, and exact source parity; the digest is recorded outside
+- portable archive: **1,520 files**, clean CRC, and exact source parity; the digest is recorded outside
   the archive in the assembly handoff so the archive does not contain a self-referential checksum;
 - serial `compileall`, diff whitespace checks, and changed-file secret-pattern checks passed.
 
-The root skips are eight separately authorized live/native-provider selectors, two foreign-host process
-coordinates, three absent-interpreter coordinates, one pre-existing opt-in Atlas node, and two optional
-vendored-EverOS nodes. Ruff, Pyright, and basedpyright were unavailable. No current-pin LIVE provider,
-Atlas/EverOS, remote restore, foreign-host, or absent-interpreter claim was made.
+The root skips remain explicit prerequisite coordinates: nine separately authorized live/provider/service
+selectors, three platform/CI-host selectors, four absent/undeclared interpreter coordinates, and two
+optional vendored-EverOS nodes. Ruff, Pyright, and basedpyright were unavailable. No current-pin LIVE
+provider, Atlas/EverOS, remote restore, foreign-host, or absent-interpreter claim was made.

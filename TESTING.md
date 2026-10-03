@@ -12,11 +12,13 @@ current Python interpreter, supplies absolute `src` and `harness` import roots, 
 category once. It preserves the native frameworks: product tests use pytest; orchestrator harness and
 watcher tests use unittest discovery.
 
-The child environment deliberately removes ambient `PYTEST_ADDOPTS` and `PYTEST_PLUGINS`. Host-level
-pytest options or injected plugins therefore cannot add selectors, turn a category into collect-only,
-or smuggle command-line authorization into the live session; the runner's manifest and argv remain the
-collection authority. Ordinary inherited environment (including explicit product prerequisites) remains
-available to the tests themselves.
+The child environment deliberately removes ambient `PYTEST_ADDOPTS` and `PYTEST_PLUGINS` and forces
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`. The forced setting also blocks installed `pytest11` entry-point
+plugins, which otherwise load without `PYTEST_PLUGINS` and can silently truncate collection while
+returning success. Host-level pytest options or injected plugins therefore cannot add selectors, turn a
+category into collect-only, rewrite collection, or smuggle command-line authorization into the live
+session; the runner's manifest and argv remain the collection authority. Ordinary inherited environment
+(including explicit product prerequisites) remains available to the tests themselves.
 
 The source of truth is [`tests/suite_manifest.json`](tests/suite_manifest.json). A contract test
 independently scans all supported test roots and fails if
@@ -36,11 +38,11 @@ a module is missing, assigned twice, or placed outside the declared roots.
 | `platform` | 1 | Exact process identity, termination, reaping, PID-reuse safety, and platform-specific qualification. | Runs the native-host coordinate; foreign OS coordinates skip explicitly. |
 | `distribution` | dynamic | Easy installer, checked-ZIP byte parity, deterministic complete-product ZIP coverage, extracted-archive offline builds, coordinated two-wheel/two-sdist/editable installation, non-overlapping package ownership, exact dependency/extras, an accepted-plan lifecycle through the installed public harness boundary, CLI smoke, and supported CPython coordinates. | Missing interpreters skip explicitly; a stale checked ZIP fails until deliberately regenerated after source stabilization. |
 | `live` | 3 | Current-pin Atlas, EverOS, native-provider, remote snapshot, privacy/egress, APC, baseline, and nested-harness qualification. | One indivisible pytest session. Without the separate one-use authorization, candidate artifact, disposable namespace, budgets, driver, and credentials, nodes skip before setup. |
-| `harness` | 50 | Controller/lane lifecycle, queues, leases, hooks, review and acceptance, attempt attestation, process cleanup, isolation, packaging, visualizer behavior, and all v2 acceptance maps. | Native unittest discovery under `harness/`. Platform/provider prerequisites may skip. |
+| `harness` | 56 | Controller/lane lifecycle, queues, leases, hooks, review and acceptance, attempt attestation, process cleanup, isolation, packaging, visualizer behavior, and all v2 acceptance maps. | Native unittest discovery under `harness/`. Platform/provider prerequisites may skip. |
 | `watcher` | 5 | Diagnostic ingestion, attention records, CLI validation, start/stop/status, both supported working directories, burst handling, abrupt restart, and exact PID reaping. | Native unittest discovery; evaluator remains disabled. |
 
-The module counts describe the current manifest. They are explanatory only—the executable coverage
-contract discovers the files dynamically instead of trusting these numbers.
+The module counts describe the current manifest. The executable coverage contract discovers the files
+dynamically and checks every exact numeric claim in this table against that discovery.
 
 ## Common commands
 

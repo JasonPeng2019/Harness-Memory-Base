@@ -103,6 +103,92 @@ class OutcomeSettlementTests(unittest.TestCase):
             self.local._create_local_effect_intents(self.outcome, self.decision)
         self.addCleanup(self.local.close)
 
+    def _configured_case(
+        self, *, objective: str, requested: dict, status: str
+    ) -> tuple[Path, dict, dict, store.MemoryStore]:
+        worktree = self.root / objective
+        (worktree / ".agent-workspace").mkdir(parents=True)
+        plan = contracts.make_plan(
+            plan_id=f"{objective}-plan",
+            objective_id=objective,
+            route="ordinary",
+            state="accepted",
+            content={"steps": ["implement", "verify"]},
+            accepted_by="ROOT",
+        )
+        card = contracts.make_task_card(
+            task=f"complete {objective}",
+            base_commit="base-1",
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id=objective,
+                route="ordinary",
+                plan=plan,
+                configuration=requested,
+                checkpoint="checkpoint-1",
+            ),
+        )
+        decision = contracts.make_decision(
+            card,
+            plan,
+            configuration=config.configuration_record(config.resolve_config(requested)),
+        )
+        review = {
+            "schema": "completion-review/v1",
+            "review_outcome": status,
+            "review_summary": f"ROOT reviewed {objective}",
+            "reviewed_at": "2026-10-02T00:00:00Z",
+            "commit": "commit-1",
+            "failed_hypotheses": [],
+        }
+        review["content_hash"] = content_hash(review)
+        acceptance = {
+            "schema": "orchestrator-acceptance/v1",
+            "approval": "ACCEPTED",
+        }
+        acceptance["content_hash"] = content_hash(acceptance)
+        evidence = {
+            "schema": "native-terminal-evidence/v1",
+            "run_id": f"{objective}-run",
+            "objective_id": objective,
+            "decision_id": decision["decision_id"],
+            "task_card": card,
+            "accepted_plan": plan,
+            "decision": decision,
+            "review": review,
+            "acceptance": acceptance,
+        }
+        if status == "UNKNOWN":
+            proof = {"schema": "terminal-proof/v1", "state": "unknown"}
+            proof["content_hash"] = content_hash(proof)
+            evidence["result"] = None
+            evidence["terminal_proof"] = proof
+        else:
+            result = {"schema": "result/v1", "outcome": status}
+            result["content_hash"] = content_hash(result)
+            evidence["result"] = result
+        evidence["content_hash"] = content_hash(evidence)
+        outcome = contracts.make_outcome(
+            decision_id=decision["decision_id"],
+            plan_id=plan["plan_id"],
+            plan_digest=plan["content_hash"],
+            status=status,
+            evidence_digest=evidence["content_hash"],
+            linked_run_id=evidence["run_id"],
+            task_card_digest=card["content_hash"],
+            objective_id=objective,
+            observed_at=review["reviewed_at"],
+        )
+        local = store.MemoryStore(
+            worktree / ".agent-workspace" / "memory-state.sqlite3"
+        )
+        local.initialize()
+        local.record_decision(decision)
+        local.record_outcome(outcome)
+        with local._require_connection():
+            local._create_local_effect_intents(outcome, decision)
+        self.addCleanup(local.close)
+        return worktree, card, evidence, local
+
     def test_exact_replay_is_idempotent_and_never_publishes_procedure(self) -> None:
         with product_composition.compose_product(
             harness_root=self.harness,
@@ -225,6 +311,119 @@ class OutcomeSettlementTests(unittest.TestCase):
             local_store=self.local,
             composition=composition,
         )
+
+    def test_experience_write_off_retains_review_without_searchable_trajectory(self) -> None:
+        worktree, card, evidence, local = self._configured_case(
+            objective="experience-write-off",
+            requested={"experience_write": False},
+            status="PASS",
+        )
+        with product_composition.compose_product(
+            harness_root=self.harness,
+            task_card=card,
+            route="ordinary",
+        ) as composed:
+            first = settlement.settle_accepted_outcome(
+                worktree_path=worktree,
+                evidence=evidence,
+                local_store=local,
+                composition=composed,
+            )
+            second = settlement.settle_accepted_outcome(
+                worktree_path=worktree,
+                evidence=evidence,
+                local_store=local,
+                composition=composed,
+            )
+            self.assertEqual(first, second)
+            self.assertIsNone(first["trajectory_id"])
+            self.assertIsNone(first["central_trajectory_id"])
+            self.assertEqual("experience_write_disabled", first["trajectory_status"])
+            self.assertEqual({"review_receipt": "confirmed"}, first["local_effects"])
+            self.assertEqual([], local.list_reviewed_trajectories(self.scope))
+            self.assertEqual(
+                [], composed.store.list_reviewed_trajectories(self.scope)
+            )
+            self.assertIsNotNone(
+                local.get_review_receipt(first["review_receipt_id"])
+            )
+            self.assertIsNotNone(
+                composed.store.get_review_receipt(
+                    first["central_review_receipt_id"]
+                )
+            )
+
+    def test_generated_skill_off_makes_zero_generation_capable_calls(self) -> None:
+        worktree, card, evidence, local = self._configured_case(
+            objective="skill-generation-off",
+            requested={
+                "experience_write": True,
+                "generated_skill_creation": False,
+            },
+            status="PASS",
+        )
+        with product_composition.compose_product(
+            harness_root=self.harness,
+            task_card=card,
+            route="ordinary",
+        ) as composed:
+            adapter = MagicMock()
+            composed.everos_adapter = adapter
+            with patch.object(
+                composed.experience_service,
+                "extract_trajectory",
+                wraps=composed.experience_service.extract_trajectory,
+            ) as extract:
+                settled = settlement.settle_accepted_outcome(
+                    worktree_path=worktree,
+                    evidence=evidence,
+                    local_store=local,
+                    composition=composed,
+                )
+            extract.assert_not_called()
+            adapter.search_skill_candidates.assert_not_called()
+            self.assertFalse(settled["everos"]["called"])
+            self.assertEqual(
+                "generation_capable_backend_suppressed",
+                settled["everos"]["status"],
+            )
+            self.assertEqual("creation_disabled", settled["generated_skill"]["status"])
+
+    def test_accepted_unknown_settles_idempotently_without_trajectory(self) -> None:
+        worktree, card, evidence, local = self._configured_case(
+            objective="accepted-unknown",
+            requested={},
+            status="UNKNOWN",
+        )
+        with product_composition.compose_product(
+            harness_root=self.harness,
+            task_card=card,
+            route="ordinary",
+        ) as composed:
+            first = settlement.settle_accepted_outcome(
+                worktree_path=worktree,
+                evidence=evidence,
+                local_store=local,
+                composition=composed,
+            )
+            second = settlement.settle_accepted_outcome(
+                worktree_path=worktree,
+                evidence=evidence,
+                local_store=local,
+                composition=composed,
+            )
+            self.assertEqual(first, second)
+            self.assertIsNone(first["trajectory_id"])
+            self.assertIsNone(first["central_trajectory_id"])
+            self.assertEqual("not_applicable_unknown", first["trajectory_status"])
+            self.assertEqual({"review_receipt": "confirmed"}, first["local_effects"])
+            self.assertEqual([], local.list_reviewed_trajectories(self.scope))
+            self.assertEqual(
+                [], composed.store.list_reviewed_trajectories(self.scope)
+            )
+            self.assertIsNotNone(
+                local.get_review_receipt(first["review_receipt_id"])
+            )
 
 
 if __name__ == "__main__":

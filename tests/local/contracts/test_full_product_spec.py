@@ -138,7 +138,10 @@ def test_full_product_reader_has_closed_source_and_evidence_ledgers() -> None:
 
 def test_structured_verification_ledger_is_exact_and_executable() -> None:
     ledger = json.loads(LEDGER.read_text(encoding="utf-8"))
-    assert ledger["schema"] == "memory-harness-verification-ledger/v1"
+    assert set(ledger) == {
+        "coordinates", "direct_oracle_bindings", "schema", "source_requirements",
+    }
+    assert ledger["schema"] == "memory-harness-verification-ledger/v2"
     expected = {
         *[f"G{number:02d}" for number in range(1, 14)],
         *[f"T{number:02d}" for number in range(1, 30)],
@@ -203,7 +206,11 @@ def test_structured_verification_ledger_is_exact_and_executable() -> None:
         ("T28", "NATIVE"),
     }
     existing = {("G02", "CONTRACT")}
-    existing.update((f"T{number:02d}", "LOCAL") for number in range(2, 12))
+    existing.update(
+        (f"T{number:02d}", "LOCAL")
+        for number in range(2, 12)
+        if number != 9
+    )
     existing.update({
         ("T12", "CONTRACT"), ("T12", "LOCAL"),
         ("T13", "LOCAL"), ("T14", "LOCAL"),
@@ -248,6 +255,62 @@ def test_structured_verification_ledger_is_exact_and_executable() -> None:
                     if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
                 )
         assert "::".join(selectors) in executable, coordinate["node"]
+
+    direct_bindings = ledger["direct_oracle_bindings"]
+    assert {
+        (item["requirement_id"], item["evidence_class"])
+        for item in direct_bindings
+    } == {("T09", "LOCAL"), ("T16", "LOCAL")}
+    binding_fields = {
+        "requirement_id", "evidence_class", "node", "scenario_id",
+        "positive_oracle_id", "negative_oracle_id",
+    }
+    coordinate_by_key = {
+        (item["requirement_id"], item["evidence_class"]): item
+        for item in coordinates
+    }
+    scenario_ids: set[str] = set()
+    oracle_ids: set[str] = set()
+    for binding in direct_bindings:
+        assert set(binding) == binding_fields
+        key = (binding["requirement_id"], binding["evidence_class"])
+        coordinate = coordinate_by_key[key]
+        assert binding["node"] == coordinate["node"]
+        assert re.fullmatch(r"[GT]\d{2}\.[A-Z-]+\.[a-z0-9-]+", binding["scenario_id"])
+        assert re.fullmatch(
+            r"[GT]\d{2}\.[A-Z-]+\.[a-z0-9-]+", binding["positive_oracle_id"]
+        )
+        assert re.fullmatch(
+            r"[GT]\d{2}\.[A-Z-]+\.[a-z0-9-]+", binding["negative_oracle_id"]
+        )
+        assert binding["scenario_id"] not in scenario_ids
+        assert binding["positive_oracle_id"] not in oracle_ids
+        assert binding["negative_oracle_id"] not in oracle_ids
+        assert binding["positive_oracle_id"] != binding["negative_oracle_id"]
+        scenario_ids.add(binding["scenario_id"])
+        oracle_ids.update(
+            (binding["positive_oracle_id"], binding["negative_oracle_id"])
+        )
+
+        path_text, *selectors = binding["node"].split("::")
+        tree = ast.parse((PRODUCT / path_text).read_text(encoding="utf-8-sig"))
+        declaration = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "VERIFICATION_ORACLE_BINDINGS"
+                for target in node.targets
+            )
+        )
+        declared = ast.literal_eval(declaration.value)
+        selector = "::".join(item.split("[", 1)[0] for item in selectors)
+        assert declared[selector] == {
+            field: binding[field]
+            for field in binding_fields
+            if field != "node"
+        }
 
     for target in ("NATIVE-WINDOWS", "NATIVE-MACOS"):
         coordinate = next(item for item in coordinates if item["evidence_class"] == target)

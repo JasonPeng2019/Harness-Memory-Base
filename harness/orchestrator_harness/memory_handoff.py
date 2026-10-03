@@ -888,27 +888,105 @@ _PROVIDER_CREDENTIAL_KEYS = {
     "qwen-code": frozenset({"QWEN_API_KEY", "DASHSCOPE_API_KEY", "GEMINI_API_KEY"}),
 }
 
+DISPATCH_BINDING_FIELDS = (
+    "task_card_digest",
+    "decision_id",
+    "plan_id",
+    "plan_digest",
+    "context_id",
+    "context_digest",
+    "envelope_digest",
+    "lane_id",
+    "run_id",
+    "base_commit",
+    "route",
+    "configuration_digest",
+)
+
+
+class _ConfiguredCredentialPresence(Mapping[str, str]):
+    """Availability-only view used to validate nonsecret credential references.
+
+    A controller receives the already scrubbed environment, so loading the
+    trusted product configuration there must not require the credential value
+    that launch deliberately removed.  Configuration identity contains the
+    reference and availability fact, never this synthetic marker.
+    """
+
+    def __getitem__(self, key: str) -> str:
+        return "configured-credential-present"
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return 0
+
+    def get(self, key: str, default: Any = None) -> str:
+        return "configured-credential-present"
+
+
+def _configured_worker_policy(
+    harness_root: str | Path | None = None,
+) -> tuple[frozenset[str], Any]:
+    """Return configured service-auth names and the worker privacy policy.
+
+    Absence of the optional product configuration is the legacy empty policy.
+    A present but malformed/drifted configuration fails closed.
+    """
+
+    privacy = _memory_module("privacy")
+    try:
+        from .config import find_harness_root
+        from .memory_product_config import (
+            CONFIG_FILE_NAME,
+            load_memory_product_config,
+            read_known_secrets,
+        )
+
+        if harness_root is None:
+            try:
+                harness_root = find_harness_root()
+            except Exception:
+                return frozenset(), privacy.PrivacyPolicy()
+        if not (Path(harness_root) / CONFIG_FILE_NAME).is_file():
+            return frozenset(), privacy.PrivacyPolicy()
+        configuration = load_memory_product_config(
+            harness_root,
+            environ=_ConfiguredCredentialPresence(),
+        )
+        references = frozenset(configuration.credential_environment_references)
+        defaults = privacy.PrivacyPolicy()
+        policy = privacy.PrivacyPolicy(
+            known_secrets=read_known_secrets(configuration),
+            forbidden_environment_keys=tuple(sorted(
+                set(defaults.forbidden_environment_keys) | set(references)
+            )),
+        )
+        return references, policy
+    except MemoryHandoffError:
+        raise
+    except Exception as exc:
+        raise MemoryHandoffError(
+            f"trusted worker privacy configuration is unavailable: {type(exc).__name__}"
+        ) from exc
+
 
 def _task_credential_keys(task_card: Mapping[str, Any] | None) -> frozenset[str]:
     """Validate declared names; a name cannot prove a token's authority."""
 
     declared = (task_card or {}).get("worker_task_credentials", [])
-    if not isinstance(declared, list) or any(not isinstance(key, str) for key in declared):
-        raise MemoryHandoffError("worker_task_credentials must list environment names")
-    if len(declared) != len(set(declared)):
-        raise MemoryHandoffError("worker_task_credentials contains duplicate names")
-    for key in declared:
-        if (
-            re.fullmatch(r"TASK_ONLY_[A-Z0-9_]+", key) is None
-            or not _credential_key(key)
-            or _control_credential_key(key)
-        ):
-            raise MemoryHandoffError("worker_task_credentials contains a non-task credential name")
-    return frozenset(declared)
+    from memory_harness import privacy
+
+    try:
+        return privacy.validate_worker_task_credentials(declared)
+    except privacy.MandatorySecretError as exc:
+        raise MemoryHandoffError(str(exc)) from exc
 
 
 def worker_environment(
-    task_card: Mapping[str, Any] | None = None, *, provider_id: str = "codex"
+    task_card: Mapping[str, Any] | None = None, *, provider_id: str = "codex",
+    harness_root: str | Path | None = None,
 ) -> dict[str, str]:
     """Return a worker environment without product control credentials.
 
@@ -920,17 +998,22 @@ def worker_environment(
 
     from memory_harness import privacy
 
-    inherited = privacy.worker_environment(os.environ)
+    configured_references, policy = _configured_worker_policy(harness_root)
+    inherited = privacy.worker_environment(os.environ, policy)
     _task_credential_keys(task_card)
     allowed_provider = _PROVIDER_CREDENTIAL_KEYS.get(provider_id, frozenset())
     forbidden = {
         key: value for key, value in os.environ.items()
-        if _control_credential_key(key) and isinstance(value, str) and value
+        if (
+            _control_credential_key(key) or key in configured_references
+        ) and isinstance(value, str) and value
     }
+    forbidden_values = tuple(forbidden.values())
     return {
         key: value for key, value in inherited.items()
         if not _control_credential_key(key)
-        and value not in forbidden.values()
+        and key not in configured_references
+        and not any(secret in value for secret in forbidden_values)
         and (not _credential_key(key) or key in allowed_provider)
     }
 
@@ -978,6 +1061,7 @@ def redact_control_diagnostic(message: str) -> str:
 def validate_worker_material(
     *, worktree_path: str | Path, invocation: Mapping[str, Any],
     environment: Mapping[str, str], task_card: Mapping[str, Any] | None = None,
+    harness_root: str | Path | None = None,
 ) -> None:
     """Check the actual restricted worker inputs before recording an intent.
 
@@ -991,15 +1075,41 @@ def validate_worker_material(
     prompt = workspace / "worker-prompt.md"
     if not prompt.is_file():
         raise MemoryHandoffError("restricted worker prompt is missing")
+    privacy = _memory_module("privacy")
+    configured_references, policy = _configured_worker_policy(harness_root)
     forbidden = {
         key: value for key, value in os.environ.items()
-        if _control_credential_key(key) and isinstance(value, str) and value
+        if (
+            _control_credential_key(key) or key in configured_references
+        ) and isinstance(value, str) and value
     }
-    if any(_control_credential_key(key) for key in environment):
+    if any(
+        _control_credential_key(key) or key in configured_references
+        for key in environment
+    ):
         raise MemoryHandoffError("restricted worker environment has product control authority")
-    if any(value in environment.values() for value in forbidden.values()):
+    if any(
+        secret in value
+        for value in environment.values()
+        for secret in forbidden.values()
+    ):
         raise MemoryHandoffError("restricted worker environment aliases product control authority")
     _task_credential_keys(task_card)
+    task_card_path = workspace / "task-card.json"
+    if not task_card_path.is_file():
+        raise MemoryHandoffError("restricted worker task card is missing")
+    try:
+        copied_task_card = json.loads(task_card_path.read_text(encoding="utf-8"))
+        if not isinstance(copied_task_card, Mapping) or (
+            task_card is not None and copied_task_card != dict(task_card)
+        ):
+            raise ValueError("copied task card differs from the validated source")
+        _memory_module("contracts").validate_task_card(copied_task_card)
+        privacy.guard_worker_task_card(copied_task_card, policy)
+    except Exception as exc:
+        raise MemoryHandoffError(
+            "restricted worker task card contains prohibited or invalid material"
+        ) from exc
     provider_id = invocation.get("provider", {}).get("id")
     allowed_provider = _PROVIDER_CREDENTIAL_KEYS.get(provider_id, frozenset())
     if any(
@@ -1129,46 +1239,120 @@ def record_dispatch_intent(
 def record_native_review(
     *, worktree_path: str | Path, evidence: Mapping[str, Any],
     attempts_path: str | Path | None = None,
+    reconcile_optional: bool = True,
 ) -> dict[str, Any]:
-    """Submit the complete retained native bundle to the domain transaction."""
+    """Fix the authoritative review, then optionally reconcile side effects.
+
+    The signed attempt journal is part of authoritative dispatch provenance and
+    is validated before outcome fixation.  Usage and product-memory settlement
+    are replayable bookkeeping; callers that publish acceptance can defer them
+    until after the acceptance authorization is durable.
+    """
 
     memory_store, memory_runtime = _open_runtime(worktree_path)
     try:
+        if attempts_path is not None:
+            _validated_native_attempt_rows(
+                worktree_path=worktree_path,
+                attempts_path=attempts_path,
+                evidence=evidence,
+                validate_transcripts=False,
+            )
         if evidence["acceptance"]["approval"] == "REJECTED":
             result = memory_runtime.record_rejected_native_attempt(evidence)
         else:
             result = memory_runtime.record_terminal_outcome(evidence)
-        if attempts_path is not None:
-            _reconcile_native_usage_in_store(
-                memory_store, worktree_path=worktree_path,
-                attempts_path=attempts_path, evidence=evidence,
+        if reconcile_optional:
+            _reconcile_native_review_effects_in_store(
+                memory_store,
+                worktree_path=worktree_path,
+                evidence=evidence,
+                attempts_path=attempts_path,
             )
-        if evidence["acceptance"]["approval"] == "ACCEPTED":
-            # Settlement is enabled only by the trusted harness-root product
-            # config.  Legacy/unconfigured harnesses preserve their established
-            # outcome path without creating optional state.
-            try:
-                from .config import find_harness_root
-                from . import product_composition, settlement
-
-                harness_root = find_harness_root()
-            except Exception:
-                harness_root = None
-            if harness_root is not None and product_composition.configured(harness_root):
-                with product_composition.compose_product(
-                    harness_root=harness_root,
-                    task_card=evidence["task_card"],
-                    route=evidence["accepted_plan"]["route"],
-                ) as composition:
-                    settlement.settle_accepted_outcome(
-                        worktree_path=worktree_path,
-                        evidence=evidence,
-                        local_store=memory_store,
-                        composition=composition,
-                    )
         return result
     except Exception as exc:
         raise MemoryHandoffError(f"cannot record native review: {exc}") from exc
+    finally:
+        memory_store.close()
+
+
+def _reconcile_native_review_effects_in_store(
+    memory_store: Any,
+    *,
+    worktree_path: str | Path,
+    evidence: Mapping[str, Any],
+    attempts_path: str | Path | None,
+) -> dict[str, Any]:
+    """Attempt replayable usage/experience effects without changing acceptance."""
+
+    status: dict[str, Any] = {}
+    if attempts_path is None:
+        status["usage"] = {"status": "not_requested"}
+    else:
+        try:
+            receipts = _reconcile_native_usage_in_store(
+                memory_store,
+                worktree_path=worktree_path,
+                attempts_path=attempts_path,
+                evidence=evidence,
+            )
+            status["usage"] = {"status": "settled", "receipt_count": len(receipts)}
+        except Exception as exc:
+            status["usage"] = {
+                "status": "error",
+                "retryable": True,
+                "error_type": type(exc).__name__,
+            }
+
+    if evidence.get("acceptance", {}).get("approval") != "ACCEPTED":
+        status["settlement"] = {"status": "not_applicable"}
+        return status
+
+    try:
+        from .config import find_harness_root
+        from . import product_composition, settlement
+
+        harness_root = find_harness_root()
+        if not product_composition.configured(harness_root):
+            status["settlement"] = {"status": "not_configured"}
+            return status
+        with product_composition.compose_product(
+            harness_root=harness_root,
+            task_card=evidence["task_card"],
+            route=evidence["accepted_plan"]["route"],
+        ) as composition:
+            settled = settlement.settle_accepted_outcome(
+                worktree_path=worktree_path,
+                evidence=evidence,
+                local_store=memory_store,
+                composition=composition,
+            )
+        status["settlement"] = {
+            "status": str(settled.get("status", "settled")),
+        }
+    except Exception as exc:
+        status["settlement"] = {
+            "status": "error",
+            "retryable": True,
+            "error_type": type(exc).__name__,
+        }
+    return status
+
+
+def reconcile_native_review_effects(
+    *, worktree_path: str | Path, evidence: Mapping[str, Any],
+    attempts_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Replay optional post-acceptance bookkeeping and return visible status."""
+
+    memory_store, _ = _open_runtime(worktree_path)
+    try:
+        return _reconcile_native_review_effects_in_store(
+            memory_store,
+            worktree_path=worktree_path,
+            evidence=evidence,
+            attempts_path=attempts_path,
+        )
     finally:
         memory_store.close()
 
@@ -1264,6 +1448,7 @@ def _native_model(observation: Mapping[str, Any]) -> str | None:
 def _trusted_attempt_rows(
     *, attempts_path: str | Path, worktree_path: str | Path,
     lane_id: str, run_id: str,
+    validate_transcripts: bool = True,
 ) -> list[dict[str, Any]]:
     """Read and authenticate a controller-sealed attempt-journal run."""
 
@@ -1331,6 +1516,8 @@ def _trusted_attempt_rows(
             "controller attempt journal does not match its closed-run attestation"
         )
     for row in rows:
+        if not validate_transcripts:
+            continue
         start = row.get("transcript_start_byte")
         end = row.get("transcript_end_byte")
         digest = row.get("transcript_sha256")
@@ -1368,13 +1555,13 @@ def _trusted_attempt_rows(
     return rows
 
 
-def _reconcile_native_usage_in_store(
-    memory_store: Any, *, worktree_path: str | Path,
-    attempts_path: str | Path, evidence: Mapping[str, Any],
+def _validated_native_attempt_rows(
+    *, worktree_path: str | Path, attempts_path: str | Path,
+    evidence: Mapping[str, Any],
+    validate_transcripts: bool = True,
 ) -> list[dict[str, Any]]:
-    """Join immutable controller attempt facts to the durable usage ledger."""
+    """Return signed attempt rows only after their exact dispatch is joined."""
 
-    contracts = _memory_module("contracts")
     lane_id = evidence.get("lane_id")
     run_id = evidence.get("run_id")
     objective_id = evidence.get("objective_id")
@@ -1387,15 +1574,50 @@ def _reconcile_native_usage_in_store(
         row for row in _trusted_attempt_rows(
             attempts_path=attempts_path, worktree_path=worktree_path,
             lane_id=lane_id, run_id=run_id,
+            validate_transcripts=validate_transcripts,
         )
     ]
-    reconciled: dict[tuple[str, str], dict[str, Any]] = {}
+    observed_invocation = evidence.get("dispatch", {}).get("observed_invocation")
+    if not isinstance(observed_invocation, Mapping):
+        raise MemoryHandoffError("native usage evidence has no exact dispatch observation")
+    expected_dispatch = {
+        field: observed_invocation.get(field) for field in DISPATCH_BINDING_FIELDS
+    }
+    if any(not isinstance(value, str) or not value for value in expected_dispatch.values()):
+        raise MemoryHandoffError("native usage evidence has an incomplete dispatch binding")
     for row in rows:
         if row.get("provider_started") is not True:
             continue
         dispatch = row.get("dispatch_binding")
-        if not isinstance(dispatch, Mapping) or dispatch.get("decision_id") != decision_id:
+        if (
+            not isinstance(dispatch, Mapping)
+            or set(dispatch) != set(DISPATCH_BINDING_FIELDS)
+            or dict(dispatch) != expected_dispatch
+        ):
             raise MemoryHandoffError("native usage attempt has a conflicting dispatch binding")
+    return rows
+
+
+def _reconcile_native_usage_in_store(
+    memory_store: Any, *, worktree_path: str | Path,
+    attempts_path: str | Path, evidence: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Join immutable controller attempt facts to the durable usage ledger."""
+
+    contracts = _memory_module("contracts")
+    lane_id = str(evidence["lane_id"])
+    run_id = str(evidence["run_id"])
+    objective_id = str(evidence["objective_id"])
+    decision_id = str(evidence["decision_id"])
+    rows = _validated_native_attempt_rows(
+        attempts_path=attempts_path,
+        worktree_path=worktree_path,
+        evidence=evidence,
+    )
+    reconciled: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        if row.get("provider_started") is not True:
+            continue
         provider = row.get("provider")
         attempt = row.get("attempt")
         if (
@@ -1799,6 +2021,7 @@ __all__ = [
     "record_ambiguous_dispatch",
     "record_dispatch_intent",
     "record_native_review",
+    "reconcile_native_review_effects",
     "reconcile_native_usage",
     "supersession_id_for_launch",
     "record_observed_invocation",

@@ -11,20 +11,51 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from memory_harness import contracts, experience, privacy, store
+from memory_harness import (
+    config,
+    contracts,
+    experience,
+    local_procedure_adapters,
+    privacy,
+    procedures,
+    store,
+    templates,
+)
+
+
+VERIFICATION_ORACLE_BINDINGS = {
+    "GeneratedSkillTrustTests::test_revoked_and_stale_replay_cannot_regain_trust_after_restart": {
+        "requirement_id": "T09",
+        "evidence_class": "LOCAL",
+        "scenario_id": "T09.LOCAL.trust-replay-fence",
+        "positive_oracle_id": "T09.LOCAL.current-trust-survives-restart",
+        "negative_oracle_id": "T09.LOCAL.revoked-stale-replay-denied",
+    },
+    "GeneratedSkillTrustTests::test_feature_dependency_and_deferred_gates_make_zero_calls_or_optional_writes": {
+        "requirement_id": "T16",
+        "evidence_class": "LOCAL",
+        "scenario_id": "T16.LOCAL.feature-dependency-gate",
+        "positive_oracle_id": "T16.LOCAL.valid-dependencies-resolve",
+        "negative_oracle_id": "T16.LOCAL.zero-call-zero-write-on-disabled-dependency",
+    },
+}
 
 
 class _EverOSResults:
     def __init__(self) -> None:
         self.case_results: list[dict] = []
+        self.memorize_calls: list[dict] = []
+        self.search_calls: list[dict] = []
 
-    async def memorize(self, _: dict, **__: object) -> dict:
+    async def memorize(self, payload: dict, **__: object) -> dict:
+        self.memorize_calls.append(dict(payload))
         return {"status": "extracted", "message_count": 1}
 
     def make_search_request(self, **kwargs: object) -> dict:
         return dict(kwargs)
 
-    async def search(self, _: object) -> dict:
+    async def search(self, request: object) -> dict:
+        self.search_calls.append(dict(request) if isinstance(request, dict) else {})
         return {
             "request_id": "search-1",
             "data": {"agent_cases": list(self.case_results), "agent_skills": []},
@@ -96,10 +127,10 @@ class GeneratedSkillTrustTests(unittest.TestCase):
         self.memory_store.close()
         self.temporary.cleanup()
 
-    def _confirmed_case(self) -> dict:
+    def _reviewed_trajectory(self, suffix: str) -> dict:
         plan = contracts.make_plan(
-            plan_id="plan-1",
-            objective_id="objective-1",
+            plan_id=f"plan-{suffix}",
+            objective_id=f"objective-{suffix}",
             route="ordinary",
             state="accepted",
             content={"steps": ["inspect", "repair", "verify"]},
@@ -109,7 +140,7 @@ class GeneratedSkillTrustTests(unittest.TestCase):
             task="Repair parser failure",
             base_commit="base-1",
             memory_handoff=contracts.make_memory_handoff(
-                objective_id="objective-1", route="ordinary", plan=plan
+                objective_id=f"objective-{suffix}", route="ordinary", plan=plan
             ),
         )
         decision = contracts.make_decision(task_card, plan)
@@ -119,20 +150,20 @@ class GeneratedSkillTrustTests(unittest.TestCase):
             plan_id=plan["plan_id"],
             plan_digest=plan["content_hash"],
             status="PASS",
-            evidence_digest="evidence-1",
-            linked_run_id="run-1",
+            evidence_digest=f"evidence-{suffix}",
+            linked_run_id=f"run-{suffix}",
             task_card_digest=task_card["content_hash"],
-            objective_id="objective-1",
+            objective_id=f"objective-{suffix}",
         )
         self.memory_store.record_outcome(outcome)
         review = contracts.make_review_receipt(
-            review_id="review-1",
+            review_id=f"review-{suffix}",
             outcome=outcome,
             decision=decision,
             task_card=task_card,
             plan=plan,
             reviewed_by="ROOT",
-            evidence_refs=("review://run-1",),
+            evidence_refs=(f"review://run-{suffix}",),
             raw_evidence="The parser repair passed after the local lock was released.",
             failed_hypotheses=("network timeout",),
         )
@@ -144,6 +175,10 @@ class GeneratedSkillTrustTests(unittest.TestCase):
             review_receipt=review,
             scope=self.scope,
         )
+        return trajectory
+
+    def _confirmed_case(self) -> dict:
+        trajectory = self._reviewed_trajectory("1")
         pending = asyncio.run(
             self.service.extract_trajectory(trajectory["trajectory_id"], self.adapter)
         )
@@ -167,6 +202,104 @@ class GeneratedSkillTrustTests(unittest.TestCase):
         )
         self.assertEqual("confirmed", confirmed["status"])
         return trajectory
+
+    def _curated_procedure(
+        self,
+        service: procedures.TrustedProcedureService,
+        *,
+        logical_name: str,
+        body: str,
+        approval_id: str,
+        created_at: str,
+    ) -> tuple[dict, dict, dict]:
+        receiver = self.scope.to_record()
+        partition = {
+            "scope": "project",
+            "application": receiver["application"],
+            "project": receiver["project"],
+            "namespace": receiver["namespace"],
+            "recipients": [receiver],
+        }
+        procedure = contracts.make_procedure_revision(
+            logical_name=logical_name,
+            origin="curated",
+            origin_scope=receiver,
+            body=body,
+            references=[
+                {"id": f"guide://{logical_name}", "content": "Retain exact trust evidence."}
+            ],
+            predicates={
+                "applicability": {},
+                "conflicts": {},
+                "capabilities": {},
+                "routes": {
+                    "all": [
+                        {"field": "route", "operator": "equals", "value": "ordinary"}
+                    ]
+                },
+            },
+            source={
+                "kind": "curated_authoring",
+                "provenance_ref": f"curation://root/{logical_name}",
+            },
+            created_at=created_at,
+        )
+        approval = contracts.make_procedure_approval(
+            approval_id=approval_id,
+            procedure=procedure,
+            issuer="ROOT",
+            recipients=[receiver],
+            authority_evidence={"policy_id": "trusted-root/v1", "subject": "root"},
+            approved_at=created_at,
+        )
+        approval = service.record_approved_revision(procedure, approval)
+        identity = templates.representation_identity()
+        service.record_representation(
+            contracts.make_procedure_representation(
+                procedure=procedure,
+                model=identity["model"],
+                dimensions=identity["dimensions"],
+                metric=identity["metric"],
+                sanitizer_version=identity["sanitizer_version"],
+                search_text="parser lock replay trust evidence",
+                vector=[0.01] * int(identity["dimensions"]),
+                created_at=created_at,
+            )
+        )
+        designation = service.designate(
+            procedure=procedure,
+            approval=approval,
+            partition=partition,
+            issuer="ROOT",
+        )
+        return procedure, approval, designation
+
+    def _curated_candidates(
+        self, service: procedures.TrustedProcedureService
+    ) -> list[dict]:
+        curated = next(
+            item
+            for item in local_procedure_adapters.make_local_procedure_search_stores(
+                procedure_service=service,
+                memory_store=self.memory_store,
+                receiver=self.scope.to_record(),
+                facts={},
+                route="ordinary",
+            )
+            if item.store_id == local_procedure_adapters.CURATED_STORE_ID
+        )
+        objective = templates.objective_representation(
+            "parser lock replay trust evidence", route="ordinary"
+        )
+        payload = {
+            "representation": {
+                key: objective[key]
+                for key in ("model", "dimensions", "metric", "sanitizer_version")
+            },
+            "tokens": objective["tokens"],
+            "route": "ordinary",
+        }
+        return list(curated.query(payload))
 
     def _skill(self, **updates: object) -> dict:
         skill = {
@@ -370,6 +503,146 @@ class GeneratedSkillTrustTests(unittest.TestCase):
         restored = self.memory_store.get_skill_approval(approval["approval_id"])
         self.assertEqual(approval, restored)
         self.assertEqual("generated", restored["origin"])
+
+    def test_revoked_and_stale_replay_cannot_regain_trust_after_restart(self) -> None:
+        procedure_service = procedures.TrustedProcedureService(
+            self.memory_store,
+            trusted_issuers={"ROOT"},
+            privacy_policy=self.policy,
+        )
+        revoked, _revoked_approval, revoked_designation = self._curated_procedure(
+            procedure_service,
+            logical_name="revoked-replay",
+            body="Inspect the revoked parser-lock procedure.",
+            approval_id="approval-revoked",
+            created_at="2026-09-21T00:00:01Z",
+        )
+        self.memory_store.record_procedure_revocation(
+            contracts.make_procedure_revocation(
+                procedure=revoked,
+                issuer="ROOT",
+                reason="the reviewed procedure was revoked",
+                created_at="2026-09-21T00:00:02Z",
+            )
+        )
+
+        stale, _stale_approval, stale_designation = self._curated_procedure(
+            procedure_service,
+            logical_name="stale-replay",
+            body="Inspect the first parser-lock procedure.",
+            approval_id="approval-stale-1",
+            created_at="2026-09-21T00:00:03Z",
+        )
+        current, _current_approval, current_designation = self._curated_procedure(
+            procedure_service,
+            logical_name="stale-replay",
+            body="Inspect the revised parser-lock procedure and verify it.",
+            approval_id="approval-stale-2",
+            created_at="2026-09-21T00:00:04Z",
+        )
+        self.assertEqual(stale["logical_id"], current["logical_id"])
+        self.assertEqual(1, stale_designation["generation"])
+        self.assertEqual(2, current_designation["generation"])
+
+        self.memory_store.close()
+        self.memory_store = store.MemoryStore(self.root / "memory.sqlite3")
+        self.memory_store.initialize()
+        procedure_service = procedures.TrustedProcedureService(
+            self.memory_store,
+            trusted_issuers={"ROOT"},
+            privacy_policy=self.policy,
+        )
+
+        with self.assertRaisesRegex(store.ProcedureConflictError, "revoked"):
+            self.memory_store.record_procedure_designation(revoked_designation)
+        replayed_stale = self.memory_store.record_procedure_designation(stale_designation)
+        self.assertEqual(stale_designation, replayed_stale)
+        durable_current = self.memory_store.get_current_procedure_designation(
+            current["logical_id"], current_designation["partition"]
+        )
+        self.assertIsNotNone(durable_current)
+        self.assertEqual(current["revision_id"], durable_current["revision_id"])
+        self.assertEqual(2, durable_current["generation"])
+
+        candidates = self._curated_candidates(procedure_service)
+        self.assertEqual(
+            [(current["logical_id"], current["revision_id"])],
+            [(item["logical_id"], item["revision_id"]) for item in candidates],
+        )
+        self.assertNotIn(
+            revoked["revision_id"], {item["revision_id"] for item in candidates}
+        )
+        self.assertNotIn(
+            stale["revision_id"], {item["revision_id"] for item in candidates}
+        )
+
+    def test_feature_dependency_and_deferred_gates_make_zero_calls_or_optional_writes(
+        self,
+    ) -> None:
+        enabled = config.resolve_config(
+            {"experience_write": True, "generated_skill_creation": True}
+        )
+        self.assertTrue(enabled.experience_write)
+        self.assertTrue(enabled.generated_skill_creation)
+
+        blocked = config.resolve_config(
+            {"experience_write": False, "generated_skill_creation": True}
+        )
+        generated = blocked.feature_state_by_name["generated_skill_creation"]
+        self.assertTrue(generated.requested)
+        self.assertFalse(generated.effective)
+        self.assertEqual(("experience_write",), generated.prerequisites)
+
+        trajectory = self._reviewed_trajectory("dependency-gate")
+        connection = self.memory_store._require_connection()
+        optional_tables = (
+            "effect_operations",
+            "experience_ingestions",
+            "experience_case_receipts",
+            "generated_skill_candidates",
+            "generated_skill_approvals",
+        )
+        before = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in optional_tables
+        }
+        self.results.memorize_calls.clear()
+        self.results.search_calls.clear()
+        self.assertIsNone(
+            asyncio.run(
+                self.service.extract_trajectory(
+                    trajectory["trajectory_id"],
+                    self.adapter,
+                    current_config=blocked,
+                )
+            )
+        )
+        self.assertEqual([], self.results.memorize_calls)
+        self.assertEqual([], self.results.search_calls)
+        self.assertIsNone(
+            self.memory_store.get_experience_ingestion_for_trajectory(
+                trajectory["trajectory_id"]
+            )
+        )
+        after_dependency = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in optional_tables
+        }
+        self.assertEqual(before, after_dependency)
+
+        with self.assertRaisesRegex(
+            config.DeferredCapabilityError, "deferred/not implemented"
+        ):
+            config.resolve_config(
+                {"strategy": "learned", "policy_load": True, "policy_update": True}
+            )
+        self.assertEqual([], self.results.memorize_calls)
+        self.assertEqual([], self.results.search_calls)
+        after_deferred = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in optional_tables
+        }
+        self.assertEqual(before, after_deferred)
 
 
 if __name__ == "__main__":

@@ -174,8 +174,47 @@ def _packages() -> frozenset[str]:
     )
 
 
+def _plain_component_metadata(path: Path):
+    """Return metadata only when ``path`` is not a link/reparse component."""
+
+    metadata = path.lstat()
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    junction_probe = getattr(path, "is_junction", None)
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or bool(attributes & reparse_flag)
+        or bool(junction_probe is not None and junction_probe())
+    ):
+        return None
+    return metadata
+
+
+def _plain_absolute_file(path: Path | None, *, single_link: bool = True) -> bool:
+    """Require a regular file reached without any link/reparse component."""
+
+    if path is None or not path.is_absolute():
+        return False
+    current = Path(path.anchor)
+    try:
+        metadata = _plain_component_metadata(current)
+        if metadata is None:
+            return False
+        parts = path.parts[1:] if path.anchor else path.parts
+        for part in parts:
+            current = current / part
+            metadata = _plain_component_metadata(current)
+            if metadata is None:
+                return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return stat.S_ISREG(metadata.st_mode) and (
+        not single_link or metadata.st_nlink == 1
+    )
+
+
 def _artifact_sha256(artifact: Path | None) -> str | None:
-    if artifact is None or not artifact.is_absolute() or artifact.is_symlink() or not artifact.is_file():
+    if artifact is None or not _plain_absolute_file(artifact):
         return None
     try:
         return hashlib.sha256(artifact.read_bytes()).hexdigest()
@@ -189,9 +228,7 @@ def _receipt_binds_candidate_and_artifact(ctx: ProbeContext) -> bool:
     artifact_digest = _artifact_sha256(artifact)
     if (
         receipt_path is None
-        or not receipt_path.is_absolute()
-        or receipt_path.is_symlink()
-        or not receipt_path.is_file()
+        or not _plain_absolute_file(receipt_path)
         or artifact is None
         or artifact_digest is None
     ):
@@ -200,6 +237,10 @@ def _receipt_binds_candidate_and_artifact(ctx: ProbeContext) -> bool:
         document = verification_receipt.validate_receipt(
             receipt_path, require_qualifying=True,
         )
+        if receipt_path.read_bytes() != (
+            json.dumps(document, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8"):
+            return False
         candidate = document["candidate"]
         if Path(candidate["root"]).resolve() != ctx.product_root:
             return False
@@ -236,15 +277,15 @@ def _receipt_binds_candidate_and_artifact(ctx: ProbeContext) -> bool:
 
 
 def _nonce_file_has_expected_shape(path: Path | None) -> bool:
-    if path is None or not path.is_absolute() or path.is_symlink() or not path.is_file():
+    if path is None or not _plain_absolute_file(path):
         return False
     try:
         if path.stat().st_size > 256:
             return False
-        value = path.read_text(encoding="ascii").strip()
+        value = path.read_text(encoding="ascii")
     except (OSError, UnicodeError):
         return False
-    return re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    return re.fullmatch(r"[0-9a-f]{64}\n?", value) is not None
 
 
 def _proof_is_bound(
@@ -400,13 +441,10 @@ def _plain_qualification_source(selector: str, product_root: Path) -> bool:
         current = root
         for part in relative.parts:
             current = current / part
-            metadata = current.lstat()
-            junction_probe = getattr(current, "is_junction", None)
-            if stat.S_ISLNK(metadata.st_mode) or bool(
-                junction_probe is not None and junction_probe()
-            ):
+            metadata = _plain_component_metadata(current)
+            if metadata is None:
                 return False
-        if not stat.S_ISREG(current.lstat().st_mode):
+        if not stat.S_ISREG(metadata.st_mode):
             return False
         current.resolve(strict=True).relative_to(root)
     except (OSError, RuntimeError, ValueError):
@@ -423,6 +461,11 @@ def _live_argv(selector: str, ctx: ProbeContext) -> list[str]:
         "--live-candidate-artifact", (
             str(ctx.artifact) if ctx.artifact is not None
             else "<ABSOLUTE_CANDIDATE_ARTIFACT>"
+        ),
+        "--live-verification-receipt", (
+            str(ctx.verification_receipt_path)
+            if ctx.verification_receipt_path is not None
+            else "<ABSOLUTE_QUALIFYING_VERIFICATION_RECEIPT>"
         ),
         "--live-namespace", ctx.namespace or "mhq-<DISPOSABLE_ID>",
         "--live-call-budget", str(LIVE_CALL_BUDGET),

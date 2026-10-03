@@ -491,6 +491,16 @@ def _write_pair(
         # only after the enhanced evidence and managed close are durable.
         if existing_acceptance is None:
             atomic_write_json(acceptance_path, acceptance)
+        if terminal is not None and acceptance["approval"] == "ACCEPTED":
+            try:
+                terminal_evidence.reconcile_optional_effects(
+                    rt, epoch_id, lane, terminal,
+                )
+            except Exception:
+                # Acceptance and the fixed native outcome are authoritative.
+                # Optional usage/memory reconciliation remains replayable from
+                # the retained terminal evidence and must not revoke them.
+                pass
     return review, acceptance
 
 
@@ -525,6 +535,11 @@ def _replay_retained_pair(
         if terminal is None or terminal["review"] != review or terminal["acceptance"] != acceptance:
             raise ReviewError(COMPLETION_REVIEW_OUTPUT_CONFLICT, "retained native evidence is absent or conflicts")
         terminal_evidence.record_domain_review(rt, epoch_id, lane, terminal)
+        if acceptance["approval"] == "ACCEPTED":
+            try:
+                terminal_evidence.reconcile_optional_effects(rt, epoch_id, lane, terminal)
+            except Exception:
+                pass
     return review, acceptance
 
 
@@ -585,6 +600,11 @@ def _replay_retained_preparation(
                     f"review prepared but the event could not be closed: {exc}",
                 ) from exc
         atomic_write_json(acceptance_path, acceptance)
+        if acceptance["approval"] == "ACCEPTED":
+            try:
+                terminal_evidence.reconcile_optional_effects(rt, epoch_id, lane, terminal)
+            except Exception:
+                pass
     return review, acceptance
 
 
@@ -754,6 +774,9 @@ def run_completion_review(
             str(folder / "COMPLETION_REVIEW.json"),
             str(folder / "ORCHESTRATOR_ACCEPTANCE.json"),
         ] + ([str(folder / terminal_evidence.TERMINAL_EVIDENCE_NAME)]
-             if (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file() else []),
+             if (folder / terminal_evidence.TERMINAL_EVIDENCE_NAME).is_file() else [])
+            + ([str(folder / terminal_evidence.OPTIONAL_RECONCILIATION_NAME)]
+               if (folder / terminal_evidence.OPTIONAL_RECONCILIATION_NAME).is_file()
+               else []),
         "next_action": next_action,
     }

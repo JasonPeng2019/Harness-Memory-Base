@@ -12,6 +12,24 @@ from orchestrator_harness import attempt_attestation, memory_handoff
 from orchestrator_harness.records import append_jsonl, atomic_write_json, read_jsonl
 
 
+def _dispatch_binding(decision_id: str) -> dict[str, str]:
+    """One complete synthetic controller dispatch for focused usage tests."""
+
+    binding = {
+        field: f"usage-{field}"
+        for field in memory_handoff.DISPATCH_BINDING_FIELDS
+    }
+    binding.update({
+        "decision_id": decision_id,
+        "plan_id": "plan-usage",
+        "lane_id": "lane-usage",
+        "run_id": "run-usage",
+        "base_commit": "base",
+        "route": "ordinary",
+    })
+    return binding
+
+
 def _domain(worktree: Path) -> tuple[store.MemoryStore, dict, dict]:
     worktree.mkdir(parents=True, exist_ok=True)
     plan = contracts.make_plan(
@@ -33,6 +51,14 @@ def _domain(worktree: Path) -> tuple[store.MemoryStore, dict, dict]:
     evidence = {
         "lane_id": "lane-usage", "run_id": "run-usage",
         "objective_id": "objective-usage", "decision_id": decision["decision_id"],
+        "dispatch": {
+            "observed_invocation": {
+                **_dispatch_binding(decision["decision_id"]),
+                "invocation_id": "controller:1:usage",
+                "pid": 41,
+                "creation_time": "usage-controller-incarnation",
+            },
+        },
     }
     return state, decision, evidence
 
@@ -53,7 +79,7 @@ def _attempt(
         "transcript_start_byte": 0, "transcript_end_byte": 100,
         "transcript_sha256": hashlib.sha256(b"x" * 100).hexdigest(),
         "provider_started": True, "result_state": "valid", "cleanup_proven": True,
-        "dispatch_binding": {"decision_id": decision_id},
+        "dispatch_binding": _dispatch_binding(decision_id),
         "native_usage_state": "observed" if observations else "incomplete",
         "native_usage_observations": observations,
         "native_usage_capture_error": None,

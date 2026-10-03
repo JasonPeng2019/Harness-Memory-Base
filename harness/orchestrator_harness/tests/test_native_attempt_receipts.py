@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from orchestrator_harness import attempt_attestation, controller
+from orchestrator_harness import attempt_attestation, controller, memory_handoff
 from orchestrator_harness.core import content_hash
 from orchestrator_harness.records import read_jsonl
 
@@ -65,6 +65,99 @@ def append_observed_attempt(
 
 
 class NativeAttemptReceipts(unittest.TestCase):
+    def test_signed_attempt_requires_every_exact_dispatch_binding_field(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            transcript = worktree / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps({
+                    "type": "turn.completed",
+                    "turn_id": "turn-1",
+                    "usage": {"input_tokens": 4},
+                }) + "\n",
+                encoding="utf-8",
+            )
+            lane = lane_at(worktree, "codex")
+            lane["attempts_path"] = str(root / "controller.attempts.jsonl")
+            dispatch = {
+                field: f"exact-{field}"
+                for field in memory_handoff.DISPATCH_BINDING_FIELDS
+            }
+            dispatch.update({"lane_id": "lane-1", "run_id": "run-1"})
+            controller._append_attempt(
+                lane,
+                attempt_number=1,
+                argv=["codex", "exec"],
+                session_id="session-1",
+                prompt_path=worktree / "prompt",
+                paths={"transcript": transcript, "stderr": worktree / "stderr"},
+                exit_code=0,
+                result_state="valid",
+                cleanup_proven=True,
+                binding=binding("codex"),
+                dispatch_binding=dispatch,
+            )
+            controller._publish_attempt_attestation(lane)
+            evidence = {
+                "lane_id": "lane-1",
+                "run_id": "run-1",
+                "objective_id": "objective-1",
+                "decision_id": dispatch["decision_id"],
+                "dispatch": {"observed_invocation": {
+                    **dispatch,
+                    "invocation_id": "controller:1:test",
+                    "pid": 1,
+                    "creation_time": "incarnation-1",
+                }},
+            }
+            self.assertEqual(
+                1,
+                len(memory_handoff._validated_native_attempt_rows(
+                    worktree_path=worktree,
+                    attempts_path=lane["attempts_path"],
+                    evidence=evidence,
+                )),
+            )
+            transcript.unlink()
+            self.assertEqual(
+                1,
+                len(memory_handoff._validated_native_attempt_rows(
+                    worktree_path=worktree,
+                    attempts_path=lane["attempts_path"],
+                    evidence=evidence,
+                    validate_transcripts=False,
+                )),
+            )
+            with self.assertRaisesRegex(
+                memory_handoff.MemoryHandoffError,
+                "transcript is unavailable",
+            ):
+                memory_handoff._validated_native_attempt_rows(
+                    worktree_path=worktree,
+                    attempts_path=lane["attempts_path"],
+                    evidence=evidence,
+                )
+            for field in memory_handoff.DISPATCH_BINDING_FIELDS:
+                if field == "decision_id":
+                    continue
+                with self.subTest(field=field):
+                    changed = json.loads(json.dumps(evidence))
+                    changed["dispatch"]["observed_invocation"][field] = (
+                        f"conflicting-{field}"
+                    )
+                    with self.assertRaisesRegex(
+                        memory_handoff.MemoryHandoffError,
+                        "conflicting dispatch binding",
+                    ):
+                        memory_handoff._validated_native_attempt_rows(
+                            worktree_path=worktree,
+                            attempts_path=lane["attempts_path"],
+                            evidence=changed,
+                            validate_transcripts=False,
+                        )
+
     def test_untrusted_usage_fields_are_dropped_and_do_not_mark_observed(self):
         cases = (
             ({"latency_ms": 5, "access_token": "TOPSECRET"}, "incomplete", None),

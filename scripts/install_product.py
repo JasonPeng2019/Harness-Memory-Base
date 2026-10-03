@@ -34,6 +34,12 @@ IGNORED_PARTS = {
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     "runtime", "local-config", "build", "dist",
 }
+MUTABLE_CONFIG_NAMES = frozenset({
+    "harness-config.json",
+    "resource-manifest.json",
+    "memory-product-config.json",
+})
+PENDING_RECEIPT_NAME = ".install-receipt.pending.json"
 
 
 class InstallError(RuntimeError):
@@ -153,6 +159,38 @@ def _atomic_json(path: Path, document: Mapping[str, Any]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        _sync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _sync_directory(path: Path) -> None:
+    """Durably order directory-entry changes where the platform supports it."""
+
+    if os.name != "posix":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _sync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -265,6 +303,182 @@ def _write_configs(
     return scope
 
 
+def _configuration_record(path: Path) -> tuple[bytes, dict[str, Any]]:
+    if not path.is_file() or _redirected(path):
+        raise InstallError(f"operator configuration is missing or redirected: {path}")
+    try:
+        content = path.read_bytes()
+        record = json.loads(content.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InstallError(f"operator configuration is unreadable: {path}: {exc}") from exc
+    if not isinstance(record, dict):
+        raise InstallError(f"operator configuration must be a JSON object: {path}")
+    return content, record
+
+
+def _canonical_nonempty(value: Any, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise InstallError(f"operator configuration {field} must be a canonical nonempty string")
+    return value
+
+
+def _assert_plain_absolute_path(raw: Any, *, field: str, kind: str) -> Path:
+    if not isinstance(raw, str) or not raw:
+        raise InstallError(f"operator configuration {field} must be an absolute plain path")
+    path = Path(raw)
+    if not path.is_absolute() or os.path.normpath(raw) != raw:
+        raise InstallError(f"operator configuration {field} must be an absolute plain path")
+    for component in (path, *path.parents):
+        if _redirected(component):
+            raise InstallError(
+                f"operator configuration {field} contains a link or junction: {component}"
+            )
+    if kind == "directory" and (not path.is_dir() or _redirected(path)):
+        raise InstallError(f"operator configuration {field} must identify a directory")
+    if kind == "file" and (not path.is_file() or _redirected(path)):
+        raise InstallError(f"operator configuration {field} must identify a regular file")
+    return path
+
+
+def _validate_harness_config(record: Mapping[str, Any], path: Path) -> None:
+    if not {"root_workspace"} <= set(record) <= {
+        "root_workspace", "managed_coordination",
+    }:
+        raise InstallError(f"operator harness configuration has invalid closed keys: {path}")
+    workspace = record.get("root_workspace")
+    if not isinstance(workspace, str) or not workspace or not Path(workspace).is_absolute():
+        raise InstallError(f"operator harness configuration workspace must be absolute: {path}")
+    if Path(workspace).expanduser().is_symlink():
+        raise InstallError(f"operator harness configuration workspace must not be a link: {path}")
+    if record.get("managed_coordination", "enabled") not in {"enabled", "disabled"}:
+        raise InstallError(
+            f"operator harness configuration coordination must be enabled or disabled: {path}"
+        )
+
+
+def _validate_resource_manifest(record: Mapping[str, Any], path: Path) -> None:
+    if set(record) != {"schema", "resources"} or record.get("schema") != "resource-manifest/v1":
+        raise InstallError(f"operator resource manifest has an invalid closed schema: {path}")
+    resources = record.get("resources")
+    if not isinstance(resources, list):
+        raise InstallError(f"operator resource manifest resources must be a list: {path}")
+    seen: set[str] = set()
+    for entry in resources:
+        if not isinstance(entry, dict) or set(entry) != {"id", "exclusive"}:
+            raise InstallError(f"operator resource manifest entry has invalid closed keys: {path}")
+        resource_id = entry.get("id")
+        if not isinstance(resource_id, str) or not resource_id or resource_id in seen:
+            raise InstallError(f"operator resource manifest resource id is invalid or duplicate: {path}")
+        if entry.get("exclusive") is not True:
+            raise InstallError(f"operator resource manifest resources must be exclusive: {path}")
+        seen.add(resource_id)
+
+
+def _validate_memory_product_config(
+    record: Mapping[str, Any], path: Path,
+) -> dict[str, str]:
+    scope_fields = {"application", "namespace", "project", "owner"}
+    top_level = {
+        "schema", *scope_fields, "store_root", "policy_generation",
+        "known_secret_files", "services",
+    }
+    if set(record) != top_level or record.get("schema") != "memory-product-config/v1":
+        raise InstallError(f"operator memory configuration has an invalid closed schema: {path}")
+    scope = {
+        field: _canonical_nonempty(record.get(field), field=field)
+        for field in scope_fields
+    }
+    store_root = _assert_plain_absolute_path(
+        record.get("store_root"), field="store_root", kind="directory",
+    )
+    _canonical_nonempty(record.get("policy_generation"), field="policy_generation")
+    secret_values = record.get("known_secret_files")
+    if not isinstance(secret_values, list):
+        raise InstallError("operator memory configuration known_secret_files must be a list")
+    secret_paths: list[Path] = []
+    secrets_root = store_root / "secrets"
+    for raw in secret_values:
+        secret = _assert_plain_absolute_path(raw, field="known_secret_files entry", kind="file")
+        try:
+            secret.relative_to(secrets_root)
+        except ValueError as exc:
+            raise InstallError(
+                "operator memory configuration secret files must be below store_root/secrets"
+            ) from exc
+        if secret == secrets_root or (os.name == "posix" and secret.stat().st_mode & 0o077):
+            raise InstallError("operator memory configuration secret files must be private")
+        secret_paths.append(secret)
+    if len(set(secret_paths)) != len(secret_paths):
+        raise InstallError("operator memory configuration secret files must be unique")
+
+    service_fields = {
+        "local_experience": {"enabled"},
+        "local_procedures": {"enabled"},
+        "everos": {"enabled", "credential_env"},
+        "atlas": {"enabled", "credential_env", "database", "collection", "index"},
+    }
+    services = record.get("services")
+    if not isinstance(services, dict) or set(services) != set(service_fields):
+        raise InstallError("operator memory configuration has an invalid services object")
+    environment_name = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    location_value = re.compile(r"^[A-Za-z0-9_-]+$")
+    for name, allowed in service_fields.items():
+        service = services[name]
+        if not isinstance(service, dict) or set(service) - allowed or "enabled" not in service:
+            raise InstallError(f"operator memory configuration service {name!r} is malformed")
+        if not isinstance(service["enabled"], bool):
+            raise InstallError(f"operator memory configuration service {name!r} enabled is not boolean")
+        credential = service.get("credential_env")
+        if credential is not None and (
+            not isinstance(credential, str) or environment_name.fullmatch(credential) is None
+        ):
+            raise InstallError(f"operator memory configuration service {name!r} credential is invalid")
+        for field in ("database", "collection", "index"):
+            value = service.get(field)
+            if value is not None and (
+                not isinstance(value, str) or location_value.fullmatch(value) is None
+            ):
+                raise InstallError(
+                    f"operator memory configuration service {name!r} {field} is invalid"
+                )
+        if name == "atlas" and service["enabled"] and any(
+            service.get(field) is None
+            for field in ("credential_env", "database", "collection", "index")
+        ):
+            raise InstallError("operator memory configuration enabled Atlas service is incomplete")
+    return scope
+
+
+def _validated_mutable_configs(
+    harness: Path, *, memory_enabled: bool,
+) -> tuple[dict[str, bytes], dict[str, str] | None]:
+    expected = {
+        "harness-config.json", "resource-manifest.json",
+        *(("memory-product-config.json",) if memory_enabled else ()),
+    }
+    records: dict[str, bytes] = {}
+    scope: dict[str, str] | None = None
+    for name in sorted(expected):
+        path = harness / name
+        content, record = _configuration_record(path)
+        if name == "harness-config.json":
+            _validate_harness_config(record, path)
+        elif name == "resource-manifest.json":
+            _validate_resource_manifest(record, path)
+        else:
+            scope = _validate_memory_product_config(record, path)
+        records[name] = content
+    unexpected_memory = harness / "memory-product-config.json"
+    if not memory_enabled and unexpected_memory.exists():
+        raise InstallError("memory-disabled installation unexpectedly contains memory configuration")
+    return records, scope
+
+
 def _owned_entries(harness: Path) -> tuple[dict[str, str], list[str]]:
     redirected = next((path for path in harness.rglob("*") if _redirected(path)), None)
     if redirected is not None:
@@ -314,10 +528,16 @@ def _verify_owned(install_root: Path, manifest: Mapping[str, Any]) -> None:
         raise InstallError(f"unowned entry exists in installer-owned harness: {harness / extra[0]}")
     if missing:
         raise InstallError(f"installer-owned entry is missing: {harness / missing[0]}")
+    memory_enabled = "memory-product-config.json" in expected_files
+    _validated_mutable_configs(harness, memory_enabled=memory_enabled)
     for relative, expected in raw.items():
         if not isinstance(relative, str) or not isinstance(expected, str):
             raise InstallError("ownership manifest contains a malformed file entry")
         path = harness / relative
+        if relative in MUTABLE_CONFIG_NAMES:
+            if not path.is_file() or _redirected(path):
+                raise InstallError(f"operator configuration is missing or redirected: {path}")
+            continue
         if not path.is_file() or _redirected(path) or _sha(path) != expected:
             raise InstallError(f"installer-owned file is missing or drifted: {path}")
 
@@ -350,6 +570,7 @@ def _copy_update_backup(install_root: Path) -> Path:
         ).is_file():
             raise InstallError("cannot create a complete update rollback snapshot")
         os.replace(staging, backup)
+        _sync_directory(install_root)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -361,7 +582,7 @@ def _restore_update_backup(install_root: Path, backup: Path) -> None:
 
     for name in (
         "venv", "harness", "install-receipt.json", "ownership-manifest.json",
-        "install-state.json", "setup-journal.json",
+        "install-state.json", "setup-journal.json", PENDING_RECEIPT_NAME,
     ):
         current = install_root / name
         if current.is_dir():
@@ -374,22 +595,126 @@ def _restore_update_backup(install_root: Path, backup: Path) -> None:
         elif saved.is_file():
             os.replace(saved, current)
     shutil.rmtree(backup)
+    _sync_directory(install_root)
 
 
-def _recover_interrupted_update(install_root: Path) -> None:
-    """Recover only a provably pre-setup interrupted update."""
+def _discard_update_backup(backup: Path) -> None:
+    shutil.rmtree(backup)
+    _sync_directory(backup.parent)
+
+
+def _remove_receipt_artifact(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        if path.is_dir() and not path.is_symlink():
+            raise InstallError(f"installer receipt artifact is unexpectedly a directory: {path}")
+        path.unlink()
+        _sync_directory(path.parent)
+
+
+def _publish_pending_receipt(pending: Path, receipt: Path) -> None:
+    if not pending.is_file() or _redirected(pending):
+        raise InstallError(f"pending install receipt is missing or redirected: {pending}")
+    if receipt.exists() or receipt.is_symlink():
+        raise InstallError(f"public install receipt already exists before final publication: {receipt}")
+    os.replace(pending, receipt)
+    _sync_directory(receipt.parent)
+
+
+def _validate_completion_candidate(
+    install_root: Path, candidate_path: Path, state: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not candidate_path.is_file() or _redirected(candidate_path):
+        raise InstallError(f"completion receipt candidate is missing or redirected: {candidate_path}")
+    receipt = _read_json(candidate_path, RECEIPT_SCHEMA)
+    ownership_path = install_root / "ownership-manifest.json"
+    if not ownership_path.is_file() or _redirected(ownership_path):
+        raise InstallError("completed installation has no plain ownership manifest")
+    ownership = _read_json(ownership_path, OWNERSHIP_SCHEMA)
+    if (
+        receipt.get("candidate_digest") != state.get("candidate_digest")
+        or receipt.get("project_identity") != state.get("project_identity")
+    ):
+        raise InstallError("completion receipt candidate disagrees with COMPLETE state")
+    requested = receipt.get("requested")
+    if not isinstance(requested, dict):
+        raise InstallError("completion receipt candidate has malformed requested options")
+    _verify_owned(install_root, ownership)
+    _validate_existing_receipt(
+        install_root, receipt, ownership, requested=requested,
+    )
+    return receipt
+
+
+def _recover_interrupted_update(
+    install_root: Path, *, build_tool_paths: Sequence[Path] = (),
+) -> None:
+    """Reconcile hidden/premature receipts and provable update crash states."""
 
     backup = install_root / UPDATE_BACKUP_NAME
-    if not backup.is_dir():
-        return
     state_path = install_root / "install-state.json"
+    receipt_path = install_root / "install-receipt.json"
+    pending_path = install_root / PENDING_RECEIPT_NAME
+    has_recovery_artifact = backup.exists() or pending_path.exists()
+    if not has_recovery_artifact and not receipt_path.exists():
+        return
     try:
         state = _read_json(state_path, STATE_SCHEMA)
     except InstallError:
-        raise InstallError(
-            f"interrupted update cannot be classified; inspect {backup} manually"
+        if has_recovery_artifact:
+            raise InstallError(
+                "interrupted installation cannot be classified; inspect installer records manually"
+            )
+        return
+    state_name = state.get("state")
+
+    if state_name == "COMPLETE":
+        if not has_recovery_artifact:
+            return
+        if pending_path.exists() and receipt_path.exists():
+            _remove_receipt_artifact(receipt_path)
+            raise InstallError(
+                "both pending and public completion receipts exist; inspect installation manually"
+            )
+        candidate = pending_path if pending_path.exists() else receipt_path
+        if not candidate.exists():
+            if backup.is_dir():
+                raise InstallError(
+                    f"COMPLETE update has no receipt candidate; inspect {backup} manually"
+                )
+            return
+        receipt = _validate_completion_candidate(install_root, candidate, state)
+        _validate_installed_environment(
+            install_root,
+            receipt,
+            cwd=install_root / "harness",
+            build_tool_paths=build_tool_paths,
         )
-    if state.get("state") == "SETUP_CHECKED":
+        if candidate == receipt_path and backup.is_dir():
+            os.replace(receipt_path, pending_path)
+            _sync_directory(install_root)
+            candidate = pending_path
+        if backup.exists():
+            if not backup.is_dir() or _redirected(backup):
+                raise InstallError(f"update backup is malformed; inspect {backup} manually")
+            _discard_update_backup(backup)
+        if candidate == pending_path:
+            _publish_pending_receipt(pending_path, receipt_path)
+        return
+
+    # A receipt outside COMPLETE is never success evidence.  Remove installer-owned
+    # premature markers before either rollback or partial-setup classification.
+    if pending_path.exists():
+        _remove_receipt_artifact(pending_path)
+    if receipt_path.exists() and (install_root / "ownership-manifest.json").is_file():
+        _remove_receipt_artifact(receipt_path)
+
+    if not backup.is_dir():
+        return
+    if _redirected(backup):
+        raise InstallError(
+            f"interrupted update backup is redirected; inspect {backup} manually"
+        )
+    if state_name == "SETUP_CHECKED":
         journal_path = install_root / "setup-journal.json"
         journal_error: InstallError | None = None
         try:
@@ -423,7 +748,7 @@ def _recover_interrupted_update(install_root: Path) -> None:
             "interrupted update may have reached setup; setup outcome is unknown and "
             f"manual inspection of {backup} and {journal_path} is required{detail}"
         )
-    if state.get("state") not in {"UPDATING", "PROMOTING"}:
+    if state_name not in {"UPDATING", "PROMOTING"}:
         raise InstallError(
             f"update may have reached setup; inspect {backup} and setup-journal.json manually"
         )
@@ -454,6 +779,7 @@ def _validate_existing_receipt(
     ownership: Mapping[str, Any],
     *,
     requested: Mapping[str, Any],
+    alternate_project_root: Path | None = None,
 ) -> None:
     """Cross-check the reusable receipt against every owned local record."""
 
@@ -526,6 +852,9 @@ def _validate_existing_receipt(
     if not isinstance(hashes, dict) or set(hashes) != config_names:
         raise InstallError("install receipt configuration hashes are malformed")
     harness = install_root / "harness"
+    ownership_files = ownership.get("files")
+    if not isinstance(ownership_files, dict):
+        raise InstallError("ownership manifest files must be an object")
     for name in sorted(config_names):
         path = harness / name
         expected = hashes.get(name)
@@ -534,11 +863,36 @@ def _validate_existing_receipt(
             or re.fullmatch(r"[0-9a-f]{64}", expected) is None
             or not path.is_file()
             or _redirected(path)
-            or _sha(path) != expected
+            or ownership_files.get(name) != expected
         ):
-            raise InstallError(f"install receipt configuration hash mismatch: {path}")
-    if not memory_enabled and (harness / "memory-product-config.json").exists():
-        raise InstallError("memory-disabled installation unexpectedly contains memory configuration")
+            raise InstallError(
+                f"install receipt configuration hash mismatch with ownership anchor: {path}"
+            )
+    _, configured_scope = _validated_mutable_configs(
+        harness, memory_enabled=memory_enabled,
+    )
+    memory_config_path = harness / "memory-product-config.json"
+    if (
+        memory_enabled
+        and configured_scope != scope
+        and _sha(memory_config_path) == hashes["memory-product-config.json"]
+    ):
+        raise InstallError(
+            "install receipt scope disagrees with memory configuration"
+        )
+    _, harness_config = _configuration_record(harness / "harness-config.json")
+    configured_workspace = Path(str(harness_config["root_workspace"]))
+    allowed_workspaces = [Path(str(receipt["project_root"]))]
+    if alternate_project_root is not None:
+        allowed_workspaces.append(alternate_project_root)
+    if not any(
+        _identity(configured_workspace) == _identity(allowed)
+        for allowed in allowed_workspaces
+    ):
+        raise InstallError(
+            "operator harness configuration workspace disagrees with the install receipt "
+            "project binding"
+        )
 
     mutations = receipt.get("setup_mutations")
     if not isinstance(mutations, dict) or set(mutations) != {"planned_paths", "observed_paths"}:
@@ -840,10 +1194,13 @@ def install(options: Options, *, source_root: Path = SOURCE_ROOT) -> dict[str, A
 
     with _InstallLock(options.install_root):
         if options.install_root.exists():
-            _recover_interrupted_update(options.install_root)
+            _recover_interrupted_update(
+                options.install_root, build_tool_paths=options.build_tool_paths,
+            )
         existing_receipt: dict[str, Any] | None = None
         existing_ownership: dict[str, Any] | None = None
         project_relinked = False
+        configuration_reanchor_required = False
         if options.install_root.exists():
             if (
                 not receipt_path.is_file()
@@ -871,6 +1228,14 @@ def install(options: Options, *, source_root: Path = SOURCE_ROOT) -> dict[str, A
                 existing_receipt,
                 existing_ownership,
                 requested=desired,
+                alternate_project_root=(
+                    project_root if options.relink_project else None
+                ),
+            )
+            recorded_configuration = existing_receipt["configuration_sha256"]
+            configuration_reanchor_required = any(
+                _sha(options.install_root / "harness" / name) != expected
+                for name, expected in recorded_configuration.items()
             )
             if tuple(existing_receipt.get("git_root_commits", ())) != git_roots:
                 raise InstallError("install root is owned by a different Git project identity")
@@ -899,7 +1264,11 @@ def install(options: Options, *, source_root: Path = SOURCE_ROOT) -> dict[str, A
                 cwd=options.install_root / "harness",
                 build_tool_paths=options.build_tool_paths,
             )
-            if existing_receipt.get("candidate_digest") == digest and not project_relinked:
+            if (
+                existing_receipt.get("candidate_digest") == digest
+                and not project_relinked
+                and not configuration_reanchor_required
+            ):
                 return {
                     "ok": True,
                     "code": "ALREADY_INSTALLED",
@@ -923,9 +1292,18 @@ def install(options: Options, *, source_root: Path = SOURCE_ROOT) -> dict[str, A
         )
         state_path = options.install_root / "install-state.json"
         update_backup: Path | None = None
+        preserved_configs: dict[str, bytes] = {}
         if existing_receipt is not None:
             update_backup = _copy_update_backup(options.install_root)
+            try:
+                preserved_configs, _ = _validated_mutable_configs(
+                    update_backup / "harness", memory_enabled=options.memory,
+                )
+            except BaseException:
+                _discard_update_backup(update_backup)
+                raise
             receipt_path.unlink()
+            _sync_directory(options.install_root)
         _atomic_json(state_path, {
             "schema": STATE_SCHEMA,
             "state": "UPDATING" if update_backup is not None else "INSTALLING",
@@ -958,6 +1336,15 @@ def install(options: Options, *, source_root: Path = SOURCE_ROOT) -> dict[str, A
             scope = _write_configs(
                 stage, options=options, project_identity=project_identity, store_root=store_root,
             )
+            for name, content in preserved_configs.items():
+                if project_relinked and name == "harness-config.json":
+                    continue
+                _atomic_bytes(stage / name, content)
+            _, preserved_scope = _validated_mutable_configs(
+                stage, memory_enabled=options.memory,
+            )
+            if preserved_scope is not None:
+                scope = preserved_scope
             package_versions = _install_packages(options, source_root)
             _validate_installed_environment(
                 options.install_root,
@@ -1119,13 +1506,15 @@ def install(options: Options, *, source_root: Path = SOURCE_ROOT) -> dict[str, A
             },
             "created_unix_seconds": int(time.time()),
         }
-        _atomic_json(receipt_path, receipt)
+        pending_receipt_path = options.install_root / PENDING_RECEIPT_NAME
+        _atomic_json(pending_receipt_path, receipt)
         _atomic_json(state_path, {
             "schema": STATE_SCHEMA, "state": "COMPLETE",
             "candidate_digest": digest, "project_identity": project_identity,
         })
         if update_backup is not None and update_backup.exists():
-            shutil.rmtree(update_backup)
+            _discard_update_backup(update_backup)
+        _publish_pending_receipt(pending_receipt_path, receipt_path)
         return {
             "ok": True,
             "code": "INSTALL_OK",

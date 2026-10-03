@@ -169,6 +169,14 @@ class NativeReviewEvidenceTests(unittest.TestCase):
     def _run_failed_controller_with_usage(self) -> dict:
         """Run the real terminal controller path with one native usage event."""
 
+        context = memory_handoff.load_final_context(
+            worktree_path=self.worktree,
+            envelope=self.envelope,
+        )
+        exact_dispatch = memory_handoff.dispatch_binding(
+            envelope=self.envelope,
+            context=context,
+        )
         invocation = {
             "schema": "controller-invocation/v1",
             "lane_id": self.lane_id,
@@ -230,7 +238,7 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             patch.object(
                 controller,
                 "_validate_enhanced_dispatch",
-                return_value={"decision_id": self.envelope["decision_id"]},
+                return_value=exact_dispatch,
             ),
             patch.object(
                 controller.processes,
@@ -633,6 +641,49 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         self.assertTrue(self._review()["ok"])
         self.assertEqual(before, (self.folder / "COMPLETION_REVIEW.json").read_bytes())
         self.assertEqual(evidence, self._evidence())
+
+    def test_optional_reconciliation_failure_cannot_suppress_acceptance_and_replays(self) -> None:
+        failed_effects = {
+            "usage": {
+                "status": "error",
+                "retryable": True,
+                "error_type": "StoreError",
+            },
+            "settlement": {
+                "status": "error",
+                "retryable": True,
+                "error_type": "OutcomeSettlementError",
+            },
+        }
+        with patch.object(
+            memory_handoff,
+            "reconcile_native_review_effects",
+            return_value=failed_effects,
+        ):
+            first = self._review()
+        self.assertTrue(first["ok"], first)
+        self.assertTrue((self.folder / "ORCHESTRATOR_ACCEPTANCE.json").is_file())
+        sidecar = review.read_json(
+            self.folder / terminal_evidence.OPTIONAL_RECONCILIATION_NAME
+        )
+        self.assertEqual(failed_effects, sidecar["effects"])
+
+        settled_effects = {
+            "usage": {"status": "settled", "receipt_count": 0},
+            "settlement": {"status": "settled"},
+        }
+        with patch.object(
+            memory_handoff,
+            "reconcile_native_review_effects",
+            return_value=settled_effects,
+        ) as reconcile:
+            replay = self._review()
+        self.assertTrue(replay["ok"], replay)
+        reconcile.assert_called_once()
+        sidecar = review.read_json(
+            self.folder / terminal_evidence.OPTIONAL_RECONCILIATION_NAME
+        )
+        self.assertEqual(settled_effects, sidecar["effects"])
 
     def test_crash_after_evidence_before_acceptance_recovers_without_advancement(self) -> None:
         real_write = review.atomic_write_json

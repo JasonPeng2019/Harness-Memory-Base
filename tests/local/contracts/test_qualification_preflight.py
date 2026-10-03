@@ -339,6 +339,9 @@ def test_live_readiness_requires_exact_candidate_bound_inputs_and_can_be_ready(
     assert argv[argv.index("--live-call-budget") + 1] == "37"
     assert argv[argv.index("--live-cost-budget-usd") + 1] == "1.90"
     assert argv[argv.index("--live-timeout") + 1] == "1800"
+    assert argv[argv.index("--live-verification-receipt") + 1] == str(
+        inputs["verification_receipt_path"]
+    )
     assert report["qualification_evidence_earned"] is False
     rendered = json.dumps(report, sort_keys=True)
     for secret in inputs["environ"].values():
@@ -369,6 +372,51 @@ def test_selector_symlink_escape_is_blocked_without_an_executable_argv(
     assert "qualification_source:tests/live/qualification/test_current_pin_lifecycle.py" in action["missing"]
     assert action["next_argv"] is None
     assert str(external) not in json.dumps(report)
+
+
+def test_selector_reparse_attribute_escape_is_blocked_without_is_junction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CPython 3.11 must reject a Windows junction by its stat attribute."""
+
+    inputs = _ready_inputs(tmp_path, monkeypatch)
+    candidate = inputs["product_root"]
+    assert isinstance(candidate, Path)
+    selector = preflight._LIVE_ACTIONS["live-enhanced"][0]
+    source = candidate / selector.split("::", 1)[0]
+    reparse_component = source.parent
+    real_lstat = Path.lstat
+
+    class ReparseMetadata:
+        st_file_attributes = 0x400
+
+        def __init__(self, wrapped) -> None:
+            self._wrapped = wrapped
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+    def simulated_windows_lstat(path: Path):
+        metadata = real_lstat(path)
+        if path == reparse_component:
+            return ReparseMetadata(metadata)
+        return metadata
+
+    # Path.is_junction does not exist on CPython 3.11.  The file-attribute
+    # fallback must independently prevent a selector through an outside
+    # junction from becoming executable argv.
+    monkeypatch.delattr(Path, "is_junction", raising=False)
+    monkeypatch.setattr(Path, "lstat", simulated_windows_lstat)
+
+    assert not preflight._plain_qualification_source(selector, candidate)
+    report = preflight.build_report(**inputs)
+    action = {
+        row["key"]: row for row in report["coordinates"]
+    }["live-everos"]["actions"][0]
+
+    assert action["status"] == "blocked"
+    assert f"qualification_source:{selector.split('::', 1)[0]}" in action["missing"]
+    assert action["next_argv"] is None
 
 
 @pytest.mark.parametrize(
@@ -437,6 +485,22 @@ def test_receipt_must_cover_the_candidate_declared_complete_suite(
     assert "qualifying_verification_receipt" in action["missing"]
 
 
+def test_receipt_bytes_must_remain_the_canonical_qualified_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = _ready_inputs(tmp_path, monkeypatch)
+    receipt = inputs["verification_receipt_path"]
+    assert isinstance(receipt, Path)
+    receipt.write_text(
+        receipt.read_text(encoding="utf-8") + " ", encoding="utf-8",
+    )
+    report = preflight.build_report(**inputs)
+    action = {
+        row["key"]: row for row in report["coordinates"]
+    }["live-everos"]["actions"][0]
+    assert "qualifying_verification_receipt" in action["missing"]
+
+
 def test_provider_executable_and_authorization_must_form_a_supported_pair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -466,6 +530,36 @@ def test_nonce_file_requires_lowercase_256_bit_shape_without_disclosure(
     action = {row["key"]: row for row in report["coordinates"]}["live-everos"]["actions"][0]
     assert "one_use_authorization_nonce_file" in action["missing"]
     assert contents not in json.dumps(report)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX link fixture")
+@pytest.mark.parametrize("kind", ("symlink", "hardlink", "parent-symlink"))
+def test_preflight_rejects_linked_nonce_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    inputs = _ready_inputs(tmp_path, monkeypatch)
+    original = inputs["authorization_file"]
+    assert isinstance(original, Path)
+    supplied = tmp_path / "linked.nonce"
+    if kind == "symlink":
+        supplied.symlink_to(original)
+    elif kind == "hardlink":
+        os.link(original, supplied)
+    else:
+        real = tmp_path / "nonce-parent"
+        real.mkdir()
+        nested = real / "linked.nonce"
+        nested.write_bytes(original.read_bytes())
+        alias = tmp_path / "nonce-parent-alias"
+        alias.symlink_to(real, target_is_directory=True)
+        supplied = alias / nested.name
+    inputs["authorization_file"] = supplied
+
+    report = preflight.build_report(**inputs)
+    action = {
+        row["key"]: row for row in report["coordinates"]
+    }["live-everos"]["actions"][0]
+    assert "one_use_authorization_nonce_file" in action["missing"]
 
 
 def test_egress_and_topology_require_schema_and_artifact_bound_proofs_not_env_flags(

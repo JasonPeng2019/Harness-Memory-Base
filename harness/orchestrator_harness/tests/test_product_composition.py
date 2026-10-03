@@ -11,6 +11,7 @@ from memory_harness import apc, config, contracts, experience, store
 from orchestrator_harness import (
     bootstrap,
     memory_handoff,
+    memory_product_config,
     product_composition,
     resume,
     setup,
@@ -178,6 +179,99 @@ class ProductCompositionTests(unittest.TestCase):
         self.assertIn("configured content secret", result["summary"])
         self.assertNotIn(self.secret, result["summary"])
         self.assertFalse(worktree.exists())
+
+    def test_credential_extension_fails_before_worktree(self) -> None:
+        card, _ = accepted_card(objective="credential-extension-preflight")
+        card["password"] = "fixture-extension-value"
+        self._rehash(card)
+        result, worktree = self.fixture.run_bootstrap(
+            lane_id="credential-extension-preflight", card=card
+        )
+        self.assertFalse(result["ok"], result)
+        self.assertIn("prohibited", result["summary"])
+        self.assertNotIn("fixture-extension-value", result["summary"])
+        self.assertFalse(worktree.exists())
+
+    def test_malformed_task_credential_declaration_fails_before_worktree(self) -> None:
+        for index, declaration in enumerate(
+            (
+                ["PASSWORD=credential-value"],
+                ["TASK_ONLY_TOKEN", "TASK_ONLY_TOKEN"],
+                ["TASK_ONLY_CONTROL_TOKEN"],
+            ),
+            start=1,
+        ):
+            with self.subTest(declaration=declaration):
+                card, _ = accepted_card(
+                    objective=f"invalid-task-credential-{index}"
+                )
+                card["worker_task_credentials"] = declaration
+                self._rehash(card)
+                result, worktree = self.fixture.run_bootstrap(
+                    lane_id=f"invalid-task-credential-{index}", card=card
+                )
+                self.assertFalse(result["ok"], result)
+                self.assertIn("worker_task_credentials", result["summary"])
+                self.assertNotIn("credential-value", result["summary"])
+                self.assertFalse(worktree.exists())
+
+    def test_unknown_requested_configuration_fails_before_effects(self) -> None:
+        for index, request in enumerate(
+            (
+                {"experince_write": False},
+                {"network_profiel": "restricted_local"},
+            ),
+            start=1,
+        ):
+            with self.subTest(request=request):
+                card, _ = accepted_card(
+                    objective=f"invalid-request-{index}", configuration=request
+                )
+                result, worktree = self.fixture.run_bootstrap(
+                    lane_id=f"invalid-request-{index}", card=card
+                )
+                self.assertFalse(result["ok"], result)
+                self.assertIn("unknown requested configuration field", result["summary"])
+                self.assertFalse(worktree.exists())
+
+    def test_configured_service_auth_and_value_alias_are_absent_from_spawn(self) -> None:
+        config_path = self.fixture.harness / "memory-product-config.json"
+        configured = json.loads(config_path.read_text(encoding="utf-8"))
+        configured["policy_generation"] = "test-generation-2"
+        configured["services"]["atlas"]["credential_env"] = "PRIVATE_ATLAS_URI"
+        self.fixture.write_json(config_path, configured)
+        memory_product_config.record_secret_rotation_state(
+            memory_product_config.load_memory_product_config(self.fixture.harness)
+        )
+
+        card, _ = accepted_card(objective="configured-service-auth")
+        prepared, _ = self.fixture.run_bootstrap(
+            lane_id="configured-service-auth", card=card
+        )
+        self.assertTrue(prepared["ok"], prepared)
+        with patch.dict(
+            "os.environ",
+            {
+                "PRIVATE_ATLAS_URI": "fixture-private-service-auth",
+                "UNRELATED_ALIAS": "fixture-private-service-auth",
+                "EMBEDDED_ALIAS": "prefix-fixture-private-service-auth-suffix",
+            },
+        ):
+            launched, spawn = self.fixture.run_launch(
+                lane_id="configured-service-auth"
+            )
+        self.assertTrue(launched["ok"], launched)
+        worker_env = spawn.call_args.kwargs["env"]
+        self.assertNotIn("PRIVATE_ATLAS_URI", worker_env)
+        self.assertNotIn("UNRELATED_ALIAS", worker_env)
+        self.assertNotIn("EMBEDDED_ALIAS", worker_env)
+        self.assertNotIn("fixture-private-service-auth", worker_env.values())
+        self.assertFalse(
+            any(
+                "fixture-private-service-auth" in value
+                for value in worker_env.values()
+            )
+        )
 
     def test_unsupported_provider_is_refused_before_enhanced_product_effects(self) -> None:
         qwen = LaunchBoundaryFixture(include_qwen=True)

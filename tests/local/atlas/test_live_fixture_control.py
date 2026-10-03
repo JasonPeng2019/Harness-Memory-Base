@@ -329,12 +329,24 @@ class AtlasLiveHandoffControlTests(unittest.TestCase):
         )
         self.assertNotEqual(expected["collection"], other["collection"])
 
-    def test_opt_out_still_skips_without_identity_or_remote_setup(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(unittest.SkipTest):
-                fixture.LiveAtlasTrustedProcedureTests(
-                    "test_vector_discovery_exact_validation_and_revocation"
-                ).test_vector_discovery_exact_validation_and_revocation()
+    def test_legacy_ambient_authorization_cannot_reach_atlas(self) -> None:
+        fake_client = mock.Mock(side_effect=AssertionError("MongoClient reached"))
+        fake_pymongo = types.SimpleNamespace(MongoClient=fake_client)
+        hostile_environment = {
+            "MEMORY_HARNESS_RUN_LIVE_ATLAS": "1",
+            "MEMORY_HARNESS_ATLAS_URI": "mongodb://offline.invalid",
+            "MEMORY_HARNESS_ATLAS_LIVE_DATABASE": "synthetic_live",
+            "MEMORY_HARNESS_ATLAS_RUN_TOKEN": (
+                "1c2850372db24777bf0a2e72dfd341c4"
+            ),
+        }
+        with mock.patch.dict(os.environ, hostile_environment, clear=True):
+            with mock.patch.dict(sys.modules, {"pymongo": fake_pymongo}):
+                with self.assertRaises(unittest.SkipTest):
+                    fixture.LiveAtlasTrustedProcedureTests(
+                        "test_vector_discovery_exact_validation_and_revocation"
+                    ).test_vector_discovery_exact_validation_and_revocation()
+        self.assertEqual(0, fake_client.call_count)
 
     def test_opt_in_rejects_invalid_identity_before_remote_setup(self) -> None:
         tokens = (
@@ -342,35 +354,14 @@ class AtlasLiveHandoffControlTests(unittest.TestCase):
             "1C2850372DB24777BF0A2E72DFD341C4",
             "1c2850372db23777bf0a2e72dfd341c4",
         )
-        fake_client = mock.Mock(side_effect=AssertionError("MongoClient reached"))
-        fake_pymongo = types.SimpleNamespace(MongoClient=fake_client)
         for token in tokens:
             with self.subTest(token=token):
-                environment = {
-                    "MEMORY_HARNESS_RUN_LIVE_ATLAS": "1",
-                    "MEMORY_HARNESS_ATLAS_URI": "mongodb://offline.invalid",
-                    "MEMORY_HARNESS_ATLAS_LIVE_DATABASE": "synthetic_live",
-                }
-                if token is not None:
-                    environment["MEMORY_HARNESS_ATLAS_RUN_TOKEN"] = token
-                with mock.patch.dict(os.environ, environment, clear=True):
-                    with mock.patch.dict(sys.modules, {"pymongo": fake_pymongo}):
-                        with self.assertRaises(ValueError):
-                            fixture.LiveAtlasTrustedProcedureTests(
-                                "test_vector_discovery_exact_validation_and_revocation"
-                            ).test_vector_discovery_exact_validation_and_revocation()
-        with mock.patch.dict(os.environ, {
-            "MEMORY_HARNESS_RUN_LIVE_ATLAS": "1",
-            "MEMORY_HARNESS_ATLAS_URI": "mongodb://offline.invalid",
-            "MEMORY_HARNESS_ATLAS_LIVE_DATABASE": "invalid.name",
-            "MEMORY_HARNESS_ATLAS_RUN_TOKEN": "1c2850372db24777bf0a2e72dfd341c4",
-        }, clear=True):
-            with mock.patch.dict(sys.modules, {"pymongo": fake_pymongo}):
                 with self.assertRaises(ValueError):
-                    fixture.LiveAtlasTrustedProcedureTests(
-                        "test_vector_discovery_exact_validation_and_revocation"
-                    ).test_vector_discovery_exact_validation_and_revocation()
-        self.assertEqual(0, fake_client.call_count)
+                    fixture.owned_atlas_identity("synthetic_live", token)
+        with self.assertRaises(ValueError):
+            fixture.owned_atlas_identity(
+                "invalid.name", "1c2850372db24777bf0a2e72dfd341c4",
+            )
 
     def test_failed_action_and_failed_drop_leave_independent_exact_target(self) -> None:
         token = "1c2850372db24777bf0a2e72dfd341c4"

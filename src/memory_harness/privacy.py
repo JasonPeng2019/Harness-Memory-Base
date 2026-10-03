@@ -28,6 +28,15 @@ _SAFE_SCALAR = re.compile(
     "|".join(re.escape(token) for token in sorted(_SAFE_AUTHORITY | {"0", "null"}, key=len, reverse=True)),
     re.IGNORECASE,
 )
+_TASK_CREDENTIAL_NAME = re.compile(r"TASK_ONLY_[A-Z0-9_]+")
+_TASK_CREDENTIAL_WORDS = frozenset({
+    "TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "CREDENTIALS",
+    "AUTH", "ASKPASS",
+})
+_CONTROL_AUTHORITY_WORDS = frozenset({
+    "APPROVAL", "APPROVE", "PUBLICATION", "PUBLISH", "REVOCATION",
+    "REVOKE", "POLICY", "CONTROL",
+})
 _CONCEPTS = tuple(sorted(_CREDENTIAL_WORDS | _AUTHORITY_ACTIONS | _AUTHORITY_GRANTS | {
     "api", "access", "refresh", "root", "role", "token", "manager", "admin", "execute", "parent",
     "memory", "plane", "private", "key", "approval", "publication", "mutation",
@@ -305,6 +314,60 @@ def guard_worker_bound(value: Any, policy: PrivacyPolicy | None = None) -> None:
     finding = worker_bound_finding(value, policy)
     if finding:
         raise MandatorySecretError(f"worker-bound content contains prohibited {finding}")
+
+
+def guard_worker_task_card(
+    task_card: Mapping[str, Any], policy: PrivacyPolicy | None = None
+) -> None:
+    """Reject prohibited meaning in the exact worker-readable task card.
+
+    ``worker_task_credentials`` is a declaration of environment *names*, not a
+    credential channel or a credential value.  The harness validates those
+    names separately and currently withholds them.  Exclude that one metadata
+    field from the content scan so the declaration cannot make an otherwise
+    safe card look like a delivered secret; every other task-card field,
+    including extension fields, remains worker-bound and is scanned.
+    """
+
+    if not isinstance(task_card, Mapping):
+        raise MandatorySecretError("worker-bound task card is not an object")
+    validate_worker_task_credentials(task_card.get("worker_task_credentials", []))
+    visible = {
+        key: value
+        for key, value in task_card.items()
+        if key != "worker_task_credentials"
+    }
+    guard_worker_bound(visible, policy)
+
+
+def validate_worker_task_credentials(value: Any) -> frozenset[str]:
+    """Validate the sole task-card field excluded from semantic scanning.
+
+    The declaration can contain canonical task-only environment *names*, never
+    assignments, values, aliases, control-authority names, or duplicates.  It
+    must be validated at every task-card contract boundary before the field is
+    excluded from the general worker-content scanner.
+    """
+
+    if not isinstance(value, list) or any(not isinstance(key, str) for key in value):
+        raise MandatorySecretError(
+            "worker_task_credentials must list environment names"
+        )
+    if len(value) != len(set(value)):
+        raise MandatorySecretError(
+            "worker_task_credentials contains duplicate names"
+        )
+    for key in value:
+        words = set(re.split(r"[^A-Z0-9]+", key.upper()))
+        if (
+            _TASK_CREDENTIAL_NAME.fullmatch(key) is None
+            or not (words & _TASK_CREDENTIAL_WORDS)
+            or (words & _CONTROL_AUTHORITY_WORDS)
+        ):
+            raise MandatorySecretError(
+                "worker_task_credentials contains a non-task credential name"
+            )
+    return frozenset(value)
 
 
 def guard_worker_bound_remote(value: Any, policy: PrivacyPolicy | None = None) -> None:

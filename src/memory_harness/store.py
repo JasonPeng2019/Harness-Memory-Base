@@ -1504,7 +1504,15 @@ class MemoryStore:
         """Called inside the same write transaction as native quality fixation."""
         connection = self._require_connection()
         captured = decision["configuration"]
-        for kind in contracts.LOCAL_EFFECT_KINDS:
+        # UNKNOWN is an exact terminal fact, not reviewed reusable experience.
+        # Retain its ROOT review receipt but do not create trajectory-dependent
+        # operations that can never acquire a valid source.
+        kinds = (
+            ("review_receipt",)
+            if outcome.get("status") == "UNKNOWN"
+            else contracts.LOCAL_EFFECT_KINDS
+        )
+        for kind in kinds:
             if not effect_submission_enabled(captured, kind):
                 continue
             operation_id = contracts.effect_operation_id(outcome["outcome_id"], kind)

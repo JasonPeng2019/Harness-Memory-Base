@@ -220,6 +220,13 @@ def compose_product(
             "trusted task card contains a configured content secret; remove it "
             "or use an approved task-only credential channel before bootstrap"
         )
+    try:
+        privacy.guard_worker_task_card(task_card, privacy_policy)
+    except privacy.MandatorySecretError as exc:
+        raise ProductCompositionError(
+            "trusted task card contains prohibited worker-bound credential or "
+            "authority meaning; use an approved task-only channel before bootstrap"
+        ) from exc
     scope = experience.ExperienceScope.from_record(scope_record)
     from memory_harness import config as memory_config
 

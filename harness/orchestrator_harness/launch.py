@@ -595,26 +595,28 @@ def run_launch(
         if memory_envelope is not None:
             try:
                 spawn_options["env"] = memory_handoff.worker_environment(
-                    task_card, provider_id=provider_id
+                    task_card, provider_id=provider_id, harness_root=harness_root
                 )
                 memory_handoff.validate_worker_material(
                     worktree_path=lane["worktree_path"],
                     invocation=invocation,
                     environment=spawn_options["env"],
                     task_card=task_card,
+                    harness_root=harness_root,
                 )
             except memory_handoff.MemoryHandoffError as exc:
                 raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
         elif worker_environment == WORKER_ENVIRONMENT_SCRUBBED:
             try:
                 spawn_options["env"] = memory_handoff.worker_environment(
-                    task_card, provider_id=provider_id
+                    task_card, provider_id=provider_id, harness_root=harness_root
                 )
                 memory_handoff.validate_worker_material(
                     worktree_path=lane["worktree_path"],
                     invocation=invocation,
                     environment=spawn_options["env"],
                     task_card=task_card,
+                    harness_root=harness_root,
                 )
             except memory_handoff.MemoryHandoffError as exc:
                 raise LaunchError(LAUNCH_INVOCATION_INVALID, str(exc)) from exc
@@ -683,6 +685,7 @@ def run_launch(
                         invocation=invocation,
                         environment=spawn_options["env"],
                         task_card=current_card,
+                        harness_root=harness_root,
                     )
                     existing = memory_handoff.get_dispatch_operation(
                         worktree_path=lane["worktree_path"], envelope=memory_envelope

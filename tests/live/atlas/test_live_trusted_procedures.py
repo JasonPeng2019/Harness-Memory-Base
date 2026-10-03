@@ -12,6 +12,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -369,80 +371,26 @@ def run_owned_collection(collection: object, *, action: object, manifest_path: P
             collection.drop()
 
 
+@pytest.fixture
+def _authorized_live_atlas(request, live_authorization) -> None:
+    """Bind the shared session gate to this legacy unittest instance."""
+
+    request.instance.live_authorization = live_authorization
+
+
+@pytest.mark.usefixtures("_authorized_live_atlas")
 class LiveAtlasTrustedProcedureTests(unittest.TestCase):
-    """One synthetic UUID-owned collection; explicit manifest path opts in to handoff."""
+    """Legacy entrypoint retained only as a gated, non-effectful sentinel."""
 
     def test_vector_discovery_exact_validation_and_revocation(self) -> None:
-        if os.environ.get("MEMORY_HARNESS_RUN_LIVE_ATLAS") != "1":
-            self.skipTest("set MEMORY_HARNESS_RUN_LIVE_ATLAS=1 for the owned live Atlas test")
-        uri = os.environ.get("MEMORY_HARNESS_ATLAS_URI")
-        run_token = os.environ.get("MEMORY_HARNESS_ATLAS_RUN_TOKEN")
-        identity = owned_atlas_identity(
-            os.environ.get("MEMORY_HARNESS_ATLAS_LIVE_DATABASE"), run_token
+        if not hasattr(self, "live_authorization"):
+            self.skipTest(
+                "legacy Atlas variables are not authorization; use the shared live gate"
+            )
+        self.skipTest(
+            "direct Atlas mutation is retired; the authorized current-pin driver "
+            "is the only live Atlas proof path"
         )
-        database = identity["database"]
-        if not uri:
-            self.skipTest("set MEMORY_HARNESS_ATLAS_URI")
-        handoff_path = os.environ.get("MEMORY_HARNESS_ATLAS_HANDOFF_MANIFEST_PATH")
-        if handoff_path == "":
-            raise ValueError("handoff manifest path must be nonempty")
-        try:
-            from pymongo import MongoClient
-        except ImportError as exc:  # pragma: no cover - environment gated
-            self.skipTest(f"Atlas optional dependency unavailable: {exc.__class__.__name__}")
-
-        namespace = identity["namespace"]
-        collection_name = identity["collection"]
-        index_name = identity["index"]
-        client = MongoClient(uri, serverSelectionTimeoutMS=10_000)
-        collection = client[database][collection_name]
-        temporary = tempfile.TemporaryDirectory()
-        memory_store = store.MemoryStore(Path(temporary.name) / "memory.sqlite3")
-
-        def action() -> dict:
-            memory_store.initialize()
-            scope = {
-                "application": "memory-harness-live-test",
-                "project": "step18-synthetic",
-                "namespace": namespace,
-                "owner": "root-live-test",
-            }
-            fixtures = (
-                make_fixture(scope, run_token, retained=True),
-                make_fixture(scope, run_token, retained=False),
-            )
-            service = procedures.TrustedProcedureService(
-                memory_store, trusted_issuers={"ROOT"}
-            )
-            adapter = atlas.AtlasProcedureAdapter.from_pymongo_collection(
-                collection=collection,
-                embedding=DeterministicEmbeddings(),
-                index_name=index_name,
-            )
-            create_fixture_index(adapter, fixtures=fixtures)
-            retained, _ = prove_fixture_eligibility(
-                self, service=service, adapter=adapter, scope=scope,
-                run_token=run_token, fixtures=fixtures,
-            )
-            return handoff_manifest(
-                database=database, collection=collection_name, index=index_name,
-                publication=retained, receiver=scope, query=ELIGIBLE_QUERY,
-                route=ROUTE, facts=FACTS,
-            )
-
-        try:
-            run_owned_collection(
-                collection, action=action,
-                manifest_path=Path(handoff_path) if handoff_path is not None else None,
-            )
-        finally:
-            try:
-                client.close()
-            finally:
-                try:
-                    memory_store.close()
-                finally:
-                    temporary.cleanup()
 
 
 if __name__ == "__main__":

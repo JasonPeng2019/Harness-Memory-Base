@@ -20,6 +20,8 @@ TERMINAL_EVIDENCE_SCHEMA = "native-terminal-evidence/v1"
 TERMINAL_EVIDENCE_NAME = "NATIVE_TERMINAL_EVIDENCE.json"
 REJECTED_ATTEMPT_NAME = "REJECTED_NATIVE_ATTEMPT.json"
 ACCEPTED_OUTCOME_NAME = "NATIVE_OUTCOME_RECORDED.json"
+OPTIONAL_RECONCILIATION_NAME = "NATIVE_OPTIONAL_RECONCILIATION.json"
+OPTIONAL_RECONCILIATION_SCHEMA = "native-optional-reconciliation/v1"
 
 
 class TerminalEvidenceError(ValueError):
@@ -109,6 +111,7 @@ def record_domain_review(
     result = memory_handoff.record_native_review(
         worktree_path=lane["worktree_path"], evidence=evidence,
         attempts_path=attempts_path,
+        reconcile_optional=False,
     )
     authorization = ({
         "schema": "rejected-native-authorization/v1",
@@ -131,6 +134,40 @@ def record_domain_review(
         else:
             atomic_write_json(path, authorization)
     return authorization if rejected else None
+
+
+def reconcile_optional_effects(
+    rt: Path, epoch_id: str, lane: Mapping[str, Any], evidence: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Retry post-acceptance bookkeeping and publish its current safe status."""
+
+    from . import memory_handoff
+
+    if evidence.get("acceptance", {}).get("approval") != "ACCEPTED":
+        return None
+    worktree = Path(str(lane["worktree_path"]))
+    if not worktree.is_dir():
+        return None
+    root_folder = lane_record_dir(rt, epoch_id, str(lane["lane_id"]))
+    attempts_path = root_folder / "controller.attempts.jsonl"
+    status = memory_handoff.reconcile_native_review_effects(
+        worktree_path=worktree,
+        evidence=evidence,
+        attempts_path=attempts_path,
+    )
+    record: dict[str, Any] = {
+        "schema": OPTIONAL_RECONCILIATION_SCHEMA,
+        "lane_id": evidence["lane_id"],
+        "run_id": evidence["run_id"],
+        "decision_id": evidence["decision_id"],
+        "evidence_digest": evidence["content_hash"],
+        "effects": status,
+    }
+    record["content_hash"] = content_hash(record)
+    path = publication_dir(rt, epoch_id, lane) / OPTIONAL_RECONCILIATION_NAME
+    with RecordLock(path):
+        atomic_write_json(path, record)
+    return record
 
 
 def _validate_retained_sources(

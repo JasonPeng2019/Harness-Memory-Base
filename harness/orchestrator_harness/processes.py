@@ -1288,6 +1288,8 @@ class ProcessBoundary:
         captured: dict[int, str] = {}
         recorded_identities = set(self._owned)
         known_pids = {pid for pid, _ in recorded_identities}
+        boundary_candidates: list[tuple[ProcessInfo, str]] = []
+        boundary_anchored = False
         for item in snapshot.processes:
             in_boundary = (
                 self.process_group_id is not None
@@ -1300,15 +1302,27 @@ class ProcessBoundary:
             creation = self._snapshot_identity(item)
             if creation is None:
                 continue
-            if (item.pid, creation) not in recorded_identities:
+            if (item.pid, creation) in recorded_identities:
+                # A current exact incarnation, not a historical numeric group
+                # or session ID, is the durable anchor that may authorize the
+                # discovery of new descendants in this snapshot.
+                if in_boundary:
+                    boundary_anchored = True
+            else:
                 if not in_boundary:
                     continue
                 # Membership would rest on a snapshot containment fact alone;
                 # the snapshot incarnation must be the live incarnation.
                 if not self._snapshot_identity_bound(item, creation):
                     continue
+                boundary_candidates.append((item, creation))
+                continue
             captured[item.pid] = creation
             selected.append(item)
+        if boundary_anchored:
+            for item, creation in boundary_candidates:
+                captured[item.pid] = creation
+                selected.append(item)
         changed = True
         while changed:
             changed = False

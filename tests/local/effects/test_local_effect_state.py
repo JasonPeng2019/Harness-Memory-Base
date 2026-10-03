@@ -198,7 +198,7 @@ class LocalEffectStateTests(unittest.TestCase):
         case.observe()
         outcome = case.runtime.record_terminal_outcome(case.bundle())
         effects = case.state.list_effect_operations(outcome["outcome_id"])
-        self.assertEqual({"review_receipt", "recent_evidence"}, {effect["kind"] for effect in effects})
+        self.assertEqual({"review_receipt"}, {effect["kind"] for effect in effects})
         self.assertTrue(all(effect["configuration_digest"] == case.decision["configuration_digest"]
                             for effect in effects))
         self._review(outcome)
@@ -233,7 +233,7 @@ class LocalEffectStateTests(unittest.TestCase):
         outcome = case.runtime.record_terminal_outcome(case.bundle())
         effects = case.state.list_effect_operations(outcome["outcome_id"])
         self.assertEqual(
-            {"review_receipt", "recent_evidence"}, {effect["kind"] for effect in effects}
+            {"review_receipt"}, {effect["kind"] for effect in effects}
         )
         self.assertTrue(all(effect["configuration"] == captured for effect in effects))
         case.state.close()

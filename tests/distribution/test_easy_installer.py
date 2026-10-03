@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -258,6 +259,264 @@ def _skip_installed_environment_validation(monkeypatch: pytest.MonkeyPatch) -> N
         "_validate_installed_environment",
         lambda _root, _receipt, *, cwd, build_tool_paths=(): None,
     )
+
+
+def test_update_preserves_valid_operator_configuration_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    digests = iter(("a" * 64, "b" * 64, "b" * 64))
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: next(digests))
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+
+    harness = install_root / "harness"
+    secret = install_root / "memory" / "secrets" / "atlas-token.txt"
+    secret.write_text("operator secret\n", encoding="utf-8")
+    if os.name == "posix":
+        secret.chmod(0o600)
+    configured = {
+        "harness-config.json": (
+            json.dumps({
+                "managed_coordination": "disabled",
+                "root_workspace": str(project.resolve()),
+            }, indent=2, sort_keys=False) + "\n"
+        ).encode(),
+        "resource-manifest.json": (
+            json.dumps({
+                "resources": [{"exclusive": True, "id": "operator-gpu"}],
+                "schema": "resource-manifest/v1",
+            }, indent=4, sort_keys=False) + "\n"
+        ).encode(),
+    }
+    memory_path = harness / "memory-product-config.json"
+    memory = json.loads(memory_path.read_text(encoding="utf-8"))
+    memory.update({
+        "application": "operator-app",
+        "namespace": "operator-namespace",
+        "project": "operator-project",
+        "owner": "OPERATOR_ROOT",
+        "policy_generation": "operator-generation-7",
+        "known_secret_files": [str(secret)],
+    })
+    memory["services"]["atlas"] = {
+        "enabled": True,
+        "credential_env": "ATLAS_OPERATOR_TOKEN",
+        "database": "operator_db",
+        "collection": "operator_collection",
+        "index": "operator_index",
+    }
+    configured["memory-product-config.json"] = (
+        json.dumps(memory, indent=3, sort_keys=False) + "\n"
+    ).encode()
+    for name, content in configured.items():
+        (harness / name).write_bytes(content)
+
+    updated = install_product.install(options, source_root=PRODUCT)
+
+    assert updated["code"] == "INSTALL_OK"
+    assert updated["setup"]["code"] == "SETUP_SKIPPED"
+    for name, content in configured.items():
+        assert (harness / name).read_bytes() == content
+    receipt = json.loads((install_root / "install-receipt.json").read_text(encoding="utf-8"))
+    ownership = json.loads((install_root / "ownership-manifest.json").read_text(encoding="utf-8"))
+    assert receipt["scope"] == {
+        "application": "operator-app",
+        "namespace": "operator-namespace",
+        "project": "operator-project",
+        "owner": "OPERATOR_ROOT",
+    }
+    for name, content in configured.items():
+        expected = hashlib.sha256(content).hexdigest()
+        assert receipt["configuration_sha256"][name] == expected
+        assert ownership["files"][name] == expected
+    assert install_product.install(options, source_root=PRODUCT)["code"] == "ALREADY_INSTALLED"
+    for name, content in configured.items():
+        assert (harness / name).read_bytes() == content
+
+
+def test_valid_harness_config_cannot_rebind_receipt_to_unrelated_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path, "bound-project")
+    unrelated = _project(tmp_path, "unrelated-project")
+    install_root = tmp_path / "install"
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: "a" * 64)
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+    config_path = install_root / "harness" / "harness-config.json"
+    configured = {
+        "root_workspace": str(unrelated.resolve()),
+        "managed_coordination": "disabled",
+    }
+    install_product._atomic_json(config_path, configured)
+    prior_receipt = (install_root / "install-receipt.json").read_bytes()
+
+    with pytest.raises(install_product.InstallError, match="workspace.*project binding"):
+        install_product.install(options, source_root=PRODUCT)
+
+    assert json.loads(config_path.read_text(encoding="utf-8")) == configured
+    assert (install_root / "install-receipt.json").read_bytes() == prior_receipt
+    assert not (install_root / install_product.UPDATE_BACKUP_NAME).exists()
+
+
+def test_same_candidate_valid_memory_edit_is_preserved_and_receipt_reanchored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: "a" * 64)
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+    memory_path = install_root / "harness" / "memory-product-config.json"
+    memory = json.loads(memory_path.read_text(encoding="utf-8"))
+    memory["namespace"] = "operator-edited-namespace"
+    configured = (json.dumps(memory, indent=3, sort_keys=False) + "\n").encode()
+    memory_path.write_bytes(configured)
+
+    refreshed = install_product.install(options, source_root=PRODUCT)
+
+    assert refreshed["code"] == "INSTALL_OK"
+    assert memory_path.read_bytes() == configured
+    receipt = json.loads((install_root / "install-receipt.json").read_text(encoding="utf-8"))
+    ownership = json.loads((install_root / "ownership-manifest.json").read_text(encoding="utf-8"))
+    expected_hash = hashlib.sha256(configured).hexdigest()
+    assert receipt["scope"]["namespace"] == "operator-edited-namespace"
+    assert receipt["configuration_sha256"]["memory-product-config.json"] == expected_hash
+    assert ownership["files"]["memory-product-config.json"] == expected_hash
+    assert install_product.install(options, source_root=PRODUCT)["code"] == "ALREADY_INSTALLED"
+
+
+def test_same_candidate_rejects_receipt_scope_tamper_when_config_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: "a" * 64)
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+    receipt_path = install_root / "install-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["scope"]["namespace"] = "tampered-receipt-namespace"
+    install_product._atomic_json(receipt_path, receipt)
+
+    with pytest.raises(install_product.InstallError, match="scope disagrees with memory configuration"):
+        install_product.install(options, source_root=PRODUCT)
+
+    configured = json.loads(
+        (install_root / "harness/memory-product-config.json").read_text(encoding="utf-8")
+    )
+    assert configured["namespace"] != "tampered-receipt-namespace"
+
+
+@pytest.mark.parametrize("config_name", [
+    "harness-config.json",
+    "resource-manifest.json",
+    "memory-product-config.json",
+])
+def test_update_rejects_invalid_operator_configuration_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_name: str,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: "a" * 64)
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+    receipt_path = install_root / "install-receipt.json"
+    prior_receipt = receipt_path.read_bytes()
+    config_path = install_root / "harness" / config_name
+    if config_name == "harness-config.json":
+        invalid = {"root_workspace": "relative/workspace", "managed_coordination": "enabled"}
+    elif config_name == "resource-manifest.json":
+        invalid = {
+            "schema": "resource-manifest/v1",
+            "resources": [
+                {"id": "duplicate", "exclusive": True},
+                {"id": "duplicate", "exclusive": True},
+            ],
+        }
+    else:
+        invalid = json.loads(config_path.read_text(encoding="utf-8"))
+        invalid["unknown_operator_key"] = True
+    install_product._atomic_json(config_path, invalid)
+    invalid_bytes = config_path.read_bytes()
+
+    with pytest.raises(install_product.InstallError, match="operator .* configuration|resource manifest"):
+        install_product.install(options, source_root=PRODUCT)
+
+    assert config_path.read_bytes() == invalid_bytes
+    assert receipt_path.read_bytes() == prior_receipt
+    assert not (install_root / install_product.UPDATE_BACKUP_NAME).exists()
+    assert not (install_root / install_product.PENDING_RECEIPT_NAME).exists()
+
+
+def test_mutable_config_exception_does_not_weaken_other_owned_file_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: "a" * 64)
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+    target = install_root / "harness" / "tools" / "qualification_preflight.py"
+    target.write_bytes(target.read_bytes() + b"\n# operator drift\n")
+    prior_receipt = (install_root / "install-receipt.json").read_bytes()
+
+    with pytest.raises(install_product.InstallError, match="owned file is missing or drifted"):
+        install_product.install(options, source_root=PRODUCT)
+
+    assert target.read_bytes().endswith(b"# operator drift\n")
+    assert (install_root / "install-receipt.json").read_bytes() == prior_receipt
+
+
+def test_failed_update_restores_operator_configuration_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    digests = iter(("a" * 64, "b" * 64))
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: next(digests))
+    _skip_installed_environment_validation(monkeypatch)
+    calls = 0
+
+    def packages(options: install_product.Options, source: Path) -> dict[str, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise install_product.InstallError("injected package update failure")
+        return _fake_packages(options, source)
+
+    monkeypatch.setattr(install_product, "_install_packages", packages)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+    config_path = install_root / "harness" / "harness-config.json"
+    configured = (
+        json.dumps({
+            "managed_coordination": "disabled",
+            "root_workspace": str(project.resolve()),
+        }, indent=4) + "\n"
+    ).encode()
+    config_path.write_bytes(configured)
+
+    with pytest.raises(install_product.InstallError, match="package update failure"):
+        install_product.install(options, source_root=PRODUCT)
+
+    assert config_path.read_bytes() == configured
+    assert json.loads((install_root / "install-receipt.json").read_text(encoding="utf-8"))["candidate_digest"] == "a" * 64
+    assert not (install_root / install_product.UPDATE_BACKUP_NAME).exists()
 
 
 def test_real_no_setup_install_validates_console_without_touching_project(
@@ -766,6 +1025,306 @@ def test_interrupted_setup_checked_update_is_reclassified_partial(
     assert journal["state"] == "PARTIAL_SETUP"
     assert journal["outcome_known"] is False
     assert journal["manual_repair_required"] is True
+
+
+def test_update_crash_before_complete_restores_prior_receipt_and_removes_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    digests = iter(("a" * 64, "b" * 64, "a" * 64))
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: next(digests))
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+    original_atomic = install_product._atomic_json
+    crashed = False
+
+    def crash_before_complete(path: Path, document: dict[str, object]) -> None:
+        nonlocal crashed
+        if path.name == "install-state.json" and document.get("state") == "COMPLETE" and not crashed:
+            crashed = True
+            raise SystemExit("injected before COMPLETE")
+        original_atomic(path, document)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(install_product, "_atomic_json", crash_before_complete)
+        with pytest.raises(SystemExit, match="before COMPLETE"):
+            install_product.install(options, source_root=PRODUCT)
+
+    assert not (install_root / "install-receipt.json").exists()
+    assert (install_root / install_product.PENDING_RECEIPT_NAME).is_file()
+    assert (install_root / install_product.UPDATE_BACKUP_NAME).is_dir()
+
+    recovered = install_product.install(options, source_root=PRODUCT)
+
+    assert recovered["code"] == "ALREADY_INSTALLED"
+    receipt = json.loads((install_root / "install-receipt.json").read_text(encoding="utf-8"))
+    assert receipt["candidate_digest"] == "a" * 64
+    assert not (install_root / install_product.PENDING_RECEIPT_NAME).exists()
+    assert not (install_root / install_product.UPDATE_BACKUP_NAME).exists()
+
+
+def test_update_crash_before_backup_disposition_finalizes_only_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    digests = iter(("a" * 64, "b" * 64, "b" * 64))
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: next(digests))
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+    original_discard = install_product._discard_update_backup
+
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            install_product,
+            "_discard_update_backup",
+            lambda _backup: (_ for _ in ()).throw(SystemExit("injected before backup disposition")),
+        )
+        with pytest.raises(SystemExit, match="backup disposition"):
+            install_product.install(options, source_root=PRODUCT)
+
+    assert not (install_root / "install-receipt.json").exists()
+    assert (install_root / install_product.PENDING_RECEIPT_NAME).is_file()
+    assert (install_root / install_product.UPDATE_BACKUP_NAME).is_dir()
+    assert json.loads((install_root / "install-state.json").read_text(encoding="utf-8"))["state"] == "COMPLETE"
+
+    monkeypatch.setattr(install_product, "_discard_update_backup", original_discard)
+    recovered = install_product.install(options, source_root=PRODUCT)
+
+    assert recovered["code"] == "ALREADY_INSTALLED"
+    assert json.loads((install_root / "install-receipt.json").read_text(encoding="utf-8"))["candidate_digest"] == "b" * 64
+    assert not (install_root / install_product.PENDING_RECEIPT_NAME).exists()
+    assert not (install_root / install_product.UPDATE_BACKUP_NAME).exists()
+
+
+def test_complete_recovery_validates_real_environment_before_publication_or_backup_disposal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: "a" * 64)
+    options = _fast_options(project, install_root)
+    with monkeypatch.context() as initial:
+        initial.setattr(install_product, "_install_packages", _fake_packages)
+        initial.setattr(
+            install_product,
+            "_validate_installed_environment",
+            lambda _root, _receipt, *, cwd, build_tool_paths=(): None,
+        )
+        install_product.install(options, source_root=PRODUCT)
+    backup = install_product._copy_update_backup(install_root)
+    public_receipt = install_root / "install-receipt.json"
+    pending_receipt = install_root / install_product.PENDING_RECEIPT_NAME
+    os.replace(public_receipt, pending_receipt)
+
+    with pytest.raises(install_product.InstallError, match="Python is missing"):
+        install_product.install(options, source_root=PRODUCT)
+
+    assert backup.is_dir()
+    assert pending_receipt.is_file()
+    assert not public_receipt.exists()
+
+
+def test_update_crash_after_backup_disposition_publishes_pending_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    digests = iter(("a" * 64, "b" * 64, "b" * 64))
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: next(digests))
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            install_product,
+            "_publish_pending_receipt",
+            lambda _pending, _receipt: (_ for _ in ()).throw(
+                SystemExit("injected before final receipt publication")
+            ),
+        )
+        with pytest.raises(SystemExit, match="final receipt publication"):
+            install_product.install(options, source_root=PRODUCT)
+
+    assert not (install_root / "install-receipt.json").exists()
+    assert (install_root / install_product.PENDING_RECEIPT_NAME).is_file()
+    assert not (install_root / install_product.UPDATE_BACKUP_NAME).exists()
+
+    recovered = install_product.install(options, source_root=PRODUCT)
+
+    assert recovered["code"] == "ALREADY_INSTALLED"
+    assert json.loads((install_root / "install-receipt.json").read_text(encoding="utf-8"))["candidate_digest"] == "b" * 64
+    assert not (install_root / install_product.PENDING_RECEIPT_NAME).exists()
+
+
+def test_fresh_install_crash_before_final_receipt_recovers_complete_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: "a" * 64)
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            install_product,
+            "_publish_pending_receipt",
+            lambda _pending, _receipt: (_ for _ in ()).throw(
+                SystemExit("injected fresh receipt publication crash")
+            ),
+        )
+        with pytest.raises(SystemExit, match="fresh receipt publication"):
+            install_product.install(options, source_root=PRODUCT)
+
+    assert not (install_root / "install-receipt.json").exists()
+    assert (install_root / install_product.PENDING_RECEIPT_NAME).is_file()
+    assert json.loads((install_root / "install-state.json").read_text(encoding="utf-8"))["state"] == "COMPLETE"
+
+    recovered = install_product.install(options, source_root=PRODUCT)
+
+    assert recovered["code"] == "ALREADY_INSTALLED"
+    assert (install_root / "install-receipt.json").is_file()
+    assert not (install_root / install_product.PENDING_RECEIPT_NAME).exists()
+
+
+def test_fresh_install_crash_before_complete_removes_nonpublic_pending_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: "a" * 64)
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    original_atomic = install_product._atomic_json
+
+    def crash_before_complete(path: Path, document: dict[str, object]) -> None:
+        if path.name == "install-state.json" and document.get("state") == "COMPLETE":
+            raise SystemExit("injected fresh COMPLETE crash")
+        original_atomic(path, document)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(install_product, "_atomic_json", crash_before_complete)
+        with pytest.raises(SystemExit, match="fresh COMPLETE"):
+            install_product.install(options, source_root=PRODUCT)
+
+    assert not (install_root / "install-receipt.json").exists()
+    assert (install_root / install_product.PENDING_RECEIPT_NAME).is_file()
+    with pytest.raises(install_product.InstallError, match="complete ownership records"):
+        install_product.install(options, source_root=PRODUCT)
+    assert not (install_root / "install-receipt.json").exists()
+    assert not (install_root / install_product.PENDING_RECEIPT_NAME).exists()
+
+
+def test_premature_public_receipt_is_removed_before_pre_setup_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: "a" * 64)
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+    backup = install_product._copy_update_backup(install_root)
+    ownership = json.loads((install_root / "ownership-manifest.json").read_text(encoding="utf-8"))
+    install_product._atomic_json(install_root / "install-state.json", {
+        "schema": install_product.STATE_SCHEMA,
+        "state": "PROMOTING",
+        "candidate_digest": "b" * 64,
+        "project_identity": ownership["project_identity"],
+    })
+
+    recovered = install_product.install(options, source_root=PRODUCT)
+
+    assert recovered["code"] == "ALREADY_INSTALLED"
+    assert not backup.exists()
+    assert json.loads((install_root / "install-receipt.json").read_text(encoding="utf-8"))["candidate_digest"] == "a" * 64
+
+
+def test_premature_public_receipt_is_removed_when_setup_recovery_becomes_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: "a" * 64)
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    responses = iter((
+        {"ok": True, "code": "SETUP_CHECK_OK", "planned_paths": [str(project / ".codex/hooks.json")]},
+        {"ok": True, "code": "SETUP_OK", "evidence_paths": []},
+    ))
+    monkeypatch.setattr(
+        install_product, "_json_command", lambda _argv, *, cwd: next(responses),
+    )
+    options = _fast_options(project, install_root, setup=True)
+    install_product.install(options, source_root=PRODUCT)
+    backup = install_product._copy_update_backup(install_root)
+    ownership = json.loads((install_root / "ownership-manifest.json").read_text(encoding="utf-8"))
+    install_product._atomic_json(install_root / "install-state.json", {
+        "schema": install_product.STATE_SCHEMA,
+        "state": "SETUP_CHECKED",
+        "candidate_digest": "b" * 64,
+        "project_identity": ownership["project_identity"],
+    })
+
+    with pytest.raises(install_product.InstallError, match="outcome is unknown"):
+        install_product.install(options, source_root=PRODUCT)
+
+    assert backup.is_dir()
+    assert not (install_root / "install-receipt.json").exists()
+    assert not (install_root / install_product.PENDING_RECEIPT_NAME).exists()
+    state = json.loads((install_root / "install-state.json").read_text(encoding="utf-8"))
+    assert state["state"] == "PARTIAL_SETUP"
+
+
+def test_success_receipt_publication_is_after_complete_and_backup_disposition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(tmp_path)
+    install_root = tmp_path / "install"
+    digests = iter(("a" * 64, "b" * 64))
+    monkeypatch.setattr(install_product, "_candidate_digest", lambda _root: next(digests))
+    monkeypatch.setattr(install_product, "_install_packages", _fake_packages)
+    _skip_installed_environment_validation(monkeypatch)
+    options = _fast_options(project, install_root)
+    install_product.install(options, source_root=PRODUCT)
+    events: list[str] = []
+    original_atomic = install_product._atomic_json
+    original_discard = install_product._discard_update_backup
+    original_publish = install_product._publish_pending_receipt
+
+    def observed_atomic(path: Path, document: dict[str, object]) -> None:
+        original_atomic(path, document)
+        if path.name == "install-state.json" and document.get("state") == "COMPLETE":
+            events.append("complete")
+
+    def observed_discard(backup: Path) -> None:
+        original_discard(backup)
+        events.append("backup-disposed")
+
+    def observed_publish(pending: Path, receipt: Path) -> None:
+        assert not (install_root / install_product.UPDATE_BACKUP_NAME).exists()
+        assert json.loads((install_root / "install-state.json").read_text(encoding="utf-8"))["state"] == "COMPLETE"
+        original_publish(pending, receipt)
+        events.append("receipt-published")
+
+    monkeypatch.setattr(install_product, "_atomic_json", observed_atomic)
+    monkeypatch.setattr(install_product, "_discard_update_backup", observed_discard)
+    monkeypatch.setattr(install_product, "_publish_pending_receipt", observed_publish)
+
+    install_product.install(options, source_root=PRODUCT)
+
+    assert events[-3:] == ["complete", "backup-disposed", "receipt-published"]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink fixture")

@@ -275,6 +275,11 @@ def test_environment(
     # still returning success for the declared category.
     environment.pop("PYTEST_ADDOPTS", None)
     environment.pop("PYTEST_PLUGINS", None)
+    # Entry-point plugins are discovered independently of PYTEST_PLUGINS and
+    # can silently rewrite or truncate collection while pytest still exits 0.
+    # Force the pytest-owned kill switch even when the parent supplied a
+    # hostile false value.
+    environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     required = [
         str((product_root / "src").resolve()),
         str((product_root / "harness").resolve()),

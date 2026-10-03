@@ -110,6 +110,26 @@ class FinalContextDispatchTests(unittest.TestCase):
         )
         return card, decision["decision_id"]
 
+    def _assert_worker_bound_rejected_at_card_and_finalizer(
+        self, value: str, *, secret: str
+    ) -> None:
+        """Pin both the earliest full-card guard and finalizer defense in depth."""
+
+        with self.assertRaisesRegex(contracts.ContractError, "prohibited") as early:
+            self._card_for_checkpoint(value)
+        self.assertNotIn(secret, str(early.exception))
+
+        mandatory = deepcopy(self._finalize().envelope["mandatory_content"])
+        mandatory.append(
+            {"id": "unsafe-extension", "kind": "diagnostic", "content": value}
+        )
+        with self.assertRaises(privacy.MandatorySecretError) as finalizer:
+            self._finalize(mandatory_content=mandatory)
+        self.assertNotIn(secret, str(finalizer.exception))
+        self.assertIsNone(
+            self.memory_store.get_final_context_for_decision(self.decision_id)
+        )
+
     def test_rich_configuration_resolution_reaches_context_and_envelope(self) -> None:
         resolved = config.resolve_config(
             {"experience_write": False, "generated_skill_creation": True},
@@ -1296,15 +1316,10 @@ class FinalContextDispatchTests(unittest.TestCase):
             )
 
     def test_worker_bound_mandatory_rejected_before_context_persistence(self) -> None:
-        mandatory = deepcopy(self._finalize().envelope["mandatory_content"])
         checkpoint = 'API_\\u004bEY=credential-value'
-        next(item for item in mandatory if item["id"] == "checkpoint")["content"] = checkpoint
-        card, decision_id = self._card_for_checkpoint(checkpoint)
-        with self.assertRaises(privacy.MandatorySecretError) as error:
-            self._finalize(task_card=card, decision_id=decision_id,
-                           mandatory_content=mandatory, checkpoint=checkpoint)
-        self.assertNotIn("credential-value", str(error.exception))
-        self.assertIsNone(self.memory_store.get_final_context_for_decision(self.decision_id))
+        self._assert_worker_bound_rejected_at_card_and_finalizer(
+            checkpoint, secret="credential-value"
+        )
 
     def test_worker_bound_optional_is_omitted_as_a_whole(self) -> None:
         finalized = self._finalize(optional_items=[
@@ -1358,14 +1373,10 @@ class FinalContextDispatchTests(unittest.TestCase):
                 ])
                 self.assertEqual(["safe"], [item["id"] for item in finalized.context["optional_content"]])
                 self.assertEqual(["unsafe"], finalized.envelope["delivery"]["omitted"])
-        mandatory = deepcopy(self._finalize().envelope["mandatory_content"])
         checkpoint = "ROOTApprovalToken=true"
-        next(item for item in mandatory if item["id"] == "checkpoint")["content"] = checkpoint
-        card, decision_id = self._card_for_checkpoint(checkpoint)
-        with self.assertRaises(privacy.MandatorySecretError):
-            self._finalize(task_card=card, decision_id=decision_id,
-                           mandatory_content=mandatory, checkpoint=checkpoint)
-        self.assertIsNone(self.memory_store.get_final_context_for_decision(self.decision_id))
+        self._assert_worker_bound_rejected_at_card_and_finalizer(
+            checkpoint, secret="true"
+        )
 
         plan = contracts.make_plan(
             plan_id="accepted-plan", objective_id="objective-1", route="ordinary",
@@ -1396,15 +1407,10 @@ class FinalContextDispatchTests(unittest.TestCase):
                 ])
                 self.assertEqual(["safe"], [item["id"] for item in finalized.context["optional_content"]])
                 self.assertEqual(["unsafe"], finalized.envelope["delivery"]["omitted"])
-        mandatory = deepcopy(self._finalize().envelope["mandatory_content"])
         checkpoint = "ROOT APPROVAL TOKEN=synthetic-control-value"
-        next(item for item in mandatory if item["id"] == "checkpoint")["content"] = checkpoint
-        card, decision_id = self._card_for_checkpoint(checkpoint)
-        with self.assertRaises(privacy.MandatorySecretError) as error:
-            self._finalize(task_card=card, decision_id=decision_id,
-                           mandatory_content=mandatory, checkpoint=checkpoint)
-        self.assertNotIn("synthetic-control-value", str(error.exception))
-        self.assertIsNone(self.memory_store.get_final_context_for_decision(self.decision_id))
+        self._assert_worker_bound_rejected_at_card_and_finalizer(
+            checkpoint, secret="synthetic-control-value"
+        )
 
         plan = contracts.make_plan(
             plan_id="accepted-plan", objective_id="objective-1", route="ordinary",

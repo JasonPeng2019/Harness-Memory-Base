@@ -216,6 +216,20 @@ LEARNED_REQUEST_KEYS = (
     "learner",
 )
 
+# Closed ordinary request surface.  Captured rich/legacy configuration records
+# are recognized before this allowlist is applied.  ``network_profile`` is
+# resolved by the harness launch boundary, but it is part of the same
+# content-hashed request and must be accepted here so misspellings cannot fall
+# through to the permissive default network profile.
+REQUEST_CONFIGURATION_FIELDS = frozenset({
+    "all_features",
+    "strategy",
+    "network_profile",
+    "policy",
+    *FEATURE_NAMES,
+    *LEARNED_REQUEST_KEYS,
+})
+
 
 class DeferredCapabilityError(RuntimeError):
     """A future capability was explicitly requested but is not implemented."""
@@ -489,7 +503,7 @@ def replace_config(
 def effect_submission_enabled(configuration: Mapping[str, Any] | MemoryConfig, kind: str) -> bool:
     """Apply the captured or current effective write gate to an effect kind."""
     resolved = configuration if isinstance(configuration, MemoryConfig) else resolve_config(configuration)
-    if kind == "experience_ingestion":
+    if kind in {"recent_evidence", "experience_ingestion"}:
         return resolved.experience_write
     if kind == "generated_skill_creation":
         return resolved.experience_write and resolved.generated_skill_creation
@@ -500,9 +514,14 @@ def effect_submission_enabled(configuration: Mapping[str, Any] | MemoryConfig, k
 
 def _reject_learned_requests(raw: Mapping[str, Any]) -> None:
     requested_strategy = raw.get("strategy")
-    if isinstance(requested_strategy, str) and requested_strategy.lower() in {
+    normalized_strategy = (
+        requested_strategy.strip().lower().replace("-", "_")
+        if isinstance(requested_strategy, str)
+        else None
+    )
+    if normalized_strategy in {
         "learned",
-        "learned-selection",
+        "learned_selection",
         "learned_strategy",
         "learned_selector",
     }:
@@ -520,7 +539,7 @@ def _reject_learned_requests(raw: Mapping[str, Any]) -> None:
             raise DeferredCapabilityError(
                 f"deferred/not implemented: learned request {key!r} is not implemented"
             )
-    if raw.get("policy") is not None and raw.get("strategy") is None:
+    if raw.get("policy") is not None:
         raise DeferredCapabilityError(
             "deferred/not implemented: learned policy loading is not implemented"
         )
@@ -573,6 +592,16 @@ def resolve_config(
             return MemoryConfig(**dict(raw))  # type: ignore[arg-type]
         except TypeError as exc:
             raise ValueError("captured legacy configuration is invalid") from exc
+
+    unknown_request_fields = sorted(set(raw) - REQUEST_CONFIGURATION_FIELDS)
+    if unknown_request_fields:
+        raise ValueError(
+            f"unknown requested configuration field: {unknown_request_fields[0]!r}"
+        )
+    if "network_profile" in raw:
+        requested_network = raw["network_profile"]
+        if not isinstance(requested_network, str) or requested_network not in NETWORK_MODES:
+            raise ValueError("invalid network_profile: unsupported network mode")
 
     availability = {} if availability is None else availability
     transitions = {} if transitions is None else transitions

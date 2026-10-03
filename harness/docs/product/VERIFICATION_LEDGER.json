@@ -290,12 +290,12 @@
     },
     {
       "evidence_class": "LOCAL",
-      "negative_oracle": "revoked or stale replay cannot regain trust",
-      "node": "tests/local/experience/test_generated_trust.py::GeneratedSkillTrustTests::test_verified_approval_evidence_survives_store_restart",
-      "positive_oracle": "trust evidence survives restart",
+      "negative_oracle": "revoked replay is rejected and stale replay cannot replace the newer current designation or regain delivery trust",
+      "node": "tests/local/experience/test_generated_trust.py::GeneratedSkillTrustTests::test_revoked_and_stale_replay_cannot_regain_trust_after_restart",
+      "positive_oracle": "current trusted designation and revocation evidence survive restart",
       "prerequisite": "none",
       "requirement_id": "T09",
-      "status": "EXISTING-SUFFICIENT"
+      "status": "NEW-LOCAL-PASS"
     },
     {
       "evidence_class": "LOCAL",
@@ -371,8 +371,8 @@
     },
     {
       "evidence_class": "LOCAL",
-      "negative_oracle": "illegal/deferred dependencies cannot perform calls or writes",
-      "node": "tests/local/contracts/test_config.py::FixedConfigurationTests::test_feature_prerequisites_resolve_to_effective_off",
+      "negative_oracle": "dependency-disabled and deferred features perform zero remote calls and zero optional writes",
+      "node": "tests/local/experience/test_generated_trust.py::GeneratedSkillTrustTests::test_feature_dependency_and_deferred_gates_make_zero_calls_or_optional_writes",
       "positive_oracle": "valid feature dependencies resolve deterministically",
       "prerequisite": "none",
       "requirement_id": "T16",
@@ -595,7 +595,25 @@
       "status": "NEW-LOCAL-PASS"
     }
   ],
-  "schema": "memory-harness-verification-ledger/v1",
+  "direct_oracle_bindings": [
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle_id": "T09.LOCAL.revoked-stale-replay-denied",
+      "node": "tests/local/experience/test_generated_trust.py::GeneratedSkillTrustTests::test_revoked_and_stale_replay_cannot_regain_trust_after_restart",
+      "positive_oracle_id": "T09.LOCAL.current-trust-survives-restart",
+      "requirement_id": "T09",
+      "scenario_id": "T09.LOCAL.trust-replay-fence"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle_id": "T16.LOCAL.zero-call-zero-write-on-disabled-dependency",
+      "node": "tests/local/experience/test_generated_trust.py::GeneratedSkillTrustTests::test_feature_dependency_and_deferred_gates_make_zero_calls_or_optional_writes",
+      "positive_oracle_id": "T16.LOCAL.valid-dependencies-resolve",
+      "requirement_id": "T16",
+      "scenario_id": "T16.LOCAL.feature-dependency-gate"
+    }
+  ],
+  "schema": "memory-harness-verification-ledger/v2",
   "source_requirements": {
     "gap_ids": [
       "G01",

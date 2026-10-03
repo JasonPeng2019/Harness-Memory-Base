@@ -87,7 +87,8 @@ def _settle_store(
     scope: Any,
     privacy_policy: Any,
     replicate_authority: bool,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+    capture_experience: bool,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     from memory_harness import experience
 
     if replicate_authority:
@@ -96,14 +97,18 @@ def _settle_store(
     service = experience.ReviewedExperienceService(
         memory_store, privacy_policy=privacy_policy
     )
-    trajectory = service.capture(
-        task_card=evidence["task_card"],
-        plan=evidence["accepted_plan"],
-        decision=evidence["decision"],
-        outcome=outcome,
-        review_receipt=receipt,
-        scope=scope,
-    )
+    if capture_experience:
+        trajectory = service.capture(
+            task_card=evidence["task_card"],
+            plan=evidence["accepted_plan"],
+            decision=evidence["decision"],
+            outcome=outcome,
+            review_receipt=receipt,
+            scope=scope,
+        )
+    else:
+        memory_store.record_review_receipt(receipt)
+        trajectory = None
     return memory_store.get_review_receipt(receipt["review_receipt_id"]), trajectory
 
 
@@ -147,8 +152,31 @@ def settle_accepted_outcome(
             "local settlement store does not belong to the reviewed worktree"
         )
     try:
+        from memory_harness import config as memory_config
+
         outcome = _outcome(evidence)
         receipt = _review_receipt(evidence, outcome)
+        captured_config = evidence["decision"]["configuration"]
+        current_config = composition.resolved_memory_config
+        unknown = outcome["status"] == "UNKNOWN"
+        experience_enabled = (
+            not unknown
+            and memory_config.effect_submission_enabled(
+                captured_config, "recent_evidence"
+            )
+            and memory_config.effect_submission_enabled(
+                current_config, "recent_evidence"
+            )
+        )
+        generation_enabled = (
+            experience_enabled
+            and memory_config.effect_submission_enabled(
+                captured_config, "generated_skill_creation"
+            )
+            and memory_config.effect_submission_enabled(
+                current_config, "generated_skill_creation"
+            )
+        )
         local_receipt, local_trajectory = _settle_store(
             local_store,
             evidence=evidence,
@@ -157,6 +185,7 @@ def settle_accepted_outcome(
             scope=composition.scope,
             privacy_policy=composition.privacy_policy,
             replicate_authority=False,
+            capture_experience=experience_enabled,
         )
         central_receipt, central_trajectory = _settle_store(
             composition.store,
@@ -166,12 +195,19 @@ def settle_accepted_outcome(
             scope=composition.scope,
             privacy_policy=composition.privacy_policy,
             replicate_authority=True,
+            capture_experience=experience_enabled,
         )
         ingestion = None
+        everos_called = False
         generated_candidates: list[dict[str, Any]] = []
-        if composition.everos_adapter is not None:
+        if (
+            composition.everos_adapter is not None
+            and central_trajectory is not None
+            and generation_enabled
+        ):
             from memory_harness import experience as experience_module
 
+            everos_called = True
             ingestion = _run(
                 composition.experience_service.extract_trajectory(
                     central_trajectory["trajectory_id"],
@@ -213,12 +249,36 @@ def settle_accepted_outcome(
             "status": "settled",
             "outcome_id": outcome["outcome_id"],
             "review_receipt_id": local_receipt["review_receipt_id"],
-            "trajectory_id": local_trajectory["trajectory_id"],
+            "trajectory_id": (
+                None if local_trajectory is None else local_trajectory["trajectory_id"]
+            ),
             "central_review_receipt_id": central_receipt["review_receipt_id"],
-            "central_trajectory_id": central_trajectory["trajectory_id"],
+            "central_trajectory_id": (
+                None
+                if central_trajectory is None
+                else central_trajectory["trajectory_id"]
+            ),
+            "trajectory_status": (
+                "not_applicable_unknown"
+                if unknown
+                else "retained" if experience_enabled
+                else "experience_write_disabled"
+            ),
             "everos": (
                 {"status": "not_configured", "called": False}
                 if composition.everos_adapter is None
+                else {
+                    "status": (
+                        "not_applicable_unknown"
+                        if unknown
+                        else "experience_write_disabled"
+                        if not experience_enabled
+                        else "generation_capable_backend_suppressed"
+                    ),
+                    "called": False,
+                    "ingestion_id": None,
+                }
+                if not everos_called
                 else {
                     "status": None if ingestion is None else ingestion.get("status"),
                     "called": True,
@@ -233,7 +293,11 @@ def settle_accepted_outcome(
             },
             "generated_skill": {
                 "status": (
-                    "candidate_retained"
+                    "not_applicable_unknown"
+                    if unknown
+                    else "creation_disabled"
+                    if not generation_enabled
+                    else "candidate_retained"
                     if generated_candidates
                     else "no_candidate_returned"
                 ),

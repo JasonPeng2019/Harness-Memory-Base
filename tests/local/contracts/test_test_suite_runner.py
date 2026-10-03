@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -60,9 +61,25 @@ def test_every_test_module_is_covered_by_exactly_one_category() -> None:
     discovered = runner.discover_test_modules(product_root=PRODUCT)
     assert set(ownership) == discovered
     assert all(len(owners) == 1 for owners in ownership.values())
-    # The 113-module baseline plus this contract module. Discovery remains the
-    # oracle so future modules cannot hide behind a stale hard-coded total.
-    assert len(discovered) >= 114
+    spec = (PRODUCT / "harness/docs/product/FULL_PRODUCT_SPEC.md").read_text(
+        encoding="utf-8"
+    )
+    claimed_total = re.search(r"\*\*(\d+) discovered test modules\*\*", spec)
+    assert claimed_total is not None
+    assert int(claimed_total.group(1)) == len(discovered)
+
+    guide = (PRODUCT / "TESTING.md").read_text(encoding="utf-8")
+    category_counts = {
+        category.name: sum(
+            category.name in owners for owners in ownership.values()
+        )
+        for category in categories
+    }
+    for name, claimed in re.findall(
+        r"^\| `([^`]+)` \| (\d+) \|", guide, flags=re.MULTILINE
+    ):
+        assert name in category_counts
+        assert int(claimed) == category_counts[name]
 
 
 def test_commands_preserve_one_native_framework_session_per_category() -> None:
@@ -99,6 +116,7 @@ def test_commands_preserve_one_native_framework_session_per_category() -> None:
     ]
     assert "PYTEST_ADDOPTS" not in environment
     assert "PYTEST_PLUGINS" not in environment
+    assert environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
     assert environment["INHERITED_SENTINEL"] == "kept"
 
     structured = runner.command_for(
@@ -226,10 +244,82 @@ def test_execution_aggregates_failures_and_fail_fast_and_interrupt(
     assert result == 130
     assert len(interrupted.calls) == 2
     assert all(
-        "PYTEST_ADDOPTS" not in environment and "PYTEST_PLUGINS" not in environment
+        "PYTEST_ADDOPTS" not in environment
+        and "PYTEST_PLUGINS" not in environment
+        and environment.get("PYTEST_DISABLE_PLUGIN_AUTOLOAD") == "1"
         for executor in (continuing, stopping, interrupted)
         for _, _, environment in executor.calls
     )
+
+
+def test_real_ambient_pytest_entry_point_cannot_truncate_runner_collection(
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    candidate = tmp_path / "candidate"
+    tests = candidate / "tests/category"
+    tests.mkdir(parents=True)
+    (candidate / "src").mkdir()
+    (candidate / "harness").mkdir()
+    (tests / "test_complete.py").write_text(
+        "def test_first(): pass\ndef test_second(): pass\n",
+        encoding="utf-8",
+    )
+
+    plugins = tmp_path / "ambient-plugins"
+    plugins.mkdir()
+    (plugins / "hostile_truncation.py").write_text(
+        "def pytest_collection_modifyitems(items):\n"
+        "    del items[1:]\n",
+        encoding="utf-8",
+    )
+    metadata = plugins / "hostile_truncation-1.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: hostile-truncation\nVersion: 1.0\n",
+        encoding="utf-8",
+    )
+    (metadata / "entry_points.txt").write_text(
+        "[pytest11]\nhostile-truncation = hostile_truncation\n",
+        encoding="utf-8",
+    )
+
+    category = runner.Category(
+        "category", "entry-point isolation", "pytest", ("tests/category",),
+    )
+    hostile_xml = tmp_path / "hostile.xml"
+    hostile_command = runner.command_for(
+        category, product_root=candidate, structured_output=hostile_xml,
+    )
+    inherited = dict(os.environ)
+    inherited.pop("PYTEST_DISABLE_PLUGIN_AUTOLOAD", None)
+    inherited.pop("PYTEST_ADDOPTS", None)
+    inherited.pop("PYTEST_PLUGINS", None)
+    inherited["PYTHONPATH"] = str(plugins)
+    hostile = subprocess.run(
+        hostile_command, cwd=candidate, env=inherited,
+        text=True, capture_output=True, timeout=30,
+    )
+    assert hostile.returncode == 0, hostile.stderr
+    assert runner._parse_pytest_result(hostile_xml)["tests"] == 1
+
+    protected_xml = tmp_path / "protected.xml"
+    protected_command = runner.command_for(
+        category, product_root=candidate, structured_output=protected_xml,
+    )
+    # A hostile inherited value must be overridden, not merely defaulted.
+    inherited["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "0"
+    protected = subprocess.run(
+        protected_command,
+        cwd=candidate,
+        env=runner.test_environment(product_root=candidate, inherited=inherited),
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert protected.returncode == 0, protected.stderr
+    result = runner._parse_pytest_result(protected_xml)
+    assert result["tests"] == result["testcases"] == result["passed"] == 2
 
 
 def _candidate_repository(root: Path) -> None:

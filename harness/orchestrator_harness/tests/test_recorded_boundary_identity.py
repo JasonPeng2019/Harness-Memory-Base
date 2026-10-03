@@ -71,6 +71,60 @@ def fake_identity(identities: dict[int, str]):
 
 
 class RecordedBoundaryIdentityTests(unittest.TestCase):
+    def test_unanchored_reused_group_and_session_member_is_never_adopted_or_terminated(
+        self,
+    ) -> None:
+        """A historical numeric boundary is not durable ownership evidence.
+
+        Once every exact recorded incarnation is gone, another process can reuse
+        the old leader PID, create a group/session with the same numeric ID, fork
+        a child, and exit before the next snapshot.  The surviving unrelated
+        child must not be adopted solely because its current PGID/SID match the
+        historical numbers.
+        """
+
+        record = {
+            "kind": "posix-process-group",
+            "root": {"pid": 11001, "creation_time": "old-root"},
+            "process_group_id": 11001,
+            "session_id": 11001,
+            "processes": [
+                {"pid": 11001, "creation_time": "old-root"},
+            ],
+        }
+        unrelated_creation = iso_utc(CREATED)
+        processes = snapshot(
+            ProcessInfo(
+                33003,
+                1,
+                "unrelated-child",
+                "unrelated child of a reused group leader",
+                CREATED,
+                process_group_id=11001,
+                session_id=11001,
+            ),
+        )
+        identities = {33003: unrelated_creation}
+
+        def terminate(pid: int, creation: str, **_kwargs: object) -> bool:
+            identities.pop(pid, None)
+            return True
+
+        terminated = MagicMock(side_effect=terminate)
+        with (
+            patch.object(p, "process_identity", side_effect=fake_identity(identities)),
+            patch.object(p, "process_alive", side_effect=lambda pid: pid in identities),
+            patch.object(p, "terminate_process", terminated),
+        ):
+            boundary = p.ProcessBoundary.from_record(
+                record, snapshot_provider=lambda: processes,
+            )
+            self.assertTrue(boundary.observe())
+            self.assertNotIn((33003, unrelated_creation), boundary._owned)
+            self.assertTrue(boundary.cleanup(timeout_seconds=0.1))
+
+        self.assertFalse(any(call.args[0] == 33003 for call in terminated.call_args_list))
+
     def test_reused_child_pid_is_not_adopted_and_never_terminated(self) -> None:
         record = recorded_boundary()
         processes = snapshot(

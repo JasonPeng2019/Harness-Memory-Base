@@ -1372,6 +1372,24 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
         finally:
             memory_store.close()
 
+    def test_copied_task_card_is_revalidated_before_intent(self) -> None:
+        copied_path = self.worktree / ".agent-workspace" / "task-card.json"
+        copied = json.loads(copied_path.read_text(encoding="utf-8"))
+        copied["password"] = "fixture-worker-card-value"
+        copied["content_hash"] = content_hash(copied)
+        self.fixture.write_json(copied_path, copied)
+
+        result, spawn = self.fixture.run_launch(lane_id="launch-lane")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
+        self.assertNotIn("fixture-worker-card-value", result["summary"])
+        spawn.assert_not_called()
+        memory_store = self.fixture.open_store(self.worktree)
+        try:
+            self.assertEqual([], memory_store.list_operations(self.envelope["decision_id"]))
+        finally:
+            memory_store.close()
+
     def test_launch_diagnostic_redacts_a_control_credential(self) -> None:
         _, envelope_path = self.fixture.memory_paths(self.worktree)
         changed = dict(self.envelope)
