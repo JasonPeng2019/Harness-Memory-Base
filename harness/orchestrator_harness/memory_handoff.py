@@ -949,20 +949,25 @@ def worker_environment(
         if provider_home is not None:
             key, path = provider_home
             environment[key] = str(path)
-    # The controller is a fresh Python process.  Preserve the exact package
-    # import root selected above so a source-checkout launch behaves like the
-    # already-supported installed-package launch.  This path carries code,
-    # not product control authority, and remains subject to the same scrubbed
-    # environment validation below.
-    import_root = _memory_import_root(privacy)
-    if import_root is not None:
+    # The controller is a fresh Python process.  Put the composed product's
+    # canonical source checkout first, even when test discovery imported the
+    # standalone harness mirror earlier in this process.  Preserve the mirror
+    # as a fallback so the refreshed harness remains self-contained.
+    import_roots = [
+        root for root in (
+            enable_source_checkout_import(),
+            _memory_import_root(privacy),
+        )
+        if root is not None
+    ]
+    if import_roots:
         current = [
             item for item in environment.get("PYTHONPATH", "").split(os.pathsep)
             if item
         ]
-        root_text = str(import_root)
+        ordered = [str(root) for root in import_roots]
         environment["PYTHONPATH"] = os.pathsep.join(
-            [root_text, *(item for item in current if item != root_text)]
+            [*ordered, *(item for item in current if item not in ordered)]
         )
     return environment
 
