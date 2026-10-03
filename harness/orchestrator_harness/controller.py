@@ -958,6 +958,8 @@ def run_controller(lane_id: str) -> int:
                 dispatch_binding=dispatch_binding,
                 provider_started=True,
             )
+            # Keep the boundary's own reasons so a stuck lane is diagnosable.
+            boundary_errors = list(dict.fromkeys(execution.boundary.errors))[:8]
             _write_status(
                 lane,
                 {
@@ -965,12 +967,14 @@ def run_controller(lane_id: str) -> int:
                     "process_boundary": execution.boundary.record(),
                     "cleanup_proven": False,
                     "cleanup_error": "provider/helper process boundary remains unknown or live",
+                    "cleanup_errors": boundary_errors,
                 },
             )
             _append_event(
                 lane,
                 "cleanup_unproven",
-                "provider/helper process boundary was not proven gone; leases remain held",
+                "provider/helper process boundary was not proven gone; leases remain held"
+                + (f" ({'; '.join(boundary_errors)})" if boundary_errors else ""),
             )
             return 5
 

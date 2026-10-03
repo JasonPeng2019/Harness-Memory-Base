@@ -1,4 +1,5 @@
 {
-  "root_workspace": "C:/Users/Jason/Documents/Jason/Orchestrator-Harness-3/development/product/worktree_example",
-  "managed_coordination": "enabled"
+  "root_workspace": "/private/tmp/harness-mem-rehearsal2",
+  "managed_coordination": "enabled",
+  "visualizer": "auto"
 }

@@ -21,6 +21,21 @@ from orchestrator_harness.processes import (
 
 
 class ProcessProviderTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX sessions only")
+    def test_detached_process_has_its_own_session(self) -> None:
+        child = processes.spawn_detached(
+            [
+                sys.executable,
+                "-c",
+                "import os; print(os.getsid(0), flush=True)",
+            ],
+            stdout=subprocess.PIPE,
+        )
+        output, _ = child.communicate(timeout=10)
+        self.assertEqual(0, child.returncode)
+        self.assertEqual(child.pid, int(output))
+        self.assertNotEqual(os.getsid(0), int(output))
+
     @unittest.skipUnless(os.name == "nt", "Windows venv redirector only")
     def test_detached_venv_python_keeps_identity_and_pid(self) -> None:
         if sys.prefix == sys.base_prefix:

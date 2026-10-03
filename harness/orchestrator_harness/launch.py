@@ -165,7 +165,14 @@ def _reap_controller_and_prove_exit(
             pid, creation, RETIRE_CONTROLLER_EXIT_WAIT_SECONDS
         ):
             if not processes.terminate_process(pid, creation, force=True):
-                return False
+                # A delivered SIGKILL can leave this launch-owned direct
+                # child observable as a zombie until its Popen handle is
+                # reaped. Reap that exact child before failing the proof.
+                try:
+                    child.wait(timeout=RETIRE_CONTROLLER_EXIT_WAIT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    return False
+                return not processes.identity_matches(pid, creation)
     try:
         child.wait(timeout=RETIRE_CONTROLLER_EXIT_WAIT_SECONDS)
     except subprocess.TimeoutExpired:

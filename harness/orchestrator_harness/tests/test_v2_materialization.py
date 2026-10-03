@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from orchestrator_harness import bootstrap, setup
+from orchestrator_harness import bootstrap, setup, view_launch
 
 
 class GitWorktreeFailureCleanupTests(unittest.TestCase):
@@ -838,6 +838,38 @@ class V2MaterializationTests(unittest.TestCase):
             )
             self.assertEqual(str(runtime.resolve()), binding["runtime_root"])
             self.assertEqual(provider_id, binding["provider_id"])
+
+    def test_setup_second_auto_run_reopens_a_missing_viewer(self) -> None:
+        config_path = self.fixture.harness / "harness-config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["visualizer"] = "auto"
+        self.fixture._write_json(config_path, config)
+        child = MagicMock(pid=1701)
+        with (
+            patch.object(setup, "find_harness_root", return_value=self.fixture.harness),
+            patch.object(setup.processes, "python_argv", return_value=["python", "-m", "monitor"]),
+            patch.object(setup.processes, "spawn_detached", return_value=child),
+            patch.object(
+                setup.processes,
+                "process_identity",
+                return_value={"pid": 1701, "creation_time": "test-creation"},
+            ),
+            patch.object(setup.processes, "identity_matches", return_value=True),
+            patch.object(
+                view_launch,
+                "open_viewer_window",
+                return_value={"launched": True, "method": "test-terminal"},
+            ) as open_viewer,
+        ):
+            first = setup.run_setup()
+            second = setup.run_setup()
+
+        self.assertEqual("SETUP_OK", first["code"])
+        self.assertEqual(setup.SETUP_MONITOR_ALREADY_RUNNING, second["code"])
+        self.assertEqual(
+            {"launched": True, "method": "test-terminal"}, second["viewer"]
+        )
+        self.assertEqual(2, open_viewer.call_count)
 
     def test_setup_manifest_change_ignores_persistent_lease_lock_file(self) -> None:
         child = MagicMock(pid=1701)

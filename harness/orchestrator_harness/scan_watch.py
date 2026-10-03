@@ -190,6 +190,8 @@ def _root_session_id(explicit: str | None) -> str:
 def _watch_event(
     queue: dict[str, Any], *, root_session_id: str, binding_id: str,
     requested_event_id: str | None = None,
+    requested_lane_id: str | None = None,
+    requested_event_type: str | None = None,
 ) -> dict[str, Any] | None:
     queue_id = queue.get("queue_id")
     for event in queue.get("events", []):
@@ -199,6 +201,10 @@ def _watch_event(
         if not isinstance(event_id, str) or not event_id:
             continue
         if requested_event_id is not None and event_id != requested_event_id:
+            continue
+        if requested_lane_id is not None and event.get("lane_id") != requested_lane_id:
+            continue
+        if requested_event_type is not None and event.get("type") != requested_event_type:
             continue
         already_delivered = any(
             receipt.get("source") == "watch"
@@ -218,6 +224,7 @@ def run_watch(
     *,
     timeout: str | None = None,
     until_event: str | None = None,
+    until_review_for: str | None = None,
     root_session_id: str | None = None,
     binding_id: str | None = None,
 ) -> dict[str, Any]:
@@ -268,6 +275,10 @@ def run_watch(
                     root_session_id=session_id,
                     binding_id=watch_binding_id,
                     requested_event_id=until_event,
+                    requested_lane_id=until_review_for,
+                    requested_event_type=(
+                        "COMPLETION_REVIEW_REQUIRED" if until_review_for else None
+                    ),
                 )
             except Exception:
                 event = None
@@ -296,6 +307,23 @@ def run_watch(
         actionable = _find_actionable(rt, epoch_id, orphaned_leases)
         if actionable is not None:
             lane_id, status = actionable
+            if until_review_for is not None and (
+                lane_id != until_review_for or status == "review_pending"
+            ):
+                # The controller can publish review_pending just before the
+                # monitor publishes its managed review event. Keep the native
+                # wait blocked for that exact event instead of exposing the
+                # queue-promotion race to callers.
+                if deadline is not None and time.monotonic() >= deadline:
+                    return {
+                        "ok": False,
+                        "code": WATCH_TIMEOUT,
+                        "summary": "no matching completion-review event appeared before the timeout",
+                        "evidence_paths": [],
+                        "next_action": "recover the monitor or inspect the exact lane status",
+                    }
+                time.sleep(WATCH_POLL_SECONDS)
+                continue
             result = {
                 "ok": True,
                 "code": "WATCH_ACTIONABLE",

@@ -44,6 +44,7 @@ class HarnessConfig:
     harness_root: Path
     root_workspace: Path | None = None
     managed_coordination: str = "enabled"
+    visualizer: str = "off"
     config_path: Path | None = None
     suite_root: Path | None = None
     run_globs: tuple[str, ...] = ()
@@ -275,11 +276,11 @@ def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
         record = read_json(path)
     except (OSError, ValueError) as exc:
         raise ConfigError(f"harness config unreadable: {path}: {exc}") from exc
-    unknown = sorted(set(record) - {"root_workspace", "managed_coordination"})
+    unknown = sorted(set(record) - {"root_workspace", "managed_coordination", "visualizer"})
     if unknown:
         raise ConfigError(
             f"harness config unknown key {unknown[0]!r} "
-            f"(closed keys: root_workspace, managed_coordination): {path}"
+            f"(closed keys: root_workspace, managed_coordination, visualizer): {path}"
         )
     root_workspace = record.get("root_workspace")
     if not isinstance(root_workspace, str) or not root_workspace:
@@ -296,10 +297,16 @@ def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
         raise ConfigError(
             f"harness config managed_coordination must be enabled or disabled: {path}"
         )
+    # ``visualizer`` only controls the read-only terminal viewer, so it is
+    # deliberately outside the epoch-breaking configuration identity.
+    visualizer = record.get("visualizer", "off")
+    if visualizer not in ("auto", "off"):
+        raise ConfigError(f"harness config visualizer must be auto or off: {path}")
     return HarnessConfig(
         harness_root=root,
         root_workspace=workspace,
         managed_coordination=managed,
+        visualizer=visualizer,
     )
 
 
