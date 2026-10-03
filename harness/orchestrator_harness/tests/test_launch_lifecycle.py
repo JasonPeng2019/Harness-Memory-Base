@@ -201,6 +201,7 @@ class ControllerLeaseTests(unittest.TestCase):
             patch.object(controller, "_load_binding", return_value=object()),
             patch.object(controller, "acquire_leases"),
             patch.object(controller, "_run_provider", side_effect=ControllerError("LAUNCH_PROVIDER_START_FAILED", "not created", no_provider_started=True)),
+            patch.object(controller, "_append_attempt"),
             patch.object(controller, "release_leases") as release,
         ):
             self.assertEqual(4, controller.run_controller("lane-1"))

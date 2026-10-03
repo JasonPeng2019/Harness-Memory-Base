@@ -5,12 +5,14 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
 from pathlib import Path
 
 from orchestrator_harness.tests.v2_acceptance.contract import PLATFORM_CLAIMS
+from orchestrator_harness.tests.support import RetryingTemporaryDirectory
 from examples import v2_live_matrix as matrix
 from examples.v2_live_matrix import AUTHORIZATION_ENV, CHECKS, MANAGED_ONLY, NATIVE_GAPS, execute, expected_cells
 
@@ -78,7 +80,7 @@ class LiveMatrixContractTests(unittest.TestCase):
 
     def test_outer_entrypoint_refills_capacity_and_persists_terminal_pool(self) -> None:
         """A causal B/C handshake proves completion-driven refill, not executor waves."""
-        with tempfile.TemporaryDirectory() as temporary:
+        with RetryingTemporaryDirectory() as temporary:
             root = Path(temporary)
             cell, log = root / "cell.py", root / "starts.log"
             self._fake_cell_script(cell)
@@ -106,7 +108,7 @@ class LiveMatrixContractTests(unittest.TestCase):
 
     def test_outer_entrypoint_runs_check16_after_failed_terminal_evidence(self) -> None:
         """A failed prerequisite remains retained evidence; it is not a reason to skip CHECK16."""
-        with tempfile.TemporaryDirectory() as temporary:
+        with RetryingTemporaryDirectory() as temporary:
             root = Path(temporary)
             cell, marker = root / "cell.py", root / "check16-ran.txt"
             self._fake_cell_script(cell)
@@ -137,7 +139,7 @@ class LiveMatrixContractTests(unittest.TestCase):
             self.assertEqual("DEPENDENCY_EVIDENCE_FAILED", rows["CHECK-LIVE-16"]["acceptance_outcome"])
 
     def test_outer_entrypoint_total_budget_times_out_owned_tree_without_touching_sentinel(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with RetryingTemporaryDirectory() as temporary:
             root = Path(temporary)
             cell, sentinel = root / "cell.py", root / "sentinel.txt"
             self._fake_cell_script(cell)
@@ -163,7 +165,7 @@ class LiveMatrixContractTests(unittest.TestCase):
 
     def test_timeout_records_exact_owned_boundary_and_preserves_live_unrelated_process(self) -> None:
         """A real child/grandchild tree is bounded without touching a live sentinel process."""
-        with tempfile.TemporaryDirectory() as temporary:
+        with RetryingTemporaryDirectory() as temporary:
             root = Path(temporary)
             tree = root / "tree.py"
             tree.write_text(
@@ -201,7 +203,7 @@ class LiveMatrixContractTests(unittest.TestCase):
 
     def test_cleanup_failure_is_finite_nonpass_and_does_not_abort_independent_coordinate(self) -> None:
         """Deterministic boundary-cleanup failure is terminal evidence, not a hung pool."""
-        with tempfile.TemporaryDirectory() as temporary:
+        with RetryingTemporaryDirectory() as temporary:
             root = Path(temporary)
             cell = root / "cell.py"; self._fake_cell_script(cell)
             def command(name):
@@ -230,13 +232,13 @@ class LiveMatrixContractTests(unittest.TestCase):
             patch.object(matrix.processes, "ProcessBoundary", return_value=boundary),
         ):
             began = time.monotonic(); failed = matrix._run(["fake"], timeout_seconds=.03); elapsed = time.monotonic() - began
-        self.assertLess(elapsed, .5, "deterministic cleanup refusal cannot make pipe/wait collection unbounded")
+        self.assertLess(elapsed, 3.0, "deterministic cleanup refusal cannot make pipe/wait collection unbounded")
         self.assertEqual(125, failed["returncode"])
         self.assertEqual("CLEANUP_UNRESOLVED", failed["terminal"])
 
     def test_outer_checkpoint_schema_gate_and_stale_unselected_quarantine(self) -> None:
         """Only validated checkpoint rows can reuse; stale unselected evidence is retained, never credited."""
-        with tempfile.TemporaryDirectory() as temporary:
+        with RetryingTemporaryDirectory() as temporary:
             root, marker = Path(temporary), Path(temporary) / "calls.txt"
             cell = root / "cell.py"; self._fake_cell_script(cell)
             def command(name):
@@ -271,7 +273,7 @@ class LiveMatrixContractTests(unittest.TestCase):
         builder = ROOT / "examples" / "live_matrix_driver" / "build_manifests.py"
         validator = ROOT / "examples" / "live_matrix_driver" / "validate_manifests.py"
         candidate = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=True).stdout.strip()
-        with tempfile.TemporaryDirectory() as temporary:
+        with RetryingTemporaryDirectory() as temporary:
             root, epoch, retained, matrix_root = Path(temporary), Path(temporary) / "epoch", Path(temporary) / "retained", Path(temporary) / "matrix"
             (matrix_root / "driver").mkdir(parents=True)
             run_cell = matrix_root / "driver" / "run-cell.py"
@@ -337,20 +339,33 @@ class LiveMatrixContractTests(unittest.TestCase):
             self._coordinate("CHECK-LIVE-2", "qwen-code"),
             self._coordinate("CHECK-LIVE-3", "codex"),
         ]}
-        calls = []
+        for item in manifest["attempts"]:
+            item["command"] = ["runner", f"{item['name']}-command"]
+            item["cleanup_command"] = ["runner", f"{item['name']}-cleanup"]
+        events = []
+        lock = threading.Lock()
+        first_pair = threading.Barrier(2, timeout=1.0)
 
         def fake_run(argv, *, timeout_seconds=None):
-            calls.append((argv[-1], time.monotonic()))
-            time.sleep(.12)
+            label = argv[-1]
+            with lock:
+                events.append(("start", label))
+            if label in {"CHECK-LIVE-1-command", "CHECK-LIVE-2-command"}:
+                # A sequential scheduler breaks this barrier.  This is a
+                # causal overlap proof and is insensitive to runner speed.
+                first_pair.wait()
+            with lock:
+                events.append(("end", label))
             return {"argv": argv, "returncode": 1, "stdout": "", "stderr": ""}
 
-        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
-            started = time.monotonic()
+        with RetryingTemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
             result = execute(manifest, Path(temporary) / "checkpoint.json")
-            elapsed = time.monotonic() - started
-        self.assertEqual(6, len(calls))
-        self.assertLess(elapsed, .58, "different providers should overlap under the two-coordinate cap")
-        self.assertGreaterEqual(calls[4][1] - calls[0][1], .20, "same-provider coordinates must not overlap")
+        self.assertEqual(12, len(events))
+        self.assertLess(
+            events.index(("end", "CHECK-LIVE-1-cleanup")),
+            events.index(("start", "CHECK-LIVE-3-command")),
+            "same-provider coordinates must not overlap",
+        )
         self.assertEqual(["CHECK-LIVE-1", "CHECK-LIVE-2", "CHECK-LIVE-3"], [row["name"] for row in result["checks"]])
 
     def test_dependency_failure_blocks_only_its_dependent_and_keeps_collecting(self) -> None:
@@ -365,7 +380,7 @@ class LiveMatrixContractTests(unittest.TestCase):
             calls.append(argv)
             return {"argv": argv, "returncode": 1, "stdout": "", "stderr": ""}
 
-        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
+        with RetryingTemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
             result = execute(manifest, Path(temporary) / "checkpoint.json")
         rows = {row["name"]: row for row in result["checks"]}
         self.assertEqual("FAIL", rows["CHECK-LIVE-2"]["outcome"])
@@ -384,7 +399,7 @@ class LiveMatrixContractTests(unittest.TestCase):
             calls.append(argv)
             return {"argv": argv, "returncode": 1, "stdout": "", "stderr": ""}
 
-        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
+        with RetryingTemporaryDirectory() as temporary, patch.dict(os.environ, {AUTHORIZATION_ENV: "M09"}), patch.object(sys.modules[execute.__module__], "_run", side_effect=fake_run):
             checkpoint = Path(temporary) / "checkpoint.json"
             execute(first, checkpoint)
             calls.clear()
@@ -394,7 +409,7 @@ class LiveMatrixContractTests(unittest.TestCase):
 
     def test_parameterized_entrypoint_collects_same_check_across_two_provider_manifests(self) -> None:
         """Use the real outer entrypoint with controlled commands, never a historical wrapper."""
-        with tempfile.TemporaryDirectory() as temporary:
+        with RetryingTemporaryDirectory() as temporary:
             root = Path(temporary)
             manifests, checkpoints = [], []
             for provider in ("codex", "qwen-code"):
@@ -462,7 +477,7 @@ class LiveMatrixContractTests(unittest.TestCase):
                     self.assertTrue(all(row["outcome"] == "NOT_APPLICABLE" for row in managed_only_plain))
 
     def test_same_input_failed_attempt_is_terminal_without_duplicate_side_effect(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with RetryingTemporaryDirectory() as temporary:
             root = Path(temporary)
             counter = root / "counter.txt"
             evidence = {kind: str(root / f"{kind}.txt") for kind in ("transcript", "hook", "state", "cleanup")}

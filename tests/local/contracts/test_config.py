@@ -69,6 +69,125 @@ class FixedConfigurationTests(unittest.TestCase):
         self.assertEqual("standard", deeper_disabled.strategy)
         self.assertIn("fallback", deeper_disabled.reason)
 
+    def test_feature_resolution_exposes_requested_effective_and_reasons(self) -> None:
+        resolved = config.resolve_config(
+            {
+                "experience_write": False,
+                "generated_skill_creation": True,
+                "template_memory": False,
+                "apc": True,
+                "light_adaptation": True,
+            },
+            availability={
+                "atlas_shared_retrieval": {
+                    "available": False,
+                    "reason": "Atlas adapter is not configured",
+                }
+            },
+        )
+        by_name = resolved.feature_state_by_name
+        generated = by_name["generated_skill_creation"]
+        self.assertTrue(generated.requested)
+        self.assertFalse(generated.effective)
+        self.assertEqual(("experience_write",), generated.prerequisites)
+        self.assertIn("experience_write", generated.reason)
+        atlas = by_name["atlas_shared_retrieval"]
+        self.assertTrue(atlas.requested)
+        self.assertFalse(atlas.available)
+        self.assertFalse(atlas.effective)
+        self.assertIn("not configured", atlas.reason)
+        self.assertEqual(64, len(resolved.configuration_identity))
+        self.assertEqual(
+            resolved.configuration_identity,
+            config.resolve_config(
+                {
+                    "experience_write": False,
+                    "generated_skill_creation": True,
+                    "template_memory": False,
+                    "apc": True,
+                    "light_adaptation": True,
+                },
+                availability={
+                    "atlas_shared_retrieval": {
+                        "available": False,
+                        "reason": "Atlas adapter is not configured",
+                    }
+                },
+            ).configuration_identity,
+        )
+        # The richer state is JSON-safe when captured in decision records.
+        self.assertEqual(
+            resolved.configuration_identity,
+            config.configuration_record(resolved)["configuration_identity"],
+        )
+        captured = config.configuration_record(resolved)
+        self.assertEqual(
+            resolved.configuration_identity,
+            config.resolve_config(captured).configuration_identity,
+        )
+        captured["feature_states"][0]["reason"] = "tampered"
+        with self.assertRaisesRegex(ValueError, "identity mismatch"):
+            config.resolve_config(captured)
+
+    def test_off_transition_is_truthful_while_new_work_is_suppressed(self) -> None:
+        resolved = config.resolve_config(
+            {"experience_write": False},
+            transitions={"experience_write": "transitioning"},
+        )
+        state = resolved.feature_state_by_name["experience_write"]
+        self.assertFalse(state.requested)
+        self.assertFalse(state.effective)
+        self.assertEqual("transitioning", state.transition_state)
+        self.assertIn("pending or in-flight", state.reason)
+
+        for invalid in ("off", "unknown", ""):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                config.resolve_config(
+                    {"experience_write": False},
+                    transitions={"experience_write": invalid},
+                )
+
+    def test_feature_resolution_rejects_unknown_availability_or_transition_keys(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown feature"):
+            config.resolve_config({}, availability={"future_feature": True})
+        with self.assertRaisesRegex(ValueError, "unknown feature"):
+            config.resolve_config({}, transitions={"future_feature": "stable"})
+
+    def test_direct_configuration_rejects_impossible_dependency_combinations(self) -> None:
+        for changes in (
+            {"experience_write": False, "generated_skill_creation": True},
+            {"template_memory": False, "apc": True},
+            {"apc": False, "light_adaptation": True},
+        ):
+            with self.subTest(changes=changes), self.assertRaisesRegex(
+                ValueError, "prerequisite"
+            ):
+                config.MemoryConfig(**changes)
+
+    def test_rich_configuration_record_is_explicitly_versioned(self) -> None:
+        resolved = config.resolve_config(
+            {"experience_write": False, "generated_skill_creation": True},
+            availability={
+                "atlas_shared_retrieval": {
+                    "available": False,
+                    "reason": "Atlas is not configured",
+                }
+            },
+            transitions={"experience_write": "transitioning"},
+        )
+        record = config.configuration_record(resolved)
+        self.assertEqual("memory-feature-resolution/v1", record["schema"])
+        restored = config.resolve_config(record)
+        self.assertEqual(record, config.configuration_record(restored))
+        self.assertTrue(
+            restored.feature_state_by_name["generated_skill_creation"].requested
+        )
+        self.assertFalse(restored.generated_skill_creation)
+        self.assertEqual(
+            "transitioning",
+            restored.feature_state_by_name["experience_write"].transition_state,
+        )
+
     def test_atlas_requires_both_launched_payload_and_independent_block_proof(self) -> None:
         evidence = {
             "launched_payload": {"verified": True, "evidence_id": "payload-7"},

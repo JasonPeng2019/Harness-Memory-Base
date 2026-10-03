@@ -15,12 +15,14 @@ binding; it never copies a binding into product source.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import shutil
 import stat
 import sys
+import time
 import tomllib
 import uuid
 from copy import deepcopy
@@ -592,9 +594,32 @@ def _check_owned_tree(path: Path, manifest: dict[str, Any], *, verify_bytes: boo
             raise SetupError(SETUP_CACHE_INVALID, f"transaction artifact cannot be verified: {path}: {exc}") from exc
 
 
-def _remove_owned_tree(path: Path, manifest: dict[str, Any], *, verify_bytes: bool) -> None:
-    _check_owned_tree(path, manifest, verify_bytes=verify_bytes)
-    shutil.rmtree(path)
+def _remove_owned_tree(
+    path: Path,
+    manifest: dict[str, Any],
+    *,
+    verify_bytes: bool,
+    timeout_seconds: float = 2.0,
+) -> None:
+    """Remove one proven-owned cache tree despite transient filesystem races."""
+
+    deadline = time.monotonic() + timeout_seconds
+    retryable = {errno.EACCES, errno.EBUSY, errno.ENOTEMPTY, errno.EPERM}
+    while True:
+        if not _path_present(path):
+            return
+        # Re-prove the remaining tree on every retry so a concurrent unknown
+        # path is preserved rather than swept up by a blind second rmtree.
+        _check_owned_tree(path, manifest, verify_bytes=verify_bytes)
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno not in retryable or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 def _inspect_active_cache(
@@ -1539,7 +1564,7 @@ def run_monitor_recover(harness_root: Path | None = None) -> dict[str, Any]:
                 "evidence_paths": [str(record_path)],
                 "next_action": "confirm the replacement monitor heartbeat in MONITOR.json",
             }
-    except ConfigError as exc:
+    except (ConfigError, ValueError, OSError) as exc:
         return _failure(
             SETUP_CONFIG_INVALID,
             str(exc),
@@ -1560,6 +1585,155 @@ def _failure(code: str, summary: str, next_action: str) -> dict[str, Any]:
         "summary": summary,
         "evidence_paths": [],
         "next_action": next_action,
+    }
+
+
+def run_setup_check(*, overwrite: bool = False) -> dict[str, Any]:
+    """Validate the complete setup plan without writing any target or runtime path."""
+
+    try:
+        harness_root = find_harness_root()
+        config = load_config(harness_root)
+        manifest = load_resource_manifest(harness_root)
+        if config.root_workspace is None:
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                "harness config does not declare root_workspace",
+            )
+        rt = config.runtime_root
+        _require_plain_workspace_boundary(rt, code=SETUP_CONFIG_INVALID)
+        harness_identity = path_identity(harness_root)
+        workspace_identity = path_identity(config.root_workspace)
+        if workspace_identity == harness_identity or workspace_identity.startswith(
+            harness_identity + os.sep
+        ):
+            raise SetupError(
+                SETUP_CONFIG_INVALID,
+                f"root workspace must not be inside the harness root: {config.root_workspace}",
+            )
+        root_plan = _plan_root_payloads(harness_root)
+        root_bindings = _plan_root_hook_bindings(harness_root, root_plan)
+        binding_templates = {
+            config.root_workspace / relative: template
+            for _, relative, template in root_bindings
+        }
+        _preflight_root_payloads(
+            root_plan,
+            config.root_workspace,
+            overwrite=overwrite,
+            harness_root=harness_root,
+            runtime_root=rt,
+            binding_templates=binding_templates,
+        )
+        cache_plan = _plan_active_cache(harness_root, root_plan=root_plan)
+        _inspect_active_cache(cache_plan, rt, overwrite=overwrite)
+        _check_launcher_bindings(harness_root)
+        # Validate every late setup input before any runtime or project write.
+        # Secret rotation is verified when already initialized; a missing
+        # witness is planned for creation by setup rather than created here.
+        from .memory_product_config import (
+            CONFIG_FILE_NAME,
+            SECRET_KEY_FILE_NAME,
+            SECRET_STATE_FILE_NAME,
+            _load_key,
+            load_memory_product_config,
+            verify_secret_rotation_state,
+        )
+
+        memory_configuration = None
+        if (harness_root / CONFIG_FILE_NAME).is_file():
+            memory_configuration = load_memory_product_config(harness_root)
+            if (memory_configuration.store_root / SECRET_STATE_FILE_NAME).exists():
+                verify_secret_rotation_state(memory_configuration)
+            elif (memory_configuration.store_root / SECRET_KEY_FILE_NAME).exists():
+                # Actual setup will reuse this key while creating the witness;
+                # validate it now so --check cannot approve a later failure.
+                _load_key(memory_configuration, create=False)
+
+        state_path = runtime_state_path(rt)
+        if state_path.is_file():
+            state = read_record(state_path, RUNTIME_STATE_SCHEMA)
+            if state.get("state") not in ("CLOSED", "OPEN", "SHUTTING_DOWN"):
+                raise SetupError(
+                    SETUP_CONFIG_INVALID,
+                    f"unexpected runtime state: {state.get('state')}",
+                )
+        queue_path = manager_queue_path(rt)
+        if config.profile == "managed" and queue_path.is_file():
+            read_record(queue_path, MANAGER_QUEUE_SCHEMA)
+        manifest_path = rt / "resources" / "RESOURCE_MANIFEST.json"
+        if manifest_path.is_file():
+            active = read_record(manifest_path, RESOURCE_MANIFEST_SCHEMA)
+            if active.get("resources") != [dict(item) for item in manifest.resources]:
+                if read_current_epoch(rt) is not None or any(
+                    (rt / "resources" / "leases").glob("*.lease")
+                ):
+                    raise SetupError(
+                        SETUP_RESOURCE_MANIFEST_INVALID,
+                        "resource manifest cannot change while an epoch or lease is active",
+                    )
+    except SetupError as exc:
+        return _failure(
+            exc.code,
+            str(exc),
+            exc.next_action
+            or "resolve the named target; --overwrite replaces only harness-owned payloads",
+        )
+    except (ConfigError, ValueError, OSError) as exc:
+        return _failure(
+            SETUP_CONFIG_INVALID,
+            str(exc),
+            "fix harness-config.json and resource-manifest.json, then re-run setup --check",
+        )
+
+    root_targets = [config.root_workspace / relative for _, relative in root_plan]
+    stable_runtime_targets = [
+        rt,
+        *(rt / parent for parent in ("worktrees", "monitor", "epochs", "resources")),
+        rt / "resources" / "leases",
+        runtime_state_path(rt),
+        runtime_state_path(rt).parent / f".{runtime_state_path(rt).name}.lock",
+        rt / "super-cache",
+        _transaction_path(rt),
+        rt / "resources" / "RESOURCE_MANIFEST.json",
+        monitor_record_path(rt),
+        monitor_record_path(rt).parent / f".{monitor_record_path(rt).name}.lock",
+        *(rt / "super-cache" / relative for _, relative in cache_plan),
+        *(
+            rt / "super-cache" / parent
+            for _, relative in cache_plan
+            for parent in relative.parents
+            if parent != Path(".")
+        ),
+    ]
+    if config.profile == "managed":
+        queue = manager_queue_path(rt)
+        stable_runtime_targets.extend(
+            (rt / "manager", queue, queue.parent / f".{queue.name}.lock")
+        )
+    if memory_configuration is not None:
+        stable_runtime_targets.extend((
+            memory_configuration.store_root / SECRET_KEY_FILE_NAME,
+            memory_configuration.store_root / SECRET_STATE_FILE_NAME,
+        ))
+    planned = {
+        *(str(path) for path in root_targets),
+        *(
+            str(config.root_workspace / parent)
+            for _, relative in root_plan
+            for parent in relative.parents
+            if parent != Path(".")
+        ),
+        *(str(path) for path in stable_runtime_targets),
+    }
+    return {
+        "ok": True,
+        "code": "SETUP_CHECK_OK",
+        "summary": "the complete setup plan passed without writing any path",
+        "planned_paths": sorted(planned),
+        "resource_count": len(manifest.resources),
+        "evidence_paths": [],
+        "next_action": "run `harness setup` to apply this plan",
     }
 
 
@@ -1621,7 +1795,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
             str(exc),
             exc.next_action or "resolve the named target; --overwrite replaces only harness-owned payloads",
         )
-    except ConfigError as exc:
+    except (ConfigError, ValueError, OSError) as exc:
         return _failure(
             SETUP_CONFIG_INVALID,
             str(exc),
@@ -1629,6 +1803,19 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
         )
 
     try:
+        # ROOT setup is the only implicit initializer for the operator-only
+        # secret-rotation witness.  Ordinary bootstrap/resume only verify it
+        # and therefore cannot silently bless changed secret contents.
+        from .memory_product_config import (
+            CONFIG_FILE_NAME,
+            initialize_secret_rotation_state,
+            load_memory_product_config,
+        )
+
+        if (harness_root / CONFIG_FILE_NAME).is_file():
+            initialize_secret_rotation_state(
+                load_memory_product_config(harness_root)
+            )
         for parent in ("worktrees", "monitor", "epochs", "resources"):
             (rt / parent).mkdir(parents=True, exist_ok=True)
         if config.profile == "managed":
@@ -1744,7 +1931,7 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
             str(exc),
             exc.next_action or "resolve the named target; --overwrite replaces only harness-owned payloads",
         )
-    except ConfigError as exc:
+    except (ConfigError, ValueError, OSError) as exc:
         return _failure(
             SETUP_CONFIG_INVALID,
             str(exc),

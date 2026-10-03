@@ -10,7 +10,14 @@ from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from .privacy import PrivacyPolicy, guard_mandatory
-from .config import NetworkResolution, NETWORK_MODES, NETWORK_CONTEXT_FIELDS
+from .config import (
+    CONFIGURATION_SCHEMA,
+    NETWORK_CONTEXT_FIELDS,
+    NETWORK_MODES,
+    NetworkResolution,
+    configuration_record,
+    resolve_config,
+)
 
 TASK_CARD_SCHEMA = "project-task-card/v1"
 # The explicit worker-environment boundary a task card may declare.  A
@@ -406,6 +413,25 @@ def _normalize_json_object(value: Any, field: str) -> dict[str, Any]:
     return normalized
 
 
+def _validate_resolved_configuration(
+    configuration: Mapping[str, Any], *, strategy: str, field: str
+) -> None:
+    """Validate rich configuration records while retaining legacy projections."""
+
+    if configuration.get("schema") is None:
+        return
+    if configuration.get("schema") != CONFIGURATION_SCHEMA:
+        raise ContractError(f"{field} configuration schema is unsupported")
+    try:
+        resolved = resolve_config(configuration)
+    except (TypeError, ValueError) as exc:
+        raise ContractError(f"{field} configuration resolution is invalid") from exc
+    if resolved.strategy != strategy:
+        raise ContractError(f"{field} strategy does not match its configuration")
+    if canonical_json(configuration_record(resolved)) != canonical_json(configuration):
+        raise ContractError(f"{field} configuration is not canonical")
+
+
 def make_task_card(
     *,
     task: str,
@@ -784,6 +810,9 @@ def validate_decision(record: Mapping[str, Any]) -> None:
         raise ContractError("configuration must be an object")
     if configuration.get("strategy") != record["strategy"]:
         raise ContractError("decision strategy does not match its configuration")
+    _validate_resolved_configuration(
+        configuration, strategy=record["strategy"], field="decision"
+    )
     if record["configuration_digest"] != sha256_hex(configuration):
         raise ContractError("decision configuration digest mismatch")
 
@@ -950,6 +979,9 @@ def validate_envelope(
         raise ContractError("envelope configuration must be an object")
     if configuration.get("strategy") != strategy:
         raise ContractError("envelope strategy does not match its configuration")
+    _validate_resolved_configuration(
+        configuration, strategy=strategy, field="envelope"
+    )
     if record.get("configuration_digest") != sha256_hex(configuration):
         raise ContractError("envelope configuration digest mismatch")
     mandatory = _normalize_content_list(record.get("mandatory_content"), "mandatory_content")
@@ -1299,6 +1331,41 @@ def normalize_experience_scope(scope: Mapping[str, Any]) -> dict[str, str]:
         field: _require_nonempty_str(scope.get(field), f"scope.{field}")
         for field in ("application", "project", "namespace", "owner")
     }
+
+
+EXACT_SCOPE_FIELDS = frozenset({"application", "project", "namespace", "owner"})
+
+
+def require_exact_scope(
+    expected: Mapping[str, Any], actual: Mapping[str, Any]
+) -> dict[str, str]:
+    """Return ``actual`` only when both values name one exact scope.
+
+    The older :func:`normalize_experience_scope` intentionally projects the
+    four authorization fields out of a larger record.  Product configuration
+    needs a stronger boundary: task-selected input must neither omit nor add a
+    field, and all four values must exactly equal the ROOT-captured scope.
+    """
+
+    if not isinstance(expected, Mapping) or set(expected) != EXACT_SCOPE_FIELDS:
+        raise ContractError("expected scope must contain exactly the four scope fields")
+    if not isinstance(actual, Mapping) or set(actual) != EXACT_SCOPE_FIELDS:
+        raise ContractError("actual scope must contain exactly the four scope fields")
+    normalized_expected = normalize_experience_scope(expected)
+    normalized_actual = normalize_experience_scope(actual)
+    if normalized_actual != normalized_expected:
+        raise ContractError("actual scope does not match the exact configured scope")
+    return normalized_actual
+
+
+def exact_scope_matches(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> bool:
+    """Return whether two records identify exactly the same closed scope."""
+
+    try:
+        require_exact_scope(expected, actual)
+    except ContractError:
+        return False
+    return True
 
 
 def _normalize_string_refs(
@@ -3694,6 +3761,9 @@ def validate_preparation(record: Mapping[str, Any]) -> None:
         raise ContractError("preparation configuration must be an object")
     if configuration.get("strategy") != record["strategy"]:
         raise ContractError("preparation strategy does not match its configuration")
+    _validate_resolved_configuration(
+        configuration, strategy=record["strategy"], field="preparation"
+    )
     if record["configuration_digest"] != sha256_hex(configuration):
         raise ContractError("preparation configuration digest mismatch")
     if "network_resolution" in record:
@@ -4185,6 +4255,9 @@ def validate_finalized_context(record: Mapping[str, Any]) -> None:
         raise ContractError("finalized context configuration digest mismatch")
     if configuration.get("strategy") != record["strategy"]:
         raise ContractError("finalized context strategy mismatch")
+    _validate_resolved_configuration(
+        configuration, strategy=record["strategy"], field="finalized context"
+    )
     for field in ("mandatory_items", "optional_items", "omitted"):
         if not isinstance(record.get(field), list):
             raise ContractError(f"finalized context {field} must be a list")

@@ -3,15 +3,29 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import tempfile
 import unittest
-from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from memory_harness import config as memory_config, contracts, store
-from orchestrator_harness import controller, launch, lanes, leases, manager_queue, memory_handoff, monitor, operator_launch, resume, review, terminal_evidence
+from orchestrator_harness import (
+    attempt_attestation,
+    bootstrap,
+    controller,
+    launch,
+    lanes,
+    leases,
+    manager_queue,
+    memory_handoff,
+    monitor,
+    operator_launch,
+    resume,
+    review,
+    terminal_evidence,
+)
 from orchestrator_harness.core import content_hash
 from orchestrator_harness.epochs import current_epoch_path, lane_record_dir, manager_queue_path, read_active_lanes, write_active_lanes
 from orchestrator_harness.lanes import LaneError
@@ -22,9 +36,8 @@ from orchestrator_harness.tests.test_memory_handoff import _finalized_lane1_fixt
 
 class NativeReviewEvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(bootstrap._remove_owned_tree, self.root, timeout_seconds=5.0)
         self.rt = self.root / "runtime"
         self.worktree = self.root / "worktree"
         (self.worktree / ".agent-workspace").mkdir(parents=True)
@@ -50,7 +63,13 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             "worktree_path": str(self.worktree), "lifecycle": "review_pending",
             "memory_plan_state": "execution_accepted",
             "controller_status_path": str(self.worktree / ".agent-workspace" / "controller.status.json"),
+            "controller_events_path": str(self.worktree / ".agent-workspace" / "controller.events.jsonl"),
+            "attempts_path": str(self.folder / "controller.attempts.jsonl"),
+            "result_path": str(self.worktree / "RESULT.json"),
+            "transcript_path": str(self.worktree / ".agent-workspace" / "provider-transcript.jsonl"),
+            "stderr_path": str(self.worktree / ".agent-workspace" / "provider-stderr.txt"),
             "process": {"pid": 123, "creation_time": "incarnation-1"},
+            "provider": {"id": "codex", "model": "requested-model"},
         }
         self.result_path = self.worktree / "RESULT.json"
         self._result("PASS")
@@ -61,9 +80,11 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             memory_store.record_decision(contracts.make_decision(
                 self.card,
                 self.plan,
-                configuration=asdict(memory_config.resolve_config(
-                    self.card["memory_handoff"].get("configuration")
-                )),
+                configuration=memory_config.configuration_record(
+                    memory_config.resolve_config(
+                        self.card["memory_handoff"].get("configuration")
+                    )
+                ),
             ))
         finally:
             memory_store.close()
@@ -98,10 +119,143 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         value["content_hash"] = content_hash(value)
         atomic_write_json(self.result_path, value)
 
+    def _seal_controller_attempts(self, run_id: str) -> None:
+        """Produce a seal through the real controller signing/publish path."""
+
+        path = attempt_attestation.attestation_path(
+            self.lane["attempts_path"], run_id,
+        )
+        if not path.exists():
+            run_slot = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:16]
+            evidence_dir = (
+                self.worktree / ".agent-workspace" / "attempts" / run_slot
+            )
+            paths = {
+                "transcript": evidence_dir / "provider-transcript.jsonl",
+                "stderr": evidence_dir / "provider-stderr.txt",
+            }
+            prompt = self.worktree / ".agent-workspace" / "worker-prompt.md"
+            prompt.write_text("perform native work\n", encoding="utf-8")
+            self.lane["_controller_attempt_attestation_key"] = hashlib.sha256(
+                f"controller-test:{run_id}".encode("utf-8")
+            ).digest()
+            self.lane["_controller_attempt_content_hashes"] = []
+            controller._append_attempt(
+                self.lane,
+                attempt_number=1,
+                argv=None,
+                session_id=None,
+                prompt_path=prompt,
+                paths=paths,
+                exit_code=None,
+                result_state="invalid",
+                cleanup_proven=True,
+                validation_error="provider exited without a result",
+                binding=SimpleNamespace(parse_line=lambda _line: None),
+                dispatch_binding=None,
+                provider_started=False,
+            )
+            controller._publish_attempt_attestation(self.lane)
+            self.lane.pop("_controller_attempt_attestation_key", None)
+            self.lane.pop("_controller_attempt_content_hashes", None)
+        seal = terminal_evidence.read_json(path)
+        self.lane["attempt_attestation"] = {
+            "path": str(path),
+            "content_hash": seal["content_hash"],
+            "controller_key_id": seal["controller_key_id"],
+            "row_count": seal["row_count"],
+        }
+
+    def _run_failed_controller_with_usage(self) -> dict:
+        """Run the real terminal controller path with one native usage event."""
+
+        invocation = {
+            "schema": "controller-invocation/v1",
+            "lane_id": self.lane_id,
+            "run_id": self.run_id,
+            "provider": {"id": "codex", "model": "requested-model"},
+            "exclusive_resources": [],
+        }
+        atomic_write_json(
+            self.worktree / ".agent-workspace" / "invocation.json", invocation,
+        )
+
+        def update_test_lane(_rt, _epoch, _lane_id, mutator):
+            updated = mutator(dict(self.lane))
+            self.lane.clear()
+            self.lane.update(updated)
+            return dict(updated)
+
+        def failed_provider(*args, **kwargs):
+            current_lane = args[2]
+            paths = controller._attempt_paths(current_lane, kwargs["attempt_number"])
+            paths["transcript"].parent.mkdir(parents=True, exist_ok=True)
+            paths["transcript"].write_text(
+                '{"type":"turn.completed","turn_id":"turn-unknown","usage":{"input_tokens":7,"output_tokens":2}}\n',
+                encoding="utf-8",
+            )
+            paths["stderr"].write_text(
+                "provider failed after reporting usage\n", encoding="utf-8",
+            )
+            boundary = MagicMock(
+                root_pid=321,
+                root_creation_time="provider-incarnation",
+                process_group_id=321,
+                session_id="provider-process-session",
+            )
+            boundary.record.return_value = {
+                "root": {"pid": 321, "creation_time": "provider-incarnation"},
+            }
+            boundary.cleanup.return_value = True
+            return controller.ProviderExecution(
+                9,
+                boundary,
+                "native-session-unknown",
+                ("codex", "exec", "--json"),
+                True,
+            )
+
+        with (
+            patch.object(controller, "find_harness_root", return_value=self.root),
+            patch.object(
+                controller,
+                "load_config",
+                return_value=SimpleNamespace(runtime_root=self.rt),
+            ),
+            patch.object(
+                controller,
+                "find_active_lane",
+                return_value=(self.epoch_id, self.lane),
+            ),
+            patch.object(
+                controller,
+                "_validate_enhanced_dispatch",
+                return_value={"decision_id": self.envelope["decision_id"]},
+            ),
+            patch.object(
+                controller.processes,
+                "process_identity",
+                return_value={"pid": 123, "creation_time": "incarnation-1"},
+            ),
+            patch.object(
+                controller,
+                "_load_binding",
+                return_value=SimpleNamespace(parse_line=lambda _line: None),
+            ),
+            patch.object(controller, "acquire_leases"),
+            patch.object(controller, "release_leases"),
+            patch.object(controller, "update_lane", side_effect=update_test_lane),
+            patch.object(controller, "_run_provider", side_effect=failed_provider),
+        ):
+            self.assertEqual(0, controller.run_controller(self.lane_id))
+        return terminal_evidence.read_json(Path(self.lane["controller_status_path"]))
+
     def _review(self, *, outcome: str = "PASS", approval: str = "ACCEPTED",
                 force_reason: str | None = None, managed: bool = False,
                 close_side_effect: Exception | None = None,
                 event_state: str = "ACKNOWLEDGED") -> dict:
+        run_id = self.lane["run_id"]
+        self._seal_controller_attempts(run_id)
         event = {"event_id": "event-1", "state": event_state}
         with (
             patch.object(review, "find_harness_root", return_value=self.root),
@@ -141,11 +295,13 @@ class NativeReviewEvidenceTests(unittest.TestCase):
     def _native_unknown_review_queue(self) -> dict:
         self.result_path.unlink()
         self.lane["lifecycle"] = "result_invalid"
+        self._seal_controller_attempts(self.run_id)
         atomic_write_json(Path(self.lane["controller_status_path"]), {
             "schema": "controller-status/v1", "lane_id": self.lane_id, "run_id": self.run_id,
             "controller_state": "exited", "provider_state": {"state": "exited", "exit_code": 1},
             "result_state": "invalid", "recorded_status": "provider_exited_no_result",
             "cleanup_proven": True, "updated_at": "2026-09-25T00:00:00Z",
+            "attempt_attestation": self.lane["attempt_attestation"],
         })
         atomic_write_json(current_epoch_path(self.rt), {
             "schema": "current-epoch/v1", "epoch_id": self.epoch_id, "queue_id": "queue-1",
@@ -272,9 +428,11 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             memory_store.record_decision(contracts.make_decision(
                 self.card,
                 self.plan,
-                configuration=asdict(memory_config.resolve_config(
-                    self.card["memory_handoff"].get("configuration")
-                )),
+                configuration=memory_config.configuration_record(
+                    memory_config.resolve_config(
+                        self.card["memory_handoff"].get("configuration")
+                    )
+                ),
             ))
         finally:
             memory_store.close()
@@ -1238,12 +1396,11 @@ class NativeReviewEvidenceTests(unittest.TestCase):
 
     def test_true_unknown_requires_same_run_cleanup_and_root_exception(self) -> None:
         self.result_path.unlink()
-        status = {
-            "schema": "controller-status/v1", "lane_id": self.lane_id, "run_id": self.run_id,
-            "controller_state": "exited", "provider_state": {"state": "exited", "exit_code": 1},
-            "result_state": "invalid", "recorded_status": "provider_exited_no_result",
-            "cleanup_proven": True, "updated_at": "2026-09-25T00:00:00Z",
-        }
+        status = self._run_failed_controller_with_usage()
+        self.assertEqual("result_invalid", self.lane["lifecycle"])
+        self.assertEqual(
+            self.lane["attempt_attestation"], status["attempt_attestation"],
+        )
         status_path = Path(self.lane["controller_status_path"])
         for change in ("missing", "wrong-run", "no-cleanup", "mere-exit", "no-reason"):
             with self.subTest(change=change):
@@ -1269,6 +1426,27 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         self.assertEqual("UNKNOWN", evidence["review"]["review_outcome"])
         self.assertEqual(status, evidence["terminal_proof"])
         self.assertEqual("ROOT accepts terminal uncertainty", evidence["acceptance"]["force_accept_reason"])
+        memory_store = store.MemoryStore(memory_handoff.memory_paths(self.worktree)[0])
+        memory_store.initialize()
+        try:
+            usage = memory_store.list_native_usage(objective_id="objective-1")
+            self.assertEqual(1, len(usage))
+            self.assertEqual("provider:codex", usage[0]["source"])
+            self.assertEqual("complete", usage[0]["coverage"])
+            self.assertEqual(
+                7,
+                usage[0]["measures"]["input_tokens|tokens|included"]["value"],
+            )
+            self.assertEqual(
+                2,
+                usage[0]["measures"]["output_tokens|tokens|included"]["value"],
+            )
+            self.assertEqual(
+                "UNKNOWN",
+                memory_store.get_outcome(evidence["decision_id"])["status"],
+            )
+        finally:
+            memory_store.close()
 
     def test_managed_no_result_status_event_is_reviewable_only_for_exact_status(self) -> None:
         event = {

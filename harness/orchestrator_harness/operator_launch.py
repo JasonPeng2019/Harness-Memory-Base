@@ -14,7 +14,18 @@ import json
 import sys
 from typing import Any
 
-from . import bootstrap, launch, resume, review, scan_watch, setup, shutdown, view_term
+from . import (
+    bootstrap,
+    launch,
+    memory_commands,
+    resume,
+    review,
+    scan_watch,
+    setup,
+    shutdown,
+    visualizer_launch,
+    view_term,
+)
 from .config import find_harness_root, load_config, load_resource_manifest
 from .lanes import LaneError, find_active_lane
 from .leases import (
@@ -75,10 +86,20 @@ def _emit(result: dict[str, Any], *, as_json: bool) -> int:
     """Print one structured result and return the process exit code."""
     if as_json:
         sys.stdout.write(json.dumps(result, sort_keys=True, indent=2) + "\n")
-    elif result.get("ok"):
-        sys.stdout.write(str(result.get("summary", "")).strip() + "\n")
     else:
-        sys.stderr.write(f"{result.get('code', 'FAILED')}: {result.get('summary', '')}\n")
+        if result.get("ok"):
+            sys.stdout.write(str(result.get("summary", "")).strip() + "\n")
+        else:
+            sys.stderr.write(
+                f"{result.get('code', 'FAILED')}: {result.get('summary', '')}\n"
+            )
+        visualizer = result.get("visualizer")
+        if isinstance(visualizer, dict) and visualizer.get("warning") is True:
+            sys.stderr.write(
+                f"{visualizer.get('code', 'VISUALIZER_WARNING')}: "
+                f"{visualizer.get('summary', '')}. "
+                f"{visualizer.get('next_action', 'run `orchestrator-harness view` manually')}\n"
+            )
     return 0 if result.get("ok") else 1
 
 
@@ -332,6 +353,166 @@ def _nonblank_summary(value: str) -> str:
     return summary
 
 
+def _json_value(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"value must be valid JSON: {exc.msg}") from exc
+
+
+def _json_object(value: str) -> dict[str, Any]:
+    decoded = _json_value(value)
+    if not isinstance(decoded, dict):
+        raise argparse.ArgumentTypeError("value must be a JSON object")
+    return decoded
+
+
+def _add_expected_config(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--expected-config-digest", required=True)
+    parser.add_argument("--expected-policy-generation", required=True)
+
+
+def _add_plan_observation(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--lane-id", required=True)
+    parser.add_argument("--expected-run-id", required=True)
+    parser.add_argument("--expected-task-card-digest", required=True)
+    parser.add_argument("--disposition-id", required=True)
+    parser.add_argument("--expected-disposition-digest", required=True)
+    parser.add_argument("--expected-decision-id", required=True)
+    parser.add_argument("--expected-objective-id", required=True)
+
+
+def _add_pending_plan_observation(parser: argparse.ArgumentParser) -> None:
+    _add_plan_observation(parser)
+    parser.add_argument("--expected-plan-id", required=True)
+    parser.add_argument("--expected-plan-digest", required=True)
+
+
+def _add_memory_parser(subparsers: Any) -> None:
+    memory = subparsers.add_parser(
+        "memory", help="ROOT-only memory, trust, effect, and snapshot administration"
+    )
+    memory_sub = memory.add_subparsers(dest="memory_command", required=True)
+
+    config = memory_sub.add_parser("config", help="trusted memory-product configuration")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser("status", help="inspect nonsecret resolved configuration")
+    for name in ("init-secret-state", "rotate-secret-state"):
+        action = config_sub.add_parser(name, help=f"{name.replace('-', ' ')}")
+        _add_expected_config(action)
+        if name == "rotate-secret-state":
+            action.add_argument("--expected-prior-policy-generation", required=True)
+
+    plan = memory_sub.add_parser("plan", help="review exact pending plans")
+    plan_sub = plan.add_subparsers(dest="plan_command", required=True)
+    inspect = plan_sub.add_parser("inspect", help="inspect a pending plan")
+    _add_plan_observation(inspect)
+    for name in ("propose", "correct"):
+        action = plan_sub.add_parser(name, help=f"{name} a distinct exact plan revision")
+        _add_pending_plan_observation(action)
+        action.add_argument("--new-plan-id", required=True)
+        action.add_argument("--content-json", dest="plan_content", required=True, type=_json_value)
+    accept = plan_sub.add_parser("accept", help="accept and safely reprepare an exact pending plan")
+    _add_pending_plan_observation(accept)
+    accept.add_argument("--checkpoint", required=True)
+    reject = plan_sub.add_parser("reject", help="reject an exact pending plan")
+    _add_pending_plan_observation(reject)
+    reject.add_argument("--reason", required=True, type=_nonblank_summary)
+    reject.add_argument("--fresh-plan-id", required=True)
+
+    procedure = memory_sub.add_parser("procedure", help="govern trusted procedure revisions")
+    procedure_sub = procedure.add_subparsers(dest="procedure_command", required=True)
+    approve = procedure_sub.add_parser("approve", help="approve one exact procedure revision")
+    _add_expected_config(approve)
+    approve.add_argument("--procedure-json", dest="procedure", required=True, type=_json_object)
+    approve.add_argument("--expected-logical-id", required=True)
+    approve.add_argument("--expected-revision-id", required=True)
+    approve.add_argument("--expected-revision-digest", required=True)
+    approve.add_argument("--expected-origin", required=True, choices=["curated", "generated"])
+    approve.add_argument("--approval-id", required=True)
+
+    represent = procedure_sub.add_parser(
+        "represent", help="create the canonical search representation for one revision"
+    )
+    _add_expected_config(represent)
+    represent.add_argument("--logical-id", required=True)
+    represent.add_argument("--revision-id", required=True)
+    represent.add_argument("--expected-revision-digest", required=True)
+    represent.add_argument(
+        "--expected-origin", required=True, choices=["curated", "generated"]
+    )
+    represent.add_argument("--search-text", required=True, type=_nonblank_summary)
+
+    designate = procedure_sub.add_parser("designate", help="designate one approved project revision")
+    _add_expected_config(designate)
+    designate.add_argument("--logical-id", required=True)
+    designate.add_argument("--revision-id", required=True)
+    designate.add_argument("--expected-revision-digest", required=True)
+    designate.add_argument("--approval-id", required=True)
+    designate.add_argument("--expected-approval-digest", required=True)
+    designate.add_argument("--expected-origin", required=True, choices=["curated", "generated"])
+
+    publish = procedure_sub.add_parser("publish", help="publish through configured governed Atlas")
+    _add_expected_config(publish)
+    publish.add_argument("--logical-id", required=True)
+    publish.add_argument("--revision-id", required=True)
+    publish.add_argument("--expected-revision-digest", required=True)
+    publish.add_argument("--approval-id", required=True)
+    publish.add_argument("--expected-approval-digest", required=True)
+    publish.add_argument("--representation-id", required=True)
+    publish.add_argument("--expected-representation-digest", required=True)
+    publish.add_argument("--designation-id", required=True)
+    publish.add_argument("--expected-designation-digest", required=True)
+
+    withdraw = procedure_sub.add_parser("withdraw", help="withdraw one exact current designation")
+    _add_expected_config(withdraw)
+    withdraw.add_argument("--logical-id", required=True)
+    withdraw.add_argument("--expected-designation-id", required=True)
+    withdraw.add_argument("--expected-revision-id", required=True)
+    withdraw.add_argument("--expected-generation", required=True, type=int)
+    withdraw.add_argument("--expected-designation-digest", required=True)
+
+    revoke = procedure_sub.add_parser("revoke", help="revoke one exact procedure revision")
+    _add_expected_config(revoke)
+    revoke.add_argument("--revision-id", required=True)
+    revoke.add_argument("--expected-revision-digest", required=True)
+    revoke.add_argument("--expected-origin", required=True, choices=["curated", "generated"])
+    revoke.add_argument("--reason", required=True, type=_nonblank_summary)
+
+    effects = memory_sub.add_parser("effects", help="inspect or reconcile pending effects")
+    effects_sub = effects.add_subparsers(dest="effects_command", required=True)
+    listing = effects_sub.add_parser("list", help="list privacy-safe actionable effect summaries")
+    listing.add_argument("--outcome-id")
+    reconcile = effects_sub.add_parser("reconcile", help="reconcile exact observed effect evidence")
+    _add_expected_config(reconcile)
+    reconcile.add_argument("--operation-id", required=True)
+    reconcile.add_argument("--expected-status", required=True)
+    reconcile.add_argument("--expected-version", required=True, type=int)
+    reconcile.add_argument("--expected-kind", required=True)
+    reconcile.add_argument("--expected-source-digest", required=True)
+    reconcile.add_argument("--evidence-json", dest="evidence", required=True, type=_json_object)
+    reconcile.add_argument("--result", required=True, choices=["acknowledged", "absent", "idempotent"])
+    reconcile.add_argument("--claim-id")
+
+    snapshot = memory_sub.add_parser("snapshot", help="authorized snapshot operations")
+    snapshot_sub = snapshot.add_subparsers(dest="snapshot_command", required=True)
+    export = snapshot_sub.add_parser("export", help="export the configured central store")
+    _add_expected_config(export)
+    export.add_argument("--snapshot-id", required=True)
+    readiness = snapshot_sub.add_parser("readiness", help="fully inspect one derived snapshot")
+    _add_expected_config(readiness)
+    readiness.add_argument("--snapshot-id", required=True)
+    readiness.add_argument("--expected-snapshot-digest", required=True)
+    restore = snapshot_sub.add_parser("import", help="restore into a new derived store")
+    _add_expected_config(restore)
+    restore.add_argument("--snapshot-id", required=True)
+    restore.add_argument("--expected-snapshot-digest", required=True)
+    restore.add_argument("--restore-id", required=True)
+    restore.add_argument(
+        "--required-capability", action="append", choices=["local", "experience", "atlas"]
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="operator_launch",
@@ -347,6 +528,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="replace harness-owned payloads; shared provider configuration is merged",
+    )
+    setup_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="validate and report the complete setup plan without writing",
     )
     harness_sub.add_parser("shutdown", help="end the whole runtime")
 
@@ -368,6 +554,11 @@ def _build_parser() -> argparse.ArgumentParser:
     bootstrap_parser.add_argument("--task-card", required=True)
     launch_parser = lane_sub.add_parser("launch", help="start one prepared lane")
     launch_parser.add_argument("--lane-id", required=True)
+    launch_parser.add_argument(
+        "--no-visualizer",
+        action="store_true",
+        help="do not automatically open the live viewer for this epoch",
+    )
     review_parser = lane_sub.add_parser("completion-review", help="record ROOT's review and acceptance")
     review_selector = review_parser.add_mutually_exclusive_group(required=True)
     review_selector.add_argument("--event-id")
@@ -428,6 +619,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "monitor-recover", help="recover the persistent monitor (managed, runtime OPEN)"
     )
 
+    _add_memory_parser(subparsers)
     return parser
 
 
@@ -435,6 +627,8 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
     command = args.command
     if command == "harness":
         if args.harness_command == "setup":
+            if args.check:
+                return setup.run_setup_check(overwrite=args.overwrite)
             return setup.run_setup(overwrite=args.overwrite)
         if args.harness_command == "shutdown":
             return shutdown.run_shutdown()
@@ -450,7 +644,29 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 task_card_path=args.task_card,
             )
         if args.lane_command == "launch":
-            return launch.run_launch(args.lane_id)
+            visualizer = visualizer_launch.ensure_for_current_epoch(
+                disabled=args.no_visualizer
+            )
+            if args.no_visualizer and visualizer.get("decision_committed") is not True:
+                return {
+                    "ok": False,
+                    "code": "VISUALIZER_OPT_OUT_FAILED",
+                    "summary": (
+                        "the explicit --no-visualizer decision could not be "
+                        "persisted; no provider was started"
+                    ),
+                    "evidence_paths": list(
+                        visualizer.get("evidence_paths") or []
+                    ),
+                    "next_action": str(
+                        visualizer.get(
+                            "next_action", "resolve runtime storage and retry"
+                        )
+                    ),
+                    "visualizer": visualizer,
+                }
+            result = launch.run_launch(args.lane_id)
+            return {**result, "visualizer": visualizer}
         if args.lane_command == "completion-review":
             return review.run_completion_review(
                 event_id=args.event_id,
@@ -502,6 +718,8 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
         if args.health_command == "monitor-recover":
             return setup.run_monitor_recover()
         raise ValueError(f"unknown health command: {args.health_command}")
+    if command == "memory":
+        return memory_commands.run(args)
     raise ValueError(f"unknown command: {command}")
 
 

@@ -121,6 +121,9 @@ class MaterializationFixture:
         )
 
     def close(self) -> None:
+        # Use the production exact-owned cleanup policy so only its explicit
+        # transient errno set is retried; unrelated fixture defects fail fast.
+        bootstrap._remove_owned_tree(Path(self.temporary.name))
         self.temporary.cleanup()
 
     def _write_text(self, path: Path, contents: str) -> None:
@@ -375,6 +378,25 @@ class V2MaterializationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fixture = MaterializationFixture()
         self.addCleanup(self.fixture.close)
+
+    def test_owned_tree_removal_retries_transient_directory_race(self) -> None:
+        target = self.fixture.root / "owned-removal"
+        (target / "nested").mkdir(parents=True)
+        (target / "nested" / "value.txt").write_text("value\n", encoding="utf-8")
+        real_rmtree = shutil.rmtree
+        calls = 0
+
+        def transient(path: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError(39, "Directory not empty", str(path))
+            real_rmtree(path)
+
+        with patch.object(bootstrap.shutil, "rmtree", side_effect=transient):
+            bootstrap._remove_owned_tree(target, timeout_seconds=0.5)
+        self.assertEqual(2, calls)
+        self.assertFalse(target.exists())
 
     def test_active_cache_preserves_valid_and_rejects_invalid(self) -> None:
         destination = self.fixture.active_cache()
@@ -1198,6 +1220,22 @@ class V2MaterializationTests(unittest.TestCase):
             bootstrap._codex_control_plane_digest(worktree / ".codex"),
             lane["codex_control_plane_sha256"],
         )
+        expected_attempts = (
+            bootstrap.lane_record_dir(
+                self.fixture.root_workspace / ".harness-runtime",
+                "epoch-1", "managed-lane",
+            )
+            / "controller.attempts.jsonl"
+        )
+        self.assertEqual(str(expected_attempts), lane["attempts_path"])
+        self.assertFalse(
+            Path(lane["attempts_path"]).is_relative_to(worktree),
+            "controller usage evidence must not be worker-writable",
+        )
+        invocation = json.loads(
+            (worktree / ".agent-workspace/invocation.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("attempts", invocation["paths"])
 
     def test_missing_or_changed_installed_composition_blocks_managed_bootstrap(self) -> None:
         for failure in ("missing", "changed"):

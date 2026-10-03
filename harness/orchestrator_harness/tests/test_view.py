@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import tempfile
 import unicodedata
 import unittest
 from copy import deepcopy
@@ -12,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from orchestrator_harness import operator_launch, processes, view_render, view_state, view_term
+from orchestrator_harness.tests.support import RetryingTemporaryDirectory
 from orchestrator_harness.view_state import DONE, NOW, SKIP, WAIT
 
 NOW_UTC = datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
@@ -126,7 +126,7 @@ def _tree_fingerprint(root: Path) -> dict[str, tuple[int, int]]:
 
 class ViewStateTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = RetryingTemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.fixture = ViewFixture(self.root)
 
@@ -192,7 +192,7 @@ class ViewStateTests(unittest.TestCase):
 
 class ViewRenderTests(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = RetryingTemporaryDirectory()
         self.state = view_state.collect_state(ViewFixture(Path(self._tmp.name)).rt, now=NOW_UTC)
 
     def tearDown(self) -> None:
@@ -281,7 +281,7 @@ class ViewCommandTests(unittest.TestCase):
         self.assertTrue(parsed.once and parsed.ascii and parsed.no_color)
 
     def test_once_returns_snapshot_result(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with RetryingTemporaryDirectory() as tmp:
             fixture = ViewFixture(Path(tmp))
             config = mock.Mock(runtime_root=fixture.rt)
             with mock.patch("orchestrator_harness.config.find_harness_root", return_value=Path(tmp)), \

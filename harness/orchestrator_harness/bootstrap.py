@@ -12,6 +12,7 @@ helpers or provider material. Source trees stay unchanged.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import shutil
@@ -47,6 +48,9 @@ BOOTSTRAP_CACHE_MISSING = "BOOTSTRAP_CACHE_MISSING"
 BOOTSTRAP_RESOURCE_UNDECLARED = "BOOTSTRAP_RESOURCE_UNDECLARED"
 BOOTSTRAP_PLAN_PENDING = "BOOTSTRAP_PLAN_PENDING"
 BOOTSTRAP_ALLOWANCE_EXPIRED = "BOOTSTRAP_ALLOWANCE_EXPIRED"
+BOOTSTRAP_PROVIDER_ISOLATION_UNAVAILABLE = (
+    "BOOTSTRAP_PROVIDER_ISOLATION_UNAVAILABLE"
+)
 
 # Managed-only helpers carried by the workspace base; plain bootstrap omits them.
 PLAIN_EXCLUDED_HELPERS = (
@@ -423,7 +427,6 @@ def _write_invocation(
             "controller_events": str(agent_workspace / "controller.events.jsonl"),
             "transcript": str(agent_workspace / "provider-transcript.jsonl"),
             "stderr": str(agent_workspace / "provider-stderr.txt"),
-            "attempts": str(agent_workspace / "controller.attempts.jsonl"),
             "last_message": str(agent_workspace / "last-message.txt"),
             "prompt": str(agent_workspace / "worker-prompt.md"),
         },
@@ -475,12 +478,29 @@ def _write_worker_binding(
     return agent_workspace / "harness-hook-binding.json"
 
 
+def _remove_owned_tree(path: Path, *, timeout_seconds: float = 2.0) -> None:
+    """Remove one exact owned tree despite transient NFS/Windows directory races."""
+
+    deadline = time.monotonic() + timeout_seconds
+    retryable = {errno.EACCES, errno.EBUSY, errno.ENOTEMPTY, errno.EPERM}
+    while True:
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno not in retryable or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
 def _clear_codex_control_plane(worktree: Path) -> None:
     control_root = worktree / ".codex"
     if control_root.is_symlink() or control_root.is_file():
         control_root.unlink()
     elif control_root.exists():
-        shutil.rmtree(control_root)
+        _remove_owned_tree(control_root)
 
 
 def _install_trusted_codex_control_plane(
@@ -557,13 +577,13 @@ def _install_trusted_worker_hook_helpers(worktree: Path, harness_root: Path) -> 
         if target.is_symlink():
             target.unlink()
         elif target.exists() and not target.is_file():
-            shutil.rmtree(target)
+            _remove_owned_tree(target)
         shutil.copy2(source_path, target)
     cache = destination / "__pycache__"
     if cache.is_symlink() or cache.is_file():
         cache.unlink()
     elif cache.exists():
-        shutil.rmtree(cache)
+        _remove_owned_tree(cache)
 
 
 def _install_managed_material(
@@ -695,6 +715,26 @@ def _install_codex_worker_isolation(
         harness_root.resolve().parent,
         root_workspace / ".harness-runtime" / "operator-only",
     }
+    # The product store and its secret material are ROOT-only even when an
+    # operator places them outside the already denied harness/runtime trees.
+    # This path comes only from the trusted harness-root config, never from the
+    # task card or worker payload.
+    try:
+        from .memory_product_config import (
+            CONFIG_FILE_NAME,
+            load_memory_product_config,
+        )
+
+        if (harness_root / CONFIG_FILE_NAME).is_file():
+            memory_product = load_memory_product_config(harness_root)
+            denied.add(memory_product.store_root.resolve())
+            denied.add(memory_product.config_path.resolve())
+            denied.update(path.resolve() for path in memory_product.known_secret_files)
+    except (OSError, ValueError) as exc:
+        raise BootstrapError(
+            BOOTSTRAP_CACHE_COLLISION,
+            f"memory product isolation configuration is invalid: {exc}",
+        ) from exc
     denied.update(
         (host_workspace / name).resolve()
         for name in (
@@ -852,7 +892,7 @@ def run_bootstrap(
     exclusive_resources: list[str],
     task_card_path: str,
     allowance_seconds: float | None = None,
-    search_stores: Sequence[Any] = (),
+    search_stores: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Execute ``lane bootstrap`` and return the structured result.
 
@@ -993,6 +1033,9 @@ def run_bootstrap(
     memory: memory_handoff.LaneMemory | None = None
     codex_isolation_sha256: str | None = None
     codex_control_plane_sha256: str | None = None
+    composition: Any | None = None
+    preparation_arguments: dict[str, Any] = {}
+    effective_stores: Sequence[Any] = () if search_stores is None else search_stores
 
     def close_failed_attempt(summary: str) -> tuple[str, dict[str, Any]]:
         """Roll back attempt-created identity and report exact ownership.
@@ -1045,6 +1088,61 @@ def run_bootstrap(
     try:
         task_card = _read_task_card(Path(task_card_path))
         memory_handoff.validate_task_card(task_card)
+        branch = str(task_card.get("branch") or f"lane/{lane_id}")
+        base_commit = str(task_card.get("base_commit") or "HEAD")
+        enabled_handoff = memory_handoff.enabled_memory_handoff(task_card)
+        # A composed product store and its configured content secrets are a
+        # ROOT trust boundary.  Codex is currently the only shipped provider
+        # whose launch vector verifies the exact generated filesystem-deny
+        # profile.  Claude Code's bypassPermissions and Qwen's yolo mode are
+        # intentionally not relabelled as isolation.  Refuse before epoch,
+        # worktree, lane, or optional-store effects; legacy/all-off cards keep
+        # the established provider behavior because they expose no composed
+        # memory product.
+        if (
+            enabled_handoff is not None
+            and provider != "codex"
+        ):
+            from . import product_composition
+
+            if product_composition.configured(harness_root):
+                raise BootstrapError(
+                    BOOTSTRAP_PROVIDER_ISOLATION_UNAVAILABLE,
+                    "provider filesystem isolation unavailable for enhanced "
+                    f"memory product: {provider}; use codex or keep the memory "
+                    "handoff all-off until this provider has a verified "
+                    "config/store_root/secret-file deny mechanism",
+                )
+        # Trusted product configuration, secret rotation, exact scope, service
+        # prerequisites, feature availability, and APC binding are all
+        # resolved before the epoch or worktree can be mutated.
+        if enabled_handoff is not None:
+            from . import product_composition
+
+            if product_composition.configured(harness_root):
+                composition = product_composition.compose_product(
+                    harness_root=harness_root,
+                    task_card=task_card,
+                    route=str(task_card["memory_handoff"]["route"]),
+                )
+                if (
+                    config.memory_product_config_identity
+                    != composition.configuration.config_digest
+                ):
+                    raise BootstrapError(
+                        BOOTSTRAP_REQUEST_INVALID,
+                        "memory product configuration changed during bootstrap "
+                        "preflight; retry against one stable ROOT configuration",
+                    )
+                preparation_arguments = product_composition.preparation_arguments(
+                    task_card=task_card,
+                    composition=composition,
+                    harness_runtime_root=rt,
+                    base_commit=base_commit,
+                )
+                composed_stores = preparation_arguments.pop("stores")
+                if search_stores is None:
+                    effective_stores = composed_stores
         state = open_epoch(rt, config, manifest)
         epoch_id = state["epoch_id"]
         for entry in read_active_lanes(rt, epoch_id):
@@ -1055,8 +1153,6 @@ def run_bootstrap(
                 )
         run_id = new_id()
         worktree_path = rt / "worktrees" / epoch_id / lane_id
-        branch = str(task_card.get("branch") or f"lane/{lane_id}")
-        base_commit = str(task_card.get("base_commit") or "HEAD")
         if allowance_expired():
             # The call entered inside the allowance and ran long; its first
             # effectful phase may not start now that the caller has stopped
@@ -1125,14 +1221,20 @@ def run_bootstrap(
             receipt["provider_payload"] = f"composed-payloads/{provider}"
         atomic_write_json(agent_workspace / "overlay-receipt.json", receipt)
         atomic_write_json(agent_workspace / "task-card.json", task_card)
-        memory = memory_handoff.prepare_lane_memory(
-            task_card=task_card,
-            lane_id=lane_id,
-            run_id=run_id,
-            worktree_path=worktree_path,
-            base_commit=base_commit,
-            search_stores=search_stores,
-        )
+        try:
+            memory = memory_handoff.prepare_lane_memory(
+                task_card=task_card,
+                lane_id=lane_id,
+                run_id=run_id,
+                worktree_path=worktree_path,
+                base_commit=base_commit,
+                search_stores=effective_stores,
+                **preparation_arguments,
+            )
+        finally:
+            if composition is not None:
+                composition.close()
+                composition = None
         if memory.envelope is not None:
             network = memory_handoff.captured_network_resolution(
                 worktree_path=worktree_path, envelope=memory.envelope,
@@ -1176,7 +1278,15 @@ def run_bootstrap(
                 "controller_events_path": str(agent_workspace / "controller.events.jsonl"),
                 "transcript_path": str(agent_workspace / "provider-transcript.jsonl"),
                 "stderr_path": str(agent_workspace / "provider-stderr.txt"),
-                "attempts_path": str(agent_workspace / "controller.attempts.jsonl"),
+                # Attempt receipts live outside the ordinary worktree, but
+                # pathname placement alone is not authentication for a
+                # same-user provider.  The controller additionally HMAC-signs
+                # each row with a memory-only per-run key and publishes the
+                # exact closed-row attestation only after child cleanup.
+                "attempts_path": str(
+                    lane_record_dir(rt, epoch_id, lane_id)
+                    / "controller.attempts.jsonl"
+                ),
                 "last_message_path": str(agent_workspace / "last-message.txt"),
                 "provider": {
                     "id": provider,
@@ -1254,6 +1364,9 @@ def run_bootstrap(
             lane["dispatchable"] = memory.dispatchable
         publish_lane(lane)
     except BootstrapError as exc:
+        if composition is not None:
+            composition.close()
+            composition = None
         summary, effects = close_failed_attempt(str(exc))
         boundary_effects = getattr(exc, "attempt_effects", None)
         if isinstance(boundary_effects, dict):
@@ -1270,6 +1383,9 @@ def run_bootstrap(
             "next_action": "resolve the named target and re-run bootstrap",
         }
     except Exception as exc:
+        if composition is not None:
+            composition.close()
+            composition = None
         summary, effects = close_failed_attempt(str(exc))
         return {
             "ok": False,

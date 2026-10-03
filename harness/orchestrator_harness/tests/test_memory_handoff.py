@@ -5,7 +5,6 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -53,7 +52,9 @@ def _finalized_lane1_fixture(
 ) -> SimpleNamespace:
     """A real Lane 1 finalized record for the explicit test dispatch target."""
 
-    configuration = asdict(config.resolve_config(card["memory_handoff"].get("configuration")))
+    configuration = config.configuration_record(
+        config.resolve_config(card["memory_handoff"].get("configuration"))
+    )
     decision_id = contracts.make_decision(
         card, plan, configuration=configuration,
     )["decision_id"]
@@ -294,9 +295,11 @@ class MemoryHandoffSeamTests(unittest.TestCase):
             memory_store.record_decision(contracts.make_decision(
                 self.card,
                 self.plan,
-                configuration=asdict(config.resolve_config(
-                    self.card["memory_handoff"].get("configuration")
-                )),
+                configuration=config.configuration_record(
+                    config.resolve_config(
+                        self.card["memory_handoff"].get("configuration")
+                    )
+                ),
             ))
         finally:
             memory_store.close()

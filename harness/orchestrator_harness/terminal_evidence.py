@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import attempt_attestation
 from .core import content_hash, read_json, sha256_hex
 from .epochs import lane_record_dir
 from .records import atomic_write_json, RecordLock
@@ -79,8 +80,35 @@ def record_domain_review(
                  and retained.get("evidence_digest") == evidence["content_hash"],
                  "retained domain review provenance mismatch")
         return retained if rejected else None
+    attempts_path = root_folder / "controller.attempts.jsonl"
+    _require(
+        lane.get("attempts_path") == str(attempts_path),
+        "lane attempts path is not the controller-owned runtime journal",
+    )
+    seal_path = attempt_attestation.attestation_path(
+        attempts_path, str(evidence["run_id"]),
+    )
+    try:
+        seal = read_json(seal_path)
+        attempt_attestation.verification_key(
+            seal, lane_id=str(evidence["lane_id"]), run_id=str(evidence["run_id"]),
+        )
+    except (OSError, ValueError) as exc:
+        raise TerminalEvidenceError(
+            f"controller attempt attestation is invalid: {exc}"
+        ) from exc
+    _require(
+        lane.get("attempt_attestation") == {
+            "path": str(seal_path),
+            "content_hash": seal["content_hash"],
+            "controller_key_id": seal["controller_key_id"],
+            "row_count": seal["row_count"],
+        },
+        "lane does not carry the controller-published attempt attestation",
+    )
     result = memory_handoff.record_native_review(
         worktree_path=lane["worktree_path"], evidence=evidence,
+        attempts_path=attempts_path,
     )
     authorization = ({
         "schema": "rejected-native-authorization/v1",

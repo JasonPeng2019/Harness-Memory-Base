@@ -138,6 +138,14 @@ class SnapshotRestoreTests(unittest.TestCase):
                          self.target.get_native_usage("provider:codex", "run-1"))
         self.assertEqual(7, self.target.get_native_usage("provider:codex", "run-1")
                          ["measures"]["input|tokens|included"]["value"])
+        restored_effect = self.target.get_effect_operation(self.pending_id)
+        self.assertEqual(
+            "memory-feature-resolution/v1", restored_effect["configuration"]["schema"]
+        )
+        self.assertEqual(
+            restored_effect["configuration"]["configuration_identity"],
+            config.resolve_config(restored_effect["configuration"]).configuration_identity,
+        )
         self.assertEqual(b"unrelated", unrelated.read_bytes())
 
     def test_revocation_tombstone_remains_ineligible_after_restore(self) -> None:

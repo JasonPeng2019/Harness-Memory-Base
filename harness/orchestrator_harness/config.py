@@ -61,6 +61,7 @@ class HarnessConfig:
     record_paths: tuple[str, ...] = ()
     record_manifests: tuple[str, ...] = ()
     legacy_config_diagnostics: tuple[str, ...] = ()
+    memory_product_config_identity: str | None = None
 
     @property
     def profile(self) -> str:
@@ -296,10 +297,20 @@ def _load_v2_config(harness_root: str | os.PathLike[str]) -> HarnessConfig:
         raise ConfigError(
             f"harness config managed_coordination must be enabled or disabled: {path}"
         )
+    memory_identity: str | None = None
+    memory_path = root / "memory-product-config.json"
+    if memory_path.exists():
+        try:
+            from .memory_product_config import load_memory_product_config
+
+            memory_identity = load_memory_product_config(root).config_digest
+        except (OSError, ValueError) as exc:
+            raise ConfigError(f"memory product config invalid: {exc}") from exc
     return HarnessConfig(
         harness_root=root,
         root_workspace=workspace,
         managed_coordination=managed,
+        memory_product_config_identity=memory_identity,
     )
 
 
@@ -393,4 +404,6 @@ def compute_config_identity(
         "resource_manifest": [dict(item) for item in manifest.resources],
         "runtime_record_schema_version": 1,
     }
+    if config.memory_product_config_identity is not None:
+        payload["memory_product_config_identity"] = config.memory_product_config_identity
     return sha256_hex(payload)

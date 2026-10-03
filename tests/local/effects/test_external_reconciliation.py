@@ -474,6 +474,39 @@ class ExternalReconciliationTests(unittest.TestCase):
             self._create(source_id="new-identity")
         self.assertNotEqual(intent["operation_id"], self._create(scope_key="recipient-2")["operation_id"])
 
+    def test_rich_configuration_identity_survives_effect_restart_and_gates(self) -> None:
+        resolved = config.resolve_config(
+            {"experience_write": False, "generated_skill_creation": True},
+            availability={
+                "atlas_shared_retrieval": {
+                    "available": False,
+                    "reason": "Atlas unavailable for this run",
+                }
+            },
+            transitions={"experience_write": "unconfirmed"},
+        )
+        intent = self._create(captured_config=resolved, current_config=resolved)
+        expected = config.configuration_record(resolved)
+        self.assertEqual(expected, intent["configuration"])
+        self.state.close()
+        self.state = store.MemoryStore(Path(self.directory.name) / "effects.sqlite3")
+        self.state.initialize()
+        restored_operation = self.state.get_effect_operation(intent["operation_id"])
+        self.assertEqual(expected, restored_operation["configuration"])
+        restored = config.resolve_config(restored_operation["configuration"])
+        self.assertEqual(resolved.configuration_identity, restored.configuration_identity)
+        self.assertFalse(restored.atlas_shared_retrieval)
+        self.assertEqual(
+            "unconfirmed",
+            restored.feature_state_by_name["experience_write"].transition_state,
+        )
+        with self.assertRaisesRegex(store.OperationConflictError, "current effective"):
+            self._create(
+                scope_key="disabled-current",
+                captured_config=resolved,
+                current_config=config.resolve_config({"shared_publication": False}),
+            )
+
     def test_same_source_record_cannot_gain_second_identity(self) -> None:
         source = dict(self.source, alternate_id="alternate")
         source["content_hash"] = contracts.content_hash(source)

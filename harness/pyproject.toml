@@ -4,7 +4,14 @@ version = "2.0.0"
 description = "Durable event observation and lane control for parallel coding work"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["memory-harness==0.1.0"]
+
+[project.optional-dependencies]
+everos = ["memory-harness[everos]==0.1.0"]
+atlas = ["memory-harness[atlas]==0.1.0"]
+
+[project.scripts]
+orchestrator-harness = "orchestrator_harness.operator_launch:main"
 
 [build-system]
 requires = ["setuptools>=68"]

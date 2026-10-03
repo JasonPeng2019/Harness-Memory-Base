@@ -110,6 +110,38 @@ class FinalContextDispatchTests(unittest.TestCase):
         )
         return card, decision["decision_id"]
 
+    def test_rich_configuration_resolution_reaches_context_and_envelope(self) -> None:
+        resolved = config.resolve_config(
+            {"experience_write": False, "generated_skill_creation": True},
+            availability={
+                "atlas_shared_retrieval": {
+                    "available": False,
+                    "reason": "Atlas unavailable when this context was finalized",
+                }
+            },
+            transitions={"experience_write": "unconfirmed"},
+        )
+        captured = config.configuration_record(resolved)
+        rich_decision = contracts.make_decision(
+            self.card, self.accepted, strategy=resolved.strategy,
+            configuration=captured,
+        )
+        finalized = self._finalize(
+            decision_id=rich_decision["decision_id"], configuration=captured,
+        )
+        self.assertEqual(captured, finalized.context["configuration"])
+        self.assertEqual(captured, finalized.envelope["configuration"])
+        restored = config.resolve_config(finalized.context["configuration"])
+        self.assertEqual(resolved.configuration_identity, restored.configuration_identity)
+        self.assertTrue(
+            restored.feature_state_by_name["generated_skill_creation"].requested
+        )
+        self.assertFalse(restored.generated_skill_creation)
+        self.assertEqual(
+            "unconfirmed",
+            restored.feature_state_by_name["experience_write"].transition_state,
+        )
+
     def _finalize_selected(self, candidate, source, *, plan=None, deadline=None, limits=None, persist=False):
         accepted = plan or self.accepted
         card = self.card if plan is None else contracts.make_task_card(

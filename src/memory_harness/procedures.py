@@ -7,11 +7,15 @@ trusted approval and, when enabled, a narrow Atlas adapter.
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from typing import Any, Iterable, Mapping
 
 from . import atlas, contracts
-from .config import MemoryConfig, NetworkResolution, effect_submission_enabled
+from .config import (
+    MemoryConfig,
+    NetworkResolution,
+    configuration_record,
+    effect_submission_enabled,
+)
 from .privacy import (
     PrivacyPolicy,
     RemotePayloadPrivacyError,
@@ -966,7 +970,11 @@ class TrustedProcedureService:
             for row in self.store.list_effect_operations()
         ):
             raise ProcedureError("publication is already bound to another Atlas scope")
-        captured = asdict(captured_config) if isinstance(captured_config, MemoryConfig) else dict(captured_config)
+        captured = (
+            configuration_record(captured_config)
+            if isinstance(captured_config, MemoryConfig)
+            else dict(captured_config)
+        )
         payload = {
             "atlas_scope": scope,
             "document": atlas.make_atlas_procedure_document(publication),

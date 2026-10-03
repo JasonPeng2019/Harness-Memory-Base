@@ -8,7 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from orchestrator_harness import controller
+from orchestrator_harness import attempt_attestation, controller
+from orchestrator_harness.core import content_hash
 from orchestrator_harness.records import read_jsonl
 
 
@@ -31,6 +32,8 @@ def lane_at(root: Path, provider: str) -> dict:
         "worktree_path": str(root),
         "provider": {"id": provider, "model": "requested-model", "launch_config": {}},
         "attempts_path": str(root / "attempts.jsonl"),
+        "_controller_attempt_attestation_key": b"test-controller-key" * 2,
+        "_controller_attempt_content_hashes": [],
     }
 
 
@@ -242,11 +245,23 @@ class NativeAttemptReceipts(unittest.TestCase):
                 self.assertEqual({"decision_id": "decision-1"}, row["dispatch_binding"])
                 self.assertEqual("observed", row["native_usage_state"])
                 self.assertEqual(expected_usage, [item["usage"] for item in receipts])
+                self.assertEqual(
+                    ["cumulative"] * len(receipts) if provider == "codex"
+                    else ["incremental"] * (len(receipts) - 1) + ["cumulative"],
+                    [item["usage_mode"] for item in receipts],
+                )
+                self.assertEqual(
+                    [True] * len(receipts) if provider == "codex"
+                    else [False] * (len(receipts) - 1) + [True],
+                    [item["usage_complete"] for item in receipts],
+                )
                 self.assertEqual(list(range(1, len(events) + 1)),
                                  [item["line_number"] for item in receipts])
                 self.assertEqual([event.get("uuid") for event in events],
                                  [item.get("uuid") for item in receipts])
                 self.assertNotIn("total_tokens", row)
+                self.assertEqual(attempt_attestation.ATTEMPT_SCHEMA, row["schema"])
+                self.assertEqual(content_hash(row), row["content_hash"])
                 if provider == "codex":
                     self.assertEqual(["turn-a", "turn-a", "turn-b"],
                                      [item["turn_id"] for item in receipts])
@@ -312,6 +327,58 @@ class NativeAttemptReceipts(unittest.TestCase):
                     self.assertIn("malformed native JSON", row["native_usage_capture_error"])
                 else:
                     self.assertIsNone(row["native_usage_capture_error"])
+
+    def test_self_hashed_outside_worktree_forgery_cannot_be_controller_sealed(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            worktree = root / "worktree"
+            runtime = root / "runtime"
+            worktree.mkdir()
+            runtime.mkdir()
+            transcript = worktree / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps({
+                    "type": "turn.completed", "turn_id": "turn-1",
+                    "usage": {"input_tokens": 4},
+                }) + "\n",
+                encoding="utf-8",
+            )
+            lane = lane_at(worktree, "codex")
+            lane["attempts_path"] = str(runtime / "controller.attempts.jsonl")
+            controller._append_attempt(
+                lane, attempt_number=1, argv=["codex", "exec"], session_id="s",
+                prompt_path=worktree / "prompt",
+                paths={"transcript": transcript, "stderr": worktree / "stderr"},
+                exit_code=0, result_state="valid", cleanup_proven=True,
+                binding=binding("codex"), dispatch_binding={"decision_id": "decision-1"},
+            )
+            records = read_jsonl(Path(lane["attempts_path"]))
+            forged = dict(records[1])
+            forged["native_usage_observations"] = [{
+                "event_type": "turn.completed", "turn_id": "forged",
+                "usage_mode": "cumulative", "usage_complete": True,
+                "usage": {"input_tokens": 999},
+            }]
+            # This deliberately has a valid content hash.  It would have
+            # passed the former outside-worktree+self-hash check, but it lacks
+            # the controller-memory-only HMAC and expected-row identity.
+            forged["content_hash"] = content_hash(forged)
+            Path(lane["attempts_path"]).write_text(
+                "\n".join(
+                    json.dumps(item, sort_keys=True)
+                    for item in [records[0], forged]
+                ) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                controller.ControllerError, "changed before sealing"
+            ):
+                controller._publish_attempt_attestation(lane)
+            self.assertFalse(
+                attempt_attestation.attestation_path(
+                    lane["attempts_path"], lane["run_id"]
+                ).exists()
+            )
 
     def test_late_tail_after_exit_is_captured_for_started_attempt(self):
         with tempfile.TemporaryDirectory() as raw:

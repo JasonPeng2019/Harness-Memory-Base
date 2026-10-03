@@ -80,6 +80,258 @@ class OperatorLaunchV2Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate provider option"):
             operator_launch._provider_options([("effort", "high"), ("effort", "low")])
 
+    def test_lane_launch_visualizer_is_default_on_with_explicit_opt_out(self) -> None:
+        parser = operator_launch._build_parser()
+        default = parser.parse_args(["lane", "launch", "--lane-id", "lane-1"])
+        disabled = parser.parse_args(
+            ["lane", "launch", "--lane-id", "lane-1", "--no-visualizer"]
+        )
+        self.assertFalse(default.no_visualizer)
+        self.assertTrue(disabled.no_visualizer)
+
+    def test_lane_launch_decides_visualizer_before_provider_and_decorates_result(self) -> None:
+        parser = operator_launch._build_parser()
+        parsed = parser.parse_args(["lane", "launch", "--lane-id", "lane-1"])
+        order: list[str] = []
+        visualizer = {
+            "ok": True,
+            "code": "VISUALIZER_OPENED",
+            "status": "opened",
+            "summary": "visualizer opened",
+            "evidence_paths": [],
+            "next_action": "none",
+            "warning": False,
+        }
+
+        with (
+            mock.patch.object(
+                operator_launch.visualizer_launch,
+                "ensure_for_current_epoch",
+                side_effect=lambda **_kwargs: (order.append("visualizer"), visualizer)[1],
+            ) as ensure,
+            mock.patch.object(
+                operator_launch.launch,
+                "run_launch",
+                side_effect=lambda _lane: (
+                    order.append("provider"),
+                    {
+                        "ok": True,
+                        "code": "LAUNCH_OK",
+                        "summary": "lane started",
+                        "evidence_paths": [],
+                        "next_action": "wait",
+                    },
+                )[1],
+            ),
+        ):
+            result = operator_launch._dispatch(parsed)
+
+        self.assertEqual(["visualizer", "provider"], order)
+        ensure.assert_called_once_with(disabled=False)
+        self.assertEqual(visualizer, result["visualizer"])
+        self.assertTrue(result["ok"])
+
+    def test_lane_launch_opt_out_is_an_epoch_decision_even_when_launch_fails(self) -> None:
+        parser = operator_launch._build_parser()
+        parsed = parser.parse_args(
+            ["lane", "launch", "--lane-id", "lane-1", "--no-visualizer"]
+        )
+        disabled = {
+            "ok": True,
+            "code": "VISUALIZER_DISABLED",
+            "status": "disabled",
+            "summary": "automatic visualizer disabled",
+            "evidence_paths": [],
+            "next_action": "run the viewer manually if wanted",
+            "warning": False,
+            "decision_committed": True,
+        }
+        failure = {
+            "ok": False,
+            "code": "LAUNCH_PROVIDER_START_FAILED",
+            "summary": "provider failed",
+            "evidence_paths": [],
+            "next_action": "retry",
+        }
+        with (
+            mock.patch.object(
+                operator_launch.visualizer_launch,
+                "ensure_for_current_epoch",
+                return_value=disabled,
+            ) as ensure,
+            mock.patch.object(operator_launch.launch, "run_launch", return_value=failure),
+        ):
+            result = operator_launch._dispatch(parsed)
+        ensure.assert_called_once_with(disabled=True)
+        self.assertEqual(disabled, result["visualizer"])
+        self.assertEqual("LAUNCH_PROVIDER_START_FAILED", result["code"])
+
+    def test_lane_launch_refuses_provider_when_explicit_opt_out_cannot_persist(self) -> None:
+        parsed = operator_launch._build_parser().parse_args(
+            ["lane", "launch", "--lane-id", "lane-1", "--no-visualizer"]
+        )
+        failed = {
+            "ok": False,
+            "code": "VISUALIZER_FAILED",
+            "status": "failed",
+            "summary": "cannot persist the visualizer opt-out",
+            "evidence_paths": ["decision.json"],
+            "next_action": "resolve runtime storage",
+            "warning": True,
+            "decision_committed": False,
+        }
+        with (
+            mock.patch.object(
+                operator_launch.visualizer_launch,
+                "ensure_for_current_epoch",
+                return_value=failed,
+            ),
+            mock.patch.object(operator_launch.launch, "run_launch") as run_launch,
+        ):
+            result = operator_launch._dispatch(parsed)
+
+        run_launch.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertEqual("VISUALIZER_OPT_OUT_FAILED", result["code"])
+        self.assertEqual(failed, result["visualizer"])
+
+    def test_lane_launch_opt_out_blocks_uncommitted_ambiguous_state(self) -> None:
+        parsed = operator_launch._build_parser().parse_args(
+            ["lane", "launch", "--lane-id", "lane-1", "--no-visualizer"]
+        )
+        ambiguous = {
+            "ok": False,
+            "code": "VISUALIZER_AMBIGUOUS",
+            "status": "ambiguous",
+            "summary": "active epoch state is invalid",
+            "evidence_paths": ["epoch-state.json"],
+            "next_action": "repair the runtime",
+            "warning": True,
+            "decision_committed": False,
+        }
+        with (
+            mock.patch.object(
+                operator_launch.visualizer_launch,
+                "ensure_for_current_epoch",
+                return_value=ambiguous,
+            ),
+            mock.patch.object(operator_launch.launch, "run_launch") as run_launch,
+        ):
+            result = operator_launch._dispatch(parsed)
+        run_launch.assert_not_called()
+        self.assertEqual("VISUALIZER_OPT_OUT_FAILED", result["code"])
+
+    def test_lane_launch_opt_out_allows_verified_prior_attempt_ambiguity(self) -> None:
+        parsed = operator_launch._build_parser().parse_args(
+            ["lane", "launch", "--lane-id", "lane-1", "--no-visualizer"]
+        )
+        ambiguous = {
+            "ok": False,
+            "code": "VISUALIZER_AMBIGUOUS",
+            "status": "ambiguous",
+            "summary": "a prior launch may have opened the viewer",
+            "evidence_paths": ["visualizer-auto-launch.json"],
+            "next_action": "inspect or use the manual viewer",
+            "warning": True,
+            "decision_committed": True,
+        }
+        launched = {
+            "ok": True,
+            "code": "LAUNCH_OK",
+            "summary": "lane started",
+            "evidence_paths": [],
+            "next_action": "wait",
+        }
+        with (
+            mock.patch.object(
+                operator_launch.visualizer_launch,
+                "ensure_for_current_epoch",
+                return_value=ambiguous,
+            ),
+            mock.patch.object(
+                operator_launch.launch, "run_launch", return_value=launched
+            ) as run_launch,
+        ):
+            result = operator_launch._dispatch(parsed)
+        run_launch.assert_called_once_with("lane-1")
+        self.assertTrue(result["ok"])
+        self.assertEqual(ambiguous, result["visualizer"])
+
+    def test_human_visualizer_warning_uses_stderr_without_failing_lane(self) -> None:
+        result = {
+            "ok": True,
+            "code": "LAUNCH_OK",
+            "summary": "lane started",
+            "evidence_paths": [],
+            "next_action": "wait",
+            "visualizer": {
+                "ok": False,
+                "code": "VISUALIZER_UNAVAILABLE",
+                "status": "unavailable",
+                "summary": "no graphical terminal is available",
+                "evidence_paths": [],
+                "next_action": "run `orchestrator-harness view` manually",
+                "warning": True,
+            },
+        }
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = operator_launch._emit(result, as_json=False)
+        self.assertEqual(0, code)
+        self.assertEqual("lane started\n", stdout.getvalue())
+        self.assertIn("VISUALIZER_UNAVAILABLE", stderr.getvalue())
+        self.assertIn("orchestrator-harness view", stderr.getvalue())
+
+    def test_json_visualizer_warning_is_only_in_structured_stdout(self) -> None:
+        result = {
+            "ok": True,
+            "code": "LAUNCH_OK",
+            "summary": "lane started",
+            "evidence_paths": [],
+            "next_action": "wait",
+            "visualizer": {
+                "ok": False,
+                "code": "VISUALIZER_FAILED",
+                "status": "failed",
+                "summary": "terminal rejected the command",
+                "evidence_paths": [],
+                "next_action": "run `orchestrator-harness view` manually",
+                "warning": True,
+            },
+        }
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = operator_launch._emit(result, as_json=True)
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr.getvalue())
+        self.assertEqual(result, __import__("json").loads(stdout.getvalue()))
+
+    def test_human_mode_keeps_visualizer_warning_when_lane_also_fails(self) -> None:
+        result = {
+            "ok": False,
+            "code": "LAUNCH_PROVIDER_START_FAILED",
+            "summary": "provider failed",
+            "evidence_paths": [],
+            "next_action": "retry",
+            "visualizer": {
+                "ok": False,
+                "code": "VISUALIZER_AMBIGUOUS",
+                "status": "ambiguous",
+                "summary": "a viewer may already be open",
+                "evidence_paths": [],
+                "next_action": "run `orchestrator-harness view` manually",
+                "warning": True,
+            },
+        }
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = operator_launch._emit(result, as_json=False)
+        self.assertEqual(1, code)
+        self.assertEqual("", stdout.getvalue())
+        self.assertIn("LAUNCH_PROVIDER_START_FAILED", stderr.getvalue())
+        self.assertIn("VISUALIZER_AMBIGUOUS", stderr.getvalue())
+        self.assertIn("orchestrator-harness view", stderr.getvalue())
+
     def test_v2_commands_dispatch_through_native_modules(self) -> None:
         with mock.patch.object(
             operator_launch.setup,

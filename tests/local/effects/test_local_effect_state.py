@@ -215,6 +215,42 @@ class LocalEffectStateTests(unittest.TestCase):
             {effect["kind"] for effect in case.state.list_effect_operations(outcome["outcome_id"])},
         )
 
+    def test_outcome_intents_retain_rich_requested_effective_state_after_restart(self) -> None:
+        case = self.case
+        resolved = config.resolve_config(
+            {"experience_write": False, "generated_skill_creation": True},
+            availability={
+                "atlas_shared_retrieval": {
+                    "available": False,
+                    "reason": "Atlas unavailable at capture time",
+                }
+            },
+            transitions={"experience_write": "transitioning"},
+        )
+        captured = config.configuration_record(resolved)
+        self._recapture(captured)
+        case.observe()
+        outcome = case.runtime.record_terminal_outcome(case.bundle())
+        effects = case.state.list_effect_operations(outcome["outcome_id"])
+        self.assertEqual(
+            {"review_receipt", "recent_evidence"}, {effect["kind"] for effect in effects}
+        )
+        self.assertTrue(all(effect["configuration"] == captured for effect in effects))
+        case.state.close()
+        case.state = store.MemoryStore(case.root / "state.sqlite3")
+        case.state.initialize()
+        restored_effects = case.state.list_effect_operations(outcome["outcome_id"])
+        self.assertEqual(effects, restored_effects)
+        restored = config.resolve_config(restored_effects[0]["configuration"])
+        self.assertTrue(
+            restored.feature_state_by_name["generated_skill_creation"].requested
+        )
+        self.assertFalse(restored.generated_skill_creation)
+        self.assertEqual(
+            "transitioning",
+            restored.feature_state_by_name["experience_write"].transition_state,
+        )
+
     def test_generic_legacy_outcome_does_not_gain_effect_operations(self) -> None:
         case = self.case
         legacy = store.MemoryStore(case.root / "legacy.sqlite3")

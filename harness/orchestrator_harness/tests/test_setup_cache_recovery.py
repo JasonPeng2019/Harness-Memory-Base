@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -12,6 +13,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from orchestrator_harness import bootstrap, setup
+from orchestrator_harness.memory_product_config import (
+    SECRET_KEY_FILE_NAME,
+    SECRET_STATE_FILE_NAME,
+)
+from orchestrator_harness.tests.support import configure_local_memory_product
 from orchestrator_harness.tests.test_v2_materialization import MaterializationFixture
 
 
@@ -34,6 +40,80 @@ class SetupCacheRecoveryTests(unittest.TestCase):
             patch.object(setup, "_start_monitor"),
         ):
             return setup.run_setup(overwrite=overwrite)
+
+    def test_setup_check_returns_complete_plan_without_mutation(self) -> None:
+        before = self._bytes(self.fixture.root)
+        with patch.object(
+            setup, "find_harness_root", return_value=self.fixture.harness
+        ):
+            result = setup.run_setup_check(overwrite=False)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual("SETUP_CHECK_OK", result["code"])
+        self.assertTrue(result["planned_paths"])
+        planned = set(result["planned_paths"])
+        self.assertIn(str(self.runtime / "RUNTIME_STATE.json"), planned)
+        self.assertIn(str(self.runtime / "manager" / "QUEUE.json"), planned)
+        self.assertIn(str(self.runtime / "resources" / "RESOURCE_MANIFEST.json"), planned)
+        self.assertIn(str(self.runtime / "resources" / "leases"), planned)
+        self.assertIn(str(self.runtime / "super-cache" / "custom" / "README.md"), planned)
+        self.assertEqual(before, self._bytes(self.fixture.root))
+        self.assertFalse(self.runtime.exists())
+
+    def test_setup_check_rejects_malformed_memory_config_without_mutation(self) -> None:
+        memory_config = self.fixture.harness / "memory-product-config.json"
+        memory_config.write_text('{"schema":"wrong"}\n', encoding="utf-8")
+        before = self._bytes(self.fixture.root)
+        with patch.object(
+            setup, "find_harness_root", return_value=self.fixture.harness
+        ):
+            result = setup.run_setup_check(overwrite=False)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(setup.SETUP_CONFIG_INVALID, result["code"])
+        self.assertEqual(before, self._bytes(self.fixture.root))
+        self.assertFalse(self.runtime.exists())
+
+    def test_setup_check_rejects_malformed_existing_key_without_state(self) -> None:
+        store = self.fixture.root / "memory-store"
+        configure_local_memory_product(self.fixture.harness, store_root=store)
+        (store / SECRET_STATE_FILE_NAME).unlink()
+        key = store / SECRET_KEY_FILE_NAME
+        key.write_bytes(b"too-short")
+        key.chmod(0o600)
+        before = self._bytes(self.fixture.root)
+
+        with patch.object(
+            setup, "find_harness_root", return_value=self.fixture.harness
+        ):
+            result = setup.run_setup_check(overwrite=False)
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(setup.SETUP_CONFIG_INVALID, result["code"])
+        self.assertIn("HMAC key is invalid", result["summary"])
+        self.assertEqual(before, self._bytes(self.fixture.root))
+        self.assertFalse(self.runtime.exists())
+
+    def test_setup_check_plans_every_stable_path_created_by_setup(self) -> None:
+        before = {
+            path.absolute()
+            for path in self.fixture.root.rglob("*")
+        }
+        with patch.object(
+            setup, "find_harness_root", return_value=self.fixture.harness
+        ):
+            checked = setup.run_setup_check(overwrite=False)
+        self.assertTrue(checked["ok"], checked)
+        planned = {Path(path).absolute() for path in checked["planned_paths"]}
+
+        result = self._setup()
+
+        self.assertTrue(result["ok"], result)
+        after = {
+            path.absolute()
+            for path in self.fixture.root.rglob("*")
+        }
+        created = after - before
+        self.assertTrue(created, "setup fixture did not create any stable paths")
+        self.assertEqual(set(), created - planned)
 
     @staticmethod
     def _bytes(root: Path) -> dict[str, bytes]:
@@ -96,6 +176,26 @@ class SetupCacheRecoveryTests(unittest.TestCase):
             )
         open_epoch.assert_not_called()
         return result
+
+    def test_owned_stage_cleanup_retries_transient_directory_not_empty(self) -> None:
+        stage = self.runtime / (".super-cache." + "b" * 32)
+        (stage / "nested").mkdir(parents=True)
+        (stage / "nested" / "payload.txt").write_bytes(b"owned stage\n")
+        manifest = self._manifest(stage)
+        real_rmtree = shutil.rmtree
+        calls: list[Path] = []
+
+        def transient_rmtree(path: Path) -> None:
+            calls.append(Path(path))
+            if len(calls) == 1:
+                raise OSError(errno.ENOTEMPTY, "transient directory publication")
+            real_rmtree(path)
+
+        with patch.object(setup.shutil, "rmtree", side_effect=transient_rmtree):
+            setup._remove_owned_tree(stage, manifest, verify_bytes=True)
+
+        self.assertFalse(stage.exists())
+        self.assertEqual([stage, stage], calls)
 
     def test_failed_stage_or_first_rename_keeps_prior_cache_and_next_setup_repairs(self) -> None:
         for failure in ("copy", "destination-to-backup", "destination-to-backup-after"):
@@ -459,7 +559,11 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 self.assertFalse(rejected["ok"], rejected)
                 self.assertEqual(setup.SETUP_CACHE_INVALID, rejected["code"])
                 self.assertEqual(before, self._bytes(suspect))
-                shutil.rmtree(suspect)
+                # Setup must preserve this unowned artifact byte-for-byte.  At
+                # this point the test explicitly reclaims its exact fixture
+                # path, so use the production bounded owned-tree cleanup rather
+                # than a one-shot rmtree that is unreliable on NFS.
+                bootstrap._remove_owned_tree(suspect, timeout_seconds=5.0)
 
     def test_owned_backup_cleanup_failure_and_partial_cleanup_converge(self) -> None:
         self.assertTrue(self._setup()["ok"])

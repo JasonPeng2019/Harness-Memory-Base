@@ -7,22 +7,26 @@ python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lan
 ```
 
 Every public command returns the structured result `{ ok, code, summary, evidence_paths,
-next_action }`; `--json` emits the machine-readable result object. Success prints a short status
+next_action }`; `lane launch` additionally includes a `visualizer` result describing its epoch-scoped
+automatic-viewer decision. `--json` emits the machine-readable result object. Success prints a short status
 line and exits 0; failure prints one stable failure code and a message on stderr and exits
-non-zero. The harness never schedules work, chooses providers, decides outcomes, accepts
+non-zero. A visualizer warning on a successful lane launch is printed separately on stderr and does
+not change that success. The harness never schedules work, chooses providers, decides outcomes, accepts
 results, operates hardware, or replaces the root orchestrator.
 
 ## Command reference
 
 ### `harness` — runtime lifecycle
 
-- `harness setup [--overwrite]` — one-time idempotent integration. Validates
+- `harness setup [--check] [--overwrite]` — no-write plan validation (`--check`) or one-time
+  idempotent integration. Validates
   `harness-config.json` and `resource-manifest.json`, preflights the entire catalog before
   writing anything, stages and byte-verifies the active super-cache, installs the ROOT payloads,
   writes the active resource manifest and lease directory, and starts the persistent monitor.
   It starts no lane or provider and never creates an epoch or worktree. Existing Codex and Claude
   configuration is preserved while harness hook groups are merged idempotently. An existing Codex
-  config must already enable hooks. `--overwrite` re-integrates only harness-owned payload files.
+  config must already enable hooks. `--check` returns every planned target without creating the
+  runtime or copying a payload. `--overwrite` re-integrates only harness-owned payload files.
 - `harness shutdown` — end the whole runtime: OPEN -> SHUTTING_DOWN, each lane's controller cleans
   its own processes, the monitor stops, the active-epoch marker clears, and the runtime closes.
   It never kills by broad process name.
@@ -41,7 +45,17 @@ results, operates hardware, or replaces the root orchestrator.
   provider option beyond its model. `--provider-option` may repeat. The selected adapter rejects
   missing, duplicate, or unknown preferences before lane mutation, and the signed invocation
   preserves the exact configuration for launch and resume. No launcher binding chooses defaults.
-- `lane launch --lane-id <id>` — start one prepared lane's controller and provider.
+- `lane launch --lane-id <id> [--no-visualizer]` — start one prepared lane's controller and provider.
+  On the first launch attempt in an active epoch, the default path records a durable launch intent and
+  opens the existing read-only `view` command in a new terminal before the provider handshake. Later
+  lane launches do not open duplicate windows. `--no-visualizer` records the first decision as disabled
+  for the whole epoch; it does not retroactively close a viewer that is already open. A new epoch
+  defaults to automatic opening again. Headless/missing-terminal failures remain retryable and are
+  reported with the manual `orchestrator-harness view` fallback. A crash-ambiguous launch is not retried
+  automatically because that could create a duplicate window. The terminal/viewer child receives only
+  an operational environment allowlist, not provider, task, or harness-control credentials. Automatic
+  opening is auxiliary, but an explicit opt-out is authoritative: if its epoch decision cannot be
+  persisted, the command returns `VISUALIZER_OPT_OUT_FAILED` before starting the provider.
 - `lane completion-review (--event-id <id> | --lane-id <id>) --review-outcome {PASS,FAIL,BLOCKED}
   --approval {ACCEPTED,REJECTED} --review-summary <text> [--evidence <path>] [--force-accept]
   [--force-reason <text>]` — record ROOT's factual finding and the separate accept/reject
@@ -90,7 +104,8 @@ results, operates hardware, or replaces the root orchestrator.
   as skipped for plain lanes), then Work, Review, Learn. Items that need ROOT are listed at the
   bottom with the command to run. `↑`/`↓` select, `enter` shows lane details, `q` quits. It never
   writes runtime records; `--once` (or a non-terminal stdout) prints one snapshot, and `--json`
-  adds the collected `state`.
+  adds the collected `state`. Interactive mode continuously re-reads those same authoritative records,
+  including status changes made after the window opened.
 - `watch [--until-actionable] [--timeout <duration>] [--until-event <id>]` — block until an
   actionable condition exists (or the named manager event appears). Durations accept `30s`, `5m`,
   `1h`.

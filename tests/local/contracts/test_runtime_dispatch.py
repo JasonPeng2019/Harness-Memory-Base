@@ -2,9 +2,10 @@
 
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
-from memory_harness import contracts, privacy, runtime, store
+from memory_harness import config, contracts, privacy, runtime, store
 
 
 class RuntimeDispatchTests(unittest.TestCase):
@@ -53,6 +54,62 @@ class RuntimeDispatchTests(unittest.TestCase):
             contracts.sha256_hex(decision["configuration"]),
             decision["configuration_digest"],
         )
+        self.assertEqual(
+            "memory-feature-resolution/v1", decision["configuration"]["schema"]
+        )
+        self.assertEqual(
+            self.runtime.config.configuration_identity,
+            decision["configuration"]["configuration_identity"],
+        )
+        self.assertEqual(decision["configuration"], self.envelope["configuration"])
+
+    def test_requested_effective_and_transition_state_reach_runtime_envelope(self) -> None:
+        configured = config.resolve_config(
+            {"experience_write": False, "generated_skill_creation": True},
+            availability={
+                "atlas_shared_retrieval": {
+                    "available": False,
+                    "reason": "Atlas is unavailable in this installation",
+                }
+            },
+            transitions={"experience_write": "unconfirmed"},
+        )
+        product = runtime.MemoryRuntime(self.memory_store, config=configured)
+        plan = contracts.make_plan(
+            plan_id="rich-plan", objective_id="rich-objective", route="ordinary",
+            state="accepted", content={"steps": ["inspect"]}, accepted_by="ROOT",
+        )
+        card = contracts.make_task_card(
+            task="Inspect rich configuration", base_commit="base-1",
+            memory_handoff=contracts.make_memory_handoff(
+                objective_id="rich-objective", route="ordinary", plan=plan,
+            ),
+        )
+        prepared = product.prepare(
+            plan=plan, task_card=card, lane_id="rich-lane", run_id="rich-run",
+            worktree_path=self.root / "rich-worktree", base_commit="base-1",
+        )
+        record = prepared.decision["configuration"]
+        self.assertEqual(config.configuration_record(configured), record)
+        self.assertEqual(record, prepared.envelope["configuration"])
+        restored = config.resolve_config(record)
+        self.assertTrue(
+            restored.feature_state_by_name["generated_skill_creation"].requested
+        )
+        self.assertFalse(restored.generated_skill_creation)
+        self.assertEqual(
+            "unconfirmed",
+            restored.feature_state_by_name["experience_write"].transition_state,
+        )
+
+        tampered = deepcopy(prepared.decision)
+        tampered["configuration"]["feature_states"][0]["reason"] = "forged"
+        tampered["configuration_digest"] = contracts.sha256_hex(
+            tampered["configuration"]
+        )
+        tampered["content_hash"] = contracts.content_hash(tampered)
+        with self.assertRaisesRegex(contracts.ContractError, "resolution|canonical"):
+            contracts.validate_decision(tampered)
 
     def tearDown(self) -> None:
         self.memory_store.close()

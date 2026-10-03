@@ -115,6 +115,18 @@ def usage_observation(event: dict[str, Any], provider_id: str) -> dict[str, Any]
     observation = {
         "event_type": event_type,
         "usage": safe_usage,
+        # Codex turn events and provider result events are terminal rollups.
+        # Assistant events are per-message deltas.  Preserve that distinction
+        # at the parsing boundary so the durable usage join cannot silently
+        # reinterpret every provider receipt as cumulative.
+        "usage_mode": (
+            "incremental"
+            if event_type == "assistant"
+            else "cumulative"
+        ),
+        "usage_complete": event_type in {
+            "turn.completed", "turn.failed", "turn.cancelled", "result",
+        },
     }
     if model_usage:
         observation["modelUsage"] = model_usage

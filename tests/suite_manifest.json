@@ -1,0 +1,98 @@
+{
+  "schema": "memory-harness-test-suite/v1",
+  "categories": [
+    {
+      "name": "contracts",
+      "description": "Schemas, configuration, dispatch, terminal outcomes, feature boundaries, live authorization gates, and specification/runner integrity.",
+      "framework": "pytest",
+      "paths": ["tests/local/contracts"]
+    },
+    {
+      "name": "memory",
+      "description": "Experience ingestion, trust and revocation, generated skills, procedures, Atlas/EverOS adapters, and idempotent external/local effects.",
+      "framework": "pytest",
+      "paths": [
+        "tests/local/atlas",
+        "tests/local/effects",
+        "tests/local/experience",
+        "tests/local/procedures"
+      ]
+    },
+    {
+      "name": "planning",
+      "description": "Bounded preparation, search adapters, reuse planning, templates/APC, final context, provider binding, deadlines, and captured configuration.",
+      "framework": "pytest",
+      "paths": ["tests/local/preparation"]
+    },
+    {
+      "name": "lifecycle",
+      "description": "MVP and joined end-to-end fixed-strategy lifecycles from preparation through accepted terminal settlement.",
+      "framework": "pytest",
+      "paths": ["tests/local/integration", "tests/local/mvp"]
+    },
+    {
+      "name": "privacy",
+      "description": "Redaction identity, authoritative-source preservation, scrubbed provider payloads, recipient policy, and restricted-local egress suppression.",
+      "framework": "pytest",
+      "paths": ["tests/local/privacy"]
+    },
+    {
+      "name": "recovery",
+      "description": "Snapshot/restore integrity and isolation plus concurrency, queue pressure, crash, atomic publication, and exact-cleanup stress cases.",
+      "framework": "pytest",
+      "paths": ["tests/local/recovery", "tests/local/stress"]
+    },
+    {
+      "name": "usage",
+      "description": "Native usage parsing, binding, completeness, cumulative/incremental reconciliation, deduplication, replay, and immutable outcome accounting.",
+      "framework": "pytest",
+      "paths": ["tests/local/usage"]
+    },
+    {
+      "name": "platform",
+      "description": "Native process identity, termination, reaping, and foreign-platform qualification boundaries.",
+      "framework": "pytest",
+      "paths": ["tests/platform"]
+    },
+    {
+      "name": "distribution",
+      "description": "Deterministic archive parity plus isolated wheel, sdist, editable, asset, CLI, and supported-interpreter installation checks.",
+      "framework": "pytest",
+      "paths": ["tests/distribution"]
+    },
+    {
+      "name": "live",
+      "description": "Explicitly authorized current-pin Atlas, EverOS, native-provider, privacy/egress, snapshot, APC, and nested-ownership qualification.",
+      "framework": "pytest",
+      "paths": ["tests/live"]
+    },
+    {
+      "name": "harness",
+      "description": "Orchestrator controller, lanes, lifecycle, queues, hooks, review, attestation, processes, packaging, visualizer, and v2 acceptance behavior.",
+      "framework": "unittest",
+      "paths": ["harness/orchestrator_harness/tests"],
+      "top_level": "harness"
+    },
+    {
+      "name": "watcher",
+      "description": "Diagnostic watcher ingestion, attention records, CLI, lifecycle, cwd independence, burst handling, and exact process reaping.",
+      "framework": "unittest",
+      "paths": ["harness/harness_watcher_implementation/tests"],
+      "top_level": "harness"
+    }
+  ],
+  "all": [
+    "contracts",
+    "memory",
+    "planning",
+    "lifecycle",
+    "privacy",
+    "recovery",
+    "usage",
+    "platform",
+    "distribution",
+    "live",
+    "harness",
+    "watcher"
+  ]
+}

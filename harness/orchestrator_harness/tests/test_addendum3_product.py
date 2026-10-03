@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -8,9 +7,17 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
-from orchestrator_harness import controller, leases, manager_queue, monitor, review, scan_watch
+from orchestrator_harness import (
+    attempt_attestation,
+    controller,
+    leases,
+    manager_queue,
+    monitor,
+    review,
+    scan_watch,
+)
 from orchestrator_harness.controller import ProviderExecution
-from orchestrator_harness.core import content_hash
+from orchestrator_harness.core import content_hash, read_json
 from orchestrator_harness.epochs import CURRENT_EPOCH_SCHEMA, MANAGER_QUEUE_SCHEMA
 from orchestrator_harness.manager_queue import (
     append_assignment,
@@ -20,11 +27,12 @@ from orchestrator_harness.manager_queue import (
     read_manager_queue,
 )
 from orchestrator_harness.records import atomic_write_json, read_jsonl, read_record
+from orchestrator_harness.tests.support import RetryingTemporaryDirectory
 
 
 class Addendum3ProductTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = RetryingTemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.runtime = Path(self.temp.name) / "runtime"
         atomic_write_json(
@@ -716,7 +724,7 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertIsInstance(attempts, list)
         assert isinstance(calls, list)
         assert isinstance(attempts, list)
-        self.assertEqual({"schema": "controller-attempts/v1"}, attempts[0])
+        self.assertEqual({"schema": "controller-attempts/v2"}, attempts[0])
         rows = attempts[1:]
         self.assertEqual(list(range(1, 7)), [row["attempt"] for row in rows])
         self.assertEqual(expected_states, [row["result_state"] for row in rows])
@@ -973,7 +981,7 @@ class Addendum3ProductTests(unittest.TestCase):
         attempts = observed["attempts"]
         self.assertIsInstance(attempts, list)
         assert isinstance(attempts, list)
-        self.assertEqual({"schema": "controller-attempts/v1"}, attempts[0])
+        self.assertEqual({"schema": "controller-attempts/v2"}, attempts[0])
         attempt_rows = attempts[1:]
         self.assertEqual(list(range(1, 7)), [row["attempt"] for row in attempt_rows])
         self.assertEqual(["invalid"] * 5 + ["valid"], [row["result_state"] for row in attempt_rows])
@@ -1035,6 +1043,16 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual("invalid", rows[0]["result_state"])
         self.assertEqual("observed", rows[0]["native_usage_state"])
         self.assertEqual("turn-1", rows[0]["native_usage_observations"][0]["turn_id"])
+        lane = observed["lane"]
+        status = observed["status"]
+        self.assertIn("attempt_attestation", lane)
+        self.assertEqual(lane["attempt_attestation"], status["attempt_attestation"])
+        seal = read_json(Path(lane["attempt_attestation"]["path"]))
+        key = attempt_attestation.verification_key(
+            seal, lane_id="lane-1", run_id="run-1",
+        )
+        self.assertEqual([rows[0]["content_hash"]], seal["row_content_hashes"])
+        self.assertTrue(attempt_attestation.validate_signed_attempt(rows[0], key))
 
     def test_malformed_receipt_still_appends_failed_attempt_and_releases_lease(self) -> None:
         observed = self._run_candidate_correction_boundary(
@@ -1069,7 +1087,7 @@ class Addendum3ProductTests(unittest.TestCase):
         )
 
         attempts = observed["attempts"]
-        self.assertEqual({"schema": "controller-attempts/v1"}, attempts[0])
+        self.assertEqual({"schema": "controller-attempts/v2"}, attempts[0])
         attempt_rows = attempts[1:]
         self.assertEqual(list(range(1, 7)), [row["attempt"] for row in attempt_rows])
         self.assertEqual(["invalid"] * 6, [row["result_state"] for row in attempt_rows])

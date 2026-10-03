@@ -146,6 +146,13 @@ class NativeChildHarness:
         self.stop_calls: list[str] = []
 
     def close(self) -> None:
+        # Native child fixtures populate the copied control plane while the
+        # test is running.  On Linux/NFS, an entry can become visible between
+        # TemporaryDirectory's directory scan and rmdir, yielding a transient
+        # ENOTEMPTY even after the bounded child thread has joined.  Use the
+        # harness's exact-owned-tree retry policy before disarming the stdlib
+        # finalizer; this remains scoped to this fixture's private root.
+        bootstrap._remove_owned_tree(self.root, timeout_seconds=5.0)
         self.temporary.cleanup()
 
     def write_text(self, path: Path, contents: str) -> None:
@@ -775,7 +782,9 @@ class NativeApcChildTests(unittest.TestCase):
         # The adapter answered inside its own allowance instead of blocking on
         # the native call, and it started no later effectful phase.
         self.assertFalse(released)
-        self.assertLess(elapsed, 2.0)
+        # The 1.5s product allowance plus bounded scheduler/SQLite teardown
+        # overhead must still return well before the blocked 10s call.
+        self.assertLess(elapsed, 2.5)
         self.assertGreater(elapsed, 0.2)
         self.assertEqual("launch", observed["phase"])
         self.assertEqual(self.fixture.bootstrap_calls, [observed["lane_id"]])

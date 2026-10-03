@@ -13,17 +13,21 @@ import json
 import math
 import re
 import time
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import dataclass, fields, replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import apc, contracts, context as context_module, harness_bridge, templates
 from .config import (
+    CONFIGURATION_SCHEMA,
     DEEPER,
+    FEATURE_NAMES,
     PROBLEM_FOCUSED,
     STANDARD,
     MemoryConfig,
     NetworkResolver,
     PreparationLimits,
+    configuration_record,
+    replace_config,
     resolve_config,
     resolve_limits,
 )
@@ -120,19 +124,30 @@ class PreparationService:
         """
 
         recorded = preparation["configuration"]
-        return MemoryConfig(
-            **{
-                field.name: recorded[field.name]
-                for field in fields(MemoryConfig)
-                if field.name in recorded
-            }
-        )
+        try:
+            return resolve_config(recorded)
+        except (TypeError, ValueError) as exc:
+            raise MandatoryStateFailure(
+                "captured preparation configuration is invalid; recover mandatory state"
+            ) from exc
 
     @staticmethod
     def _decision_config(decision: Mapping[str, Any]) -> MemoryConfig:
         """Require a complete fixed policy before using durable state as authority."""
 
         recorded = decision.get("configuration")
+        if isinstance(recorded, Mapping) and recorded.get("schema") == CONFIGURATION_SCHEMA:
+            try:
+                resolved = resolve_config(recorded)
+            except (TypeError, ValueError) as exc:
+                raise MandatoryStateFailure(
+                    "durable logical decision configuration is invalid; recover mandatory state"
+                ) from exc
+            if resolved.strategy != decision.get("strategy"):
+                raise MandatoryStateFailure(
+                    "durable logical decision strategy conflicts with its configuration"
+                )
+            return resolved
         names = {field.name for field in fields(MemoryConfig)}
         if not isinstance(recorded, Mapping) or set(recorded) != names:
             raise MandatoryStateFailure(
@@ -152,7 +167,12 @@ class PreparationService:
             raise MandatoryStateFailure(
                 "durable logical decision strategy conflicts with its configuration"
             )
-        return MemoryConfig(**recorded)
+        try:
+            return resolve_config(recorded)
+        except (TypeError, ValueError) as exc:
+            raise MandatoryStateFailure(
+                "durable logical decision configuration is invalid; recover mandatory state"
+            ) from exc
 
     @staticmethod
     def _standalone_config(
@@ -161,6 +181,19 @@ class PreparationService:
         """Fill only absent decision fields without changing its recorded meaning."""
 
         recorded = decision.get("configuration")
+        if isinstance(recorded, Mapping) and recorded.get("schema") == CONFIGURATION_SCHEMA:
+            try:
+                captured = resolve_config(recorded)
+            except (TypeError, ValueError) as exc:
+                raise MandatoryStateFailure(
+                    "standalone logical decision policy is invalid; recover mandatory state"
+                ) from exc
+            if captured.strategy != decision.get("strategy"):
+                raise MandatoryStateFailure(
+                    "standalone logical decision strategy conflicts with its configuration"
+                )
+            PreparationService._check_explicit_policy(request, captured, captured)
+            return captured
         names = {field.name for field in fields(MemoryConfig)}
         boolean_names = names - {"strategy", "requested_strategy", "reason"}
         if not isinstance(recorded, Mapping) or not set(recorded) <= names:
@@ -215,7 +248,7 @@ class PreparationService:
                 "explicit feature policy conflicts with the captured logical decision; "
                 "recover mandatory state or start a new decision"
             )
-        return replace(
+        return replace_config(
             candidate, requested_strategy=requested_strategy,
             reason=recorded.get("reason", candidate.reason),
         )
@@ -225,6 +258,14 @@ class PreparationService:
         cls, decision: Mapping[str, Any], captured: MemoryConfig,
     ) -> None:
         recorded = decision["configuration"]
+        if isinstance(recorded, Mapping) and recorded.get("schema") == CONFIGURATION_SCHEMA:
+            expected = cls._decision_config(decision)
+            if configuration_record(captured) != configuration_record(expected):
+                raise MandatoryStateFailure(
+                    "first preparation conflicts with its immutable logical decision policy; "
+                    "recover mandatory state"
+                )
+            return
         missing = {
             field.name: getattr(captured, field.name)
             for field in fields(MemoryConfig)
@@ -263,17 +304,14 @@ class PreparationService:
                 "explicit all_features policy conflicts with the captured logical decision; "
                 "recover mandatory state or start a new decision"
             )
-        requested = asdict(captured)
-        for key in requested:
+        for key in ("strategy", *FEATURE_NAMES):
             if key not in request:
                 continue
-            value = (
-                resolved.requested_strategy if key == "strategy"
-                else getattr(resolved, key) if isinstance(requested[key], bool)
-                else request[key]
-            )
+            value = resolved.requested_strategy if key == "strategy" else request[key]
             captured_value = (
-                captured.requested_strategy if key == "strategy" else requested[key]
+                captured.requested_strategy
+                if key == "strategy"
+                else captured.feature_state_by_name[key].requested
             )
             if value != captured_value:
                 raise MandatoryStateFailure(
@@ -434,11 +472,7 @@ class PreparationService:
             "strategy": first[0].get("strategy"),
         })
         self._check_decision_preparation(decision, captured)
-        normalized_request = (
-            requested if not request or "all_features" in request
-            else resolve_config({**asdict(captured), **request})
-        )
-        self._check_explicit_policy(request, normalized_request, captured)
+        self._check_explicit_policy(request, requested, captured)
         network_modes = set()
         rich_resolutions: list[dict[str, Any] | None] = []
         for packet in prior:
@@ -453,11 +487,12 @@ class PreparationService:
                 "configuration": packet.get("configuration"),
                 "strategy": packet.get("strategy"),
             })
-            if packet.get("requested_strategy") != captured.requested_strategy or any(
+            if (packet.get("requested_strategy") != captured.requested_strategy
+                    or packet_config.feature_states != captured.feature_states or any(
                 getattr(packet_config, field.name) != getattr(captured, field.name)
                 for field in fields(MemoryConfig)
                 if isinstance(getattr(captured, field.name), bool)
-            ):
+            )):
                 raise MandatoryStateFailure(
                     "captured logical decision feature policy is inconsistent; "
                     "recover mandatory state"
@@ -467,7 +502,8 @@ class PreparationService:
                 raise MandatoryStateFailure(
                     "captured logical decision strategy is inconsistent; recover mandatory state"
                 )
-            if packet.get("attempt") == 1 and packet_config != captured:
+            if (packet.get("attempt") == 1
+                    and configuration_record(packet_config) != configuration_record(captured)):
                 raise MandatoryStateFailure(
                     "first preparation conflicts with its captured preparation configuration; "
                     "recover mandatory state"
@@ -525,13 +561,13 @@ class PreparationService:
 
         strategy = resolved_config.strategy
         if strategy == PROBLEM_FOCUSED and not (failure_context or "").strip():
-            return replace(
+            return replace_config(
                 resolved_config,
                 strategy=STANDARD,
                 reason="fallback to standard: problem-focused needs real failure context",
             )
         if strategy == DEEPER and unknown_time:
-            return replace(
+            return replace_config(
                 resolved_config,
                 strategy=STANDARD,
                 reason="fallback to standard: unknown time permits only the cheap fixed pass",
@@ -693,7 +729,7 @@ class PreparationService:
                 and supplied_config.all_off and durable["strategy"] == STANDARD
                 and not any(
                     enabled for name, enabled in durable["configuration"].items()
-                    if name not in ("strategy", "requested_strategy", "reason")
+                    if name in FEATURE_NAMES
                 )
             )
             if ((durable is None and supplied_config.all_off)
@@ -719,7 +755,7 @@ class PreparationService:
                 else:
                     ownership_decision = contracts.make_decision(
                         task_card, plan_of_record, strategy=requested_config.strategy,
-                        configuration=asdict(requested_config),
+                        configuration=configuration_record(requested_config),
                     )
                 if self.store is not None and durable is None:
                     try:
@@ -735,7 +771,7 @@ class PreparationService:
                         # a genuinely distinct exact plan needs a new suffix.
                         ownership_decision = contracts.make_decision(
                             task_card, plan_of_record, strategy=requested_config.strategy,
-                            configuration=asdict(requested_config),
+                            configuration=configuration_record(requested_config),
                             decision_id=contracts.sha256_hex({
                                 "domain": "memory-decision-exact/v1",
                                 "accepted_id": ownership_decision["decision_id"],
@@ -807,7 +843,7 @@ class PreparationService:
             decision = (
                 durable if durable is not None else contracts.make_decision(
                     task_card, plan_of_record, strategy=resolved_config.strategy,
-                    configuration=asdict(resolved_config),
+                    configuration=configuration_record(resolved_config),
                     decision_id=ownership_decision["decision_id"],
                 )
             )
@@ -822,7 +858,7 @@ class PreparationService:
                 current_plan_state=current_plan_state,
                 strategy=resolved_config.strategy,
                 requested_strategy=resolved_config.requested_strategy,
-                configuration=asdict(resolved_config),
+                configuration=configuration_record(resolved_config),
                 network_mode=effective_network_mode,
                 network_resolution=network_resolution,
                 budget_source=budget_source,
@@ -1238,7 +1274,7 @@ class PreparationService:
             current_plan_state=packet["current_plan_state"],
             strategy=replacement_config.strategy,
             requested_strategy=replacement_config.requested_strategy,
-            configuration=asdict(replacement_config),
+            configuration=configuration_record(replacement_config),
             network_mode=packet["network_mode"],
             network_resolution=packet.get("network_resolution"),
             budget_source=packet["budget_source"],
@@ -1373,7 +1409,7 @@ class PreparationService:
             return resolved_config, True, ""
         if resolved_config.strategy != STANDARD and self._recipe_fits(STANDARD, remaining):
             return (
-                replace(
+                replace_config(
                     resolved_config,
                     strategy=STANDARD,
                     reason=(
@@ -1385,7 +1421,7 @@ class PreparationService:
                 "one bounded demotion to standard: the requested recipe did not fit",
             )
         return (
-            replace(
+            replace_config(
                 resolved_config,
                 strategy=STANDARD,
                 reason=(

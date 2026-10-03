@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping
 
 from . import contracts
-from .config import MemoryConfig, resolve_config
+from .config import MemoryConfig, configuration_record, resolve_config
 from .privacy import PrivacyPolicy, guard_mandatory, sanitize_optional, worker_bound_finding
 from .store import MemoryStore, StoreError
 
@@ -63,12 +63,14 @@ class MemoryRuntime:
         optional = list(optional_content or [])
         if plan["state"] == "accepted":
             guard_mandatory({"task": task_card["task"], "plan": plan["content"],
-                             "mandatory": mandatory, "configuration": asdict(self.config)}, self.privacy_policy)
+                             "mandatory": mandatory,
+                             "configuration": configuration_record(self.config)},
+                            self.privacy_policy)
         decision = contracts.make_decision(
             task_card,
             plan,
             strategy=self.config.strategy,
-            configuration=asdict(self.config),
+            configuration=configuration_record(self.config),
         )
         self.store.record_decision(decision)
 
@@ -98,7 +100,7 @@ class MemoryRuntime:
             optional_content=safe_optional,
             omitted_content=omitted,
             strategy=self.config.strategy,
-            configuration=asdict(self.config),
+            configuration=configuration_record(self.config),
             privacy_policy=self.privacy_policy,
         )
         return PreparedMemory(decision=decision, envelope=envelope)

@@ -16,10 +16,11 @@ import json
 import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from orchestrator_harness.tests.support import RetryingTemporaryDirectory
 
 WORKTREE_ROOT = Path(__file__).resolve().parents[2]
 SUPER_CACHE_DIR = WORKTREE_ROOT / "adapters" / "codex" / "super-cache"
@@ -71,7 +72,7 @@ def _invoked_command(run):
 
 class CodexWorkerHooksTestCase(unittest.TestCase):
     def test_plain_lane_hooks_allow_tools_and_require_a_valid_result(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with RetryingTemporaryDirectory() as temp_dir:
             worktree = Path(temp_dir) / "plain-worker"
             shutil.copytree(SUPER_CACHE_DIR / ".codex", worktree / ".codex")
             agent_workspace = worktree / ".agent-workspace"

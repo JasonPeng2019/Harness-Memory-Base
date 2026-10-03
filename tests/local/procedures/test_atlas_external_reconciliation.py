@@ -663,6 +663,38 @@ class AtlasExternalReconciliationTests(unittest.TestCase):
         self.assertEqual("acknowledged", self._governed_publish()["status"])
         self.assertEqual(1, self.adapter.publication_writes)
 
+    def test_governed_memory_config_replay_retains_rich_resolution(self) -> None:
+        resolved = config.resolve_config(
+            {"experience_write": False, "generated_skill_creation": True},
+            availability={
+                "atlas_shared_retrieval": {
+                    "available": False,
+                    "reason": "task retrieval unavailable while admin publication remains",
+                }
+            },
+            transitions={"experience_write": "transitioning"},
+        )
+        arguments = {
+            "procedure": self.procedure,
+            "approval": self.approval,
+            "representation": self.representation,
+            "designation": self.designation,
+            "adapter": self.adapter,
+            "claimant": self._claimant(),
+            "captured_config": resolved,
+            "current_config": resolved,
+            "atlas_scope": self._atlas_scope(),
+        }
+        first = self.service.publish(**arguments)
+        replay = self.service.publish(**arguments)
+        self.assertEqual(first, replay)
+        effect = self.memory_store.list_effect_operations()[0]
+        self.assertEqual(config.configuration_record(resolved), effect["configuration"])
+        self.assertEqual(
+            resolved.configuration_identity,
+            config.resolve_config(effect["configuration"]).configuration_identity,
+        )
+
     def test_acknowledged_governed_replay_rejects_wrong_scope_config_and_adapter(self) -> None:
         self.assertEqual("acknowledged", self._governed_publish()["status"])
         self.assertEqual("acknowledged", self._governed_publish()["status"])

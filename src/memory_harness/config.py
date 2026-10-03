@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+import hashlib
+import json
+from dataclasses import asdict, dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
@@ -10,6 +12,32 @@ STANDARD = "standard"
 PROBLEM_FOCUSED = "problem_focused"
 DEEPER = "deeper"
 FIXED_STRATEGIES = frozenset({STANDARD, PROBLEM_FOCUSED, DEEPER})
+FEATURE_NAMES = (
+    "experience_read",
+    "experience_write",
+    "generated_skill_creation",
+    "generated_skill_use",
+    "shared_publication",
+    "atlas_shared_retrieval",
+    "template_memory",
+    "apc",
+    "light_adaptation",
+    "deeper",
+)
+FEATURE_PREREQUISITES: Mapping[str, tuple[str, ...]] = MappingProxyType({
+    "experience_read": (),
+    "experience_write": (),
+    "generated_skill_creation": ("experience_write",),
+    "generated_skill_use": (),
+    "shared_publication": (),
+    "atlas_shared_retrieval": (),
+    "template_memory": (),
+    "apc": ("template_memory",),
+    "light_adaptation": ("apc",),
+    "deeper": (),
+})
+FEATURE_TRANSITION_STATES = frozenset({"stable", "transitioning", "unconfirmed"})
+CONFIGURATION_SCHEMA = "memory-feature-resolution/v1"
 NETWORK_MODES = frozenset({
     "normal", "soft_guardrail_network", "atlas_memory_only", "restricted_local",
 })
@@ -194,6 +222,19 @@ class DeferredCapabilityError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class FeatureState:
+    """Truthful resolution of one current, non-learned feature switch."""
+
+    name: str
+    requested: bool
+    effective: bool
+    prerequisites: tuple[str, ...]
+    available: bool
+    reason: str
+    transition_state: str = "stable"
+
+
+@dataclass(frozen=True)
 class MemoryConfig:
     strategy: str = STANDARD
     requested_strategy: str = STANDARD
@@ -208,6 +249,47 @@ class MemoryConfig:
     apc: bool = True
     light_adaptation: bool = True
     deeper: bool = True
+
+    def __post_init__(self) -> None:
+        # Keep the historic dataclass field set stable: several durable-record
+        # readers enumerate it and old records contain exactly these fields.
+        # Rich resolution is exposed separately and can be captured with
+        # ``configuration_record`` at version-aware boundaries.
+        if self.strategy not in FIXED_STRATEGIES:
+            raise ValueError("strategy must be one of the fixed strategies")
+        if not isinstance(self.requested_strategy, str) or not self.requested_strategy:
+            raise ValueError("requested_strategy must be a nonempty string")
+        if not isinstance(self.reason, str) or not self.reason:
+            raise ValueError("configuration reason must be a nonempty string")
+        for name in FEATURE_NAMES:
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean")
+        for name, prerequisites in FEATURE_PREREQUISITES.items():
+            if getattr(self, name) and any(
+                not getattr(self, prerequisite) for prerequisite in prerequisites
+            ):
+                raise ValueError(f"{name} has a disabled prerequisite")
+        states = tuple(
+            FeatureState(
+                name=name,
+                requested=bool(getattr(self, name)),
+                effective=bool(getattr(self, name)),
+                prerequisites=FEATURE_PREREQUISITES[name],
+                available=True,
+                reason=(
+                    "requested on and prerequisites satisfied"
+                    if getattr(self, name) else "requested off"
+                ),
+            )
+            for name in FEATURE_NAMES
+        )
+        object.__setattr__(self, "_feature_states", states)
+        object.__setattr__(self, "_configuration_identity", _configuration_identity(
+            strategy=self.strategy,
+            requested_strategy=self.requested_strategy,
+            strategy_reason=self.reason,
+            states=states,
+        ))
 
     @property
     def all_off(self) -> bool:
@@ -225,6 +307,183 @@ class MemoryConfig:
                 self.deeper,
             )
         )
+
+    @property
+    def feature_states(self) -> tuple[FeatureState, ...]:
+        return self._feature_states
+
+    @property
+    def feature_state_by_name(self) -> dict[str, FeatureState]:
+        return {state.name: state for state in self._feature_states}
+
+    @property
+    def configuration_identity(self) -> str:
+        return self._configuration_identity
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _configuration_identity(
+    *, strategy: str, requested_strategy: str, strategy_reason: str,
+    states: tuple[FeatureState, ...],
+) -> str:
+    payload = {
+        "schema": CONFIGURATION_SCHEMA,
+        "strategy": strategy,
+        "requested_strategy": requested_strategy,
+        "strategy_reason": strategy_reason,
+        "features": [asdict(state) for state in states],
+    }
+    return hashlib.sha256(_canonical_json(payload)).hexdigest()
+
+
+def configuration_record(configuration: MemoryConfig) -> dict[str, Any]:
+    """Return the stable legacy values plus the complete feature resolution.
+
+    Existing durable readers continue to accept ``dataclasses.asdict(config)``.
+    New version-aware composition code should use this record when it owns a
+    schema that permits the two additive rich-resolution fields.
+    """
+
+    record = {"schema": CONFIGURATION_SCHEMA, **asdict(configuration)}
+    record["feature_states"] = [
+        {**asdict(state), "prerequisites": list(state.prerequisites)}
+        for state in configuration.feature_states
+    ]
+    record["configuration_identity"] = configuration.configuration_identity
+    return record
+
+
+def _from_configuration_record(raw: Mapping[str, Any]) -> MemoryConfig | None:
+    """Validate and restore an explicitly captured rich feature resolution."""
+
+    rich_fields = {"schema", "feature_states", "configuration_identity"}
+    present = rich_fields & set(raw)
+    if not present:
+        return None
+    if present != rich_fields:
+        raise ValueError("captured feature resolution is incomplete")
+    legacy_fields = {"strategy", "requested_strategy", "reason", *FEATURE_NAMES}
+    if set(raw) != legacy_fields | rich_fields:
+        raise ValueError("captured feature resolution has unsupported fields")
+    if raw["schema"] != CONFIGURATION_SCHEMA:
+        raise ValueError("captured feature resolution schema mismatch")
+    strategy = raw["strategy"]
+    requested_strategy = raw["requested_strategy"]
+    strategy_reason = raw["reason"]
+    if strategy not in FIXED_STRATEGIES:
+        raise ValueError("captured strategy is invalid")
+    if any(
+        not isinstance(value, str) or not value
+        for value in (requested_strategy, strategy_reason)
+    ):
+        raise ValueError("captured strategy attribution is invalid")
+    effective: dict[str, bool] = {}
+    for name in FEATURE_NAMES:
+        value = raw[name]
+        if not isinstance(value, bool):
+            raise ValueError(f"captured {name} must be boolean")
+        effective[name] = value
+    serialized_states = raw["feature_states"]
+    if not isinstance(serialized_states, (list, tuple)) or len(serialized_states) != len(
+        FEATURE_NAMES
+    ):
+        raise ValueError("captured feature_states must contain every current feature")
+    states: list[FeatureState] = []
+    effective_by_name: dict[str, bool] = {}
+    fields = {
+        "name", "requested", "effective", "prerequisites", "available", "reason",
+        "transition_state",
+    }
+    for expected_name, value in zip(FEATURE_NAMES, serialized_states):
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("captured feature state is not a closed record")
+        name = value["name"]
+        prerequisites = value["prerequisites"]
+        if name != expected_name or not isinstance(prerequisites, (list, tuple)):
+            raise ValueError("captured feature state order or prerequisites are invalid")
+        state = FeatureState(
+            name=name,
+            requested=value["requested"],
+            effective=value["effective"],
+            prerequisites=tuple(prerequisites),
+            available=value["available"],
+            reason=value["reason"],
+            transition_state=value["transition_state"],
+        )
+        if (
+            not isinstance(state.requested, bool)
+            or not isinstance(state.effective, bool)
+            or not isinstance(state.available, bool)
+            or state.prerequisites != FEATURE_PREREQUISITES[name]
+            or not isinstance(state.reason, str)
+            or not state.reason
+            or state.transition_state not in FEATURE_TRANSITION_STATES
+            or state.effective != effective[name]
+        ):
+            raise ValueError(f"captured feature state for {name} is invalid")
+        expected_effective = bool(
+            state.requested
+            and state.available
+            and all(effective_by_name[prerequisite] for prerequisite in state.prerequisites)
+        )
+        if state.effective != expected_effective:
+            raise ValueError(f"captured feature state for {name} violates its prerequisites")
+        states.append(state)
+        effective_by_name[name] = state.effective
+    resolved_states = tuple(states)
+    identity = _configuration_identity(
+        strategy=strategy,
+        requested_strategy=requested_strategy,
+        strategy_reason=strategy_reason,
+        states=resolved_states,
+    )
+    if raw["configuration_identity"] != identity:
+        raise ValueError("captured configuration identity mismatch")
+    if strategy == DEEPER and not effective_by_name["deeper"]:
+        raise ValueError("captured deeper strategy is disabled")
+    configuration = MemoryConfig(
+        strategy=strategy,
+        requested_strategy=requested_strategy,
+        reason=strategy_reason,
+        **effective,  # type: ignore[arg-type]
+    )
+    object.__setattr__(configuration, "_feature_states", resolved_states)
+    object.__setattr__(configuration, "_configuration_identity", identity)
+    return configuration
+
+
+def replace_config(
+    configuration: MemoryConfig,
+    *,
+    strategy: str | None = None,
+    requested_strategy: str | None = None,
+    reason: str | None = None,
+) -> MemoryConfig:
+    """Replace strategy attribution without discarding captured feature facts."""
+
+    replacement = replace(
+        configuration,
+        strategy=configuration.strategy if strategy is None else strategy,
+        requested_strategy=(
+            configuration.requested_strategy
+            if requested_strategy is None else requested_strategy
+        ),
+        reason=configuration.reason if reason is None else reason,
+    )
+    states = configuration.feature_states
+    object.__setattr__(replacement, "_feature_states", states)
+    object.__setattr__(replacement, "_configuration_identity", _configuration_identity(
+        strategy=replacement.strategy,
+        requested_strategy=replacement.requested_strategy,
+        strategy_reason=replacement.reason,
+        states=states,
+    ))
+    return replacement
 
 
 def effect_submission_enabled(configuration: Mapping[str, Any] | MemoryConfig, kind: str) -> bool:
@@ -267,7 +526,32 @@ def _reject_learned_requests(raw: Mapping[str, Any]) -> None:
         )
 
 
-def resolve_config(raw: Mapping[str, Any] | None = None) -> MemoryConfig:
+def _availability_record(
+    feature: str, raw: bool | Mapping[str, Any] | None
+) -> tuple[bool, str]:
+    if raw is None:
+        return True, "available"
+    if isinstance(raw, bool):
+        return raw, "available" if raw else "required service is unavailable"
+    if not isinstance(raw, Mapping) or set(raw) != {"available", "reason"}:
+        raise ValueError(
+            f"availability for {feature} must be boolean or a closed available/reason object"
+        )
+    available = raw["available"]
+    reason = raw["reason"]
+    if not isinstance(available, bool):
+        raise ValueError(f"availability for {feature} must be boolean")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(f"availability reason for {feature} must be a nonempty string")
+    return available, reason.strip()
+
+
+def resolve_config(
+    raw: Mapping[str, Any] | None = None,
+    *,
+    availability: Mapping[str, bool | Mapping[str, Any]] | None = None,
+    transitions: Mapping[str, str] | None = None,
+) -> MemoryConfig:
     """Resolve one fixed recipe or the all-off baseline before preparation."""
 
     if raw is None:
@@ -276,11 +560,39 @@ def resolve_config(raw: Mapping[str, Any] | None = None) -> MemoryConfig:
         raise ValueError("configuration must be an object")
     _reject_learned_requests(raw)
 
+    captured = _from_configuration_record(raw)
+    if captured is not None:
+        if availability is not None or transitions is not None:
+            raise ValueError("captured feature resolution cannot be resolved again")
+        return captured
+    legacy_fields = {"strategy", "requested_strategy", "reason", *FEATURE_NAMES}
+    if set(raw) == legacy_fields:
+        if availability is not None or transitions is not None:
+            raise ValueError("captured legacy configuration cannot be resolved again")
+        try:
+            return MemoryConfig(**dict(raw))  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise ValueError("captured legacy configuration is invalid") from exc
+
+    availability = {} if availability is None else availability
+    transitions = {} if transitions is None else transitions
+    if not isinstance(availability, Mapping):
+        raise ValueError("feature availability must be an object")
+    if not isinstance(transitions, Mapping):
+        raise ValueError("feature transitions must be an object")
+    for values, label in ((availability, "availability"), (transitions, "transition")):
+        unknown = sorted(set(values) - set(FEATURE_NAMES))
+        if unknown:
+            raise ValueError(f"unknown feature in {label}: {unknown[0]!r}")
+    for name, transition in transitions.items():
+        if transition not in FEATURE_TRANSITION_STATES:
+            raise ValueError(f"invalid transition state for {name}: {transition!r}")
+
     all_features = raw.get("all_features", True)
     if not isinstance(all_features, bool):
         raise ValueError("all_features must be boolean")
     if not all_features:
-        return MemoryConfig(
+        configuration = MemoryConfig(
             strategy=STANDARD,
             requested_strategy=str(raw.get("strategy", STANDARD)),
             reason="all enhancements off",
@@ -295,6 +607,31 @@ def resolve_config(raw: Mapping[str, Any] | None = None) -> MemoryConfig:
             light_adaptation=False,
             deeper=False,
         )
+        states = tuple(
+            FeatureState(
+                name=name,
+                requested=False,
+                effective=False,
+                prerequisites=FEATURE_PREREQUISITES[name],
+                available=_availability_record(name, availability.get(name))[0],
+                reason=(
+                    "all enhancements off"
+                    if transitions.get(name, "stable") == "stable"
+                    else "all enhancements off for new work; pending or in-flight effects "
+                    "are not yet confirmed drained"
+                ),
+                transition_state=transitions.get(name, "stable"),
+            )
+            for name in FEATURE_NAMES
+        )
+        object.__setattr__(configuration, "_feature_states", states)
+        object.__setattr__(configuration, "_configuration_identity", _configuration_identity(
+            strategy=configuration.strategy,
+            requested_strategy=configuration.requested_strategy,
+            strategy_reason=configuration.reason,
+            states=states,
+        ))
+        return configuration
 
     requested_strategy = raw.get("strategy", STANDARD)
     if not isinstance(requested_strategy, str):
@@ -307,7 +644,7 @@ def resolve_config(raw: Mapping[str, Any] | None = None) -> MemoryConfig:
         strategy = STANDARD
         reason = f"fallback to standard: unsupported strategy {requested_strategy!r}"
 
-    feature_values = {
+    requested_features = {
         "experience_read": raw.get("experience_read", True),
         "experience_write": raw.get("experience_write", True),
         "generated_skill_creation": raw.get("generated_skill_creation", True),
@@ -319,27 +656,59 @@ def resolve_config(raw: Mapping[str, Any] | None = None) -> MemoryConfig:
         "light_adaptation": raw.get("light_adaptation", True),
         "deeper": raw.get("deeper", strategy == DEEPER),
     }
-    for key, value in feature_values.items():
+    for key, value in requested_features.items():
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be boolean")
 
-    feature_values["generated_skill_creation"] = bool(
-        feature_values["generated_skill_creation"] and feature_values["experience_write"]
-    )
-    feature_values["apc"] = bool(feature_values["apc"] and feature_values["template_memory"])
-    feature_values["light_adaptation"] = bool(
-        feature_values["light_adaptation"] and feature_values["apc"]
-    )
+    feature_values: dict[str, bool] = {}
+    states: list[FeatureState] = []
+    for name in FEATURE_NAMES:
+        requested = requested_features[name]
+        available, availability_reason = _availability_record(name, availability.get(name))
+        prerequisites = FEATURE_PREREQUISITES[name]
+        missing = tuple(prerequisite for prerequisite in prerequisites
+                        if not feature_values[prerequisite])
+        effective = bool(requested and available and not missing)
+        transition = transitions.get(name, "stable")
+        if not requested:
+            state_reason = "requested off"
+            if transition != "stable":
+                state_reason += "; pending or in-flight effects are not yet confirmed drained"
+        elif not available:
+            state_reason = availability_reason
+        elif missing:
+            state_reason = "disabled prerequisite: " + ", ".join(missing)
+        else:
+            state_reason = "requested on and prerequisites satisfied"
+        feature_values[name] = effective
+        states.append(FeatureState(
+            name=name,
+            requested=requested,
+            effective=effective,
+            prerequisites=prerequisites,
+            available=available,
+            reason=state_reason,
+            transition_state=transition,
+        ))
     if strategy == DEEPER and not feature_values["deeper"]:
         strategy = STANDARD
         reason = "fallback to standard: deeper strategy is disabled"
 
-    return MemoryConfig(
+    configuration = MemoryConfig(
         strategy=strategy,
         requested_strategy=requested_strategy,
         reason=reason,
         **feature_values,  # type: ignore[arg-type]
     )
+    resolved_states = tuple(states)
+    object.__setattr__(configuration, "_feature_states", resolved_states)
+    object.__setattr__(configuration, "_configuration_identity", _configuration_identity(
+        strategy=strategy,
+        requested_strategy=requested_strategy,
+        strategy_reason=reason,
+        states=resolved_states,
+    ))
+    return configuration
 
 
 def all_off() -> MemoryConfig:
@@ -502,6 +871,13 @@ def resolve_limits(raw: Mapping[str, Any] | None = None) -> PreparationLimits:
 __all__ = [
     "DeferredCapabilityError",
     "MemoryConfig",
+    "FeatureState",
+    "CONFIGURATION_SCHEMA",
+    "FEATURE_NAMES",
+    "FEATURE_PREREQUISITES",
+    "FEATURE_TRANSITION_STATES",
+    "configuration_record",
+    "replace_config",
     "FIXED_STRATEGIES",
     "STANDARD",
     "PROBLEM_FOCUSED",

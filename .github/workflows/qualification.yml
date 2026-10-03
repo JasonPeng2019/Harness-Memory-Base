@@ -1,0 +1,132 @@
+name: native-qualification-readiness
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-coordinate:
+    name: CPython ${{ matrix.python }} install coordinate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install deterministic test prerequisites
+        run: python -m pip install "pytest>=7,<9" "setuptools>=68,<82" "wheel>=0.41,<1"
+      - name: Prove selected interpreter and isolated distribution coordinate
+        env:
+          MEMORY_HARNESS_EXPECT_PYTHON_COORDINATE: ${{ matrix.python }}
+        run: >-
+          python -m pytest -q
+          tests/distribution/test_install_matrix.py::test_expected_release_interpreter_is_executing
+          tests/distribution/test_install_matrix.py::test_declared_release_interpreter_coordinate[${{ matrix.python }}]
+          --junitxml=python-${{ matrix.python }}.xml
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: python-${{ matrix.python }}-evidence
+          path: python-${{ matrix.python }}.xml
+
+  native-platform:
+    name: ${{ matrix.platform }} native harness
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux
+            entry: posix
+          - runner: macos-latest
+            platform: darwin
+            entry: posix
+          - runner: windows-latest
+            platform: win32
+            entry: windows
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install test prerequisites and both products
+        shell: bash
+        run: |
+          python -m pip install "pytest>=7,<9" "setuptools>=68,<82" "wheel>=0.41,<1"
+          python -m pip install --no-build-isolation --no-deps .
+          python -m pip install --no-build-isolation --no-deps ./harness
+      - name: Run exact native platform plus harness/watcher suites
+        env:
+          MEMORY_HARNESS_EXPECT_PLATFORM: ${{ matrix.platform }}
+        run: python scripts/run_tests.py platform harness watcher
+      - name: Run exact Windows Job Object and junction nodes
+        if: matrix.entry == 'windows'
+        shell: bash
+        env:
+          MEMORY_HARNESS_EXPECT_PLATFORM: win32
+        run: |
+          python -c "import os, sys; assert os.name == 'nt' and sys.platform == 'win32'"
+          python -m pytest -q \
+            tests/platform/test_native_process_contracts.py::test_expected_native_host_is_executing \
+            harness/orchestrator_harness/tests/test_product_corrections.py::ProviderBoundaryCorrectionTests::test_windows_preassigned_job_close_kills_suspended_provider_before_resume \
+            harness/orchestrator_harness/tests/test_product_corrections.py::ProviderBoundaryCorrectionTests::test_windows_job_boundary_cleans_provider_descendant \
+            harness/orchestrator_harness/tests/test_product_corrections.py::ProviderBoundaryCorrectionTests::test_windows_job_handle_close_kills_members_and_serialized_boundary_recovers \
+            harness/orchestrator_harness/tests/test_setup_cache_recovery.py::SetupCacheRecoveryTests::test_root_payload_junction_blocks_preflight_and_install_recheck \
+            harness/orchestrator_harness/tests/test_setup_cache_recovery.py::SetupCacheRecoveryTests::test_root_payload_target_junction_blocks_before_setup_writes \
+            harness/orchestrator_harness/tests/test_setup_cache_recovery.py::SetupCacheRecoveryTests::test_junction_at_root_or_beneath_cache_blocks_validation_and_dispatch \
+            harness/orchestrator_harness/tests/test_setup_cache_recovery.py::SetupCacheRecoveryTests::test_workspace_and_runtime_junctions_block_first_setup_without_writes \
+            harness/orchestrator_harness/tests/test_setup_cache_recovery.py::SetupCacheRecoveryTests::test_workspace_and_runtime_junctions_block_setup_and_both_bootstrap_profiles \
+            --junitxml=native-windows-details.xml
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always() && matrix.entry == 'windows'
+        with:
+          name: native-windows-details-evidence
+          path: native-windows-details.xml
+          if-no-files-found: error
+      - name: Create disposable installer target
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ma-harness-personal-project"
+          cd "$RUNNER_TEMP/ma-harness-personal-project"
+          git init
+          git config user.name "Qualification Runner"
+          git config user.email "qualification@example.invalid"
+          echo personal-project > README.md
+          git add README.md
+          git commit -m base
+      - name: Exercise POSIX installer entry
+        if: matrix.entry == 'posix'
+        shell: bash
+        run: >-
+          sh install.sh --project "$RUNNER_TEMP/ma-harness-personal-project"
+          --install-root "$RUNNER_TEMP/ma-harness-install" --no-setup --json
+      - name: Exercise Windows installer entry
+        if: matrix.entry == 'windows'
+        shell: pwsh
+        run: >-
+          ./install.ps1 --project "$env:RUNNER_TEMP/ma-harness-personal-project"
+          --install-root "$env:RUNNER_TEMP/ma-harness-install" --no-setup --json
+      - name: Capture native node evidence
+        env:
+          MEMORY_HARNESS_EXPECT_PLATFORM: ${{ matrix.platform }}
+        run: python -m pytest -q tests/platform --junitxml=native-${{ matrix.platform }}.xml
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: native-${{ matrix.platform }}-evidence
+          path: native-${{ matrix.platform }}.xml

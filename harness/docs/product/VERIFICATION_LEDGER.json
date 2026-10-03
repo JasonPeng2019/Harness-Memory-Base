@@ -1,0 +1,647 @@
+{
+  "coordinates": [
+    {
+      "evidence_class": "LIVE",
+      "negative_oracle": "candidate mismatch, stubbed service, missing lifecycle stage/link, over-budget use, or incomplete cleanup earns no current-pin credit",
+      "node": "tests/live/qualification/test_current_pin_lifecycle.py::test_current_pin_enhanced_lifecycle",
+      "positive_oracle": "the exact clean candidate completes actual Atlas, EverOS, and provider preparation through settlement with a linked outcome and cleanup receipt",
+      "prerequisite": "authorized disposable Atlas, EverOS, provider credentials, aggregate budgets, clean candidate artifact",
+      "requirement_id": "G01",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "CONTRACT",
+      "negative_oracle": "missing or invalid binding falls back without a provider call",
+      "node": "tests/local/preparation/test_step04_native_apc_child.py::NativeApcChildTests::test_near_match_runs_one_native_child_and_returns_only_a_proposal",
+      "positive_oracle": "explicit binding yields one proposal with cleanup proof",
+      "prerequisite": "none",
+      "requirement_id": "G02",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "NATIVE",
+      "negative_oracle": "missing, invalid, substituted, multiply counted, or uncleared provider execution earns no native credit",
+      "node": "tests/live/qualification/test_native_apc_matrix.py::test_supported_binding_runs_actual_child",
+      "positive_oracle": "both advertised binding slots launch an actual provider child with exact requested/resolved identity, one usage invocation, and proven cleanup",
+      "prerequisite": "separately authorized installed provider CLIs for both advertised bindings and aggregate live budgets",
+      "requirement_id": "G02",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "overlapping assistant deltas cannot double count the rollup",
+      "node": "tests/local/usage/test_harness_usage_reconciliation.py::test_terminal_rollup_supersedes_overlapping_incremental_messages[claude-code]",
+      "positive_oracle": "terminal native rollup is recorded once",
+      "prerequisite": "none",
+      "requirement_id": "G03",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "disabled/all-off and deferred learned behavior cannot leak state",
+      "node": "tests/local/integration/test_fixed_strategy_lifecycle.py::test_fixed_strategy_runs_joined_lifecycle[deeper-None-True-3]",
+      "positive_oracle": "fixed strategy reaches linked outcome",
+      "prerequisite": "none",
+      "requirement_id": "G04",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "partial transactions and corruption never publish a target",
+      "node": "tests/local/recovery/test_snapshot_qualification.py::test_concurrent_backup_is_one_consistent_quiescent_sqlite_view",
+      "positive_oracle": "restore yields a consistent concurrent snapshot",
+      "prerequisite": "none",
+      "requirement_id": "G05",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LIVE",
+      "negative_oracle": "unverified digest, pending/partial restore, namespace contamination, candidate mismatch, over-budget use, or incomplete cleanup earns no remote-restore credit",
+      "node": "tests/live/qualification/test_current_pin_lifecycle.py::test_remote_snapshot_restore",
+      "positive_oracle": "actual remote snapshot publication verifies its digest and restores only into the disposable isolated namespace",
+      "prerequisite": "authorized remote Atlas and EverOS disposable namespace",
+      "requirement_id": "G05",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "CONTRACT",
+      "negative_oracle": "injecting a control/content secret or placing transport auth in the prompt fails the contract",
+      "node": "tests/local/privacy/test_provider_payload_qualification.py::test_spawned_worker_gets_transport_auth_but_no_control_or_content_secret",
+      "positive_oracle": "a real local probe receives only provider transport auth while control and content secrets are absent from child environment and prompt",
+      "prerequisite": "none",
+      "requirement_id": "G06",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "remote adapter call counter remains exactly zero",
+      "node": "tests/local/privacy/test_provider_payload_qualification.py::test_restricted_local_blocks_actual_remote_search_before_adapter_call",
+      "positive_oracle": "restricted-local completes with local preparation",
+      "prerequisite": "none",
+      "requirement_id": "G06",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LIVE",
+      "negative_oracle": "soft controls alone, any forbidden call or leaked/rewritten secret, candidate mismatch, over-budget use, or incomplete cleanup earns no live privacy/egress credit",
+      "node": "tests/live/qualification/test_current_pin_lifecycle.py::test_hard_egress_and_content_privacy",
+      "positive_oracle": "the exact candidate records independently verified hard egress, zero restricted forbidden calls, unchanged authoritative source, and absence of the fixture secret from every declared provider/derived surface",
+      "prerequisite": "separately authorized clean candidate, actual provider credentials, disposable namespace, and independently verified egress enforcement",
+      "requirement_id": "G06",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "NATIVE-LINUX",
+      "negative_oracle": "foreign or recycled identity cannot be treated as live",
+      "node": "tests/platform/test_native_process_contracts.py::test_native_host_spawn_identity_and_exact_reap[linux]",
+      "positive_oracle": "Linux child identity is observed and reaped",
+      "prerequisite": "none",
+      "requirement_id": "G07",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "NATIVE-MACOS",
+      "negative_oracle": "a foreign-host skip, stale PID, identity change, live child, or changed sentinel earns no macOS-native credit",
+      "node": "tests/platform/test_native_process_contracts.py::test_native_host_spawn_identity_and_exact_reap[darwin]",
+      "positive_oracle": "a native macOS child retains exact creation identity through termination, is reaped, and leaves the unrelated sentinel unchanged",
+      "prerequisite": "macOS qualification host",
+      "requirement_id": "G07",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "NATIVE-WINDOWS",
+      "negative_oracle": "a foreign-host skip, stale PID, identity change, live child, or changed sentinel earns no Windows-native credit",
+      "node": "tests/platform/test_native_process_contracts.py::test_native_host_spawn_identity_and_exact_reap[win32]",
+      "positive_oracle": "a native Windows child retains exact creation identity through termination, is reaped, and leaves the unrelated sentinel unchanged",
+      "prerequisite": "Windows qualification host",
+      "requirement_id": "G07",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "CONTRACT-WINDOWS",
+      "negative_oracle": "unknown keys are rejected rather than treated as navigation or quit",
+      "node": "harness/orchestrator_harness/tests/test_view_interactive.py::ViewerScaleAndKeyContractTests::test_portable_key_mapping_contract",
+      "positive_oracle": "portable Windows-compatible character mappings select up, down, enter, escape, and quit deterministically",
+      "prerequisite": "none",
+      "requirement_id": "G08",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL-POSIX",
+      "negative_oracle": "terminal settings are restored on exit",
+      "node": "harness/orchestrator_harness/tests/test_view_interactive.py::InteractivePtyTests::test_keys_resize_changing_state_and_terminal_restore",
+      "positive_oracle": "viewer handles keys, resize, and changing state",
+      "prerequisite": "none",
+      "requirement_id": "G08",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "each stopped exact PID is absent before reuse",
+      "node": "harness/harness_watcher_implementation/tests/test_watcher_operational.py::WatcherOperationalTests::test_twenty_start_stop_cycles_reap_exact_pid_from_both_cwds",
+      "positive_oracle": "watcher cycles work from both supported cwd roots",
+      "prerequisite": "none",
+      "requirement_id": "G09",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL-CPYTHON-3.12",
+      "negative_oracle": "an unavailable interpreter is skipped and never inferred",
+      "node": "tests/distribution/test_install_matrix.py::test_declared_release_interpreter_coordinate[3.12]",
+      "positive_oracle": "the interpreter builds, installs, imports assets, and runs the CLI",
+      "prerequisite": "none",
+      "requirement_id": "G10",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL-CPYTHON-3.11",
+      "negative_oracle": "a missing CPython 3.11 executable exact-skips without credit; any build, isolated install, asset, version, or CLI failure fails the coordinate",
+      "node": "tests/distribution/test_install_matrix.py::test_declared_release_interpreter_coordinate[3.11]",
+      "positive_oracle": "CPython 3.11 builds the wheel, installs it without system site packages, imports packaged assets/version, and runs the operator CLI from an unrelated cwd",
+      "prerequisite": "CPython 3.11 executable with venv and pip",
+      "requirement_id": "G10",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "LOCAL-CPYTHON-3.13",
+      "negative_oracle": "a missing CPython 3.13 executable exact-skips without credit; any build, isolated install, asset, version, or CLI failure fails the coordinate",
+      "node": "tests/distribution/test_install_matrix.py::test_declared_release_interpreter_coordinate[3.13]",
+      "positive_oracle": "CPython 3.13 builds the wheel, installs it without system site packages, imports packaged assets/version, and runs the operator CLI from an unrelated cwd",
+      "prerequisite": "CPython 3.13 executable with venv and pip",
+      "requirement_id": "G10",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "LOCAL-CPYTHON-3.14",
+      "negative_oracle": "a missing CPython 3.14 executable exact-skips without credit; any build, isolated install, asset, version, or CLI failure fails the coordinate",
+      "node": "tests/distribution/test_install_matrix.py::test_declared_release_interpreter_coordinate[3.14]",
+      "positive_oracle": "CPython 3.14 builds the wheel, installs it without system site packages, imports packaged assets/version, and runs the operator CLI from an unrelated cwd",
+      "prerequisite": "CPython 3.14 executable with venv and pip",
+      "requirement_id": "G10",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "partial files and unrelated sentinels remain untouched",
+      "node": "tests/local/stress/test_runtime_fault_matrix.py::test_concurrent_atomic_publish_is_always_one_complete_writer",
+      "positive_oracle": "concurrent publishers leave one complete record",
+      "prerequisite": "none",
+      "requirement_id": "G11",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "learned/update requests fail before imports or durable state",
+      "node": "tests/local/contracts/test_deferred_scope.py::test_every_learned_or_update_request_fails_before_import_or_state",
+      "positive_oracle": "all current fixed modes remain usable",
+      "prerequisite": "none",
+      "requirement_id": "G12",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "missing IDs, vague nodes, or unstated prerequisites fail the contract",
+      "node": "tests/local/contracts/test_full_product_spec.py::test_structured_verification_ledger_is_exact_and_executable",
+      "positive_oracle": "the frozen manifest and coordinate ledger are complete",
+      "prerequisite": "none",
+      "requirement_id": "G13",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "wrong identity or unavailable native prerequisites remain unclaimed",
+      "node": "tests/local/integration/test_fixed_strategy_lifecycle.py::test_fixed_strategy_runs_joined_lifecycle[standard-None-True-1]",
+      "positive_oracle": "coherent prepare-to-outcome route succeeds",
+      "prerequisite": "none",
+      "requirement_id": "T01",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "NATIVE",
+      "negative_oracle": "memory calls, benchmark work, ownership mutation before conflict detection, failed restore, candidate mismatch, or incomplete cleanup earns no native baseline credit",
+      "node": "tests/live/qualification/test_current_pin_lifecycle.py::test_current_pin_baseline_lifecycle",
+      "positive_oracle": "the exact candidate runs the actual native all-off baseline with zero memory calls and no benchmark, and composes the pinned workspace twice without losing either family",
+      "prerequisite": "separately authorized clean candidate, installed native provider, disposable synthetic baseline workspace, and aggregate live budgets",
+      "requirement_id": "T01",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "a different valid plan is rejected",
+      "node": "tests/local/contracts/test_contracts.py::ContractBasics::test_task_card_cannot_be_bound_to_a_different_valid_plan",
+      "positive_oracle": "exact task and plan identity round-trip",
+      "prerequisite": "none",
+      "requirement_id": "T02",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "wrong base or task cannot dispatch",
+      "node": "tests/local/preparation/test_final_context_dispatch.py::FinalContextDispatchTests::test_finalized_context_binds_the_actual_target",
+      "positive_oracle": "finalized context binds the dispatched target",
+      "prerequisite": "none",
+      "requirement_id": "T03",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "unreviewed narrative cannot become instruction authority",
+      "node": "tests/local/experience/test_reviewed_trajectory.py::ReviewedTrajectoryPersistenceTests::test_reviewed_trajectory_survives_restart_with_provenance_and_protected_evidence",
+      "positive_oracle": "reviewed evidence survives restart",
+      "prerequisite": "none",
+      "requirement_id": "T04",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "ambiguous or unreviewed provenance blocks it",
+      "node": "tests/local/experience/test_generated_trust.py::GeneratedSkillTrustTests::test_generated_candidate_requires_exact_reviewed_sources_and_explicit_approval",
+      "positive_oracle": "reviewed sources and approval authorize the candidate",
+      "prerequisite": "none",
+      "requirement_id": "T05",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "duplicates cannot boost score or change digest meaning",
+      "node": "tests/local/preparation/test_step04_procedure_revision_selection.py::ProcedureRevisionSelectionTests::test_duplicate_sightings_merge_provenance_without_a_score_bonus",
+      "positive_oracle": "immutable revisions merge coherent provenance",
+      "prerequisite": "none",
+      "requirement_id": "T06",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "wrong task or plan ownership rejects the envelope",
+      "node": "tests/local/contracts/test_contracts.py::DispatchEnvelopeTests::test_envelope_validates_against_exact_task_and_plan",
+      "positive_oracle": "scope and recipient identities remain exact",
+      "prerequisite": "none",
+      "requirement_id": "T07",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "revoked sighting cannot designate or boost another revision",
+      "node": "tests/local/preparation/test_step04_procedure_revision_selection.py::ProcedureRevisionSelectionTests::test_revoked_duplicate_sighting_cannot_boost_an_eligible_revision",
+      "positive_oracle": "eligible current revision remains selectable",
+      "prerequisite": "none",
+      "requirement_id": "T08",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "revoked or stale replay cannot regain trust",
+      "node": "tests/local/experience/test_generated_trust.py::GeneratedSkillTrustTests::test_verified_approval_evidence_survives_store_restart",
+      "positive_oracle": "trust evidence survives restart",
+      "prerequisite": "none",
+      "requirement_id": "T09",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "incomparable top candidate cannot hide valid reuse",
+      "node": "tests/local/preparation/test_reuse_planning.py::ReusePlanningTests::test_incomparable_top_candidate_does_not_hide_a_lower_eligible_one",
+      "positive_oracle": "eligible lower candidate is considered deterministically",
+      "prerequisite": "none",
+      "requirement_id": "T10",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "stale or wrong-bound context fails before dispatch",
+      "node": "tests/local/preparation/test_final_context_dispatch.py::FinalContextDispatchTests::test_wrong_base_or_task_binding_fails_before_dispatch",
+      "positive_oracle": "fresh exact binding dispatches",
+      "prerequisite": "none",
+      "requirement_id": "T11",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "CONTRACT",
+      "negative_oracle": "no inherited or default model binding is accepted",
+      "node": "tests/local/preparation/test_step04_native_apc_child.py::NativeApcChildTests::test_two_explicit_binding_configurations_select_without_source_changes",
+      "positive_oracle": "each explicit APC binding selects its adapter",
+      "prerequisite": "none",
+      "requirement_id": "T12",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "missing local template capability cannot be relabeled as a reuse or adaptation success",
+      "node": "tests/local/preparation/test_step04_template_shortlist_coherence.py::Step04TemplateShortlistCoherenceTests::test_no_template_store_takes_fresh_planning_without_reuse_or_apc",
+      "positive_oracle": "absence of a template store deterministically takes the fresh-plan branch without APC",
+      "prerequisite": "none",
+      "requirement_id": "T12",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "NATIVE",
+      "negative_oracle": "missing, invalid, inherited, substituted, multiply counted, or uncleared provider execution earns no native binding credit",
+      "node": "tests/live/qualification/test_native_apc_matrix.py::test_supported_binding_runs_actual_child",
+      "positive_oracle": "both advertised explicit bindings run the actual provider child with requested/resolved identity, exact child cleanup, and one native usage invocation",
+      "prerequisite": "separately authorized clean candidate and installed provider CLIs for both advertised bindings",
+      "requirement_id": "T12",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "incomparable objective identity omits candidates",
+      "node": "tests/local/preparation/test_step04_local_search_adapters.py::Step04LocalSearchAdapterTests::test_preparation_service_consumes_the_local_stores_directly",
+      "positive_oracle": "comparable representation reaches the preparation service",
+      "prerequisite": "none",
+      "requirement_id": "T13",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "cleanup transition cannot erase spent or stale lineage",
+      "node": "harness/orchestrator_harness/tests/test_product_corrections.py::ProviderBoundaryCorrectionTests::test_cleanup_status_transition_retains_boundary_evidence",
+      "positive_oracle": "correction lineage and boundary evidence are retained",
+      "prerequisite": "none",
+      "requirement_id": "T14",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "unsupported round knobs cannot alter the fixed contract",
+      "node": "tests/local/integration/test_fixed_strategy_lifecycle.py::test_fixed_strategy_runs_joined_lifecycle[problem_focused-parser raises IndexError after malformed input-True-1]",
+      "positive_oracle": "problem-focused route completes within bounded rounds",
+      "prerequisite": "none",
+      "requirement_id": "T15",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "illegal/deferred dependencies cannot perform calls or writes",
+      "node": "tests/local/contracts/test_config.py::FixedConfigurationTests::test_feature_prerequisites_resolve_to_effective_off",
+      "positive_oracle": "valid feature dependencies resolve deterministically",
+      "prerequisite": "none",
+      "requirement_id": "T16",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "CONTRACT",
+      "negative_oracle": "missing or tampered provider controls are rejected before spawn, without granting task workers control authority",
+      "node": "harness/orchestrator_harness/tests/test_provider_network_payload.py::ProviderNetworkPayloadTests::test_controller_refuses_missing_qwen_controls_before_spawn",
+      "positive_oracle": "the controller accepts only a provider launch whose declared control boundary is intact",
+      "prerequisite": "none",
+      "requirement_id": "T17",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "control credentials, content secrets, or prompt-embedded provider authentication never cross the child boundary",
+      "node": "tests/local/privacy/test_provider_payload_qualification.py::test_spawned_worker_gets_transport_auth_but_no_control_or_content_secret",
+      "positive_oracle": "the spawned local worker receives required transport authentication and safe content",
+      "prerequisite": "none",
+      "requirement_id": "T17",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "CONTRACT",
+      "negative_oracle": "missing suppression or a secret in argv/prompt fails the provider payload contract",
+      "node": "tests/local/privacy/test_provider_payload_qualification.py::test_soft_network_controls_reach_actual_spawn_argv[codex-argv0-web_search=\"disabled\"]",
+      "positive_oracle": "declared provider search suppression reaches an actual local child argv without leaking fixture secrets",
+      "prerequisite": "none",
+      "requirement_id": "T18",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "restricted-local suppresses the remote service call before invocation",
+      "node": "tests/local/privacy/test_provider_payload_qualification.py::test_restricted_local_blocks_actual_remote_search_before_adapter_call",
+      "positive_oracle": "sanitized local flow remains available",
+      "prerequisite": "none",
+      "requirement_id": "T18",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LIVE",
+      "negative_oracle": "soft controls alone, any forbidden call or leaked/rewritten secret, candidate mismatch, over-budget use, or incomplete cleanup earns no live privacy/egress credit",
+      "node": "tests/live/qualification/test_current_pin_lifecycle.py::test_hard_egress_and_content_privacy",
+      "positive_oracle": "the exact candidate records independently verified hard egress, zero restricted forbidden calls, unchanged authoritative source, and absence of the fixture secret from every declared provider/derived surface",
+      "prerequisite": "separately authorized clean candidate, actual provider credentials, disposable namespace, and independently verified egress enforcement",
+      "requirement_id": "T18",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "usage settlement cannot revise terminal quality",
+      "node": "tests/local/usage/test_harness_usage_reconciliation.py::test_usage_reconciliation_never_changes_fixed_outcome_quality",
+      "positive_oracle": "late usage attaches to the exact fixed outcome",
+      "prerequisite": "none",
+      "requirement_id": "T19",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "abrupt death leaves no partial authoritative publication or collateral mutation",
+      "node": "tests/local/stress/test_runtime_fault_matrix.py::test_abrupt_child_death_cannot_publish_partial_record_or_touch_sentinel",
+      "positive_oracle": "recovery publishes a later complete record",
+      "prerequisite": "none",
+      "requirement_id": "T20",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "learned selectors and updates fail closed",
+      "node": "tests/local/contracts/test_deferred_scope.py::test_every_learned_or_update_request_fails_before_import_or_state",
+      "positive_oracle": "fixed strategies run without learner machinery",
+      "prerequisite": "none",
+      "requirement_id": "T21",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "a forged outside-worktree row with a recomputed content hash cannot be controller-sealed or gain accounting authority",
+      "node": "harness/orchestrator_harness/tests/test_native_attempt_receipts.py::NativeAttemptReceipts::test_self_hashed_outside_worktree_forgery_cannot_be_controller_sealed",
+      "positive_oracle": "controller-emitted rows are bound to a memory-only signing capability and sealed only after exact provider cleanup",
+      "prerequisite": "none",
+      "requirement_id": "T22",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "NATIVE",
+      "negative_oracle": "missing roles, duplicate invocation counts, binding conflicts, merged outer/inner totals, over-budget use, or incomplete cleanup earns no native usage credit",
+      "node": "tests/live/qualification/test_native_apc_matrix.py::test_native_usage_role_matrix_is_single_counted",
+      "positive_oracle": "actual worker, ROOT, reviewer, and APC-child invocations are bound and counted exactly once while outer and inner accounting remain separate",
+      "prerequisite": "separately authorized clean candidate and installed provider CLIs for the declared native role matrix",
+      "requirement_id": "T22",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "missing dependency or corruption never publishes target bytes",
+      "node": "tests/local/recovery/test_snapshot_qualification.py::test_pending_remote_dependency_and_corruption_never_publish_target",
+      "positive_oracle": "verified snapshot restores when dependencies are satisfied",
+      "prerequisite": "none",
+      "requirement_id": "T23",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "CONTRACT",
+      "negative_oracle": "missing/tampered controls fail closed and restricted mode never upgrades soft controls to a hard-egress claim",
+      "node": "tests/local/privacy/test_provider_payload_qualification.py::test_soft_network_controls_reach_actual_spawn_argv[codex-argv0-web_search=\"disabled\"]",
+      "positive_oracle": "each advertised provider receives its declared soft search-denial argv through a real local subprocess boundary",
+      "prerequisite": "none",
+      "requirement_id": "T24",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "any remote adapter invocation or hard-egress claim under soft-only controls fails",
+      "node": "tests/local/privacy/test_provider_payload_qualification.py::test_restricted_local_blocks_actual_remote_search_before_adapter_call",
+      "positive_oracle": "restricted-local records the remote store disabled and keeps the actual adapter call counter at zero",
+      "prerequisite": "none",
+      "requirement_id": "T24",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LIVE",
+      "negative_oracle": "soft controls alone, any forbidden call or leaked/rewritten secret, candidate mismatch, over-budget use, or incomplete cleanup earns no live privacy/egress credit",
+      "node": "tests/live/qualification/test_current_pin_lifecycle.py::test_hard_egress_and_content_privacy",
+      "positive_oracle": "the exact candidate records independently verified hard egress, zero restricted forbidden calls, unchanged authoritative source, and absence of the fixture secret from every declared provider/derived surface",
+      "prerequisite": "separately authorized clean candidate, actual provider credentials, disposable namespace, and independently verified egress enforcement",
+      "requirement_id": "T24",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "candidate plan and stale resume cannot dispatch",
+      "node": "harness/orchestrator_harness/tests/test_step04_lifecycle_integration.py::Step04LifecycleIntegrationTests::test_bootstrap_runs_bounded_preparation_and_finalizes_accepted_plan",
+      "positive_oracle": "candidate harness completes bounded accepted-plan bootstrap",
+      "prerequisite": "none",
+      "requirement_id": "T25",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "LIVE",
+      "negative_oracle": "stubbed services, candidate mismatch, missing lifecycle stage/link, over-budget use, or incomplete cleanup earns no live integration credit",
+      "node": "tests/live/qualification/test_current_pin_lifecycle.py::test_current_pin_enhanced_lifecycle",
+      "positive_oracle": "actual Atlas and EverOS services complete the enhanced lifecycle at the exact candidate with linked outcome and bounded cleanup",
+      "prerequisite": "separately authorized clean candidate plus disposable Atlas and EverOS resources",
+      "requirement_id": "T25",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "NATIVE",
+      "negative_oracle": "a stub/substitute provider, missing lifecycle stage/link, candidate mismatch, over-budget use, or incomplete cleanup earns no native integration credit",
+      "node": "tests/live/qualification/test_current_pin_lifecycle.py::test_current_pin_enhanced_lifecycle",
+      "positive_oracle": "the actual provider executes the exact candidate enhanced lifecycle through preparation, ROOT acceptance, dispatch, review, settlement, and linked outcome",
+      "prerequisite": "separately authorized clean candidate and installed native provider CLI",
+      "requirement_id": "T25",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "CONTRACT",
+      "negative_oracle": "mismatched CLI fails before arbitrary provider execution",
+      "node": "tests/local/preparation/test_step04_native_apc_child.py::NativeApcChildTests::test_binding_cli_must_match_the_selected_provider_adapter",
+      "positive_oracle": "matching explicit adapter binding launches",
+      "prerequisite": "none",
+      "requirement_id": "T26",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "NATIVE",
+      "negative_oracle": "missing, invalid, inherited, substituted, multiply counted, or uncleared provider execution earns no native binding credit",
+      "node": "tests/live/qualification/test_native_apc_matrix.py::test_supported_binding_runs_actual_child",
+      "positive_oracle": "both advertised explicit bindings run the actual provider child with requested/resolved identity, exact child cleanup, and one native usage invocation",
+      "prerequisite": "separately authorized clean candidate and installed provider CLIs for both advertised bindings",
+      "requirement_id": "T26",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "host and unrelated trees are not writable or cleanup targets",
+      "node": "harness/orchestrator_harness/tests/test_real_agent_isolation.py::RealAgentIsolationTests::test_bwrap_mount_manifest_has_only_synthetic_writable_binds",
+      "positive_oracle": "owned writable mounts are explicit",
+      "prerequisite": "none",
+      "requirement_id": "T27",
+      "status": "NEW-LOCAL-PASS"
+    },
+    {
+      "evidence_class": "NATIVE",
+      "negative_oracle": "ownership overlap, candidate substitution, collateral outer mutation, ambiguous descendants, over-budget use, or incomplete cleanup earns no topology credit",
+      "node": "tests/live/qualification/test_current_pin_lifecycle.py::test_nested_harness_ownership_topology",
+      "positive_oracle": "the exact candidate proves disjoint outer/inner ownership, exact delegation and entrypoint binding, complete inner cleanup, and an unchanged outer sentinel",
+      "prerequisite": "separately authorized clean candidate with the full nested native harness topology",
+      "requirement_id": "T27",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "CONTRACT",
+      "negative_oracle": "empty or untrusted usage cannot become an observation",
+      "node": "harness/orchestrator_harness/tests/test_native_attempt_receipts.py::NativeAttemptReceipts::test_source_events_keep_native_fields_and_distinct_observations",
+      "positive_oracle": "native source identities and counters are retained",
+      "prerequisite": "none",
+      "requirement_id": "T28",
+      "status": "EXISTING-SUFFICIENT"
+    },
+    {
+      "evidence_class": "NATIVE",
+      "negative_oracle": "missing, invalid, inherited, substituted, multiply counted, or uncleared provider execution earns no native binding credit",
+      "node": "tests/live/qualification/test_native_apc_matrix.py::test_supported_binding_runs_actual_child",
+      "positive_oracle": "both advertised explicit bindings run the actual provider child with requested/resolved identity, exact child cleanup, and one native usage invocation",
+      "prerequisite": "separately authorized clean candidate and installed provider CLIs for both advertised bindings",
+      "requirement_id": "T28",
+      "status": "UNPROVED-PREREQUISITE"
+    },
+    {
+      "evidence_class": "LOCAL",
+      "negative_oracle": "future B0-B3 workloads cannot start automatically",
+      "node": "tests/local/contracts/test_deferred_scope.py::test_release_tests_do_not_schedule_benchmark_workloads",
+      "positive_oracle": "release suite contains no benchmark scheduling",
+      "prerequisite": "none",
+      "requirement_id": "T29",
+      "status": "NEW-LOCAL-PASS"
+    }
+  ],
+  "schema": "memory-harness-verification-ledger/v1",
+  "source_requirements": {
+    "gap_ids": [
+      "G01",
+      "G02",
+      "G03",
+      "G04",
+      "G05",
+      "G06",
+      "G07",
+      "G08",
+      "G09",
+      "G10",
+      "G11",
+      "G12",
+      "G13"
+    ],
+    "test_ids": [
+      "T01",
+      "T02",
+      "T03",
+      "T04",
+      "T05",
+      "T06",
+      "T07",
+      "T08",
+      "T09",
+      "T10",
+      "T11",
+      "T12",
+      "T13",
+      "T14",
+      "T15",
+      "T16",
+      "T17",
+      "T18",
+      "T19",
+      "T20",
+      "T21",
+      "T22",
+      "T23",
+      "T24",
+      "T25",
+      "T26",
+      "T27",
+      "T28",
+      "T29"
+    ]
+  }
+}

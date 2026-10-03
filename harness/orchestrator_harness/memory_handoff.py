@@ -6,7 +6,9 @@ slice.  Legacy task cards without ``memory_handoff`` take the ordinary path.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
 import tomllib
@@ -14,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from . import attempt_attestation
 from .core import content_hash, read_json
 from .records import atomic_write_json
 
@@ -346,6 +349,14 @@ def _prepare_memory_outcome(
     search_stores: Sequence[Any] = (),
     required_sources: frozenset[tuple[str, str, str]] = frozenset(),
     retained_context: Mapping[str, Any] | None = None,
+    privacy_policy: Any | None = None,
+    failure_context: str | None = None,
+    bindings: Mapping[str, Any] | None = None,
+    root_replan: Mapping[str, Any] | None = None,
+    apc_binding: Mapping[str, Any] | None = None,
+    apc_launcher: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
+    apc_cleanup: Mapping[str, Any] | None = None,
+    use_resolved_config: bool = False,
 ):
     """Run one bounded preparation for the exact handoff state.
 
@@ -383,13 +394,17 @@ def _prepare_memory_outcome(
     memory_store = store.MemoryStore(store_path)
     memory_store.initialize()
     try:
-        memory_runtime = runtime.MemoryRuntime(memory_store, config=resolved_config)
+        memory_runtime = runtime.MemoryRuntime(
+            memory_store,
+            config=resolved_config,
+            privacy_policy=privacy_policy,
+        )
         return memory_runtime.prepare_with_memory(
             task_card=task_card,
             plan=plan,
             objective_id=handoff["objective_id"],
             route=handoff.get("route", "ordinary"),
-            request=handoff.get("configuration"),
+            request=None if use_resolved_config else handoff.get("configuration"),
             network_mode=network_mode,
             lane_id=lane_id,
             run_id=run_id,
@@ -402,6 +417,12 @@ def _prepare_memory_outcome(
             recipient=f"worker:{lane_id}" if finalize else None,
             finalize=finalize,
             stores=search_stores,
+            failure_context=failure_context,
+            bindings=bindings,
+            root_replan=root_replan,
+            apc_binding=apc_binding,
+            apc_launcher=apc_launcher,
+            apc_cleanup=apc_cleanup,
             required_sources=required_sources,
             retained_context=retained_context,
         )
@@ -444,6 +465,14 @@ def prepare_lane_memory(
     search_stores: Sequence[Any] = (),
     required_sources: frozenset[tuple[str, str, str]] = frozenset(),
     retained_context: Mapping[str, Any] | None = None,
+    privacy_policy: Any | None = None,
+    failure_context: str | None = None,
+    bindings: Mapping[str, Any] | None = None,
+    root_replan: Mapping[str, Any] | None = None,
+    apc_binding: Mapping[str, Any] | None = None,
+    apc_launcher: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
+    apc_cleanup: Mapping[str, Any] | None = None,
+    resolved_config: Any | None = None,
 ) -> "LaneMemory":
     """Run one bounded lane preparation and report its exact disposition.
 
@@ -464,7 +493,11 @@ def prepare_lane_memory(
     try:
         config = _memory_module("config")
 
-        resolved_config = config.resolve_config(handoff.get("configuration"))
+        resolved = (
+            resolved_config
+            if resolved_config is not None
+            else config.resolve_config(handoff.get("configuration"))
+        )
         requested_network = handoff.get("configuration", {}).get("network_profile", "normal")
         if not isinstance(requested_network, str) or requested_network not in config.NETWORK_MODES:
             raise MemoryHandoffError("ROOT handoff has an invalid network_profile")
@@ -477,7 +510,7 @@ def prepare_lane_memory(
         outcome = _prepare_memory_outcome(
             task_card=task_card,
             handoff=handoff,
-            resolved_config=resolved_config,
+            resolved_config=resolved,
             lane_id=lane_id,
             run_id=run_id,
             worktree_path=worktree_path,
@@ -487,6 +520,14 @@ def prepare_lane_memory(
             search_stores=search_stores,
             required_sources=required_sources,
             retained_context=retained_context,
+            privacy_policy=privacy_policy,
+            failure_context=failure_context,
+            bindings=bindings,
+            root_replan=root_replan,
+            apc_binding=apc_binding,
+            apc_launcher=apc_launcher,
+            apc_cleanup=apc_cleanup,
+            use_resolved_config=resolved_config is not None,
         )
         if not accepted:
             _, envelope_path = memory_paths(worktree_path)
@@ -1087,16 +1128,381 @@ def record_dispatch_intent(
 
 def record_native_review(
     *, worktree_path: str | Path, evidence: Mapping[str, Any],
+    attempts_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Submit the complete retained native bundle to the domain transaction."""
 
     memory_store, memory_runtime = _open_runtime(worktree_path)
     try:
         if evidence["acceptance"]["approval"] == "REJECTED":
-            return memory_runtime.record_rejected_native_attempt(evidence)
-        return memory_runtime.record_terminal_outcome(evidence)
+            result = memory_runtime.record_rejected_native_attempt(evidence)
+        else:
+            result = memory_runtime.record_terminal_outcome(evidence)
+        if attempts_path is not None:
+            _reconcile_native_usage_in_store(
+                memory_store, worktree_path=worktree_path,
+                attempts_path=attempts_path, evidence=evidence,
+            )
+        if evidence["acceptance"]["approval"] == "ACCEPTED":
+            # Settlement is enabled only by the trusted harness-root product
+            # config.  Legacy/unconfigured harnesses preserve their established
+            # outcome path without creating optional state.
+            try:
+                from .config import find_harness_root
+                from . import product_composition, settlement
+
+                harness_root = find_harness_root()
+            except Exception:
+                harness_root = None
+            if harness_root is not None and product_composition.configured(harness_root):
+                with product_composition.compose_product(
+                    harness_root=harness_root,
+                    task_card=evidence["task_card"],
+                    route=evidence["accepted_plan"]["route"],
+                ) as composition:
+                    settlement.settle_accepted_outcome(
+                        worktree_path=worktree_path,
+                        evidence=evidence,
+                        local_store=memory_store,
+                        composition=composition,
+                    )
+        return result
     except Exception as exc:
         raise MemoryHandoffError(f"cannot record native review: {exc}") from exc
+    finally:
+        memory_store.close()
+
+
+def _usage_measure(name: str, value: Any) -> tuple[str, dict[str, Any]]:
+    """Translate one already-sanitized provider counter without totaling it."""
+
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise MemoryHandoffError(f"native usage counter {name!r} is invalid")
+    lowered = name.lower()
+    if "cost" in lowered:
+        unit = "USD"
+        included: bool | None = None
+    else:
+        unit = "tokens"
+        included = not any(part in lowered for part in ("cache", "reasoning"))
+        if "total" in lowered:
+            included = None
+    return name, {"value": value, "unit": unit, "included_in_total": included}
+
+
+def _observation_measures(observation: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Preserve native counter families as separately named durable measures."""
+
+    measures: dict[str, dict[str, Any]] = {}
+    usage = observation.get("usage")
+    if not isinstance(usage, Mapping):
+        raise MemoryHandoffError("native usage observation has no usage mapping")
+    for name, value in usage.items():
+        if not isinstance(name, str) or not name:
+            raise MemoryHandoffError("native usage counter name is invalid")
+        measure_name, measure = _usage_measure(name, value)
+        measures[measure_name] = measure
+    model_usage = observation.get("modelUsage")
+    if model_usage is not None:
+        if not isinstance(model_usage, Mapping):
+            raise MemoryHandoffError("native model usage is not a mapping")
+        contracts = _memory_module("contracts")
+        for model, counters in model_usage.items():
+            if not isinstance(model, str) or not model or not isinstance(counters, Mapping):
+                raise MemoryHandoffError("native model usage identity is invalid")
+            model_key = contracts.sha256_hex(model)[:16]
+            for name, value in counters.items():
+                if not isinstance(name, str) or not name:
+                    raise MemoryHandoffError("native model counter name is invalid")
+                measure_name, measure = _usage_measure(
+                    f"model_{model_key}_{name}", value,
+                )
+                measures[measure_name] = measure
+    if "total_cost_usd" in observation:
+        measure_name, measure = _usage_measure(
+            "total_cost", observation["total_cost_usd"],
+        )
+        measures[measure_name] = measure
+    if not measures:
+        raise MemoryHandoffError("native usage observation has no retained counters")
+    return measures
+
+
+def _observation_identity(observation: Mapping[str, Any]) -> dict[str, Any]:
+    """Use provider event identity before falling back to the source byte location."""
+
+    identity = {
+        key: observation[key]
+        for key in ("event_type", "turn_id", "uuid", "message_id")
+        if isinstance(observation.get(key), str) and observation[key]
+    }
+    if len(identity) == 1:  # event_type alone is not a unique provider receipt
+        for key in ("line_number", "byte_offset"):
+            value = observation.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                identity[key] = value
+    return identity
+
+
+def _native_model(observation: Mapping[str, Any]) -> str | None:
+    direct = observation.get("message_model")
+    if isinstance(direct, str) and direct:
+        return direct
+    models = observation.get("modelUsage")
+    if isinstance(models, Mapping):
+        names = [name for name in models if isinstance(name, str) and name]
+        if len(names) == 1:
+            return names[0]
+    return None
+
+
+def _trusted_attempt_rows(
+    *, attempts_path: str | Path, worktree_path: str | Path,
+    lane_id: str, run_id: str,
+) -> list[dict[str, Any]]:
+    """Read and authenticate a controller-sealed attempt-journal run."""
+
+    path = Path(attempts_path).resolve()
+    worktree = Path(worktree_path).resolve()
+    try:
+        path.relative_to(worktree)
+    except ValueError:
+        pass
+    else:
+        raise MemoryHandoffError(
+            "native usage attempts must be outside the worker-writable worktree"
+        )
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise MemoryHandoffError(f"controller attempt journal is unavailable: {exc}") from exc
+    raw_lines = payload.splitlines()
+    parsed: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_lines):
+        if not raw.strip():
+            continue
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            # Only a final torn append may be ignored.  An invalid interior
+            # line would otherwise let a forged omission pass silently.
+            if index == len(raw_lines) - 1 and not payload.endswith(b"\n"):
+                break
+            raise MemoryHandoffError(
+                f"controller attempt journal line {index + 1} is malformed"
+            ) from exc
+        if not isinstance(value, dict):
+            raise MemoryHandoffError(
+                f"controller attempt journal line {index + 1} is not an object"
+            )
+        parsed.append(value)
+    if not parsed or parsed[0] != attempt_attestation.JOURNAL_HEADER:
+        raise MemoryHandoffError("controller attempt journal header is invalid")
+    try:
+        attestation = read_json(
+            attempt_attestation.attestation_path(path, run_id)
+        )
+        verification_key = attempt_attestation.verification_key(
+            attestation, lane_id=lane_id, run_id=run_id,
+        )
+    except (OSError, ValueError) as exc:
+        raise MemoryHandoffError(
+            f"controller attempt attestation is unavailable or invalid: {exc}"
+        ) from exc
+    all_rows = parsed[1:]
+    if any(row.get("schema") != attempt_attestation.ATTEMPT_SCHEMA for row in all_rows):
+        raise MemoryHandoffError("controller attempt journal row schema is invalid")
+    rows = [
+        row for row in all_rows
+        if row.get("lane_id") == lane_id and row.get("run_id") == run_id
+    ]
+    if (
+        any(not attempt_attestation.validate_signed_attempt(row, verification_key)
+            for row in rows)
+        or [row.get("content_hash") for row in rows]
+        != attestation.get("row_content_hashes")
+    ):
+        raise MemoryHandoffError(
+            "controller attempt journal does not match its closed-run attestation"
+        )
+    for row in rows:
+        start = row.get("transcript_start_byte")
+        end = row.get("transcript_end_byte")
+        digest = row.get("transcript_sha256")
+        transcript_path = row.get("transcript_path")
+        if (
+            not isinstance(start, int) or isinstance(start, bool) or start < 0
+            or not isinstance(end, int) or isinstance(end, bool) or end < start
+            or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not isinstance(transcript_path, str) or not transcript_path
+        ):
+            raise MemoryHandoffError("controller attempt transcript binding is malformed")
+        transcript = Path(transcript_path).resolve()
+        if (
+            row.get("provider_started") is not True
+            and start == end
+            and digest == hashlib.sha256(b"").hexdigest()
+        ):
+            continue
+        try:
+            transcript.relative_to(worktree)
+        except ValueError as exc:
+            raise MemoryHandoffError(
+                "controller attempt transcript is outside the lane worktree"
+            ) from exc
+        try:
+            with transcript.open("rb") as handle:
+                handle.seek(start)
+                bound = handle.read(end - start)
+        except OSError as exc:
+            raise MemoryHandoffError(
+                f"controller attempt transcript is unavailable: {exc}"
+            ) from exc
+        if len(bound) != end - start or hashlib.sha256(bound).hexdigest() != digest:
+            raise MemoryHandoffError("controller attempt transcript digest mismatch")
+    return rows
+
+
+def _reconcile_native_usage_in_store(
+    memory_store: Any, *, worktree_path: str | Path,
+    attempts_path: str | Path, evidence: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Join immutable controller attempt facts to the durable usage ledger."""
+
+    contracts = _memory_module("contracts")
+    lane_id = evidence.get("lane_id")
+    run_id = evidence.get("run_id")
+    objective_id = evidence.get("objective_id")
+    decision_id = evidence.get("decision_id")
+    if not all(isinstance(value, str) and value for value in (
+        lane_id, run_id, objective_id, decision_id,
+    )):
+        raise MemoryHandoffError("native usage evidence has incomplete ownership")
+    rows = [
+        row for row in _trusted_attempt_rows(
+            attempts_path=attempts_path, worktree_path=worktree_path,
+            lane_id=lane_id, run_id=run_id,
+        )
+    ]
+    reconciled: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        if row.get("provider_started") is not True:
+            continue
+        dispatch = row.get("dispatch_binding")
+        if not isinstance(dispatch, Mapping) or dispatch.get("decision_id") != decision_id:
+            raise MemoryHandoffError("native usage attempt has a conflicting dispatch binding")
+        provider = row.get("provider")
+        attempt = row.get("attempt")
+        if (
+            not isinstance(provider, Mapping)
+            or not isinstance(provider.get("id"), str)
+            or not provider["id"]
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt < 1
+        ):
+            raise MemoryHandoffError("native usage attempt identity is malformed")
+        requested = provider.get("model")
+        if requested is not None and (not isinstance(requested, str) or not requested):
+            raise MemoryHandoffError("native usage requested binding is malformed")
+        source = f"provider:{provider['id']}"
+        invocation_id = contracts.sha256_hex({
+            "schema": "controller-attempt-usage/v1",
+            "lane_id": lane_id,
+            "run_id": run_id,
+            "attempt": attempt,
+            "provider": provider["id"],
+            "session_id": row.get("session_id"),
+        })
+        observations = row.get("native_usage_observations")
+        if not isinstance(observations, list):
+            raise MemoryHandoffError("native usage observations are malformed")
+        validated: list[tuple[Mapping[str, Any], str, bool, dict[str, Any]]] = []
+        terminal_measure_names: set[str] = set()
+        native_models: set[str] = set()
+        for observation in observations:
+            if not isinstance(observation, Mapping):
+                raise MemoryHandoffError("native usage observation is malformed")
+            event_type = observation.get("event_type")
+            if not isinstance(event_type, str) or not event_type:
+                raise MemoryHandoffError("native usage event type is missing")
+            mode = observation.get("usage_mode")
+            complete = observation.get("usage_complete")
+            if mode not in {"cumulative", "incremental"} or not isinstance(complete, bool):
+                raise MemoryHandoffError("native usage mode or completeness is missing")
+            measures = _observation_measures(observation)
+            native_model = _native_model(observation)
+            if native_model is not None:
+                native_models.add(native_model)
+            if mode == "cumulative" and complete:
+                terminal_measure_names.update(measures)
+            validated.append((observation, mode, complete, measures))
+        if len(native_models) > 1:
+            raise MemoryHandoffError("native usage observations conflict on native model")
+        native_model = next(iter(native_models), None)
+        binding = {"requested": requested, "resolved": requested, "native": None}
+        start = contracts.make_native_usage_start(
+            source=source, invocation_id=invocation_id,
+            objective_id=objective_id, decision_id=decision_id,
+            maintenance_operation_id=None, stage="execution",
+            category="online_execution", window_id=run_id, binding=binding,
+        )
+        memory_store.start_native_usage(start)
+        for observation, mode, complete, measures in validated:
+            if mode == "incremental" and terminal_measure_names:
+                measures = {
+                    name: measure for name, measure in measures.items()
+                    if name not in terminal_measure_names
+                }
+                if not measures:
+                    continue
+            # A terminal rollup often omits the model carried by earlier
+            # assistant events.  Bind the one model proven by the complete
+            # observation set so counter de-duplication cannot discard model
+            # identity or conceal a cross-event conflict.
+            receipt_binding = {**binding, "native": native_model}
+            receipt_id = contracts.sha256_hex({
+                "source": source,
+                "invocation_id": invocation_id,
+                "provider_event": _observation_identity(observation),
+            })
+            receipt = contracts.make_native_usage_receipt(
+                source=source, invocation_id=invocation_id, receipt_id=receipt_id,
+                objective_id=objective_id, decision_id=decision_id,
+                maintenance_operation_id=None, stage="execution",
+                category="online_execution", window_id=run_id,
+                binding=receipt_binding, mode=mode,
+                complete=complete,
+                measures=measures,
+            )
+            memory_store.record_native_usage_receipt(receipt)
+        reconciled[(source, invocation_id)] = memory_store.get_native_usage(
+            source, invocation_id,
+        )
+    return [reconciled[key] for key in sorted(reconciled)]
+
+
+def reconcile_native_usage(
+    *, worktree_path: str | Path, attempts_path: str | Path,
+    evidence: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Replay controller attempts into the usage ledger without changing outcomes."""
+
+    memory_store, _ = _open_runtime(worktree_path)
+    try:
+        return _reconcile_native_usage_in_store(
+            memory_store, worktree_path=worktree_path,
+            attempts_path=attempts_path, evidence=evidence,
+        )
+    except MemoryHandoffError:
+        raise
+    except Exception as exc:
+        raise MemoryHandoffError(f"cannot reconcile native usage: {exc}") from exc
     finally:
         memory_store.close()
 
@@ -1393,6 +1799,7 @@ __all__ = [
     "record_ambiguous_dispatch",
     "record_dispatch_intent",
     "record_native_review",
+    "reconcile_native_usage",
     "supersession_id_for_launch",
     "record_observed_invocation",
     "redact_control_diagnostic",

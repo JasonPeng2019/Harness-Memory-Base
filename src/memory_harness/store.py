@@ -6,13 +6,17 @@ import json
 import math
 import os
 import sqlite3
-from dataclasses import asdict
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from . import contracts
-from .config import MemoryConfig, effect_submission_enabled, resolve_config
+from .config import (
+    MemoryConfig,
+    configuration_record,
+    effect_submission_enabled,
+    resolve_config,
+)
 
 
 class StoreError(RuntimeError):
@@ -45,6 +49,10 @@ class ProcedureDesignationConflictError(ProcedureConflictError):
 
 class PreparationConflictError(StoreError):
     """A preparation attempt lost the durable decision-budget race."""
+
+
+class PlanDispositionConflictError(StoreError):
+    """A plan disposition replacement lost its exact compare-and-swap race."""
 
 
 class NativeUsageConflictError(StoreError):
@@ -1565,7 +1573,8 @@ class MemoryStore:
             raise contracts.ContractError("external source ID is not bound to its record")
         if not isinstance(payload, Mapping) or not payload:
             raise contracts.ContractError("external effect payload must be nonempty")
-        captured = (asdict(captured_config) if isinstance(captured_config, MemoryConfig)
+        captured = (configuration_record(captured_config)
+                    if isinstance(captured_config, MemoryConfig)
                     else dict(captured_config))
         resolve_config(captured)  # Validate, but retain the caller's exact capture.
         if not effect_submission_enabled(captured, kind):
@@ -5008,6 +5017,84 @@ class MemoryStore:
             raise StoreError(f"plan disposition not found: {disposition_id}")
         return self._stored_record(row, contracts.validate_plan_disposition)
 
+    def replace_plan_disposition(
+        self,
+        disposition: Mapping[str, Any],
+        *,
+        expected_content_hash: str,
+    ) -> dict[str, Any]:
+        """Atomically replace one existing exact plan disposition.
+
+        Administrative plan review first reads a content-bound disposition and
+        then builds a corrected, accepted, or rejected successor.  This method
+        turns that observed digest into the write precondition under SQLite's
+        immediate writer lock.  A concurrent winner therefore changes the
+        digest before the next writer can inspect it, and the loser fails
+        without overwriting the winner.
+
+        This is replacement only: initial preparation continues to use
+        :meth:`record_plan_disposition`.  Logical ownership and creation
+        identity are immutable across a replacement.
+        """
+
+        contracts.validate_plan_disposition(disposition)
+        if not isinstance(expected_content_hash, str) or not expected_content_hash:
+            raise PlanDispositionConflictError(
+                "plan disposition replacement requires its expected content hash"
+            )
+        connection = self._require_connection()
+        payload = self._serialize_record(disposition)
+        try:
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT record FROM plan_dispositions WHERE disposition_id = ?",
+                    (disposition["disposition_id"],),
+                ).fetchone()
+                if row is None:
+                    raise PlanDispositionConflictError(
+                        "plan disposition replacement target does not exist"
+                    )
+                current = self._stored_record(row, contracts.validate_plan_disposition)
+                if current["content_hash"] != expected_content_hash:
+                    raise PlanDispositionConflictError(
+                        "plan disposition changed after the expected identity was observed"
+                    )
+                immutable = (
+                    "disposition_id",
+                    "decision_id",
+                    "objective_id",
+                    "route",
+                    "created_at",
+                )
+                if any(current[field] != disposition[field] for field in immutable):
+                    raise PlanDispositionConflictError(
+                        "plan disposition replacement changed its logical ownership"
+                    )
+                updated = connection.execute(
+                    """
+                    UPDATE plan_dispositions
+                    SET branch = ?, record = ?, updated_at = ?
+                    WHERE disposition_id = ? AND record = ?
+                    """,
+                    (
+                        disposition["branch"],
+                        payload,
+                        contracts.utc_now(),
+                        disposition["disposition_id"],
+                        str(row["record"]),
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise PlanDispositionConflictError(
+                        "plan disposition replacement lost its compare-and-swap race"
+                    )
+        except PlanDispositionConflictError:
+            raise
+        except sqlite3.Error as exc:
+            raise StoreError("could not atomically replace plan disposition") from exc
+        return self.get_plan_disposition(str(disposition["disposition_id"]))
+
     def list_plan_dispositions(self, decision_id: str) -> list[dict[str, Any]]:
         connection = self._require_connection()
         rows = connection.execute(
@@ -5397,5 +5484,5 @@ __all__ = [
     "MemoryStore", "StoreError", "OperationConflictError", "OutcomeConflictError",
     "TrajectoryConflictError", "ExperienceConflictError", "ProcedureConflictError",
     "ProcedureDesignationConflictError", "PreparationConflictError",
-    "NativeUsageConflictError",
+    "PlanDispositionConflictError", "NativeUsageConflictError",
 ]

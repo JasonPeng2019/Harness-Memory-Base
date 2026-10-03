@@ -17,10 +17,8 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
-from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
@@ -35,6 +33,7 @@ from orchestrator_harness.core import content_hash, read_json
 from orchestrator_harness.epochs import current_epoch_path, manager_queue_path, lane_record_dir
 from orchestrator_harness import manager_queue
 from orchestrator_harness.records import atomic_write_json
+from orchestrator_harness.tests.support import RetryingTemporaryDirectory
 from memory_harness import atlas_adapters, everos_adapters, apc
 from memory_harness import config, contracts, store
 
@@ -142,7 +141,7 @@ class LaunchBoundaryFixture:
     EPOCH = "epoch-1"
 
     def __init__(self, *, include_qwen: bool = False) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = RetryingTemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.harness = self.root / "harness"
         self.root_workspace = self.root / "root-workspace"
@@ -405,7 +404,7 @@ class Step04BootstrapBoundaryTests(unittest.TestCase):
                 content={"steps": []},
             ),
             strategy=resolved.strategy,
-            configuration=asdict(resolved),
+            configuration=config.configuration_record(resolved),
         )
         memory_store = self.fixture.open_store(worktree)
         try:
@@ -442,7 +441,8 @@ class Step04BootstrapBoundaryTests(unittest.TestCase):
         self.assertFalse(envelope_path.exists())
         resolved = config.resolve_config(None)
         decision = contracts.make_decision(
-            card, candidate, strategy=resolved.strategy, configuration=asdict(resolved)
+            card, candidate, strategy=resolved.strategy,
+            configuration=config.configuration_record(resolved),
         )
         memory_store = self.fixture.open_store(worktree)
         try:

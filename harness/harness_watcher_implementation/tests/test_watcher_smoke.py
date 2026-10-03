@@ -1077,9 +1077,10 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
 
     def test_legacy_default_source_uses_current_multi_agent_logs_owner(self) -> None:
         cfg = load_config()
+        harness_root = Path(__file__).resolve().parents[2]
         self.assertEqual(
             (
-                Path.cwd()
+                harness_root
                 / "multi-agent-logs"
                 / "orchestrator-harness"
                 / "current"
@@ -1095,7 +1096,9 @@ class HarnessWatcherSmokeTests(unittest.TestCase):
         self.assertEqual((), cfg.evaluator_identity)
 
     def test_example_config_does_not_choose_an_evaluator(self) -> None:
-        cfg = load_config("harness_watcher_implementation/config.example.json")
+        cfg = load_config(
+            Path(__file__).resolve().parents[1] / "config.example.json"
+        )
         self.assertFalse(cfg.evaluator_enabled)
         self.assertEqual((), cfg.evaluator_command)
         self.assertEqual((), cfg.evaluator_identity)

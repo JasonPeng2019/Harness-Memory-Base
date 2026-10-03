@@ -140,7 +140,9 @@ class Step04LifecycleIntegrationTests(unittest.TestCase):
                     card,
                     candidate,
                     strategy="standard",
-                    configuration=config.resolve_config(None).__dict__,
+                    configuration=config.configuration_record(
+                        config.resolve_config(None)
+                    ),
                 )["decision_id"]
             )
             self.assertTrue(decisions)

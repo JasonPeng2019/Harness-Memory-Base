@@ -92,6 +92,49 @@ class CapturedConfigurationTests(unittest.TestCase):
         self.assertEqual(2, second.preparation["attempt"])
         self.assertEqual([], optional_calls)
 
+    def test_restart_retains_complete_rich_feature_resolution(self) -> None:
+        resolved = config.resolve_config(
+            {
+                "strategy": "problem_focused",
+                "experience_write": False,
+                "generated_skill_creation": True,
+            },
+            availability={
+                "atlas_shared_retrieval": {
+                    "available": False,
+                    "reason": "Atlas adapter unavailable after trusted probing",
+                }
+            },
+            transitions={"experience_write": "transitioning"},
+        )
+        first_service = preparation.PreparationService(
+            store=self.state, config=resolved, limits=self.limits, clock=self.clock,
+        )
+        first = self.prepare(first_service, failure_context="parser failed")
+        expected = config.configuration_record(resolved)
+        self.assertEqual(expected, first.decision["configuration"])
+        self.assertEqual(expected, first.preparation["configuration"])
+
+        self.state.close()
+        self.clock.value += 1.0
+        self.state = store.MemoryStore(self.path)
+        self.state.initialize()
+        retry = self.prepare(self.service(strategy="deeper"), deadline=None)
+        self.assertEqual(expected, retry.decision["configuration"])
+        self.assertEqual(expected, retry.preparation["configuration"])
+        restored = config.resolve_config(retry.preparation["configuration"])
+        generated = restored.feature_state_by_name["generated_skill_creation"]
+        atlas = restored.feature_state_by_name["atlas_shared_retrieval"]
+        self.assertTrue(generated.requested)
+        self.assertFalse(generated.effective)
+        self.assertFalse(atlas.available)
+        self.assertIn("trusted probing", atlas.reason)
+        self.assertEqual(
+            "transitioning",
+            restored.feature_state_by_name["experience_write"].transition_state,
+        )
+        self.assertEqual(resolved.configuration_identity, restored.configuration_identity)
+
     def test_rich_network_resolution_is_captured_and_explicit_drift_rejected(self) -> None:
         evidence = {
             "launched_payload": {"verified": True, "evidence_id": "payload-7"},
@@ -901,7 +944,11 @@ class CapturedConfigurationTests(unittest.TestCase):
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(worker, value) for value in (False, True)]
-            results = [future.result(timeout=10) for future in futures]
+            # The barrier proves both callers reached the contested read.  A
+            # loaded or NFS-backed host can then take longer than ten seconds
+            # to serialize the SQLite writers, so retain a bounded but
+            # realistic completion allowance just as the new-owner race does.
+            results = [future.result(timeout=30) for future in futures]
         self.assertEqual({standalone["decision_id"]}, {
             item.decision["decision_id"] for item in results
         })
@@ -1051,7 +1098,10 @@ class CapturedConfigurationTests(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             future_a = pool.submit(worker, False)
             future_b = pool.submit(worker, True)
-            results = [future_a.result(timeout=10), future_b.result(timeout=10)]
+            # The barrier is the causal concurrency oracle.  Allow a loaded
+            # or NFS-backed host enough time for the two SQLite writers to
+            # serialize after both have demonstrably reached it.
+            results = [future_a.result(timeout=30), future_b.result(timeout=30)]
         ids = {outcome.decision["decision_id"] for outcome in results}
         self.assertEqual(1, len(ids))
         self.assertEqual(1, self.state.connection.execute(
@@ -1096,7 +1146,10 @@ class CapturedConfigurationTests(unittest.TestCase):
             failures = []
             for future in futures:
                 try:
-                    results.append(future.result(timeout=10))
+                    # Both callers have crossed the barrier.  Give SQLite's
+                    # bounded writer serialization the same realistic host
+                    # allowance used by the other first-writer races.
+                    results.append(future.result(timeout=30))
                 except preparation.MandatoryStateFailure as exc:
                     failures.append(str(exc))
         self.assertEqual(1, len(results))

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from orchestrator_harness import root_hook_wrapper as wrapper
+from orchestrator_harness.bootstrap import _remove_owned_tree
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PROVIDERS = {
@@ -24,9 +25,8 @@ PROVIDERS = {
 
 class RootHookWrapperTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.workspace = Path(self.temporary.name)
+        self.workspace = Path(tempfile.mkdtemp())
+        self.addCleanup(_remove_owned_tree, self.workspace, timeout_seconds=5.0)
         self.dotdir = self.workspace / ".codex"
         self.dotdir.mkdir()
         self.binding = self.dotdir / "orchestrator-harness-binding.json"
@@ -106,8 +106,8 @@ class RootProviderPayloadTests(unittest.TestCase):
         source_hooks = (
             REPOSITORY_ROOT / "adapters" / "codex" / "root" / ".codex" / "hooks"
         )
-        with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
+        workspace = Path(tempfile.mkdtemp())
+        try:
             installed_hooks = workspace / ".codex" / "hooks"
             installed_hooks.mkdir(parents=True)
             agent_workspace = workspace / ".agent-workspace"
@@ -147,6 +147,8 @@ class RootProviderPayloadTests(unittest.TestCase):
                         check=True,
                     )
                     self.assertEqual({}, json.loads(completed.stdout))
+        finally:
+            _remove_owned_tree(workspace, timeout_seconds=5.0)
 
     def test_native_root_wrappers_and_declarations(self) -> None:
         for provider_id, dotdir in PROVIDERS.items():

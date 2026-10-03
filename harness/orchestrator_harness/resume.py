@@ -45,6 +45,7 @@ RESUME_PLAN_PENDING = "RESUME_PLAN_PENDING"
 _RESUMABLE_LIFECYCLES = frozenset(
     {"review_pending", "result_invalid", "blocked", "abandoned", "resuming"}
 )
+_PENDING_PLAN_STATES = frozenset({"absent", "candidate_review"})
 
 
 def _live_controller(lane: dict[str, Any]) -> bool:
@@ -133,6 +134,112 @@ def _read_task_card(path: Path) -> dict[str, Any]:
     return record
 
 
+def validate_pending_plan_activation(
+    *,
+    lane: dict[str, Any],
+    accepted_task_card: dict[str, Any],
+    worktree_path: str | Path,
+) -> dict[str, str]:
+    """Validate the sole safe ``prepared``-lane plan activation transition.
+
+    This is the precondition contract used by :func:`run_resume` and exposed
+    for the ROOT plan-accept command.  A caller may replace a pending task card
+    with an exact ``execution_accepted`` card only while the lane still has no
+    execution ownership: the durable lane is ``prepared``, its recorded plan
+    state is ``absent`` or ``candidate_review``, it is explicitly
+    non-dispatchable, and it has no session, process, launch intent,
+    invocation, controller status, or finalized dispatch envelope.  The new
+    card must retain the pending card's objective, route, and base commit.
+
+    The function performs no mutation.  The supported CLI operation is
+    :func:`activate_pending_plan`, which rechecks this contract under the
+    dispatch lock and then creates a fresh run in the existing worktree.
+    """
+
+    worktree = Path(worktree_path)
+    durable_worktree = lane.get("worktree_path")
+    if (
+        not isinstance(durable_worktree, str)
+        or not durable_worktree
+        or Path(durable_worktree).resolve() != worktree.resolve()
+    ):
+        raise memory_handoff.MemoryHandoffError(
+            "pending plan activation must use the lane's exact existing worktree"
+        )
+    if lane.get("lifecycle") != "prepared":
+        raise memory_handoff.MemoryHandoffError(
+            "pending plan activation requires lifecycle='prepared'"
+        )
+    recorded_state = lane.get("memory_plan_state")
+    if recorded_state not in _PENDING_PLAN_STATES:
+        raise memory_handoff.MemoryHandoffError(
+            "pending plan activation requires durable memory_plan_state "
+            "'absent' or 'candidate_review'"
+        )
+    if lane.get("dispatchable") is not False:
+        raise memory_handoff.MemoryHandoffError(
+            "pending plan activation requires dispatchable=False"
+        )
+    if lane.get("process") or lane.get("session") or lane.get("launch_pending"):
+        raise memory_handoff.MemoryHandoffError(
+            "pending plan activation found invocation or controller ownership"
+        )
+
+    workspace = worktree / ".agent-workspace"
+    ownership_paths = [
+        workspace / "invocation.json",
+        workspace / "controller.status.json",
+        memory_handoff.memory_paths(worktree)[1],
+    ]
+    controller_status_path = lane.get("controller_status_path")
+    if isinstance(controller_status_path, str) and controller_status_path:
+        ownership_paths.append(Path(controller_status_path))
+    if any(path.exists() for path in ownership_paths):
+        raise memory_handoff.MemoryHandoffError(
+            "pending plan activation found invocation or controller ownership"
+        )
+
+    try:
+        prior_task_card = _read_task_card(workspace / "task-card.json")
+        memory_handoff.validate_task_card(prior_task_card)
+        memory_handoff.validate_task_card(accepted_task_card)
+    except (OSError, ValueError, memory_handoff.MemoryHandoffError) as exc:
+        raise memory_handoff.MemoryHandoffError(
+            f"pending plan activation task card is invalid: {exc}"
+        ) from exc
+
+    prior_state = memory_handoff.enabled_handoff_state(prior_task_card)
+    accepted_state = memory_handoff.enabled_handoff_state(accepted_task_card)
+    if prior_state != recorded_state:
+        raise memory_handoff.MemoryHandoffError(
+            "pending task card does not match the lane's durable plan state"
+        )
+    if accepted_state != "execution_accepted":
+        raise memory_handoff.MemoryHandoffError(
+            "pending plan activation requires an execution_accepted task card"
+        )
+
+    prior_handoff = prior_task_card["memory_handoff"]
+    accepted_handoff = accepted_task_card["memory_handoff"]
+    for field in ("objective_id", "route"):
+        if accepted_handoff.get(field) != prior_handoff.get(field):
+            raise memory_handoff.MemoryHandoffError(
+                f"pending plan activation changed the lane's {field}"
+            )
+    if accepted_task_card.get("base_commit") != prior_task_card.get("base_commit"):
+        raise memory_handoff.MemoryHandoffError(
+            "pending plan activation changed the lane's base_commit"
+        )
+
+    return {
+        "prior_state": str(recorded_state),
+        "accepted_state": str(accepted_state),
+        "objective_id": str(accepted_handoff["objective_id"]),
+        "route": str(accepted_handoff["route"]),
+        "base_commit": str(accepted_task_card["base_commit"]),
+    }
+
+
 def _has_valid_acceptance_chain(
     rt: Path, epoch_id: str, lane: dict[str, Any]
 ) -> bool:
@@ -213,9 +320,14 @@ def run_resume(
     lane_id: str,
     resume_task_card: str,
     rationale: str | None = None,
-    search_stores: Sequence[Any] = (),
+    search_stores: Sequence[Any] | None = None,
+    require_pending_plan_activation: bool = False,
 ) -> dict[str, Any]:
-    """Execute ``resume-lane`` and return the structured result."""
+    """Execute ``resume-lane`` and return the structured result.
+
+    ``require_pending_plan_activation`` is the fail-closed mode used by
+    :func:`activate_pending_plan`; ordinary callers should leave it false.
+    """
     try:
         harness_root = find_harness_root()
         config = load_config(harness_root)
@@ -240,6 +352,7 @@ def run_resume(
         }
 
     dispatch_lock: RecordLock | None = None
+    composition: Any | None = None
     try:
         if _has_valid_acceptance_chain(rt, epoch_id, lane):
             return {
@@ -320,10 +433,60 @@ def run_resume(
         prior_run_id = str(lane.get("run_id") or "")
         recorded_memory_state = lane.get("memory_plan_state")
         current_memory_state = memory_handoff.enabled_handoff_state(task_card)
-        if recorded_memory_state and current_memory_state != recorded_memory_state:
+        pending_plan_activation: dict[str, str] | None = None
+        if (
+            recorded_memory_state in _PENDING_PLAN_STATES
+            and current_memory_state == "execution_accepted"
+        ):
+            pending_plan_activation = validate_pending_plan_activation(
+                lane=lane,
+                accepted_task_card=task_card,
+                worktree_path=worktree,
+            )
+        elif recorded_memory_state and current_memory_state != recorded_memory_state:
             raise memory_handoff.MemoryHandoffError(
                 "resume task card changed the lane's accepted memory plan state"
             )
+        if require_pending_plan_activation and pending_plan_activation is None:
+            raise memory_handoff.MemoryHandoffError(
+                "activate_pending_plan requires the exact safe prepared-lane transition"
+            )
+        preparation_arguments: dict[str, Any] = {}
+        effective_stores: Sequence[Any] = () if search_stores is None else search_stores
+        if current_memory_state is not None:
+            from . import product_composition
+
+            if product_composition.configured(harness_root):
+                provider_id = str((lane.get("provider") or {}).get("id") or "")
+                if provider_id != "codex":
+                    raise memory_handoff.MemoryHandoffError(
+                        "provider filesystem isolation unavailable for enhanced "
+                        f"memory product: {provider_id or 'unknown'}; resume is "
+                        "refused until this provider has a verified config/"
+                        "store_root/secret-file deny mechanism"
+                    )
+                composition = product_composition.compose_product(
+                    harness_root=harness_root,
+                    task_card=task_card,
+                    route=str(task_card["memory_handoff"]["route"]),
+                )
+                if (
+                    config.memory_product_config_identity
+                    != composition.configuration.config_digest
+                ):
+                    raise memory_handoff.MemoryHandoffError(
+                        "memory product configuration changed during resume "
+                        "preflight; retry against one stable ROOT configuration"
+                    )
+                preparation_arguments = product_composition.preparation_arguments(
+                    task_card=task_card,
+                    composition=composition,
+                    harness_runtime_root=rt,
+                    base_commit=str(task_card.get("base_commit") or "HEAD"),
+                )
+                composed_stores = preparation_arguments.pop("stores")
+                if search_stores is None:
+                    effective_stores = composed_stores
         if current_memory_state == "execution_accepted":
             # Launch uses this same lock for the final intent/spawn transition.
             # Keep it through the new run record so the old run cannot dispatch
@@ -331,17 +494,27 @@ def run_resume(
             dispatch_lock = RecordLock(memory_handoff.memory_paths(worktree)[1])
             dispatch_lock.__enter__()
             lane = _recheck_resume_owner(rt, epoch_id, lane, lifecycle=lifecycle)
-        memory_handoff.validate_resume_handoff(
-            task_card=task_card,
-            lane_id=lane_id,
-            prior_run_id=prior_run_id,
-            worktree_path=worktree,
-            base_commit=str(task_card.get("base_commit") or "HEAD"),
-        )
+            if pending_plan_activation is not None:
+                pending_plan_activation = validate_pending_plan_activation(
+                    lane=lane,
+                    accepted_task_card=task_card,
+                    worktree_path=worktree,
+                )
+        if pending_plan_activation is None:
+            memory_handoff.validate_resume_handoff(
+                task_card=task_card,
+                lane_id=lane_id,
+                prior_run_id=prior_run_id,
+                worktree_path=worktree,
+                base_commit=str(task_card.get("base_commit") or "HEAD"),
+            )
         supersession = None
         required_sources: frozenset[tuple[str, str, str]] = frozenset()
         retained_context: dict[str, Any] | None = None
-        if current_memory_state == "execution_accepted":
+        if (
+            current_memory_state == "execution_accepted"
+            and pending_plan_activation is None
+        ):
             prior_envelope = memory_handoff.load_envelope(worktree)
             assert prior_envelope is not None
             prior_context = memory_handoff.load_final_context(
@@ -354,7 +527,7 @@ def run_resume(
             # instead of rejecting every resume.  Plan-required sources still
             # fail closed below if finalization cannot carry their exact
             # identities; supplied stores continue to perform a fresh search.
-            if not search_stores:
+            if not effective_stores:
                 retained_context = prior_context
             prior_operation = memory_handoff.get_dispatch_operation(
                 worktree_path=worktree, envelope=prior_envelope
@@ -461,7 +634,10 @@ def run_resume(
                     raise memory_handoff.MemoryHandoffError(
                         "no-provider cleanup and exact controller exit are not proven; resume cannot replace the run"
                     )
-        elif not isinstance(session_id, str) or not session_id:
+        elif (
+            pending_plan_activation is None
+            and (not isinstance(session_id, str) or not session_id)
+        ):
             return {
                 "ok": False,
                 "code": NO_SAVED_SESSION_ID,
@@ -469,7 +645,11 @@ def run_resume(
                 "evidence_paths": [],
                 "next_action": "bootstrap a fresh lane (resume requires a native session)",
             }
-        if lifecycle == "prepared" and (not current_memory_state or session_id):
+        if (
+            lifecycle == "prepared"
+            and pending_plan_activation is None
+            and (not current_memory_state or session_id)
+        ):
             raise memory_handoff.MemoryHandoffError(
                 "prepared lane has no proven pre-provider failure to resume"
             )
@@ -487,9 +667,10 @@ def run_resume(
             run_id=run_id,
             worktree_path=worktree,
             base_commit=str(task_card.get("base_commit") or "HEAD"),
-            search_stores=search_stores,
+            search_stores=effective_stores,
             required_sources=required_sources,
             retained_context=retained_context,
+            **preparation_arguments,
         )
         if memory.pending_plan:
             update_lane(
@@ -655,6 +836,8 @@ def run_resume(
             "next_action": "resolve the error and retry resume",
         }
     finally:
+        if composition is not None:
+            composition.close()
         if dispatch_lock is not None:
             dispatch_lock.__exit__(None, None, None)
 
@@ -668,3 +851,33 @@ def run_resume(
         ],
         "next_action": "run `lane launch --lane-id <id>` to start the resumed run",
     }
+
+
+def activate_pending_plan(
+    *,
+    lane_id: str,
+    accepted_task_card: str,
+    rationale: str | None = None,
+    search_stores: Sequence[Any] | None = None,
+) -> dict[str, Any]:
+    """Finalize one ROOT-accepted pending lane in-place under a fresh run.
+
+    The plan-accept CLI should write the complete, hash-valid task card with
+    the exact accepted plan and required checkpoint to an operator-only
+    staging path, then pass that path here.  It must *not* overwrite the
+    worktree task card first: that durable card is the prior pending-state
+    witness, and this operation publishes the accepted card only after a
+    successful reprepare.  Caller-owned staging-file cleanup remains the
+    CLI's responsibility.  The helper never accepts a generic stopped lane:
+    it delegates to :func:`run_resume` in mandatory pending-activation mode,
+    which enforces :func:`validate_pending_plan_activation` before replacing
+    any lane state.
+    """
+
+    return run_resume(
+        lane_id=lane_id,
+        resume_task_card=accepted_task_card,
+        rationale=rationale,
+        search_stores=search_stores,
+        require_pending_plan_activation=True,
+    )

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import memory_handoff, processes, terminal_evidence
+from . import attempt_attestation, memory_handoff, processes, terminal_evidence
 from .config import find_harness_root, load_config
 from .core import content_hash, iso_utc, read_json, require_schema
 from .epochs import lane_record_dir
@@ -307,7 +308,7 @@ def _append_attempt(
 ) -> None:
     """Append immutable source facts, not a derived usage or quality verdict.
 
-    The controller-attempts/v1 row binds lane_id/run_id/attempt, provider,
+    The controller-attempts/v2 journal row binds lane_id/run_id/attempt, provider,
     argv/session, and optional dispatch_binding to the exact transcript byte
     range [transcript_start_byte, transcript_end_byte). Its ordered
     native_usage_observations keep native counter names, event identities and
@@ -322,10 +323,8 @@ def _append_attempt(
     native_session_id = session_id
     transcript = paths["transcript"]
     capture_error: str | None = None
-    try:
-        transcript_end_byte = transcript.stat().st_size
-    except OSError:
-        transcript_end_byte = transcript_start_byte
+    transcript_end_byte = transcript_start_byte
+    transcript_digest = hashlib.sha256()
     parser = getattr(binding, "parse_line", None)
     if callable(parser) and transcript.is_file():
         try:
@@ -333,6 +332,7 @@ def _append_attempt(
                 handle.seek(transcript_start_byte)
                 byte_offset = transcript_start_byte
                 for line_number, raw_line in enumerate(handle, start=1):
+                    transcript_digest.update(raw_line)
                     line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                     try:
                         parsed = parser(line)
@@ -374,42 +374,168 @@ def _append_attempt(
                             **receipt,
                         })
                     byte_offset += len(raw_line)
+                transcript_end_byte = byte_offset
         except OSError as exc:
             capture_error = f"transcript read failed: {exc}"
-    append_jsonl(
-        Path(
-            lane.get("attempts_path")
-            or Path(lane["worktree_path"]) / ".agent-workspace" / "controller.attempts.jsonl"
+    elif transcript.is_file():
+        try:
+            with transcript.open("rb") as handle:
+                handle.seek(transcript_start_byte)
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    transcript_digest.update(chunk)
+                    transcript_end_byte += len(chunk)
+        except OSError as exc:
+            capture_error = capture_error or f"transcript digest failed: {exc}"
+    attempt_record = {
+        "schema": attempt_attestation.ATTEMPT_SCHEMA,
+        "lane_id": lane["lane_id"],
+        "run_id": lane["run_id"],
+        "attempt": attempt_number,
+        "provider": lane.get("provider", {}),
+        "argv": list(argv or []),
+        "session_id": native_session_id,
+        "prompt_path": str(prompt_path),
+        "transcript_path": str(paths["transcript"]),
+        "transcript_start_byte": transcript_start_byte,
+        "transcript_end_byte": transcript_end_byte,
+        "transcript_sha256": transcript_digest.hexdigest(),
+        "stderr_path": str(paths["stderr"]),
+        "provider_started": bool(argv) if provider_started is None else provider_started,
+        "exit_code": exit_code,
+        "result_state": result_state,
+        "validation_error": validation_error,
+        "native_usage_state": (
+            "observed"
+            if any(has_native_counter(item) for item in observations)
+            else "incomplete"
         ),
-        {
-            "lane_id": lane["lane_id"],
-            "run_id": lane["run_id"],
-            "attempt": attempt_number,
-            "provider": lane.get("provider", {}),
-            "argv": list(argv or []),
-            "session_id": native_session_id,
-            "prompt_path": str(prompt_path),
-            "transcript_path": str(paths["transcript"]),
-            "transcript_start_byte": transcript_start_byte,
-            "transcript_end_byte": transcript_end_byte,
-            "stderr_path": str(paths["stderr"]),
-            "provider_started": bool(argv) if provider_started is None else provider_started,
-            "exit_code": exit_code,
-            "result_state": result_state,
-            "validation_error": validation_error,
-            "native_usage_state": (
-                "observed"
-                if any(has_native_counter(item) for item in observations)
-                else "incomplete"
-            ),
-            "native_usage_observations": observations,
-            "native_usage_capture_error": capture_error,
-            **({"dispatch_binding": dispatch_binding} if dispatch_binding is not None else {}),
-            "cleanup_proven": cleanup_proven,
-            "at": iso_utc(),
-        },
-        header={"schema": "controller-attempts/v1"},
+        "native_usage_observations": observations,
+        "native_usage_capture_error": capture_error,
+        **({"dispatch_binding": dispatch_binding} if dispatch_binding is not None else {}),
+        "cleanup_proven": cleanup_proven,
+        "at": iso_utc(),
+    }
+    attempts_path = lane.get("attempts_path")
+    if not isinstance(attempts_path, str) or not attempts_path:
+        raise ControllerError(
+            LAUNCH_INVOCATION_INVALID,
+            "lane is missing its controller-owned attempts path",
+        )
+    signing_key = lane.get("_controller_attempt_attestation_key")
+    if not isinstance(signing_key, bytes) or len(signing_key) < 32:
+        raise ControllerError(
+            LAUNCH_INVOCATION_INVALID,
+            "controller attempt signing capability is unavailable",
+        )
+    attempt_record = attempt_attestation.sign_attempt(attempt_record, signing_key)
+    expected_hashes = lane.setdefault("_controller_attempt_content_hashes", [])
+    if not isinstance(expected_hashes, list):
+        raise ControllerError(
+            LAUNCH_INVOCATION_INVALID,
+            "controller attempt signing state is malformed",
+        )
+    append_jsonl(
+        Path(attempts_path),
+        attempt_record,
+        header=attempt_attestation.JOURNAL_HEADER,
     )
+    expected_hashes.append(attempt_record["content_hash"])
+
+
+def _publish_attempt_attestation(lane: dict[str, Any]) -> Path:
+    """Seal exactly the rows this controller emitted after child cleanup."""
+
+    attempts_path = lane.get("attempts_path")
+    key = lane.get("_controller_attempt_attestation_key")
+    expected_hashes = lane.get("_controller_attempt_content_hashes")
+    if (
+        not isinstance(attempts_path, str) or not attempts_path
+        or not isinstance(key, bytes) or len(key) < 32
+        or not isinstance(expected_hashes, list)
+    ):
+        raise ControllerError(
+            LAUNCH_INVOCATION_INVALID,
+            "controller attempt attestation state is incomplete",
+        )
+    journal = Path(attempts_path)
+    try:
+        with RecordLock(journal):
+            raw_records = [
+                json.loads(line)
+                for line in journal.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ControllerError(
+            LAUNCH_INVOCATION_INVALID,
+            f"controller attempt journal cannot be sealed: {exc}",
+        ) from exc
+    if not raw_records or raw_records[0] != attempt_attestation.JOURNAL_HEADER:
+        raise ControllerError(
+            LAUNCH_INVOCATION_INVALID,
+            "controller attempt journal header changed before sealing",
+        )
+    current_rows = [
+        record for record in raw_records[1:]
+        if isinstance(record, dict)
+        and record.get("lane_id") == lane["lane_id"]
+        and record.get("run_id") == lane["run_id"]
+    ]
+    if (
+        any(not attempt_attestation.validate_signed_attempt(record, key)
+            for record in current_rows)
+        or [record.get("content_hash") for record in current_rows] != expected_hashes
+    ):
+        raise ControllerError(
+            LAUNCH_INVOCATION_INVALID,
+            "controller attempt journal changed before sealing",
+        )
+    attestation = attempt_attestation.make_attestation(
+        lane_id=lane["lane_id"], run_id=lane["run_id"], key=key,
+        row_content_hashes=expected_hashes,
+    )
+    path = attempt_attestation.attestation_path(journal, lane["run_id"])
+    with RecordLock(path):
+        if path.exists():
+            try:
+                existing = read_json(path)
+            except (OSError, ValueError) as exc:
+                raise ControllerError(
+                    LAUNCH_INVOCATION_INVALID,
+                    "controller attempt attestation is unreadable",
+                ) from exc
+            if existing != attestation:
+                raise ControllerError(
+                    LAUNCH_INVOCATION_INVALID,
+                    "controller attempt attestation already conflicts",
+                )
+        else:
+            atomic_write_json(path, attestation)
+    return path
+
+
+def _seal_attempts_after_cleanup(lane: dict[str, Any]) -> dict[str, Any]:
+    """Publish and return the exact lane reference for one closed run.
+
+    Callers must invoke this only after every provider/helper process in the
+    run has been proven gone.  Both successful results and terminal no-result
+    runs are reviewable evidence, so they receive the same authenticated
+    journal closure before their terminal status is published.
+    """
+
+    attestation_path = _publish_attempt_attestation(lane)
+    sealed_attempts = read_json(attestation_path)
+    reference = {
+        "path": str(attestation_path),
+        "content_hash": sealed_attempts["content_hash"],
+        "controller_key_id": sealed_attempts["controller_key_id"],
+        "row_count": sealed_attempts["row_count"],
+    }
+    lane["attempt_attestation"] = reference
+    return reference
 
 
 def _read_acceptance_chain(
@@ -760,6 +886,12 @@ def run_controller(lane_id: str) -> int:
             "process": {"pid": identity["pid"], "creation_time": identity["creation_time"]},
         },
     )
+    # This capability exists only in the controller's memory while provider
+    # processes run.  It is deliberately absent from lane records, argv, and
+    # child environment.  Verification material is published only after the
+    # complete provider/helper boundary has been proven gone.
+    lane["_controller_attempt_attestation_key"] = secrets.token_bytes(32)
+    lane["_controller_attempt_content_hashes"] = []
     _write_status(lane, {
         "controller_identity": identity,
         **({"dispatch_binding": dispatch_binding} if dispatch_binding is not None else {}),
@@ -871,6 +1003,10 @@ def run_controller(lane_id: str) -> int:
                     dispatch_binding=dispatch_binding,
                     provider_started=bool(lane.get("_attempt_started")),
                 )
+                attestation_reference = (
+                    _seal_attempts_after_cleanup(lane)
+                    if cleanup_proven else None
+                )
                 _write_status(
                     lane,
                     {
@@ -879,6 +1015,10 @@ def run_controller(lane_id: str) -> int:
                         "result_state": "invalid",
                         "recorded_status": "provider_exited_no_result",
                         "cleanup_proven": cleanup_proven,
+                        **(
+                            {"attempt_attestation": attestation_reference}
+                            if attestation_reference is not None else {}
+                        ),
                     },
                 )
                 _append_event(
@@ -893,7 +1033,14 @@ def run_controller(lane_id: str) -> int:
                     rt,
                     epoch_id,
                     lane_id,
-                    lambda current: {**current, "lifecycle": "result_invalid"},
+                    lambda current: {
+                        **current,
+                        "lifecycle": "result_invalid",
+                        **(
+                            {"attempt_attestation": attestation_reference}
+                            if attestation_reference is not None else {}
+                        ),
+                    },
                 )
                 return 0
             provider_state = dict(status.get("provider_state") or {}) if isinstance(status, dict) else {}
@@ -1023,26 +1170,6 @@ def run_controller(lane_id: str) -> int:
             lane = {**lane, "session": {"session_id": execution.session_id}}
 
         if effective_result_state == "valid":
-            # Cleanup proof covers the complete provider/helper boundary; only
-            # now may the controller release the lane's exclusive leases.
-            _write_status(
-                lane,
-                {
-                    "cleanup_proven": True,
-                    "result_state": "valid",
-                    "recorded_status": "review_pending",
-                },
-            )
-            release_leases(rt, lane_id, lane["run_id"])
-            _append_event(lane, "leases_released", ",".join(declared) or "(none)")
-            _append_event(lane, "result_valid", "review_pending")
-            update_lane(
-                rt,
-                epoch_id,
-                lane_id,
-                lambda current: {**current, "lifecycle": "review_pending"},
-            )
-            recorded = "review_pending"
             break
 
         # The invalid result is kept as evidence while the provider continues
@@ -1062,6 +1189,7 @@ def run_controller(lane_id: str) -> int:
             or not execution.session_id
             or execution.non_retryable_failure
         ):
+            attestation_reference = _seal_attempts_after_cleanup(lane)
             _write_status(
                 lane,
                 {
@@ -1071,6 +1199,7 @@ def run_controller(lane_id: str) -> int:
                     "recorded_status": "provider_exited_no_result",
                     "cleanup_proven": True,
                     "correction_attempts": correction_count,
+                    "attempt_attestation": attestation_reference,
                 },
             )
             release_leases(rt, lane_id, lane["run_id"])
@@ -1085,7 +1214,11 @@ def run_controller(lane_id: str) -> int:
                 rt,
                 epoch_id,
                 lane_id,
-                lambda current: {**current, "lifecycle": "result_invalid"},
+                lambda current: {
+                    **current,
+                    "lifecycle": "result_invalid",
+                    "attempt_attestation": attestation_reference,
+                },
             )
             return 0
 
@@ -1109,6 +1242,35 @@ def run_controller(lane_id: str) -> int:
         )
         prompt_path = correction_prompt
         attempt_number += 1
+
+    # Do not publish review authority before sealing.  A same-user provider
+    # may have written the runtime pathname while it was alive, but it never
+    # had this controller's in-memory key or expected-row index.  Any such
+    # mutation fails here while the lane is still non-reviewable.
+    attestation_reference = _seal_attempts_after_cleanup(lane)
+    _write_status(
+        lane,
+        {
+            "cleanup_proven": True,
+            "result_state": "valid",
+            "recorded_status": "review_pending",
+            "attempt_attestation": attestation_reference,
+        },
+    )
+    release_leases(rt, lane_id, lane["run_id"])
+    _append_event(lane, "leases_released", ",".join(declared) or "(none)")
+    _append_event(lane, "result_valid", "review_pending")
+    update_lane(
+        rt,
+        epoch_id,
+        lane_id,
+        lambda current: {
+            **current,
+            "lifecycle": "review_pending",
+            "attempt_attestation": attestation_reference,
+        },
+    )
+    recorded = "review_pending"
 
     # Wait for the acceptance chain (ACCEPTED -> copy + exit; REJECTED -> exit).
     while True:

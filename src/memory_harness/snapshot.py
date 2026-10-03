@@ -1,12 +1,14 @@
 """Authorized, isolated SQLite snapshot and restore for one MemoryStore.
 
 Public API: ``SnapshotService(authorizer, dependency_verifier=None)`` exposes
-``export(source, artifact, *, scope, credential, dependencies=())`` and
+``export(source, artifact, *, scope, credential, dependencies=())``,
+``inspect(artifact, *, scope, credential)``, and
 ``restore(artifact, target, *, scope, credential, required_capabilities=("local",))``.
 ``source`` is an initialized MemoryStore; ``target`` is a closed MemoryStore
 whose path does not exist. The constructor-bound authorizer receives
-``(action, exact_scope, store_path, credential)`` and must return literal True
-for the entire exact MemoryStore file at that path and four-field scope;
+``(action, exact_scope, operation_path, credential)`` and must return literal
+True for the exact source/target store or snapshot artifact at that path and
+four-field scope;
 no subset or multi-tenant filtering is performed.
 The optional bound dependency verifier receives ``(capability, reference,
 exact_scope)`` and must return literal True. Credentials and dependency refs
@@ -86,7 +88,12 @@ def _expected_schema_digest() -> str:
 
 def _inspect_database(path: Path) -> tuple[str, sqlite3.Connection]:
     try:
-        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        # ``immutable=1`` is both a safety property and part of the public
+        # inspection promise: SQLite must not create journal/WAL sidecars or
+        # otherwise mutate an artifact while deciding whether it is ready.
+        connection = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro&immutable=1", uri=True
+        )
         if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise SnapshotError("snapshot database integrity_check failed")
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
@@ -245,6 +252,133 @@ class SnapshotService:
         finally:
             if stage.exists():
                 shutil.rmtree(stage)
+
+    def inspect(
+        self,
+        artifact: str | Path,
+        *,
+        scope: Mapping[str, str],
+        credential: object,
+    ) -> dict[str, Any]:
+        """Nonmutating validation and current readiness for one exact capture.
+
+        A manifest is not readiness evidence by itself.  Inspection rechecks
+        its hash, database bytes, SQLite integrity and schema, discovered
+        dependency set, and exact pending-operation facts before applying the
+        current dependency verifier.  It never creates a target or replays an
+        effect.
+        """
+
+        artifact_path = Path(artifact).resolve()
+        exact = self._authorize("inspect", scope, artifact_path, credential)
+        try:
+            manifest = json.loads(
+                (artifact_path / "manifest.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            raise SnapshotError("snapshot manifest is missing or invalid") from exc
+        if not isinstance(manifest, dict) or manifest.get("schema") != "snapshot/v1":
+            raise SnapshotError("snapshot manifest schema is incompatible")
+        if manifest.get("store_format") != "memory_harness_sqlite/v1":
+            raise SnapshotError("snapshot store format is incompatible")
+        content_hash = manifest.get("content_hash")
+        if (
+            not isinstance(content_hash, str)
+            or content_hash
+            != _digest({key: value for key, value in manifest.items() if key != "content_hash"})
+        ):
+            raise SnapshotError("snapshot manifest integrity mismatch")
+        source = manifest.get("source")
+        if (
+            not isinstance(source, dict)
+            or source.get("scope") != exact
+            or source.get("scope_boundary") != "whole_memory_store_file"
+        ):
+            raise SnapshotError("snapshot identity scope mismatch")
+        raw_source_path = source.get("path")
+        if not isinstance(raw_source_path, str) or not Path(raw_source_path).is_absolute():
+            raise SnapshotError("snapshot source path is not absolute")
+        source_path = Path(raw_source_path).resolve()
+        if (
+            str(source_path) != raw_source_path
+            or source.get("root") != str(source_path.parent)
+        ):
+            raise SnapshotError("snapshot source path identity is not canonical")
+        if manifest.get("database_file") != "state.sqlite3":
+            raise SnapshotError("unsupported snapshot database file")
+        database = artifact_path / "state.sqlite3"
+        if not database.is_file() or _file_digest(database) != manifest.get("database_sha256"):
+            raise SnapshotError("snapshot database digest mismatch")
+        schema, connection = _inspect_database(database)
+        try:
+            discovered, pending = _facts(connection)
+        finally:
+            connection.close()
+        if schema != manifest.get("store_schema_digest"):
+            raise SnapshotError("snapshot schema identity mismatch")
+        if (
+            pending["effect_operations"] != manifest.get("pending_effects")
+            or pending["dispatch_operations"] != manifest.get("pending_dispatches")
+            or pending["procedure_remote_operations"]
+            != manifest.get("pending_procedure_remote")
+        ):
+            raise SnapshotError("snapshot recovery facts mismatch")
+        listed = manifest.get("dependencies")
+        if not isinstance(listed, list):
+            raise SnapshotError("snapshot dependencies are invalid")
+        normalized: list[dict[str, Any]] = []
+        for item in listed:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"capability", "reference", "ready"}
+                or item.get("capability") not in {"experience", "atlas"}
+                or not isinstance(item.get("reference"), str)
+                or not item["reference"]
+                or not isinstance(item.get("ready"), bool)
+            ):
+                raise SnapshotError("snapshot dependencies are invalid")
+            normalized.append(dict(item))
+        pairs = {(item["capability"], item["reference"]) for item in normalized}
+        if len(pairs) != len(normalized):
+            raise SnapshotError("snapshot dependencies contain duplicate identities")
+        if not {
+            (item["capability"], item["reference"]) for item in discovered
+        } <= pairs:
+            raise SnapshotError("snapshot required dependency references are missing")
+        expected_completeness = (
+            "complete" if all(item["ready"] for item in normalized) else "incomplete"
+        )
+        if manifest.get("completeness") != expected_completeness:
+            raise SnapshotError("snapshot completeness is inconsistent")
+        current = [
+            {
+                "capability": item["capability"],
+                "reference": item["reference"],
+                "captured_ready": item["ready"],
+                "current_ready": self._ready(
+                    item["capability"], item["reference"], exact
+                ),
+            }
+            for item in normalized
+        ]
+        for item in current:
+            item["ready"] = item["captured_ready"] and item["current_ready"]
+        capabilities: dict[str, bool] = {"local": True}
+        for capability in ("experience", "atlas"):
+            covered = [item for item in current if item["capability"] == capability]
+            capabilities[capability] = bool(covered) and all(
+                item["ready"] for item in covered
+            )
+        return {
+            "capture": manifest,
+            "inspection": {
+                "completeness": (
+                    "complete" if all(item["ready"] for item in current) else "incomplete"
+                ),
+                "capabilities": capabilities,
+                "dependencies": current,
+            },
+        }
 
     def restore(
         self, artifact: str | Path, target: MemoryStore, *, scope: Mapping[str, str],
