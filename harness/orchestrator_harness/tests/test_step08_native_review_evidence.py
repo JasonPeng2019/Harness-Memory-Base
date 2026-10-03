@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from memory_harness import contracts, store
-from orchestrator_harness import controller, launch, lanes, leases, manager_queue, memory_handoff, monitor, operator_launch, resume, review, terminal_evidence
+from orchestrator_harness import bootstrap, controller, launch, lanes, leases, manager_queue, memory_handoff, monitor, operator_launch, resume, review, terminal_evidence
 from orchestrator_harness.core import content_hash
 from orchestrator_harness.epochs import current_epoch_path, lane_record_dir, manager_queue_path, read_active_lanes, write_active_lanes
 from orchestrator_harness.lanes import LaneError
@@ -50,6 +50,24 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             "memory_plan_state": "execution_accepted",
             "controller_status_path": str(self.worktree / ".agent-workspace" / "controller.status.json"),
             "process": {"pid": 123, "creation_time": "incarnation-1"},
+            "provider": {
+                "id": "codex",
+                "model": "test-model",
+                "launch_config": {
+                    "reasoning_effort": "high",
+                    "service_tier": "priority",
+                },
+            },
+            "git": {
+                "source_root": str(self.root),
+                "common_dir": str(self.root / ".git"),
+                "branch": "lane/lane-1",
+                "base_commit": "base-1",
+                "origin_tip": "base-1",
+                "bootstrap_tip": "base-1",
+                "harness_owned_paths": [".agent-workspace/**", "RESULT.json"],
+            },
+            "task_card_hash": content_hash(self.card),
         }
         self.result_path = self.worktree / "RESULT.json"
         self._result("PASS")
@@ -81,6 +99,40 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             worktree_path=self.worktree, envelope=self.envelope,
             observed_invocation=self.observed,
         )
+        self._bind_invocation()
+
+    def _bind_invocation(self) -> None:
+        bootstrap._write_worker_prompt(
+            self.worktree, self.card, managed=False
+        )
+        invocation = bootstrap._write_invocation(
+            self.worktree,
+            lane_id=self.lane_id,
+            run_id=self.run_id,
+            provider_id=self.lane["provider"]["id"],
+            model=self.lane["provider"]["model"],
+            launch_config=self.lane["provider"]["launch_config"],
+            exclusive_resources=[],
+            git_identity=self.lane["git"],
+            memory_envelope=(
+                self.envelope
+                if self.lane.get("memory_plan_state") == "execution_accepted"
+                else None
+            ),
+        )
+        self.lane["invocation_hash"] = invocation["content_hash"]
+        self.lane["task_card_hash"] = content_hash(self.card)
+        self.lane["result_path"] = str(self.result_path)
+        if self.result_path.is_file():
+            result = review.read_json(self.result_path)
+            self.lane["result_validation"] = {
+                "run_id": self.run_id,
+                "result_hash": result["content_hash"],
+                "invocation_hash": invocation["content_hash"],
+                "branch": self.lane["git"]["branch"],
+                "commit": "commit-1",
+                "clean": True,
+            }
 
     def _result(self, outcome: str) -> None:
         value = {
@@ -90,6 +142,16 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         }
         value["content_hash"] = content_hash(value)
         atomic_write_json(self.result_path, value)
+        if hasattr(self, "lane"):
+            self.lane["result_path"] = str(self.result_path)
+            self.lane["result_validation"] = {
+                "run_id": self.run_id,
+                "result_hash": value["content_hash"],
+                "invocation_hash": self.lane.get("invocation_hash"),
+                "branch": self.lane["git"]["branch"],
+                "commit": "commit-1",
+                "clean": True,
+            }
 
     def _review(self, *, outcome: str = "PASS", approval: str = "ACCEPTED",
                 force_reason: str | None = None, managed: bool = False,
@@ -102,6 +164,17 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             patch.object(review, "find_active_lane", return_value=(self.epoch_id, self.lane)),
             patch.object(review, "_resolve_lane_managed", return_value=(self.epoch_id, self.lane, event)),
             patch.object(review, "_worktree_commit", return_value="commit-1"),
+            patch.object(
+                review,
+                "validate_merge_ready_git",
+                return_value={
+                    "branch": self.lane["git"]["branch"],
+                    "commit": "commit-1",
+                    "common_dir": self.lane["git"]["common_dir"],
+                    "origin_tip": self.lane["git"]["origin_tip"],
+                    "clean": True,
+                },
+            ),
             patch.object(review, "close_event", side_effect=close_side_effect),
         ):
             return review.run_completion_review(
@@ -304,6 +377,7 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         }
         result["content_hash"] = content_hash(result)
         atomic_write_json(self.result_path, result)
+        self._bind_invocation()
         self.assertTrue(self._review()["ok"])
         evidence = self._evidence()
         self.assertEqual(result, evidence["result"])
@@ -358,12 +432,12 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             "process_boundary": boundary, "cleanup_proven": False,
         }
         checked = []
-        def exact_identity(pid: int, creation: str) -> bool:
+        def exact_identity(pid: int, creation: str) -> str:
             checked.append((pid, creation))
             self.assertIn((pid, creation), [
                 (123, "incarnation-1"), (42, "provider-incarnation"),
             ])
-            return False
+            return launch.processes.IDENTITY_GONE_OR_REUSED
         acceptance = self.folder / "ORCHESTRATOR_ACCEPTANCE.json"
         with (
             patch.object(launch, "find_harness_root", return_value=self.root),
@@ -372,8 +446,46 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             )),
             patch.object(launch, "find_active_lane", return_value=(self.epoch_id, self.lane)),
             patch.object(launch, "_read_controller_status", return_value=status),
-            patch.object(launch.processes, "identity_matches", side_effect=exact_identity),
+            patch.object(launch.processes, "exact_identity_state", side_effect=exact_identity),
             patch.object(launch.processes, "process_boundary_is_gone", side_effect=lambda observed: observed == boundary),
+            patch.object(
+                launch,
+                "validate_merge_ready_git",
+                return_value={
+                    "branch": self.lane["git"]["branch"],
+                    "commit": "commit-1",
+                    "common_dir": self.lane["git"]["common_dir"],
+                    "origin_tip": self.lane["git"]["origin_tip"],
+                    "clean": True,
+                },
+            ),
+            patch.object(
+                launch,
+                "_archive_retirement_evidence",
+                return_value=self.folder / "retirement-archive",
+            ),
+            patch.object(
+                launch,
+                "_read_retirement_archive",
+                return_value={
+                    "process_proof": {
+                        "controller_gone": True,
+                        "provider_boundary_gone": True,
+                        "provider_gone": True,
+                        "cleanup_proven": True,
+                    }
+                },
+            ),
+            patch.object(
+                launch,
+                "_plan_worktree_quarantine",
+                return_value={
+                    "path": str(self.worktree) + ".retiring",
+                    "gitfile": {},
+                },
+            ),
+            patch.object(launch, "_remove_exact_worktree"),
+            patch.object(launch, "_prove_retained_branch_tip"),
             patch.object(launch, "_prune_worktrees") as prune,
         ):
             unresolved = launch.run_retire(str(acceptance))
@@ -913,6 +1025,7 @@ class NativeReviewEvidenceTests(unittest.TestCase):
 
     def test_enhanced_retire_requires_current_acceptance_slot_and_valid_evidence(self) -> None:
         self.assertTrue(self._review()["ok"])
+        self.lane["lifecycle"] = "accepted"
         acceptance_path = self.folder / "ORCHESTRATOR_ACCEPTANCE.json"
         copied_path = self.root / "copied-acceptance.json"
         copied_path.write_bytes(acceptance_path.read_bytes())
@@ -921,15 +1034,62 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             "process_boundary": {"root": {"pid": 1, "creation_time": "old"}},
             "provider_state": {"state": "exited"},
         }
+
+        def update_lane(_rt, _epoch, _lane, mutate):
+            self.lane.update(mutate(self.lane))
+            return self.lane
+
         with (
             patch.object(launch, "find_harness_root", return_value=self.root),
             patch.object(launch, "load_config", return_value=SimpleNamespace(runtime_root=self.rt, root_workspace=self.root)),
             patch.object(launch, "find_active_lane", return_value=(self.epoch_id, self.lane)),
             patch.object(launch, "_read_controller_status", return_value=status),
-            patch.object(launch.processes, "identity_matches", return_value=False),
+            patch.object(
+                launch.processes,
+                "exact_identity_state",
+                return_value=launch.processes.IDENTITY_GONE_OR_REUSED,
+            ),
             patch.object(launch.processes, "process_boundary_is_gone", return_value=True),
+            patch.object(
+                launch,
+                "validate_merge_ready_git",
+                return_value={
+                    "branch": self.lane["git"]["branch"],
+                    "commit": "commit-1",
+                    "common_dir": self.lane["git"]["common_dir"],
+                    "origin_tip": self.lane["git"]["origin_tip"],
+                    "clean": True,
+                },
+            ),
+            patch.object(
+                launch,
+                "_archive_retirement_evidence",
+                return_value=self.folder / "retirement-archive",
+            ),
+            patch.object(
+                launch,
+                "_read_retirement_archive",
+                return_value={
+                    "process_proof": {
+                        "controller_gone": True,
+                        "provider_boundary_gone": True,
+                        "provider_gone": True,
+                        "cleanup_proven": True,
+                    }
+                },
+            ),
+            patch.object(
+                launch,
+                "_plan_worktree_quarantine",
+                return_value={
+                    "path": str(self.worktree) + ".retiring",
+                    "gitfile": {},
+                },
+            ),
+            patch.object(launch, "_remove_exact_worktree"),
+            patch.object(launch, "_prove_retained_branch_tip"),
             patch.object(launch, "release_leases") as release,
-            patch.object(launch, "update_lane"),
+            patch.object(launch, "update_lane", side_effect=update_lane),
             patch.object(launch, "read_active_lanes", return_value=[]),
             patch.object(launch, "write_active_lanes"),
             patch.object(launch, "_prune_worktrees"),
@@ -937,13 +1097,16 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         ):
             self.assertFalse(launch.run_retire(str(copied_path))["ok"])
             release.assert_not_called()
-            self.assertTrue(launch.run_retire(str(acceptance_path))["ok"])
+            retired = launch.run_retire(str(acceptance_path))
+            self.assertTrue(retired["ok"], retired)
             release.assert_called_once()
 
     def test_legacy_pair_still_advances_without_native_evidence(self) -> None:
         legacy_card = contracts.make_task_card(task="legacy work", base_commit="base-1")
+        self.card = legacy_card
         atomic_write_json(self.worktree / ".agent-workspace" / "task-card.json", legacy_card)
         self.lane.pop("memory_plan_state")
+        self._bind_invocation()
         self.assertTrue(self._review()["ok"])
         self.assertIsNone(terminal_evidence.read_terminal_evidence(self.rt, self.epoch_id, self.lane_id))
         self.assertIsNotNone(controller._read_acceptance_chain(self.rt, self.epoch_id, self.lane))
@@ -951,8 +1114,10 @@ class NativeReviewEvidenceTests(unittest.TestCase):
 
     def test_legacy_managed_close_failure_replays_after_retirement(self) -> None:
         legacy_card = contracts.make_task_card(task="legacy work", base_commit="base-1")
+        self.card = legacy_card
         atomic_write_json(self.worktree / ".agent-workspace" / "task-card.json", legacy_card)
         self.lane.pop("memory_plan_state")
+        self._bind_invocation()
         first = self._review(managed=True, close_side_effect=ManagerQueueError("QUEUE_UNAVAILABLE", "queue unavailable"))
         self.assertFalse(first["ok"])
         before = (self.folder / "ORCHESTRATOR_ACCEPTANCE.json").read_bytes()
@@ -978,9 +1143,19 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         ))
         self.assertEqual("run-1", rejected["run_id"])
         self.lane["session"] = {"session_id": "saved-session"}
-        self.lane["provider"] = {"id": "codex", "model": "test", "launch_config": {}}
         resume_card = self.root / "resume-card.json"
         atomic_write_json(resume_card, self.card)
+        write_active_lanes(
+            self.rt,
+            self.epoch_id,
+            [
+                {
+                    "lane_id": self.lane_id,
+                    "run_id": self.run_id,
+                    "lane_record_path": str(self.folder / "lane.json"),
+                }
+            ],
+        )
 
         def update_lane(_rt, _epoch, _lane, mutate):
             self.lane.update(mutate(self.lane))
@@ -1024,7 +1199,11 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             patch.object(launch, "find_active_lane", return_value=(self.epoch_id, self.lane)),
             patch.object(launch, "read_lane", side_effect=lambda *_: self.lane),
             patch.object(launch, "update_lane", side_effect=update_lane),
-            patch.object(launch, "_validate_provider_launch_config", return_value={}),
+            patch.object(
+                launch,
+                "_validate_provider_launch_config",
+                return_value=self.lane["provider"]["launch_config"],
+            ),
             patch.object(launch, "_wait_for_spawn_attestation", return_value={"pid": 124, "creation_time": "incarnation-2"}),
             patch.object(launch, "_read_controller_status", return_value=status),
             patch.object(launch, "_delivered_provider_outcome", return_value=("LAUNCH_OK", "provider started")),
@@ -1191,6 +1370,7 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             "run_id": "run-2", "resume_from_run_id": "run-1",
             "process": {"pid": 124, "creation_time": "incarnation-2"},
         })
+        self.envelope = second
         memory_handoff.record_observed_invocation(
             worktree_path=self.worktree, envelope=second,
             observed_invocation=memory_handoff.native_observation(
@@ -1198,6 +1378,7 @@ class NativeReviewEvidenceTests(unittest.TestCase):
             ),
         )
         self._result("PASS")
+        self._bind_invocation()
         self.assertTrue(self._review(approval="REJECTED")["ok"])
         second_attempt = terminal_evidence.record_domain_review(
             self.rt, self.epoch_id, self.lane, self._evidence(),
@@ -1298,8 +1479,10 @@ class NativeReviewEvidenceTests(unittest.TestCase):
         )
         for card in (child, all_off):
             with self.subTest(task=card["task"]):
+                self.card = card
                 atomic_write_json(self.worktree / ".agent-workspace" / "task-card.json", card)
                 self.lane.pop("memory_plan_state", None)
+                self._bind_invocation()
                 with patch.object(memory_handoff, "get_dispatch_operation", side_effect=AssertionError("optional store opened")):
                     response = self._review()
                 self.assertTrue(response["ok"], response)

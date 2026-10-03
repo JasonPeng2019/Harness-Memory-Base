@@ -82,8 +82,31 @@ class SetupCacheRecoveryTests(unittest.TestCase):
         self.assertIn(result["code"], (bootstrap.BOOTSTRAP_CACHE_MISSING, bootstrap.BOOTSTRAP_CACHE_COLLISION))
 
     def _bootstrap_preflight(self) -> dict:
+        task_card = self.runtime / "cache-preflight-task-card.json"
+        self.fixture._write_json(
+            task_card,
+            {
+                "schema": "project-task-card/v1",
+                "task": "Verify the installed cache boundary",
+                "base_commit": "base-1",
+                "acceptance_criteria": ["Reject unresolved cache transactions"],
+                "deliverables": ["A deterministic preflight result"],
+                "reason_for_acceptance_and_deliverables": (
+                    "The cache must be trusted before any lane mutation."
+                ),
+            },
+        )
+        git_identity = {
+            "source_root": str(self.fixture.root_workspace.resolve()),
+            "common_dir": str((self.fixture.root_workspace / ".git").resolve()),
+            "branch": "lane/recovery-check",
+            "base_commit": "base-1",
+            "origin_tip": "base-1",
+            "bootstrap_tip": "base-1",
+        }
         with (
             patch("orchestrator_harness.config.find_harness_root", return_value=self.fixture.harness),
+            patch.object(bootstrap, "_resolve_git_identity", return_value=git_identity),
             patch.object(bootstrap, "open_epoch") as open_epoch,
         ):
             result = bootstrap.run_bootstrap(
@@ -92,7 +115,7 @@ class SetupCacheRecoveryTests(unittest.TestCase):
                 model="test-model",
                 launch_config={"reasoning_effort": "high", "service_tier": "priority"},
                 exclusive_resources=[],
-                task_card_path=str(self.runtime / "unused-task-card.json"),
+                task_card_path=str(task_card),
             )
         open_epoch.assert_not_called()
         return result

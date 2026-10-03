@@ -6,7 +6,7 @@ workspace's `references/` directory.
 
 | Component | Source | Source identity | Destination | License/status |
 | --- | --- | --- | --- | --- |
-| Orchestrator Harness v2 | `references/harness-single` | `0bf05794b1a6ad2ec1ba4916a8b32e42be548c2d` (`working/memory-v1`) | `harness/` | No license file was present in the supplied snapshot; resolve before redistribution. |
+| Orchestrator Harness v2 | `references/harness-single` | `4baaa645cff2b6b4f8c0e4808c72170e9c2cb309` (`memory`) | `harness/` | No license file was present in the supplied snapshot; resolve before redistribution. |
 | ROOT workflow/skill suite | `references/Codex_Claude_Setup` | `b3b683e6d3396343a8ed68801cd96e7787db1e45` (`Multi-Agent`) | Product worktree root | Complete portable suite content, including its workspace-aid documentation. |
 | EverOS | `references/Harness-Memory-Base` | `5076683ab88d714390573d8f88ff3c470e51129a` (`main`), package `everos==1.3.1` | `harness/vendor/everos/` | Apache-2.0; upstream `LICENSE` and `NOTICE` retained. |
 | MongoDB/LangChain integrations | `references/Harness-Memory-Planning` | `b37195d794ac0c2cac8f257fae433b852134a41a` (`main`), `langchain-mongodb==0.12.0` | `harness/vendor/langchain-mongodb/` | MIT; upstream license files retained. |
@@ -30,6 +30,14 @@ workspace's `references/` directory.
   not edited independently by accident.
 
 ## Upstream refresh
+
+On 2026-10-03, refreshed the embedded harness to
+`4baaa645cff2b6b4f8c0e4808c72170e9c2cb309` from the outer workspace's
+`references/harness-single` submodule. This incorporates the integrated
+lifecycle-safety and memory-harness tree while retaining the product-owned
+configuration, vendor trees, specifications, and viewer/demo additions. The
+standalone memory package copy under `harness/memory_harness/` is kept aligned
+with the canonical product package under `src/memory_harness/`.
 
 At the user's request, applied the exact 41-file upstream delta from
 `9cbd5b23e94f2e3d3488b68e53881025a2f13f6e` to

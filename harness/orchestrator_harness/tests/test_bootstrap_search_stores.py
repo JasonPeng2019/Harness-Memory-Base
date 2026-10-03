@@ -11,17 +11,36 @@ from pathlib import Path
 from unittest.mock import patch
 
 from memory_harness import contracts
-from tests.local.mvp.test_coherent_memory_path import (
-    ATLAS_MARKER,
-    EVEROS_MARKER,
-    RAW_APPROVAL_MATERIAL,
-    _CoherentFixture,
-)
+try:
+    from tests.local.mvp.test_coherent_memory_path import (
+        ATLAS_MARKER,
+        EVEROS_MARKER,
+        RAW_APPROVAL_MATERIAL,
+        _CoherentFixture,
+    )
+except ModuleNotFoundError:
+    # This is an optional cross-repository integration suite. The standalone
+    # harness package does not vendor the memory product's large fake-store
+    # fixture tree; CI can add that checkout to PYTHONPATH to enable it.
+    ATLAS_MARKER = "ATLAS_MVP_MARKER"
+    EVEROS_MARKER = "EVEROS_MVP_MARKER"
+    RAW_APPROVAL_MATERIAL = "RAW_APPROVAL_EVIDENCE_DO_NOT_DELIVER"
+
+    class _CoherentFixture:
+        pass
+
+    COHERENT_FIXTURE_AVAILABLE = False
+else:
+    COHERENT_FIXTURE_AVAILABLE = True
 
 from orchestrator_harness import bootstrap, memory_handoff, resume
 from orchestrator_harness.tests.test_step04_launch_boundary import LaunchBoundaryFixture
 
 
+@unittest.skipUnless(
+    COHERENT_FIXTURE_AVAILABLE,
+    "memory product fake-store fixtures are not available on PYTHONPATH",
+)
 class BootstrapSearchStoreTests(_CoherentFixture, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -36,12 +55,36 @@ class BootstrapSearchStoreTests(_CoherentFixture, unittest.TestCase):
         def fake_git_add(root: Path, branch: str, target: Path, base_commit: str) -> None:
             target.mkdir(parents=True, exist_ok=True)
 
+        def fake_git_identity(root: Path, branch: str, base_commit: str) -> dict:
+            return {
+                "source_root": str(root.resolve()),
+                "common_dir": str((root / ".git").resolve()),
+                "branch": branch,
+                "base_commit": base_commit,
+                "origin_tip": base_commit,
+                "bootstrap_tip": base_commit,
+            }
+
         with (
             patch("orchestrator_harness.config.find_harness_root", return_value=self.harness.harness),
             patch.object(bootstrap, "open_epoch", return_value={"epoch_id": self.harness.EPOCH}),
             patch.object(bootstrap, "read_active_lanes", return_value=[]),
+            patch.object(
+                bootstrap, "_resolve_git_identity", side_effect=fake_git_identity
+            ),
             patch.object(bootstrap, "_git_worktree_add", side_effect=fake_git_add),
-            patch.object(bootstrap.subprocess, "run"),
+            patch.object(
+                bootstrap,
+                "_capture_created_worktree_identity",
+                return_value={
+                    "admin_path": str(self.harness.root / "fake-admin"),
+                    "admin_dev": 1,
+                    "admin_ino": 1,
+                    "gitfile_dev": 1,
+                    "gitfile_ino": 1,
+                },
+            ),
+            patch.object(bootstrap, "_verify_created_worktree"),
         ):
             store_argument = {} if search_stores is None else {"search_stores": search_stores}
             result = bootstrap.run_bootstrap(

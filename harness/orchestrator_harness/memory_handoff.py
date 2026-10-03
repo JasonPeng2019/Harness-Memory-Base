@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,19 +33,6 @@ class PendingPlanError(MemoryHandoffError):
     """
 
 
-def enable_source_checkout_import() -> Path | None:
-    """Expose the adjacent product package when running from a source checkout."""
-
-    source_root = Path(__file__).resolve().parents[2] / "src"
-    package = source_root / "memory_harness" / "__init__.py"
-    if not package.is_file():
-        return None
-    source_text = str(source_root)
-    if source_text not in sys.path:
-        sys.path.insert(0, source_text)
-    return source_root
-
-
 def _memory_module(name: str):
     """Import one ``memory_harness`` module for the enhanced path only.
 
@@ -59,42 +45,12 @@ def _memory_module(name: str):
 
     import importlib
 
-    module_name = f"memory_harness.{name}"
     try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-        # A source checkout keeps the optional product package next to the
-        # portable harness (``product/src/memory_harness``).  The public
-        # launcher is normally run from ``product/harness``, so that sibling
-        # ``src`` directory is not on Python's import path unless the package
-        # was installed first.  Admit only this exact, bounded source layout;
-        # arbitrary ancestor paths are never searched.
-        source_root = enable_source_checkout_import()
-        if exc.name in {"memory_harness", module_name} and source_root is not None:
-            try:
-                return importlib.import_module(module_name)
-            except Exception as retry_exc:
-                exc = retry_exc
-        raise MemoryHandoffError(
-            f"the memory_harness package is not importable: {exc}"
-        ) from exc
+        return importlib.import_module(f"memory_harness.{name}")
     except Exception as exc:  # pragma: no cover - package unavailable
         raise MemoryHandoffError(
             f"the memory_harness package is not importable: {exc}"
         ) from exc
-
-
-def _memory_import_root(module: Any) -> Path | None:
-    """Return the import root needed by a detached controller process."""
-
-    module_file = getattr(module, "__file__", None)
-    if not isinstance(module_file, str) or not module_file:
-        return None
-    try:
-        root = Path(module_file).resolve().parents[1]
-    except (OSError, IndexError):
-        return None
-    return root if (root / "memory_harness" / "__init__.py").is_file() else None
 
 
 def handoff_from_task_card(task_card: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -907,7 +863,10 @@ def _task_credential_keys(task_card: Mapping[str, Any] | None) -> frozenset[str]
 
 
 def worker_environment(
-    task_card: Mapping[str, Any] | None = None, *, provider_id: str = "codex"
+    task_card: Mapping[str, Any] | None = None,
+    *,
+    provider_id: str = "codex",
+    worktree_path: str | Path | None = None,
 ) -> dict[str, str]:
     """Return a worker environment without product control credentials.
 
@@ -917,7 +876,8 @@ def worker_environment(
     from task authority.
     """
 
-    privacy = _memory_module("privacy")
+    from memory_harness import privacy
+
     inherited = privacy.worker_environment(os.environ)
     _task_credential_keys(task_card)
     allowed_provider = _PROVIDER_CREDENTIAL_KEYS.get(provider_id, frozenset())
@@ -931,21 +891,16 @@ def worker_environment(
         and value not in forbidden.values()
         and (not _credential_key(key) or key in allowed_provider)
     }
-    # The controller is a fresh Python process.  Preserve the exact package
-    # import root selected above so a source-checkout launch behaves like the
-    # already-supported installed-package launch.  This path carries code,
-    # not product control authority, and remains subject to the same scrubbed
-    # environment validation below.
-    import_root = _memory_import_root(privacy)
-    if import_root is not None:
-        current = [
-            item for item in environment.get("PYTHONPATH", "").split(os.pathsep)
-            if item
-        ]
-        root_text = str(import_root)
-        environment["PYTHONPATH"] = os.pathsep.join(
-            [root_text, *(item for item in current if item != root_text)]
-        )
+    if worktree_path is not None:
+        worktree = Path(worktree_path).resolve()
+        provider_home = {
+            "codex": ("CODEX_HOME", worktree / ".codex"),
+            "claude-code": ("CLAUDE_CONFIG_DIR", worktree / ".claude"),
+            "qwen-code": ("QWEN_HOME", worktree / ".qwen"),
+        }.get(provider_id)
+        if provider_home is not None:
+            key, path = provider_home
+            environment[key] = str(path)
     return environment
 
 

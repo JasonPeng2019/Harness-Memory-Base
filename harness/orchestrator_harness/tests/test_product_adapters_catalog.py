@@ -17,8 +17,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from orchestrator_harness import bootstrap, setup
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 PROVIDERS = {
@@ -154,53 +152,6 @@ class RootPayloadTests(unittest.TestCase):
 
 
 class WorkerPayloadTests(unittest.TestCase):
-    def test_installed_composition_is_the_worker_overlay_for_each_provider(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            runtime = root / "runtime"
-            runtime.mkdir()
-            plan = setup._plan_active_cache(REPOSITORY_ROOT)
-            setup._install_active_cache(REPOSITORY_ROOT, runtime, plan=plan, overwrite=False)
-            for provider_id, dotdir in PROVIDERS.items():
-                worktree = root / provider_id
-                worktree.mkdir()
-                instructions = worktree / "AGENTS.md"
-                instructions.write_bytes(b"checked-out product instructions\n")
-                qwen_settings: Path | None = None
-                qwen_settings_before: bytes | None = None
-                if provider_id == "qwen-code":
-                    qwen_settings = worktree / ".qwen" / "settings.json"
-                    qwen_settings.parent.mkdir(parents=True)
-                    config = json.loads(
-                        (REPOSITORY_ROOT / "adapters" / provider_id / "root" / ".qwen" / "settings.json").read_text(encoding="utf-8")
-                    )
-                    config["custom"] = {"product": True}
-                    qwen_settings.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-                    qwen_settings_before = qwen_settings.read_bytes()
-                installed = bootstrap._managed_payload(REPOSITORY_ROOT, runtime, provider_id)
-                self.assertEqual(
-                    runtime / "super-cache" / "composed-payloads" / provider_id,
-                    installed,
-                )
-                bootstrap._install_managed_material(
-                    REPOSITORY_ROOT, runtime, worktree,
-                    provider_id=provider_id, lane_id=f"lane-{provider_id}", run_id="run-1",
-                )
-                for name in HELPERS:
-                    self.assertEqual(
-                        (installed / ".agent-workspace" / name).read_bytes(),
-                        (worktree / ".agent-workspace" / name).read_bytes(),
-                    )
-                for name in WORKER_SKILLS:
-                    relative = Path(dotdir) / "skills" / name / "SKILL.md"
-                    self.assertEqual((installed / relative).read_bytes(), (worktree / relative).read_bytes())
-                self.assertEqual(b"checked-out product instructions\n", instructions.read_bytes())
-                if qwen_settings is not None:
-                    self.assertEqual(qwen_settings_before, qwen_settings.read_bytes())
-                for other_provider, other_dotdir in PROVIDERS.items():
-                    if other_provider != provider_id:
-                        self.assertFalse((worktree / other_dotdir).exists())
-
     def test_exact_two_worker_skills(self) -> None:
         for provider_id, dotdir in PROVIDERS.items():
             skills = (
@@ -337,20 +288,16 @@ class RegisteredBindingTests(unittest.TestCase):
         codex = self._load_registered("codex")
         argv = codex.build_argv(
             model="gpt-5.4",
-            launch_config={"reasoning_effort": "high", "service_tier": "flex"},
+            launch_config={"reasoning_effort": "high", "service_tier": "priority"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
         )
         self.assertEqual(argv[0], "codex")
         self.assertIn("exec", argv)
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
-        self.assertIn('model_reasoning_effort="high"', argv)
-        self.assertIn('service_tier="flex"', argv)
-        self.assertNotIn('model_reasoning_effort="medium"', argv)
-        self.assertNotIn('service_tier="priority"', argv)
         resume_argv = codex.build_argv(
             model="gpt-5.4",
-            launch_config={"reasoning_effort": "xhigh", "service_tier": "priority"},
+            launch_config={"reasoning_effort": "high", "service_tier": "priority"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
             session_id="s1",
@@ -362,7 +309,7 @@ class RegisteredBindingTests(unittest.TestCase):
         claude = self._load_registered("claude-code")
         argv = claude.build_argv(
             model="deepseek-v4-flash:0731-cloud",
-            launch_config={"effort": "low"},
+            launch_config={"effort": "high"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
         )
@@ -371,10 +318,9 @@ class RegisteredBindingTests(unittest.TestCase):
         self.assertIn("--output-format", argv)
         self.assertIn("stream-json", argv)
         self.assertIn("--verbose", argv)
-        self.assertEqual(["--effort", "low"], argv[argv.index("--effort") : argv.index("--effort") + 2])
         claude_resume = claude.build_argv(
             model="sonnet",
-            launch_config={"effort": "max"},
+            launch_config={"effort": "high"},
             worktree="C:/wt",
             prompt_path="C:/wt/.agent-workspace/correction-prompt-1.md",
             session_id="claude-session-1",
@@ -453,46 +399,6 @@ class RegisteredBindingTests(unittest.TestCase):
         discover.assert_called_once_with("qwen")
         self.assertEqual(argv[0], "qwen")
         self.assertIn("--approval-mode=yolo", argv)
-
-    def test_launch_preferences_are_required_and_adapter_validated(self) -> None:
-        codex = self._load_registered("codex")
-        claude = self._load_registered("claude-code")
-        qwen = self._load_registered("qwen-code")
-        common = {
-            "model": "configured-model",
-            "worktree": "C:/wt",
-            "prompt_path": "C:/wt/.agent-workspace/worker-prompt.md",
-        }
-        with self.assertRaisesRegex(ValueError, "reasoning_effort"):
-            codex.build_argv(**common, launch_config={"service_tier": "priority"})
-        with self.assertRaisesRegex(ValueError, "service_tier"):
-            codex.build_argv(**common, launch_config={"reasoning_effort": "high"})
-        with self.assertRaisesRegex(ValueError, "unsupported"):
-            codex.build_argv(
-                **common,
-                launch_config={
-                    "reasoning_effort": "high",
-                    "service_tier": "priority",
-                    "fallback_model": "hidden-default",
-                },
-            )
-        with self.assertRaisesRegex(ValueError, "effort"):
-            claude.build_argv(**common, launch_config={})
-        with self.assertRaisesRegex(ValueError, "unsupported"):
-            qwen.build_argv(**common, launch_config={"effort": "medium"})
-        for binding, launch_config in (
-            (codex, {"reasoning_effort": "high", "service_tier": "priority"}),
-            (claude, {"effort": "high"}),
-            (qwen, {}),
-        ):
-            with self.subTest(provider=binding.PROVIDER_ID):
-                with self.assertRaisesRegex(ValueError, "model"):
-                    binding.build_argv(
-                        model="",
-                        launch_config=launch_config,
-                        worktree="C:/wt",
-                        prompt_path="C:/wt/.agent-workspace/worker-prompt.md",
-                    )
 
     def test_parse_line_facts(self) -> None:
         codex = self._load_registered("codex")

@@ -386,3 +386,4 @@ class NativeAttemptReceipts(unittest.TestCase):
             self.assertEqual(len(b"stale earlier invocation\n"), execution.transcript_start_byte)
             self.assertEqual(execution.transcript_start_byte, row["transcript_start_byte"])
             self.assertEqual(transcript.stat().st_size, row["transcript_end_byte"])
+

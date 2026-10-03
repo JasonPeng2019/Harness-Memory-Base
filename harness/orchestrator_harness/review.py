@@ -25,11 +25,17 @@ from .manager_queue import (
     read_manager_queue,
 )
 from .records import RecordLock, atomic_write_json, read_record
+from .task_cards import validate_task_card
 
 COMPLETION_REVIEW_SCHEMA = "completion-review/v1"
 ACCEPTANCE_SCHEMA = "orchestrator-acceptance/v1"
 RESULT_SCHEMA = "result/v1"
-TASK_CARD_SCHEMA = "project-task-card/v1"
+INVOCATION_SCHEMA = "controller-invocation/v1"
+
+FRESH_LANE_INTEGRITY_DIAGNOSTIC = (
+    "lane uses the pre-integrity runtime contract; bootstrap a fresh lane "
+    "in a fresh epoch"
+)
 
 REVIEW_OUTCOMES = frozenset({"PASS", "FAIL", "BLOCKED", "UNKNOWN"})
 APPROVALS = frozenset({"ACCEPTED", "REJECTED"})
@@ -43,10 +49,188 @@ COMPLETION_REVIEW_OUTPUT_CONFLICT = "COMPLETION_REVIEW_OUTPUT_CONFLICT"
 COMPLETION_REVIEW_WRITE_FAILED = "COMPLETION_REVIEW_WRITE_FAILED"
 
 
+class GitStateError(RuntimeError):
+    """The lane's current Git state cannot be proven merge-ready."""
+
+
 class ReviewError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def lane_integrity_contract_error(lane: dict[str, Any]) -> str | None:
+    """Return the stable migration diagnostic for a pre-integrity lane."""
+
+    git = lane.get("git")
+    if (
+        not isinstance(git, dict)
+        or "current_tip" in git
+        or not isinstance(git.get("bootstrap_tip"), str)
+        or not git.get("bootstrap_tip")
+    ):
+        return FRESH_LANE_INTEGRITY_DIAGNOSTIC
+    invocation_hash = lane.get("invocation_hash")
+    pending_plan = (
+        lane.get("memory_plan_state") in {"absent", "candidate_review"}
+        and lane.get("dispatchable") is False
+        and invocation_hash is None
+    )
+    if not pending_plan and (
+        not isinstance(invocation_hash, str) or not invocation_hash
+    ):
+        return FRESH_LANE_INTEGRITY_DIAGNOSTIC
+    return None
+
+
+def validate_invocation_binding(
+    lane: dict[str, Any], invocation: dict[str, Any]
+) -> None:
+    """Fail unless an invocation is the immutable one published by the lane."""
+
+    legacy = lane_integrity_contract_error(lane)
+    if legacy is not None:
+        raise GitStateError(legacy)
+    invocation_hash = invocation.get("content_hash")
+    if not isinstance(invocation_hash, str) or invocation_hash != content_hash(invocation):
+        raise GitStateError("invocation content hash mismatch")
+    if invocation_hash != lane.get("invocation_hash"):
+        raise GitStateError(
+            "invocation no longer matches the authoritative lane invocation hash"
+        )
+    if (
+        invocation.get("lane_id") != lane.get("lane_id")
+        or invocation.get("run_id") != lane.get("run_id")
+        or invocation.get("provider") != lane.get("provider")
+        or invocation.get("git") != lane.get("git")
+    ):
+        raise GitStateError("invocation identity does not match the authoritative lane")
+
+
+def _git(
+    worktree: Path,
+    *args: str,
+    allowed_returncodes: frozenset[int] = frozenset({0}),
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        ["git", "-C", str(worktree), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode not in allowed_returncodes:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise GitStateError(
+            f"git {' '.join(args)} failed: {detail or f'exit {completed.returncode}'}"
+        )
+    return completed
+
+
+def validate_merge_ready_git(lane: dict[str, Any]) -> dict[str, Any]:
+    """Return the exact current Git identity or fail closed.
+
+    Tracked, staged, and unmerged changes are always dirty.  Untracked files
+    are allowed only for the explicit bootstrap-owned paths recorded in the
+    lane: the reserved ``.agent-workspace`` tree, ``RESULT.json``, and exact
+    provider payload files.  Ignored files retain normal Git-clean semantics.
+    """
+
+    git = lane.get("git")
+    if not isinstance(git, dict):
+        raise GitStateError("lane has no authoritative Git identity")
+    if "current_tip" in git or "bootstrap_tip" not in git:
+        raise GitStateError(FRESH_LANE_INTEGRITY_DIAGNOSTIC)
+    required = (
+        "source_root",
+        "common_dir",
+        "branch",
+        "base_commit",
+        "origin_tip",
+        "bootstrap_tip",
+    )
+    if any(not isinstance(git.get(field), str) or not git[field] for field in required):
+        raise GitStateError("lane Git identity is incomplete")
+    worktree = Path(str(lane.get("worktree_path") or ""))
+    if not worktree.is_dir():
+        raise GitStateError(f"lane worktree is missing: {worktree}")
+
+    branch = _git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+    if branch != git["branch"]:
+        raise GitStateError(
+            f"lane branch mismatch: expected {git['branch']}, got {branch or '(detached)'}"
+        )
+    commit = _git(worktree, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+    if len(commit) != 40:
+        raise GitStateError("lane HEAD did not resolve to a full commit")
+
+    common_text = _git(worktree, "rev-parse", "--git-common-dir").stdout.strip()
+    common_dir = Path(common_text)
+    if not common_dir.is_absolute():
+        common_dir = worktree / common_dir
+    if common_dir.resolve() != Path(git["common_dir"]).resolve():
+        raise GitStateError("lane Git common directory no longer matches bootstrap")
+
+    ancestry = _git(
+        worktree,
+        "merge-base",
+        "--is-ancestor",
+        str(git["origin_tip"]),
+        commit,
+        allowed_returncodes=frozenset({0, 1}),
+    )
+    if ancestry.returncode != 0:
+        raise GitStateError("lane HEAD no longer descends from its recorded origin tip")
+
+    unmerged = _git(worktree, "ls-files", "-u", "-z").stdout
+    if unmerged:
+        raise GitStateError("lane worktree contains unmerged paths")
+    unstaged = _git(
+        worktree,
+        "diff",
+        "--quiet",
+        "--ignore-submodules=none",
+        "--",
+        allowed_returncodes=frozenset({0, 1}),
+    )
+    if unstaged.returncode != 0:
+        raise GitStateError("lane worktree has modified tracked files")
+    staged = _git(
+        worktree,
+        "diff",
+        "--cached",
+        "--quiet",
+        "--ignore-submodules=none",
+        "--",
+        allowed_returncodes=frozenset({0, 1}),
+    )
+    if staged.returncode != 0:
+        raise GitStateError("lane worktree has staged but uncommitted files")
+
+    owned = git.get("harness_owned_paths")
+    if not isinstance(owned, list) or not all(isinstance(item, str) for item in owned):
+        raise GitStateError("lane Git identity lacks its harness-owned path inventory")
+    exact_owned = {item for item in owned if item != ".agent-workspace/**"}
+    untracked_raw = _git(
+        worktree, "ls-files", "--others", "--exclude-standard", "-z"
+    ).stdout
+    untracked = [item for item in untracked_raw.split("\0") if item]
+    unexpected = sorted(
+        item
+        for item in untracked
+        if not item.startswith(".agent-workspace/") and item not in exact_owned
+    )
+    if unexpected:
+        raise GitStateError(
+            "lane worktree has unexpected untracked files: " + ", ".join(unexpected[:10])
+        )
+    return {
+        "branch": branch,
+        "commit": commit,
+        "common_dir": str(common_dir.resolve()),
+        "origin_tip": str(git["origin_tip"]),
+        "clean": True,
+    }
 
 
 def validate_acceptance_chain(
@@ -75,6 +259,7 @@ def validate_acceptance_chain(
         "run_id",
         "task_card_id",
         "task_card_hash",
+        "invocation_hash",
         "commit",
     )
     for field in required:
@@ -100,7 +285,8 @@ def validate_acceptance_chain(
             and review.get("result_hash") is None
             and acceptance.get("result_id") is None
             and acceptance.get("result_hash") is None
-            and isinstance(proof, str) and bool(proof)
+            and isinstance(proof, str)
+            and bool(proof)
             and acceptance.get("terminal_proof_digest") == proof
             and acceptance.get("approval") == "ACCEPTED"
             and isinstance(acceptance.get("force_accept_reason"), str)
@@ -112,6 +298,58 @@ def validate_acceptance_chain(
         value = review.get(field)
         if not isinstance(value, str) or not value or acceptance.get(field) != value:
             return False
+    if acceptance.get("approval") == "ACCEPTED" and outcome != "PASS":
+        reason = acceptance.get("force_accept_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            return False
+    return True
+
+
+def validate_lane_acceptance_chain(
+    review: dict[str, Any],
+    acceptance: dict[str, Any],
+    lane: dict[str, Any],
+) -> bool:
+    """Validate a review pair against the lane's current authoritative run."""
+
+    lane_id = lane.get("lane_id")
+    run_id = lane.get("run_id")
+    if not isinstance(lane_id, str) or not isinstance(run_id, str):
+        return False
+    if not validate_acceptance_chain(
+        review, acceptance, lane_id=lane_id, run_id=run_id
+    ):
+        return False
+    if review.get("task_card_hash") != lane.get("task_card_hash"):
+        return False
+    if review.get("invocation_hash") != lane.get("invocation_hash"):
+        return False
+    git = lane.get("git")
+    validation = lane.get("result_validation")
+    if not isinstance(git, dict):
+        return False
+    if "current_tip" in git or not isinstance(git.get("bootstrap_tip"), str):
+        return False
+    if review.get("review_outcome") == "UNKNOWN":
+        advancement = lane.get("acceptance_advancement")
+        return advancement is None or advancement == acceptance
+    if review.get("result_id") != run_id or not isinstance(validation, dict):
+        return False
+    expected_validation = {
+        "run_id": run_id,
+        "result_hash": review.get("result_hash"),
+        "invocation_hash": lane.get("invocation_hash"),
+        "branch": git.get("branch"),
+        "commit": review.get("commit"),
+    }
+    if any(
+        validation.get(field) != value
+        for field, value in expected_validation.items()
+    ) or validation.get("clean") is not True:
+        return False
+    advancement = lane.get("acceptance_advancement")
+    if advancement is not None and advancement != acceptance:
+        return False
     return True
 
 
@@ -123,7 +361,8 @@ def _read_task_card(worktree: Path) -> dict[str, Any]:
         )
     try:
         record = read_json(path)
-        require_schema(record, TASK_CARD_SCHEMA, path)
+        validate_task_card(record, path)
+        memory_handoff.validate_task_card(record)
     except (OSError, ValueError) as exc:
         raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, str(exc)) from exc
     return record
@@ -164,10 +403,13 @@ def _worktree_commit(worktree: Path, task_card: dict[str, Any]) -> str:
         encoding="utf-8",
         errors="replace",
     )
-    if completed.returncode == 0 and completed.stdout.strip():
-        return completed.stdout.strip()
-    base = task_card.get("base_commit")
-    return str(base) if isinstance(base, str) and base else ""
+    if completed.returncode != 0 or len(completed.stdout.strip()) != 40:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise ReviewError(
+            COMPLETION_REVIEW_STALE_SOURCE,
+            f"cannot resolve the worktree's current commit: {detail or completed.returncode}",
+        )
+    return completed.stdout.strip()
 
 
 def _resolve_lane_managed(
@@ -367,6 +609,22 @@ def _write_pair(
     terminal_path = folder / terminal_evidence.TERMINAL_EVIDENCE_NAME
     worktree = Path(lane["worktree_path"])
     task_card = _read_task_card(worktree)
+    invocation_path = worktree / ".agent-workspace" / "invocation.json"
+    try:
+        invocation = read_json(invocation_path)
+        require_schema(invocation, INVOCATION_SCHEMA, invocation_path)
+        validate_invocation_binding(lane, invocation)
+    except (OSError, ValueError, GitStateError) as exc:
+        raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, str(exc)) from exc
+    if lane.get("task_card_hash") != content_hash(task_card):
+        raise ReviewError(
+            COMPLETION_REVIEW_STALE_SOURCE,
+            "task card copy no longer matches the bootstrapped task card",
+        )
+    try:
+        git_state = validate_merge_ready_git(lane)
+    except GitStateError as exc:
+        raise ReviewError(COMPLETION_REVIEW_STALE_SOURCE, str(exc)) from exc
     native = _native_source(lane, task_card, worktree)
     if review_outcome == "UNKNOWN":
         if native is None or approval != "ACCEPTED" or force_accept_reason is None:
@@ -380,12 +638,33 @@ def _write_pair(
         result = _read_result(worktree, lane)
         terminal_proof = None
     commit = _worktree_commit(worktree, task_card)
+    if commit != git_state["commit"]:
+        raise ReviewError(
+            COMPLETION_REVIEW_STALE_SOURCE,
+            "worktree HEAD changed during completion review",
+        )
     task_card_id = str(task_card.get("card_id") or task_card.get("id") or "")
     if not task_card_id:
         task_card_id = content_hash(task_card)
     task_card_hash = content_hash(task_card)
     result_id = lane["run_id"] if result is not None else None
     result_hash = content_hash(result) if result is not None else None
+    if result is not None:
+        validation = lane.get("result_validation")
+        expected_validation = {
+            "run_id": lane["run_id"],
+            "result_hash": result_hash,
+            "branch": git_state["branch"],
+            "commit": commit,
+        }
+        if not isinstance(validation, dict) or any(
+            validation.get(field) != value
+            for field, value in expected_validation.items()
+        ) or validation.get("clean") is not True:
+            raise ReviewError(
+                COMPLETION_REVIEW_STALE_SOURCE,
+                "result is not bound to the lane's current clean branch tip",
+            )
     with RecordLock(review_path):
         existing_review = _existing_record(review_path, COMPLETION_REVIEW_SCHEMA)
         existing_acceptance = _existing_record(acceptance_path, ACCEPTANCE_SCHEMA)
@@ -413,6 +692,7 @@ def _write_pair(
             "task_card_hash": task_card_hash,
             "result_id": result_id,
             "result_hash": result_hash,
+            "invocation_hash": lane["invocation_hash"],
             "commit": commit,
             "reviewed_at": reviewed_at,
         }
@@ -430,6 +710,7 @@ def _write_pair(
             "task_card_hash": task_card_hash,
             "result_id": result_id,
             "result_hash": result_hash,
+            "invocation_hash": lane["invocation_hash"],
             "commit": commit,
             "decided_at": reviewed_at,
         }

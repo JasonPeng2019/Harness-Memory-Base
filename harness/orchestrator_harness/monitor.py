@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import processes, terminal_evidence, view_launch
+from . import processes, terminal_evidence
 from .config import (
     compute_config_identity,
     find_harness_root,
@@ -35,14 +35,17 @@ from .epochs import (
 from .lanes import LANE_SCHEMA, read_lane, update_lane
 from .manager_queue import ManagerQueueError, promote_event, read_manager_queue
 from .records import RecordLock, atomic_write_json, read_record
-from .review import validate_acceptance_chain
+from .review import (
+    lane_integrity_contract_error,
+    validate_acceptance_chain,
+    validate_lane_acceptance_chain,
+)
 from .setup import MONITOR_SCHEMA, monitor_record_path, read_monitor_record
 
 CONTROLLER_STATUS_SCHEMA = "controller-status/v1"
 LEASE_SCHEMA = "resource-lease/v1"
 
 PASS_INTERVAL_SECONDS = 30.0
-VISUALIZER_CHECK_SECONDS = 2.0
 HEARTBEAT_STALENESS_SECONDS = 180.0
 
 ACTIONABLE_STATUSES = frozenset(
@@ -94,12 +97,14 @@ def _read_acceptance_chain(
         require_schema(acceptance, "orchestrator-acceptance/v1", acceptance_path)
     except (OSError, ValueError):
         return None
-    if not validate_acceptance_chain(
-        review,
-        acceptance,
-        lane_id=lane_id,
-        run_id=lane.get("run_id") if lane is not None else None,
-    ):
+    valid = (
+        validate_lane_acceptance_chain(review, acceptance, lane)
+        if lane is not None
+        else validate_acceptance_chain(
+            review, acceptance, lane_id=lane_id, run_id=None
+        )
+    )
+    if not valid:
         return None
     if lane is not None and lane.get("memory_plan_state") == "execution_accepted":
         try:
@@ -240,12 +245,7 @@ def _review_pair_is_valid(
         require_schema(acceptance, "orchestrator-acceptance/v1", acceptance_path)
     except (OSError, ValueError):
         return False
-    valid = validate_acceptance_chain(
-        review,
-        acceptance,
-        lane_id=lane["lane_id"],
-        run_id=lane.get("run_id"),
-    )
+    valid = validate_lane_acceptance_chain(review, acceptance, lane)
     if not valid or lane.get("memory_plan_state") != "execution_accepted":
         return valid
     try:
@@ -264,6 +264,14 @@ def _recover_broken_review_pair(
     folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
     review_path = folder / "COMPLETION_REVIEW.json"
     acceptance_path = folder / "ORCHESTRATOR_ACCEPTANCE.json"
+    if review_path.exists() or acceptance_path.exists():
+        legacy = lane_integrity_contract_error(lane)
+        if legacy is not None:
+            # These records may be perfectly valid under the old contract.
+            # Preserve them and surface an explicit migration diagnostic; the
+            # monitor is not permitted to turn a version mismatch into data
+            # deletion.
+            raise ValueError(legacy)
     with RecordLock(review_path):
         if not (review_path.exists() or acceptance_path.exists()):
             return False
@@ -534,7 +542,10 @@ def reconcile_active_lanes(rt: Path, epoch_id: str) -> list[dict[str, Any]]:
                 lane = read_record(lane_path, LANE_SCHEMA)
             except (OSError, ValueError):
                 continue
-            if lane.get("lifecycle") in ("retired", "abandoned"):
+            if (
+                lane.get("lifecycle") in ("retired", "abandoned")
+                or lane.get("publication_state") == "staged"
+            ):
                 continue
             entries.append(
                 {
@@ -796,7 +807,6 @@ def main() -> int:
     except Exception as exc:
         return 1
     rt = config.runtime_root
-    visualizer = config.visualizer
     while True:
         try:
             run_monitor_once(rt, config_identity)
@@ -814,12 +824,7 @@ def main() -> int:
                     current["health"] = "STOPPED"
                     atomic_write_json(record_path, current)
             return 0
-        # Between passes, notice a user switching ``visualizer`` to ``auto``
-        # promptly and open the read-only viewer once for that change.
-        deadline = time.monotonic() + PASS_INTERVAL_SECONDS
-        while time.monotonic() < deadline:
-            visualizer = view_launch.watch_setting(harness_root, rt, visualizer)
-            time.sleep(VISUALIZER_CHECK_SECONDS)
+        time.sleep(PASS_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

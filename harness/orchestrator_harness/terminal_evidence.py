@@ -422,3 +422,4 @@ def validate_root_siblings(
             validate_terminal_evidence(historical, lane_id=lane_id, run_id=run_id)
         _require(historical == (record if field is None else record[field]),
                  f"root {name} conflicts with scoped terminal evidence")
+

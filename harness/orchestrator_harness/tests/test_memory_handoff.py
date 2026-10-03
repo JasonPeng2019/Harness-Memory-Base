@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import sys
 import tempfile
@@ -179,14 +178,6 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         )
         self.assertIsNone(memory_handoff.load_envelope(self.worktree))
 
-    def test_worker_environment_preserves_memory_package_import_root(self) -> None:
-        environment = memory_handoff.worker_environment(
-            self.card, provider_id="claude-code"
-        )
-        self.assertIn(
-            str(SRC), environment.get("PYTHONPATH", "").split(os.pathsep)
-        )
-
     def test_bootstrap_and_resume_use_equivalent_envelope_validation(self) -> None:
         bootstrap_envelope = memory_handoff.prepare_bootstrap_envelope(
             task_card=self.card,
@@ -321,6 +312,12 @@ class MemoryHandoffSeamTests(unittest.TestCase):
             self.worktree, lane_id="lane-1", run_id="run-1", provider_id="codex",
             model="test-model", launch_config={"reasoning_effort": "high"},
             exclusive_resources=[], memory_envelope=envelope,
+            git_identity={
+                "worktree_path": str(self.worktree.resolve()),
+                "branch": self.card["branch"],
+                "base_commit": self.card["base_commit"],
+                "base_tree": "tree-base-1",
+            },
         )
         lane = {"lane_id": "lane-1", "run_id": "run-1", "worktree_path": str(self.worktree),
                 "provider": invocation["provider"], "memory_plan_state": "execution_accepted",
@@ -361,7 +358,20 @@ class MemoryHandoffSeamTests(unittest.TestCase):
         )
         self.assertEqual(delivered["operation_id"], replay["operation_id"])
         self.assertEqual(1, len(calls))
-        state, result = controller._validate_result(lane)
+        with patch.object(
+            controller,
+            "validate_merge_ready_git",
+            return_value={
+                "worktree_path": str(self.worktree.resolve()),
+                "branch": self.card["branch"],
+                "base_commit": self.card["base_commit"],
+                "base_tree": "tree-base-1",
+                "head_commit": "head-1",
+                "head_tree": "tree-head-1",
+                "clean": True,
+            },
+        ):
+            state, result = controller._validate_result(lane)
         self.assertEqual("valid", state)
         self.assertEqual(["EVEROS_MVP_MARKER", "ATLAS_MVP_MARKER"], result["evidence"])
 

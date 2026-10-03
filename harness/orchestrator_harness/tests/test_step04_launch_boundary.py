@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[3]
+HARNESS_ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -148,6 +149,11 @@ class LaunchBoundaryFixture:
         self.root_workspace = self.root / "root-workspace"
         self.harness.mkdir()
         self.root_workspace.mkdir()
+        self.write_text(
+            self.harness / "orchestrator_harness" / "__init__.py",
+            "from pkgutil import extend_path\n"
+            "__path__ = extend_path(__path__, __name__)\n",
+        )
         self.write_json(
             self.harness / "harness-config.json",
             {
@@ -203,13 +209,13 @@ class LaunchBoundaryFixture:
         )
         if include_qwen:
             shutil.copytree(
-                ROOT / "harness" / "adapters" / "qwen-code",
+                HARNESS_ROOT / "adapters" / "qwen-code",
                 self.harness / "adapters" / "qwen-code",
             )
             qwen_binding = self.harness / "orchestrator_harness/provider_adapters/qwen-code/launcher_binding.py"
             qwen_binding.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(
-                ROOT / "harness/orchestrator_harness/provider_adapters/qwen-code/launcher_binding.py",
+                HARNESS_ROOT / "orchestrator_harness/provider_adapters/qwen-code/launcher_binding.py",
                 qwen_binding,
             )
         self.runtime = self.root_workspace / ".harness-runtime"
@@ -244,6 +250,16 @@ class LaunchBoundaryFixture:
         ) -> None:
             target.mkdir(parents=True, exist_ok=True)
 
+        def fake_git_identity(root: Path, branch: str, base_commit: str) -> dict:
+            return {
+                "source_root": str(root.resolve()),
+                "common_dir": str((root / ".git").resolve()),
+                "branch": branch,
+                "base_commit": base_commit,
+                "origin_tip": base_commit,
+                "bootstrap_tip": base_commit,
+            }
+
         with (
             patch(
                 "orchestrator_harness.config.find_harness_root",
@@ -253,8 +269,22 @@ class LaunchBoundaryFixture:
                 bootstrap, "open_epoch", return_value={"epoch_id": self.EPOCH}
             ),
             patch.object(bootstrap, "read_active_lanes", return_value=[]),
+            patch.object(
+                bootstrap, "_resolve_git_identity", side_effect=fake_git_identity
+            ),
             patch.object(bootstrap, "_git_worktree_add", side_effect=fake_git_add),
-            patch.object(bootstrap.subprocess, "run"),
+            patch.object(
+                bootstrap,
+                "_capture_created_worktree_identity",
+                return_value={
+                    "admin_path": str(self.root / "fake-admin"),
+                    "admin_dev": 1,
+                    "admin_ino": 1,
+                    "gitfile_dev": 1,
+                    "gitfile_ino": 1,
+                },
+            ),
+            patch.object(bootstrap, "_verify_created_worktree"),
         ):
             result = bootstrap.run_bootstrap(
                 lane_id=lane_id,
@@ -661,8 +691,32 @@ class Step04BootstrapBoundaryTests(unittest.TestCase):
             }
             result["content_hash"] = content_hash(result)
             atomic_write_json(worktree / "RESULT.json", result)
-            self.assertEqual(("valid", result), controller._validate_result(lane))
-            lane = self.fixture.write_lane_fields("all-off-complete", lifecycle="review_pending")
+            with patch.object(
+                controller,
+                "validate_merge_ready_git",
+                return_value={
+                    "branch": lane["git"]["branch"],
+                    "base_commit": lane["git"]["base_commit"],
+                    "head_commit": "commit-1",
+                    "clean": True,
+                },
+            ):
+                result_state, validated_result = controller._validate_result(lane)
+            self.assertEqual("valid", result_state)
+            assert validated_result is not None
+            validated_result.pop("_validated_git")
+            self.assertEqual(result, validated_result)
+            lane = self.fixture.write_lane_fields(
+                "all-off-complete",
+                lifecycle="review_pending",
+                result_validation={
+                    "run_id": lane["run_id"],
+                    "result_hash": result["content_hash"],
+                    "branch": lane["git"]["branch"],
+                    "commit": "commit-1",
+                    "clean": True,
+                },
+            )
             atomic_write_json(current_epoch_path(self.fixture.runtime), {
                 "schema": "current-epoch/v1", "epoch_id": self.fixture.EPOCH, "queue_id": "queue-1",
             })
@@ -679,6 +733,17 @@ class Step04BootstrapBoundaryTests(unittest.TestCase):
                 patch.object(review, "find_harness_root", return_value=self.fixture.harness),
                 patch.object(review, "_resolve_lane_managed", return_value=(self.fixture.EPOCH, lane, manager_queue.read_manager_queue(self.fixture.runtime)["events"][0])),
                 patch.object(review, "_worktree_commit", return_value="commit-1"),
+                patch.object(
+                    review,
+                    "validate_merge_ready_git",
+                    return_value={
+                        "branch": lane["git"]["branch"],
+                        "commit": "commit-1",
+                        "common_dir": lane["git"]["common_dir"],
+                        "origin_tip": lane["git"]["origin_tip"],
+                        "clean": True,
+                    },
+                ),
             ):
                 reviewed = review.run_completion_review(
                     event_id=event["event_id"], lane_id=None, review_outcome="PASS",
@@ -1210,7 +1275,7 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
             (self.worktree / ".agent-workspace" / "invocation.json").read_text(encoding="utf-8")
         )
         with patch.dict(os.environ, memory_handoff.worker_environment(
-            self.card, provider_id="codex"
+            self.card, provider_id="codex", worktree_path=self.worktree
         ), clear=True):
             binding = controller._validate_enhanced_dispatch(
                 self.fixture.lane_record("launch-lane"), invocation
@@ -1230,8 +1295,10 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
             self.fixture.runtime / "CURRENT_EPOCH.json",
             {"schema": "current-epoch/v1", "epoch_id": self.fixture.EPOCH},
         )
-        env = memory_handoff.worker_environment(self.card, provider_id="codex")
-        env["PYTHONPATH"] = os.pathsep.join((str(ROOT / "harness"), str(SRC)))
+        env = memory_handoff.worker_environment(
+            self.card, provider_id="codex", worktree_path=self.worktree
+        )
+        env["PYTHONPATH"] = os.pathsep.join((str(HARNESS_ROOT), str(SRC)))
         child = processes.spawn_detached(
             processes.python_argv("orchestrator_harness.controller", "launch-lane"),
             cwd=self.fixture.harness, env=env, stderr=subprocess.PIPE,
@@ -1419,7 +1486,7 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
         self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
         spawn.assert_not_called()
 
-    def test_global_provider_control_tool_config_is_refused(self) -> None:
+    def test_global_provider_control_tool_config_is_isolated_from_worker(self) -> None:
         codex_home = self.fixture.root / "global-codex"
         self.fixture.write_text(
             codex_home / "config.toml",
@@ -1427,9 +1494,12 @@ class Step04LaunchBoundaryTests(unittest.TestCase):
         )
         with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
             result, spawn = self.fixture.run_launch(lane_id="launch-lane")
-        self.assertFalse(result["ok"], result)
-        self.assertEqual(launch.LAUNCH_INVOCATION_INVALID, result["code"])
-        spawn.assert_not_called()
+        self.assertTrue(result["ok"], result)
+        spawn.assert_called_once()
+        self.assertEqual(
+            str((self.worktree / ".codex").resolve()),
+            spawn.call_args.kwargs["env"]["CODEX_HOME"],
+        )
 
     def test_expired_allowance_inside_dispatch_lock_creates_no_intent(self) -> None:
         clock = [0.0]
@@ -1811,7 +1881,11 @@ class Step04ScrubbedWorkerEnvironmentTests(unittest.TestCase):
             '[mcp_servers.prod]\ncommand = "productctl"\nargs = ["approve"]\n',
         )
         with patch.dict(
-            os.environ, memory_handoff.worker_environment(self.card, provider_id="codex"), clear=True
+            os.environ,
+            memory_handoff.worker_environment(
+                self.card, provider_id="codex", worktree_path=self.worktree
+            ),
+            clear=True,
         ):
             with self.assertRaises(controller.ControllerError):
                 controller._validate_enhanced_dispatch(lane, invocation)
