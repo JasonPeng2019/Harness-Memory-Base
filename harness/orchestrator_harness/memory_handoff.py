@@ -60,6 +60,11 @@ def _memory_module(name: str):
     import importlib
 
     module_name = f"memory_harness.{name}"
+    # In the composed product, ``src/memory_harness`` is the canonical package
+    # and the harness-local copy exists only so the refreshed standalone
+    # harness remains self-contained. Prefer the canonical source checkout
+    # before Python resolves the harness-local mirror from the current cwd.
+    enable_source_checkout_import()
     try:
         return importlib.import_module(module_name)
     except ModuleNotFoundError as exc:

@@ -56,6 +56,7 @@ LAUNCH_CONTROLLER_START_FAILED = "LAUNCH_CONTROLLER_START_FAILED"
 
 RESULT_OUTCOMES = frozenset({"PASS", "FAIL", "BLOCKED"})
 ACCEPTANCE_POLL_SECONDS = 2.0
+MAX_NATIVE_JSON_DEPTH = 256
 
 
 class ControllerError(RuntimeError):
@@ -77,6 +78,21 @@ class ProviderExecution:
     argv: tuple[str, ...] = ()
     non_retryable_failure: bool = False
     transcript_start_byte: int = 0
+
+
+def _native_json_too_deep(value: Any, *, limit: int = MAX_NATIVE_JSON_DEPTH) -> bool:
+    """Bound native transcript nesting independently of Python's JSON decoder."""
+
+    pending: list[tuple[Any, int]] = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > limit:
+            return True
+        if isinstance(current, dict):
+            pending.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            pending.extend((item, depth + 1) for item in current)
+    return False
 
 
 def _load_binding(harness_root: Path, provider_id: str) -> Any:
@@ -359,6 +375,8 @@ def _append_attempt(
                         native_session_id = parsed["session_id"]
                     try:
                         native_event = json.loads(raw_line)
+                        if _native_json_too_deep(native_event):
+                            raise ValueError("native JSON nesting exceeds the safety limit")
                     except (ValueError, RecursionError) as exc:
                         native_event = None
                         capture_error = (
