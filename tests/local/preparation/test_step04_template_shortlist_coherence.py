@@ -647,9 +647,22 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
         self.assertNotIn("s3cr3t", tokens)
         self.assertNotIn("value", tokens)
         self.assertIn("redacted", tokens)
-        # Sanitizing a secret yields exactly the same bounded query as writing
-        # the redaction marker literally, so the protected token is inert.
-        self.assertEqual(redacted_query, protected_query)
+        # Sanitizing a secret yields the same semantic query as writing the
+        # redaction marker literally, so the protected token is inert.  The
+        # policy context remains bound to each exact preparation identity.
+        query_fields = ("representation", "route", "tokens")
+        self.assertEqual(
+            {key: redacted_query[key] for key in query_fields},
+            {key: protected_query[key] for key in query_fields},
+        )
+        self.assertEqual(
+            "memory-search-policy-context/v1",
+            protected_query["policy_context"]["schema"],
+        )
+        self.assertNotEqual(
+            redacted_query["policy_context"]["preparation_id"],
+            protected_query["policy_context"]["preparation_id"],
+        )
         self.assertEqual(redacted_query["tokens"], protected_query["tokens"])
 
         # The trusted comparable score is computed from that same sanitized
@@ -697,7 +710,14 @@ class Step04TemplateShortlistCoherenceTests(unittest.TestCase):
         self.assertNotIn("s3cr3t", objective_tokens)
         self.assertNotIn("value", objective_tokens)
         self.assertIn("redacted", objective_tokens)
-        self.assertEqual(redacted_objective_query, protected_objective_query)
+        self.assertEqual(
+            {key: redacted_objective_query[key] for key in query_fields},
+            {key: protected_objective_query[key] for key in query_fields},
+        )
+        self.assertNotEqual(
+            redacted_objective_query["policy_context"]["preparation_id"],
+            protected_objective_query["policy_context"]["preparation_id"],
+        )
         self.assertEqual(
             redacted_objective_query["tokens"], protected_objective_query["tokens"]
         )

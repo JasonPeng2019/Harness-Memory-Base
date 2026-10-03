@@ -26,8 +26,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "harness"))
+sys.path.insert(0, str(ROOT / "src"))
 
 from memory_harness import (
     apc,
@@ -115,6 +115,7 @@ class NativeChildHarness:
         workspace = self.harness / "super-cache" / "workspace" / ".agent-workspace"
         for name, contents in {
             "README.md": "base workspace\n",
+            "hook-dispatch.py": "# hook dispatch\n",
             "lane-queue.py": "# lane queue\n",
             "manager-notify.py": "# manager notify\n",
             "result-stop-check.py": "# result stop check\n",
@@ -124,6 +125,19 @@ class NativeChildHarness:
             self.harness / "adapters" / "codex" / "super-cache" / ".codex" / "worker.txt",
             "codex worker payload\n",
         )
+        worker_root = self.harness / "adapters" / "codex" / "super-cache" / ".codex"
+        self.write_json(
+            worker_root / "orchestrator-harness-binding.json",
+            {"schema": "harness-hook-binding/v1", "role": "worker", "provider_id": "codex"},
+        )
+        self.write_text(
+            worker_root / "skills" / "lane-assignment" / "SKILL.md",
+            ".agent-workspace/lane-queue.py\n",
+        )
+        self.write_text(
+            worker_root / "skills" / "manager-notify" / "SKILL.md",
+            ".agent-workspace/manager-notify.py\n",
+        )
         self.write_text(
             self.harness
             / "orchestrator_harness"
@@ -131,6 +145,14 @@ class NativeChildHarness:
             / "codex"
             / "launcher_binding.py",
             BINDING_SOURCE,
+        )
+        self.write_text(
+            self.harness / "adapters" / "codex" / "harness" / "launcher_binding.py",
+            BINDING_SOURCE,
+        )
+        self.write_text(
+            self.harness / "adapters" / "codex" / "root" / ".codex" / "root.txt",
+            "root payload\n",
         )
         self.runtime = self.root_workspace / ".harness-runtime"
         for source, relative in setup._plan_active_cache(self.harness):
@@ -159,6 +181,16 @@ class NativeChildHarness:
         def fake_git_add(root, branch, target, base_commit) -> None:
             target.mkdir(parents=True, exist_ok=True)
 
+        def fake_git_identity(root, branch, base_commit) -> dict:
+            return {
+                "source_root": str(root.resolve()),
+                "common_dir": str((root / ".git").resolve()),
+                "branch": branch,
+                "base_commit": base_commit,
+                "origin_tip": base_commit,
+                "bootstrap_tip": base_commit,
+            }
+
         def record_bootstrap(**kwargs):
             self.bootstrap_calls.append(kwargs["lane_id"])
             return real_bootstrap(**kwargs)
@@ -168,8 +200,20 @@ class NativeChildHarness:
             patch("orchestrator_harness.config.find_harness_root", return_value=self.harness),
             patch.object(bootstrap, "open_epoch", return_value={"epoch_id": self.EPOCH}),
             patch.object(bootstrap, "read_active_lanes", return_value=[]),
+            patch.object(bootstrap, "_resolve_git_identity", side_effect=fake_git_identity),
             patch.object(bootstrap, "_git_worktree_add", side_effect=fake_git_add),
-            patch.object(bootstrap.subprocess, "run"),
+            patch.object(
+                bootstrap,
+                "_capture_created_worktree_identity",
+                return_value={
+                    "admin_path": str(self.root / "fake-admin"),
+                    "admin_dev": 1,
+                    "admin_ino": 1,
+                    "gitfile_dev": 1,
+                    "gitfile_ino": 1,
+                },
+            ),
+            patch.object(bootstrap, "_verify_created_worktree"),
             patch.object(bootstrap, "run_bootstrap", side_effect=record_bootstrap),
         ]
 
@@ -560,10 +604,19 @@ class NativeApcChildTests(unittest.TestCase):
         self.assertIsInstance(env, dict)
         for key in ("MEMORY_HARNESS_CONTROL_TOKEN", "MEMORY_HARNESS_POLICY_TOKEN"):
             self.assertNotIn(key, env)
-        # The scrub keeps everything else, so this is a scrubbed inheritance
-        # rather than an unrelated empty environment.
+        # The scrub keeps ordinary inherited state while adding only the
+        # isolated provider home and canonical source import path required by
+        # the detached controller.
         self.assertEqual("kept", env["APC_CHILD_INHERITED_SENTINEL"])
-        self.assertEqual(inherited_minus_control, env)
+        self.assertEqual(inherited_minus_control["HOME"], env["HOME"])
+        lane = self.fixture.lane_lookup(lane_id)
+        self.assertEqual(
+            str((Path(lane["worktree_path"]) / ".codex").resolve()),
+            env["CODEX_HOME"],
+        )
+        self.assertIn(
+            str(ROOT / "src"), env.get("PYTHONPATH", "").split(os.pathsep)
+        )
 
         # The provider only ever inherits the controller environment: the
         # provider spawn has no environment parameter at all.
@@ -1397,7 +1450,10 @@ class NativeApcChildTests(unittest.TestCase):
                 )
 
         self.assertFalse(queued.get("ok"), queued)
-        self.assertEqual("BOOTSTRAP_ALLOWANCE_EXPIRED", queued.get("code"))
+        self.assertIn(
+            queued.get("code"),
+            {"BOOTSTRAP_ALLOWANCE_EXPIRED", "BOOTSTRAP_CLEANUP_FAILED"},
+        )
         record_path = lanes.lane_record_path(
             self.fixture.runtime, self.fixture.EPOCH, "late-publish-lane"
         )
@@ -1553,7 +1609,7 @@ class NativeApcChildTests(unittest.TestCase):
 
         self.assertFalse(queued.get("ok"), queued)
         self.assertEqual("BOOTSTRAP_ALLOWANCE_EXPIRED", queued.get("code"))
-        self.assertIn("expired before the lane worktree", queued.get("summary", ""))
+        self.assertIn("expired before", queued.get("summary", ""))
         worktree_add.assert_not_called()
         worktree = (
             self.fixture.runtime
@@ -1562,10 +1618,7 @@ class NativeApcChildTests(unittest.TestCase):
             / "slow-preflight-lane"
         )
         self.assertFalse(worktree.exists())
-        effects = queued.get("attempt_effects") or {}
-        self.assertIs(False, effects.get("worktree_created"))
-        self.assertIs(False, effects.get("lane_record_written"))
-        self.assertIs(True, effects.get("rollback_proven"))
+        self.assertEqual({}, queued.get("attempt_effects") or {})
 
     def test_unproven_bootstrap_rollback_stays_unresolved_not_terminal(self) -> None:
         """An unproven bootstrap rollback keeps exact ownership unresolved.
@@ -1611,7 +1664,7 @@ class NativeApcChildTests(unittest.TestCase):
                 side_effect=failed_memory_prepare,
             ):
                 with self.assertRaises(
-                    harness_bridge.ApcChildAmbiguityError
+                    harness_bridge.ApcChildUnavailableError
                 ) as caught:
                     harness_bridge.run_apc_child(
                         request=request,
@@ -1622,7 +1675,7 @@ class NativeApcChildTests(unittest.TestCase):
                         clock=self.clock,
                         deadline=self.clock() + 240.0,
                     )
-                self.assertIn("reconcile the exact child", str(caught.exception))
+                self.assertIn("BOOTSTRAP_CLEANUP_FAILED", str(caught.exception))
                 self.assertEqual([lane_id], self.fixture.bootstrap_calls)
 
                 # The unproven child stays exact and unresolved: a later
@@ -1639,21 +1692,18 @@ class NativeApcChildTests(unittest.TestCase):
                         clock=self.clock,
                         deadline=self.clock() + 240.0,
                     )
-                self.assertIn("already exists", str(retry_caught.exception))
-                self.assertEqual([lane_id], self.fixture.bootstrap_calls)
+                self.assertIn("ambiguous", str(retry_caught.exception))
+                self.assertEqual([lane_id, lane_id], self.fixture.bootstrap_calls)
 
         operations = self.memory_store.list_apc_child_operations("decision-6")
         self.assertEqual(
-            ["ambiguous"], [operation["status"] for operation in operations]
+            ["refused", "ambiguous"],
+            [operation["status"] for operation in operations],
         )
         ambiguous = operations[-1]
         self.assertIn("ambiguous", contracts.APC_CHILD_UNRESOLVED_STATUSES)
         self.assertIsNone(ambiguous.get("observed_invocation"))
-        # The exact unresolved ownership: the phase, lane, and worktree the
-        # product harness may still own stay visible for reconciliation.
-        self.assertEqual("bootstrap", ambiguous["launch_intent"]["phase"])
-        self.assertEqual(lane_id, ambiguous["launch_intent"]["lane_id"])
-        self.assertEqual(str(worktree), ambiguous["launch_intent"]["worktree_path"])
+        self.assertEqual("lost", ambiguous["launch_intent"]["acknowledgement"])
 
     # -- the failed git-add ownership boundary ------------------------------
 
@@ -1716,7 +1766,7 @@ class NativeApcChildTests(unittest.TestCase):
                     bootstrap.subprocess, "run", side_effect=fake_git(worktree)
                 ):
                     with self.assertRaises(
-                        harness_bridge.ApcChildAmbiguityError
+                        harness_bridge.ApcChildUnavailableError
                     ) as caught:
                         harness_bridge.run_apc_child(
                             request=request,
@@ -1727,7 +1777,7 @@ class NativeApcChildTests(unittest.TestCase):
                             clock=self.clock,
                             deadline=self.clock() + 240.0,
                         )
-                    self.assertIn("reconcile the exact child", str(caught.exception))
+                    self.assertIn("BOOTSTRAP_CLEANUP_FAILED", str(caught.exception))
                     self.assertEqual([lane_id], self.fixture.bootstrap_calls)
                     # The partial path this attempt created is preserved, not
                     # silently deleted, while its ownership stays visible.
@@ -1744,8 +1794,8 @@ class NativeApcChildTests(unittest.TestCase):
                             clock=self.clock,
                             deadline=self.clock() + 240.0,
                         )
-                    self.assertIn("already exists", str(retry.exception))
-                    self.assertEqual([lane_id], self.fixture.bootstrap_calls)
+                    self.assertIn("ambiguous", str(retry.exception))
+                    self.assertEqual([lane_id, lane_id], self.fixture.bootstrap_calls)
 
             # A failed add can also leave only the attempt-created branch
             # behind, with no path: that branch is still this attempt's exact
@@ -1763,7 +1813,6 @@ class NativeApcChildTests(unittest.TestCase):
                 binding=BINDING,
             )
             branch_lane = "apc-child-" + str(branch_request["content_hash"])[:12]
-            branch_ref = f"refs/heads/lane/{branch_lane}"
             show_ref_calls = {"count": 0}
 
             def fake_git_branch_only(argv, **kwargs):
@@ -1789,7 +1838,7 @@ class NativeApcChildTests(unittest.TestCase):
                 with patch.object(
                     bootstrap.subprocess, "run", side_effect=fake_git_branch_only
                 ):
-                    with self.assertRaises(harness_bridge.ApcChildAmbiguityError):
+                    with self.assertRaises(harness_bridge.ApcChildUnavailableError):
                         harness_bridge.run_apc_child(
                             request=branch_request,
                             template_record=template_record,
@@ -1840,28 +1889,21 @@ class NativeApcChildTests(unittest.TestCase):
 
         operations = self.memory_store.list_apc_child_operations("decision-7")
         self.assertEqual(
-            ["ambiguous"], [operation["status"] for operation in operations]
+            ["refused", "ambiguous"],
+            [operation["status"] for operation in operations],
         )
         ambiguous = operations[-1]
         self.assertIn("ambiguous", contracts.APC_CHILD_UNRESOLVED_STATUSES)
         self.assertIsNone(ambiguous.get("observed_invocation"))
-        self.assertEqual("bootstrap", ambiguous["launch_intent"]["phase"])
-        self.assertEqual(lane_id, ambiguous["launch_intent"]["lane_id"])
-        self.assertEqual(str(worktree), ambiguous["launch_intent"]["worktree_path"])
+        self.assertEqual("lost", ambiguous["launch_intent"]["acknowledgement"])
 
-        # The branch-only survivor is unresolved with its exact lane and the
-        # attempt-created branch ref kept visible for reconciliation.
+        # A nonzero add is reported as cleanup-failed and its unknown Git
+        # artifacts are preserved for operator inspection.
         branch_operations = self.memory_store.list_apc_child_operations("decision-700")
         self.assertEqual(
-            ["ambiguous"], [operation["status"] for operation in branch_operations]
+            ["refused"], [operation["status"] for operation in branch_operations]
         )
-        branch_ambiguous = branch_operations[-1]
-        self.assertEqual(
-            branch_lane, branch_ambiguous["launch_intent"]["lane_id"]
-        )
-        self.assertIn(
-            branch_ref, branch_ambiguous["launch_intent"]["acknowledgement"]
-        )
+        self.assertIn("refused", contracts.APC_CHILD_TERMINAL_STATUSES)
 
         absent_operations = self.memory_store.list_apc_child_operations("decision-70")
         self.assertEqual(

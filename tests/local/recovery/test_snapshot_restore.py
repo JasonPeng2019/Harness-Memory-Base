@@ -361,7 +361,10 @@ class SnapshotRestoreTests(unittest.TestCase):
         try:
             manifest = self.service.export(relative, self.artifact,
                                            scope=self.scope, credential="operator")
-            self.assertEqual(str(home / "relative.sqlite3"), manifest["source"]["path"])
+            self.assertEqual(
+                str((home / "relative.sqlite3").resolve()),
+                manifest["source"]["path"],
+            )
         finally:
             relative.close()
 
