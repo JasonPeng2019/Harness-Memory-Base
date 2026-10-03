@@ -9,6 +9,7 @@ identities are gone; unknown process observations remain unproven.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import signal
@@ -242,6 +243,7 @@ def spawn_detached(
         stderr=stderr,
         stdin=subprocess.DEVNULL,
         creationflags=creationflags,
+        start_new_session=os.name != "nt",
         close_fds=True,
         env=child_env,
     )
@@ -895,12 +897,80 @@ def _linux_process_query(
         return ProcessQuery(False, None, (f"/proc/{pid}: {exc}",))
 
 
+class _DarwinProcBsdShortInfo(ctypes.Structure):
+    """macOS ``struct proc_bsdshortinfo`` (``PROC_PIDT_SHORTBSDINFO``)."""
+
+    _fields_ = [
+        ("pid", ctypes.c_uint32),
+        ("ppid", ctypes.c_uint32),
+        ("pgid", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("comm", ctypes.c_char * 16),
+        ("flags", ctypes.c_uint32),
+        ("uid", ctypes.c_uint32),
+        ("gid", ctypes.c_uint32),
+        ("ruid", ctypes.c_uint32),
+        ("rgid", ctypes.c_uint32),
+        ("svuid", ctypes.c_uint32),
+        ("svgid", ctypes.c_uint32),
+        ("rfu", ctypes.c_uint32),
+    ]
+
+
+def _darwin_process_owner(pid: int) -> int | None:
+    """Return the effective UID of one macOS process, or ``None`` if unknown."""
+
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        libproc.proc_pidinfo.argtypes = (
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int,
+        )
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        info = _DarwinProcBsdShortInfo()
+        size = ctypes.sizeof(info)
+        if libproc.proc_pidinfo(pid, 13, 0, ctypes.byref(info), size) < size:  # PROC_PIDT_SHORTBSDINFO
+            return None
+        if info.pid != pid:
+            return None
+        return int(info.uid)
+    except (AttributeError, OSError):
+        return None
+
+
+def _darwin_is_zombie(pid: int) -> bool:
+    """Return whether ``sysctl(KERN_PROC_PID)`` reports ``pid`` as a zombie."""
+
+    try:
+        libc = ctypes.CDLL("/usr/lib/libc.dylib")
+        mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
+        size = ctypes.c_size_t(648)  # sizeof(struct kinfo_proc) on 64-bit macOS
+        buffer = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 4, buffer, ctypes.byref(size), None, 0) != 0 or size.value < 648:
+            return False
+        raw = buffer.raw
+        # extern_proc: p_stat (char) at offset 36, p_pid (int) at offset 40.
+        return int.from_bytes(raw[40:44], "little", signed=True) == pid and raw[36] == 5  # SZOMB
+    except (AttributeError, OSError):
+        return False
+
+
 def _darwin_process_query(pid: int) -> ProcessQuery:
     if not _valid_pid(pid):
         return ProcessQuery(True, None, ("PID is invalid",))
     info = darwin_process_info(pid)
     if info is None:
         if not process_alive(pid):
+            return ProcessQuery(True, None)
+        # macOS refuses full BSD info for other users' processes.  A process
+        # proven to belong to another user cannot be part of a provider tree
+        # this unprivileged controller started (it could not even signal it),
+        # so it is outside every boundary rather than unknown.  A process of
+        # the current user whose identity cannot be read still fails closed.
+        owner = _darwin_process_owner(pid)
+        if owner is not None and owner != os.getuid():
+            return ProcessQuery(True, None)
+        # An exited-but-unreaped (zombie) process runs no code; it is absent.
+        if _darwin_is_zombie(pid):
             return ProcessQuery(True, None)
         return ProcessQuery(False, None, ("libproc process identity is unavailable",))
     return ProcessQuery(

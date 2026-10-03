@@ -89,6 +89,7 @@ SETUP_RESOURCE_MANIFEST_INVALID = "SETUP_RESOURCE_MANIFEST_INVALID"
 SETUP_ADAPTER_COLLISION = "SETUP_ADAPTER_COLLISION"
 SETUP_OVERWRITE_FAILED = "SETUP_OVERWRITE_FAILED"
 SETUP_MONITOR_ALREADY_RUNNING = "SETUP_MONITOR_ALREADY_RUNNING"
+SETUP_RUNTIME_SHUTTING_DOWN = "SETUP_RUNTIME_SHUTTING_DOWN"
 
 MONITOR_RECOVERED = "MONITOR_RECOVERED"
 MONITOR_HEALTHY = "MONITOR_HEALTHY"
@@ -1572,6 +1573,21 @@ def _failure(code: str, summary: str, next_action: str) -> dict[str, Any]:
     }
 
 
+def _configured_viewer(
+    harness_root: Path, rt: Path, config: HarnessConfig
+) -> dict[str, Any] | None:
+    """Ensure an auto-configured viewer is open, without affecting setup."""
+
+    if config.visualizer != "auto":
+        return None
+    from . import view_launch
+
+    try:
+        return view_launch.open_viewer_window(harness_root, rt)
+    except Exception as exc:  # the viewer never affects setup's outcome
+        return {"launched": False, "reason": str(exc)}
+
+
 def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
     """Execute ``harness setup`` and return the structured result.
 
@@ -1646,7 +1662,16 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
         state = read_runtime_state(rt)
         if state is None or state.get("state") == "CLOSED":
             set_runtime_state(rt, "OPEN")
-        elif state.get("state") not in ("OPEN", "SHUTTING_DOWN"):
+        elif state.get("state") == "SHUTTING_DOWN":
+            raise SetupError(
+                SETUP_RUNTIME_SHUTTING_DOWN,
+                "runtime is still SHUTTING_DOWN",
+                next_action=(
+                    "run `harness shutdown` to finish the interrupted shutdown, "
+                    "then re-run setup"
+                ),
+            )
+        elif state.get("state") != "OPEN":
             raise SetupError(
                 SETUP_CONFIG_INVALID, f"unexpected runtime state: {state.get('state')}"
             )
@@ -1739,13 +1764,17 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
             )
         except ConfigError as exc:
             if str(exc) == SETUP_MONITOR_ALREADY_RUNNING:
-                return {
+                result: dict[str, Any] = {
                     "ok": True,
                     "code": SETUP_MONITOR_ALREADY_RUNNING,
                     "summary": "a live monitor already exists; nothing started",
                     "evidence_paths": [str(monitor_record_path(rt))],
                     "next_action": "proceed; the runtime is already monitored",
                 }
+                viewer = _configured_viewer(harness_root, rt, config)
+                if viewer is not None:
+                    result["viewer"] = viewer
+                return result
             raise
     except SetupError as exc:
         return _failure(
@@ -1774,6 +1803,9 @@ def run_setup(*, overwrite: bool = False) -> dict[str, Any]:
         result["overwritten_paths"] = [str(path) for path in overwritten]
     if merged:
         result["merged_paths"] = [str(path) for path in merged]
+    viewer = _configured_viewer(harness_root, rt, config)
+    if viewer is not None:
+        result["viewer"] = viewer
     return result
 
 

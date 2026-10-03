@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -177,6 +178,14 @@ class MemoryHandoffSeamTests(unittest.TestCase):
             )
         )
         self.assertIsNone(memory_handoff.load_envelope(self.worktree))
+
+    def test_worker_environment_preserves_memory_package_import_root(self) -> None:
+        environment = memory_handoff.worker_environment(
+            self.card, provider_id="claude-code"
+        )
+        self.assertIn(
+            str(SRC), environment.get("PYTHONPATH", "").split(os.pathsep)
+        )
 
     def test_bootstrap_and_resume_use_equivalent_envelope_validation(self) -> None:
         bootstrap_envelope = memory_handoff.prepare_bootstrap_envelope(

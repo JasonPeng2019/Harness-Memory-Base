@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import processes, terminal_evidence
+from . import processes, terminal_evidence, view_launch
 from .config import (
     compute_config_identity,
     find_harness_root,
@@ -46,6 +46,7 @@ CONTROLLER_STATUS_SCHEMA = "controller-status/v1"
 LEASE_SCHEMA = "resource-lease/v1"
 
 PASS_INTERVAL_SECONDS = 30.0
+VISUALIZER_CHECK_SECONDS = 2.0
 HEARTBEAT_STALENESS_SECONDS = 180.0
 
 ACTIONABLE_STATUSES = frozenset(
@@ -807,6 +808,7 @@ def main() -> int:
     except Exception as exc:
         return 1
     rt = config.runtime_root
+    visualizer = config.visualizer
     while True:
         try:
             run_monitor_once(rt, config_identity)
@@ -824,7 +826,12 @@ def main() -> int:
                     current["health"] = "STOPPED"
                     atomic_write_json(record_path, current)
             return 0
-        time.sleep(PASS_INTERVAL_SECONDS)
+        # Between passes, notice a user switching ``visualizer`` to ``auto``
+        # promptly and open the read-only viewer once for that change.
+        deadline = time.monotonic() + PASS_INTERVAL_SECONDS
+        while time.monotonic() < deadline:
+            visualizer = view_launch.watch_setting(harness_root, rt, visualizer)
+            time.sleep(VISUALIZER_CHECK_SECONDS)
 
 
 if __name__ == "__main__":

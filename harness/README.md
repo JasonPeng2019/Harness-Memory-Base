@@ -5,7 +5,7 @@ launcher exposes the entire operator surface. `harness-single/` is the canonical
 launch directory; run all commands from there:
 
 ```powershell
-python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lane,manager,lease,send-lane-notification,scan,watch,health}
+python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lane,manager,lease,send-lane-notification,scan,watch,view,health}
 ```
 
 Every public command returns the small structured result `{ ok, code, summary, evidence_paths,
@@ -45,6 +45,8 @@ The sole public CLI is `operator_launch`. Its groups and subcommands:
 - `send-lane-notification --lane-id --prompt` — append one assignment to a running managed lane.
 - `scan --no-write` — read-only lane-status snapshot; `watch --until-actionable [--timeout]
   [--until-event]` — block until an actionable condition exists.
+- `view [--once] [--ascii] [--no-color]` — read-only terminal view of every lane's seven steps
+  (Recall, Vet, Plan, Pack, Work, Review, Learn) and what needs ROOT; `--once` prints one snapshot.
 - `health reconcile` — rebuild active-lanes and re-derive status.
 
 ## One-time ROOT sequence

@@ -14,7 +14,17 @@ import json
 import sys
 from typing import Any
 
-from . import bootstrap, launch, resume, review, scan_watch, setup, shutdown
+from . import (
+    bootstrap,
+    launch,
+    memory_handoff,
+    resume,
+    review,
+    scan_watch,
+    setup,
+    shutdown,
+    view_term,
+)
 from .config import find_harness_root, load_config, load_resource_manifest
 from .lanes import LaneError, find_active_lane
 from .leases import (
@@ -414,6 +424,17 @@ def _build_parser() -> argparse.ArgumentParser:
     watch_parser.add_argument("--until-actionable", action="store_true")
     watch_parser.add_argument("--timeout")
     watch_parser.add_argument("--until-event")
+    watch_parser.add_argument(
+        "--until-review-for",
+        metavar="LANE_ID",
+        help="wait for the managed completion-review event for one exact lane",
+    )
+
+    view_parser = subparsers.add_parser("view", help="read-only terminal view of every lane's steps")
+    view_parser.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    view_parser.add_argument("--no-color", action="store_true")
+    view_parser.add_argument("--ascii", action="store_true", help="use plain ASCII glyphs")
+    view_parser.add_argument("--refresh", type=float, default=2.0, help="seconds between record reads")
 
     health = subparsers.add_parser("health", help="health commands")
     health_sub = health.add_subparsers(dest="health_command", required=True)
@@ -482,7 +503,18 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if command == "scan":
         return scan_watch.run_scan()
     if command == "watch":
-        return scan_watch.run_watch(timeout=args.timeout, until_event=args.until_event)
+        return scan_watch.run_watch(
+            timeout=args.timeout,
+            until_event=args.until_event,
+            until_review_for=args.until_review_for,
+        )
+    if command == "view":
+        return view_term.run_view(
+            once=args.once,
+            no_color=args.no_color,
+            ascii_only=args.ascii,
+            refresh_seconds=max(0.5, args.refresh),
+        )
     if command == "health":
         if args.health_command == "reconcile":
             return scan_watch.run_health_reconcile()
@@ -494,6 +526,11 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the sole v2 public launcher route."""
+    # Source checkouts keep the optional memory package in the adjacent
+    # ``product/src`` tree.  Make that exact package visible before dispatch so
+    # every enhanced command, including terminal-evidence retirement, sees the
+    # same dependency as bootstrap and the detached controller.
+    memory_handoff.enable_source_checkout_import()
     if argv is None:
         argv = sys.argv[1:]
     parser = _build_parser()

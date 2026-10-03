@@ -1243,6 +1243,50 @@ class Addendum3ProductTests(unittest.TestCase):
         self.assertEqual("lane_status", result["wake_reason"])
         self.assertEqual("lane-1", result["summary"].split(" ")[0])
 
+    def test_managed_watch_for_review_waits_through_queue_promotion_race(self) -> None:
+        review_event = {
+            "event_id": "review-event-1",
+            "type": "COMPLETION_REVIEW_REQUIRED",
+            "lane_id": "lane-1",
+            "state": "PENDING",
+            "delivery_history": [],
+        }
+        with (
+            patch.object(scan_watch, "find_harness_root", return_value=Path("root")),
+            patch.object(scan_watch, "load_config", return_value=SimpleNamespace(runtime_root=self.runtime)),
+            patch.object(scan_watch, "_active_epoch", return_value=("epoch-1", {"lane_mode": "managed"})),
+            patch.object(scan_watch, "_discover_orphaned_leases", return_value=[]),
+            patch.object(
+                scan_watch,
+                "read_manager_queue",
+                side_effect=[
+                    {"queue_id": "queue-1", "events": []},
+                    {"queue_id": "queue-1", "events": [review_event]},
+                ],
+            ),
+            patch.object(scan_watch, "_find_actionable", return_value=("lane-1", "review_pending")),
+            patch.object(
+                scan_watch,
+                "append_watch_delivery",
+                return_value=True,
+            ) as append_delivery,
+            patch.object(scan_watch.time, "sleep"),
+        ):
+            result = scan_watch.run_watch(
+                timeout="1s",
+                until_review_for="lane-1",
+                root_session_id="root-1",
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual("WATCH_EVENT", result["code"])
+        self.assertEqual("review-event-1", result["event_id"])
+        append_delivery.assert_called_once_with(
+            self.runtime,
+            "review-event-1",
+            root_session_id="root-1",
+            binding_id="root",
+        )
+
     def test_plain_watch_skips_queue_reads_and_wakes_on_lane_status(self) -> None:
         def fail_queue(*_args: object, **_kwargs: object) -> object:
             raise AssertionError("plain watch must not read the manager queue")

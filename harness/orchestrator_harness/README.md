@@ -3,7 +3,7 @@
 The package exposes one public launcher:
 
 ```powershell
-python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lane,manager,lease,send-lane-notification,scan,watch,health}
+python -m orchestrator_harness.operator_launch [--json] {harness,lane,resume-lane,manager,lease,send-lane-notification,scan,watch,view,health}
 ```
 
 Every public command returns the structured result `{ ok, code, summary, evidence_paths,
@@ -73,9 +73,20 @@ results, operates hardware, or replaces the root orchestrator.
 - `send-lane-notification --lane-id <id> --prompt <text>` — append one assignment to a running
   managed lane's inbox.
 
-### `scan`, `watch`, `health`
+### `scan`, `watch`, `view`, `health`
 
 - `scan [--no-write]` — read-only lane-status snapshot.
+- `view [--once] [--ascii] [--no-color] [--refresh <seconds>]` — read-only terminal viewer. Each
+  lane is one row of seven steps: Recall, Vet, Plan, Pack (from the optional memory handoff; shown
+  as skipped for plain lanes), then Work, Review, Learn. Items that need ROOT are listed at the
+  bottom with the command to run. `↑`/`↓` select, `enter` shows lane details, `q` quits. It never
+  writes runtime records; `--once` (or a non-terminal stdout) prints one snapshot, and `--json`
+  adds the collected `state`.
+- Optional `"visualizer": "auto" | "off"` in `harness-config.json` (default `off`) opens the
+  viewer in a new terminal window or pane (Windows Terminal, Windows console, macOS Terminal,
+  tmux, or a Linux terminal): at `harness setup` when already `auto`, and from the monitor when the
+  setting changes to `auto`. It is outside the config identity, so changing it never forces a new
+  epoch. A live viewer is never opened twice; a host with no terminal gets a `next_action` instead.
 - `watch [--until-actionable] [--timeout <duration>] [--until-event <id>]` — block until an
   actionable condition exists (or the named manager event appears). Durations accept `30s`, `5m`,
   `1h`.
