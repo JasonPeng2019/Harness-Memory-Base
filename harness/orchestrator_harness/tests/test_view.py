@@ -301,6 +301,16 @@ class ViewCommandTests(unittest.TestCase):
         self.assertNotIn("\x1b[", result["summary"])
         self.assertEqual(4, len(result["state"]["lanes"]))
 
+    def test_explicit_colour_overrides_environment_only_for_terminals(self) -> None:
+        tty = mock.Mock()
+        tty.isatty.return_value = True
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1", "COLORTERM": "truecolor"}):
+            self.assertEqual(view_render.COLOR_TRUE, view_term.color_depth(tty, force_color=True))
+            self.assertEqual(view_render.NO_COLOR, view_term.color_depth(tty, force_color=True, no_color=True))
+            self.assertEqual(view_render.NO_COLOR, view_term.color_depth(io.StringIO(), force_color=True))
+        parsed = operator_launch._build_parser().parse_args(['view', '--color'])
+        self.assertTrue(parsed.color)
+
     def test_no_color_env_disables_colour(self) -> None:
         tty = mock.Mock()
         tty.isatty.return_value = True

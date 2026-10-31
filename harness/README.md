@@ -192,7 +192,9 @@ pass.
 
 Run `python3 -m orchestrator_harness.operator_launch view`. Use
 `--runtime-root /absolute/path/to/.harness-runtime` to inspect an existing run
-without changing configuration or starting agents.
+without changing configuration or starting agents. Automatically opened viewer
+windows enable color explicitly. For manual launches, use `--color` to override
+an inherited `NO_COLOR` setting, or `--no-color` for monochrome.
 
 The overview shows all agents with their task, model, status, and a prominent
 seven-stage light strip. Working stages pulse once per second; completed stages

@@ -76,7 +76,7 @@ def terminal_command(harness_root: Path) -> tuple[list[str], str] | None:
     """Return (argv, method) that opens the viewer in a new terminal, or None."""
     python = sys.executable
     root = str(harness_root)
-    view = [python, *VIEW_COMMAND]
+    view = [python, *VIEW_COMMAND, "--color"]
     if os.name == "nt":
         if shutil.which("wt"):
             return ["wt", "-w", "0", "split-pane", "-d", root, *view], "windows-terminal"

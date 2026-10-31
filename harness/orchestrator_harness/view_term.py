@@ -33,9 +33,9 @@ _SYNC_BEGIN = "\x1b[?2026h"
 _SYNC_END = "\x1b[?2026l"
 
 
-def color_depth(stream: TextIO, *, no_color: bool = False) -> int:
-    """Pick a colour depth from the environment; NO_COLOR always wins."""
-    if no_color or os.environ.get("NO_COLOR") or not _is_tty(stream):
+def color_depth(stream: TextIO, *, no_color: bool = False, force_color: bool = False) -> int:
+    """Pick terminal colours; an explicit --color overrides inherited NO_COLOR."""
+    if no_color or (os.environ.get("NO_COLOR") and not force_color) or not _is_tty(stream):
         return view_render.NO_COLOR
     if os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit") or os.environ.get("WT_SESSION"):
         return view_render.COLOR_TRUE
@@ -388,6 +388,7 @@ def run_view(
     list_replays: bool = False,
     once: bool = False,
     no_color: bool = False,
+    force_color: bool = False,
     ascii_only: bool = False,
     refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
     out: TextIO | None = None,
@@ -442,7 +443,7 @@ def run_view(
     def collect() -> dict[str, Any]:
         return view_state.collect_state(rt)
 
-    depth = color_depth(out, no_color=no_color)
+    depth = color_depth(out, no_color=no_color, force_color=force_color)
     if not interactive:
         state = playback.state() if playback else _safe_collect(collect)
         width, _ = _terminal_size() if _is_tty(out) else (120, 0)

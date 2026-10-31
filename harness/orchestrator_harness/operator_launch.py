@@ -437,7 +437,9 @@ def _build_parser() -> argparse.ArgumentParser:
     view_parser.add_argument("--epoch", help="latest epoch ID (older replays are not retained)")
     view_parser.add_argument("--speed", type=float, default=1.5, help="replay speed, 0.25–8 (default: 1.5)")
     view_parser.add_argument("--once", action="store_true", help="print one snapshot and exit")
-    view_parser.add_argument("--no-color", action="store_true")
+    colors = view_parser.add_mutually_exclusive_group()
+    colors.add_argument("--no-color", action="store_true")
+    colors.add_argument("--color", action="store_true", help="enable terminal colors even when NO_COLOR is inherited")
     view_parser.add_argument("--ascii", action="store_true", help="use plain ASCII glyphs")
     view_parser.add_argument("--refresh", type=float, default=2.0, help="seconds between record reads")
 
@@ -519,6 +521,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
             replay=args.replay, replay_epoch=args.epoch, replay_speed=args.speed, list_replays=args.list_replays,
             once=args.once,
             no_color=args.no_color,
+            force_color=args.color,
             ascii_only=args.ascii,
             refresh_seconds=max(0.5, args.refresh),
         )
