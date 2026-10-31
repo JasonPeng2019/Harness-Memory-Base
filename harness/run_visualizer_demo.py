@@ -18,7 +18,7 @@ from orchestrator_harness.records import RecordLock, atomic_write_json
 ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT.parent / "runtime" / "visualizer-demos"
 TESTS = [f"orchestrator_harness.tests.{name}" for name in
-         ("test_view", "test_view_artifacts", "test_view_feed", "test_view_review", "test_visualizer_demo")]
+         ("test_view", "test_view_artifacts", "test_view_feed", "test_view_review", "test_view_events", "test_visualizer_demo")]
 BASE_FILES = {
     "calc.py": 'def average(values):\n    return sum(values) / (len(values) + 1)\n',
     "test_calc.py": 'import unittest\nfrom calc import average\n\nclass CalcTests(unittest.TestCase):\n    def test_average(self):\n        self.assertEqual(2, average([1, 2, 3]))\n',

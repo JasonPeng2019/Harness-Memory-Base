@@ -214,6 +214,8 @@ def _transcript(path: Path, raw: bool = False) -> str:
 
 
 def output_blocks(lane: dict[str, Any]) -> list[Block]:
+    if lane.get("role") == "root":
+        return [Block("root-output", "ROOT’s prompt and terminal output are visible in the terminal CLI being used to run ROOT. ROOT’s terminal transcript is not recorded by this harness. Recorded communications are in Events.")]
     if not lane.get("worktree_path"):
         return [Block("preparing", "The agent has not started yet.")]
     aw = Path(lane["worktree_path"]) / ".agent-workspace"
@@ -299,8 +301,19 @@ def root_review_text(lane: dict[str, Any]) -> str:
 
 
 def panel_text(lane: dict[str, Any], panel: str) -> str:
+    if lane.get("role") == "root" and panel != "events":
+        if panel == "prompt":
+            return "ROOT’s prompt and terminal output are visible in the terminal CLI being used to run ROOT. The conversation prompt is not recorded by this harness. Assignments sent to agents are in Events → Outbox."
+        if panel == "output":
+            return output_blocks(lane)[0].text
+        return "### ROOT review results\n\n" + "\n\n".join(
+            "### " + worker['lane_id'] + "\n\n" + root_review_text(worker)
+            for worker in lane.get('workers', []))
     if not lane.get("worktree_path"):
         return "The agent has not started yet."
+    if panel == "events":
+        from .view_events import mailbox_text
+        return mailbox_text(lane)
     worktree = Path(lane["worktree_path"])
     aw = worktree / ".agent-workspace"
     paths = lane.get("artifact_paths") or {}

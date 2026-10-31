@@ -229,11 +229,13 @@ def render(
     new_activity: bool = False,
     revealing: bool = False,
 ) -> list[str]:
-    """Two screens: agent overview, or one agent's Prompt / Output / Result."""
+    """Two screens: agent overview, or one agent's Prompt / Output / Result / Events."""
     from .view_artifacts import safe_text
     width, height = max(40, width), max(8, height)
     glyphs = ASCII_GLYPHS if ascii_only else UNICODE_GLYPHS
-    lanes = state.get("lanes") or []
+    lanes = list(state.get("lanes") or [])
+    if state.get("root"):
+        lanes.append(state["root"])
     panel = panel or ("output" if details and lanes else None)
     lines = []
     if panel and lanes:
@@ -243,7 +245,7 @@ def render(
         provider = " · ".join(str(lane.get(k) or "") for k in ("provider", "model"))
         lines.append(Line(depth).add(" " + safe_text(provider), "muted").finish(width))
         tabs = Line(depth).add(" ")
-        for name in ("prompt", "output", "result"):
+        for name in ("prompt", "output", "result", "events"):
             tabs.add(f" [{name.title()}] " if name == panel else f"  {name.title()}  ", "live" if name == panel else "muted", bold=name == panel,
                      bg="bar" if name == panel else None)
         lines.append(tabs.finish(width))
@@ -257,7 +259,9 @@ def render(
             lines.append(Line(depth).finish(width))
         if interactive:
             position = ("Live · revealing" if revealing else "Live") if follow else f"{min(start + 1, len(body))}–{min(start + room, len(body))}/{len(body)}"
-            if new_activity:
+            if panel == "events":
+                footer = " ↑/↓ event · Enter expand/collapse · PgUp/PgDn scroll · ←/→ tab · Esc back"
+            elif new_activity:
                 footer = " New activity ↓ · End latest · ↑/↓ scroll · Esc all agents"
             else:
                 footer = " ←/→ section · ↑/↓ scroll · Esc all agents"
@@ -269,8 +273,9 @@ def render(
         status = state.get("status")
         title = " AGENTS" + ("  ·  Run complete" if status == "closed" else "")
         lines.append(Line(depth).add(title, "text", bold=True).finish(width, bg="bar"))
-        counts = _lane_counts(lanes)
-        summary = f" {len(lanes)} agents  ·  {counts['working']} working  ·  {counts['review']} awaiting review  ·  {counts['done']} accepted"
+        workers = [lane for lane in lanes if lane.get("role") != "root"]
+        counts = _lane_counts(workers)
+        summary = f" {len(workers)} agents  ·  {counts['working']} working  ·  {counts['review']} awaiting review  ·  {counts['done']} accepted"
         if counts['problem']:
             summary += f"  ·  {counts['problem']} need attention"
         lines.append(Line(depth).add(summary, "muted").finish(width))

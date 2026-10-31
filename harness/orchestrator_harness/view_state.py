@@ -419,6 +419,8 @@ def _derive_lane(
         "lane_id": lane_id,
         "worktree_path": str(worktree),
         "root_review": _root_review(rt, epoch_id, lane, acceptance),
+        "epoch_id": epoch_id,
+        "manager_queue_path": str(manager_queue_path(rt)),
         "artifact_paths": {key: lane.get(key) for key in ("transcript_path", "stderr_path", "result_path", "attempts_path")},
         "run_id": lane.get("run_id"),
         "task": _task_title(worktree),
@@ -610,6 +612,15 @@ def collect_state(rt: Path, *, now: datetime | None = None) -> dict[str, Any]:
         lanes.append(_demo_progress_lane(progress, now))
     lanes.sort(key=lambda item: item["lane_id"])
     base["lanes"] = lanes
+    base["root"] = {
+        "lane_id": "ROOT", "role": "root", "run_id": epoch_id,
+        "worktree_path": str(rt.parent), "workers": lanes,
+        "task": "Coordinate agents, handle events and review results",
+        "label": "Runtime open" if base["status"] == "open" else "Run complete",
+        "lifecycle": "coordinating" if base["status"] == "open" else "retired",
+        "tone": "idle", "steps": [SKIP] * len(STEPS), "keys": [],
+        "provider": "Root orchestrator", "model": None,
+    }
     base["keys_held"] = sum(len(lane["keys"]) for lane in lanes)
 
     queue = None

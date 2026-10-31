@@ -207,6 +207,18 @@ with up/down and press Enter to open it. Left/right (or Tab) switches between:
   followed by the worker’s summary, evidence and final response. Pending reviews
   are explicitly identified.
 
+**Events** shows an Inbox (ROOT → agent assignments) and Outbox (agent → ROOT
+notifications and labeled harness status events). It includes processed messages,
+current states, timestamps, event/signal IDs, payloads and state history for the
+selected run. Forwarded notifications appear once. Events start collapsed: Up/Down selects an
+event, Enter expands/collapses its complete record, and Page Up/Page Down scrolls
+long contents. Selection and expanded records persist through live refreshes.
+ROOT also appears in the overview with the same tabs: its Inbox contains forwarded
+agent events and its Outbox contains assignments sent to agents. ROOT’s Result
+shows recorded reviews; its Prompt and Output explain that the harness does not
+capture ROOT’s conversation or terminal transcript. This read-only view refreshes
+every two seconds and does not acknowledge or send messages.
+
 Up/down scrolls; Page Up/Page Down scrolls a page; Home goes to the beginning;
 End follows the latest output. Live agents open at the latest output, while
 completed agents open at the beginning. Escape returns to all agents; q quits.
@@ -219,7 +231,7 @@ change to provider streaming or agent execution.
 
 Scrolling up holds the displayed output steady, including when earlier command
 records grow. A “New activity ↓” indicator appears as more output arrives. Press
-End to return to live output. The agent name and the three sections stay visible
+End to return to live output. The agent name and the four sections stay visible
 while scrolling. Output is
 refreshed every two seconds. Files larger than 512 KB have an explicit preview
 limit; the full original files remain on disk. All attempts are included.

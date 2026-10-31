@@ -177,6 +177,11 @@ def run_interactive(
     artifact_text, artifact_key, artifact_time = "", None, 0.0
     feed = Feed()
     latest_output = ""
+    from . import view_events
+    event_entries, event_diagnostics = [], []
+    event_selected = None
+    event_expanded: set[str] = set()
+    event_focus = False
     previous: list[str] = []
     previous_size = (0, 0)
     out.write(_ENTER_SCREEN)
@@ -188,14 +193,17 @@ def run_interactive(
                 if now - last_collect >= refresh_seconds:
                     state = _safe_collect(collect)
                     last_collect = now
-                lane_count = len(state.get("lanes") or [])
+                display_lanes = list(state.get("lanes") or [])
+                if state.get("root"):
+                    display_lanes.append(state["root"])
+                lane_count = len(display_lanes)
                 selected = max(0, min(selected, lane_count - 1)) if lane_count else 0
                 width, height = _terminal_size()
                 if (width, height) != previous_size:
                     previous = []
                     previous_size = (width, height)
                     out.write("\x1b[2J")
-                lane = state["lanes"][selected] if lane_count else None
+                lane = display_lanes[selected] if lane_count else None
                 key_identity = (lane.get("lane_id"), lane.get("run_id"), panel) if lane else None
                 if panel and lane and (artifact_key != key_identity or now - artifact_time >= refresh_seconds):
                     opening = artifact_key != key_identity
@@ -207,9 +215,25 @@ def run_interactive(
                         latest_output = feed.full_text
                         if opening:
                             artifact_text = feed.text(now)
+                    elif panel == "events":
+                        event_entries, event_diagnostics = view_events.mailbox_entries(lane)
+                        keys_available = [item[0] for item in event_entries]
+                        if event_selected not in keys_available:
+                            event_selected = keys_available[0] if keys_available else None
+                        event_focus = opening
                     else:
                         artifact_text = view_artifacts.panel_text(lane, panel)
                     artifact_key, artifact_time = key_identity, now
+                if panel == "events" and lane:
+                    artifact_text = view_events.mailbox_text(
+                        lane, expanded=event_expanded, selected=event_selected,
+                        entries=event_entries, diagnostics=event_diagnostics, width=width - 4)
+                    if event_focus:
+                        body = view_render.artifact_lines(artifact_text, width, 0)
+                        position = next((i for i, line in enumerate(body) if '> [' in line), 0)
+                        if position < scroll or position >= scroll + max(1, height - 6):
+                            scroll = max(0, position - 1)
+                        event_focus = False
                 feed.width = max(10, width - 4)
                 if panel == "output" and follow:
                     artifact_text = feed.text(now)
@@ -237,8 +261,21 @@ def run_interactive(
                     panel, scroll = "output", 0
                     follow = lane.get("lifecycle") in ("running", "resuming")
                     artifact_key = None
+                elif panel == "events" and key in ("enter", "up", "down"):
+                    event_keys = [item[0] for item in event_entries]
+                    if event_keys:
+                        if key == "enter":
+                            if event_selected in event_expanded:
+                                event_expanded.remove(event_selected)
+                            else:
+                                event_expanded.add(event_selected)
+                        else:
+                            index = event_keys.index(event_selected) if event_selected in event_keys else 0
+                            event_selected = event_keys[max(0, min(len(event_keys) - 1, index + (-1 if key == "up" else 1)))]
+                        event_focus = True
+                        follow = False
                 elif key in ("left", "right") and panel:
-                    tabs = ("prompt", "output", "result")
+                    tabs = ("prompt", "output", "result", "events")
                     panel = tabs[(tabs.index(panel) + (-1 if key == "left" else 1)) % len(tabs)]
                     scroll = 0
                     follow = panel == "output" and lane.get("lifecycle") in ("running", "resuming")
