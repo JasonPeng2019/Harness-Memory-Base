@@ -214,6 +214,8 @@ def _transcript(path: Path, raw: bool = False) -> str:
 
 
 def output_blocks(lane: dict[str, Any]) -> list[Block]:
+    if "_recorded" in lane:
+        return [Block(**block) for block in lane["_recorded"]["blocks"]]
     if lane.get("role") == "root":
         return [Block("root-output", "ROOT’s prompt and terminal output are visible in the terminal CLI being used to run ROOT. ROOT’s terminal transcript is not recorded by this harness. Recorded communications are in Events.")]
     if not lane.get("worktree_path"):
@@ -301,6 +303,8 @@ def root_review_text(lane: dict[str, Any]) -> str:
 
 
 def panel_text(lane: dict[str, Any], panel: str) -> str:
+    if "_recorded" in lane and panel in ("prompt", "result"):
+        return lane["_recorded"][panel]
     if lane.get("role") == "root" and panel != "events":
         if panel == "prompt":
             return "ROOT’s prompt and terminal output are visible in the terminal CLI being used to run ROOT. The conversation prompt is not recorded by this harness. Assignments sent to agents are in Events → Outbox."

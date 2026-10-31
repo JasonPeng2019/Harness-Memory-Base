@@ -432,6 +432,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     view_parser = subparsers.add_parser("view", help="read-only terminal view of every lane's steps")
     view_parser.add_argument("--runtime-root", help="inspect an explicit .harness-runtime directory")
+    view_parser.add_argument("--replay", action="store_true", help="play a saved run without launching agents")
+    view_parser.add_argument("--list-replays", action="store_true", help="show the latest run and recording availability")
+    view_parser.add_argument("--epoch", help="latest epoch ID (older replays are not retained)")
+    view_parser.add_argument("--speed", type=float, default=1.5, help="replay speed, 0.25–8 (default: 1.5)")
     view_parser.add_argument("--once", action="store_true", help="print one snapshot and exit")
     view_parser.add_argument("--no-color", action="store_true")
     view_parser.add_argument("--ascii", action="store_true", help="use plain ASCII glyphs")
@@ -512,6 +516,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
     if command == "view":
         return view_term.run_view(
             runtime_root=args.runtime_root,
+            replay=args.replay, replay_epoch=args.epoch, replay_speed=args.speed, list_replays=args.list_replays,
             once=args.once,
             no_color=args.no_color,
             ascii_only=args.ascii,
@@ -547,6 +552,13 @@ def main(argv: list[str] | None = None) -> int:
             "evidence_paths": [],
             "next_action": "resolve the error and retry",
         }
+    if result.get("ok") and args.command in {"harness", "lane", "manager", "resume-lane", "send-lane-notification", "lease", "health"}:
+        try:
+            from . import view_replay
+            root = find_harness_root()
+            view_replay.record_safely(load_config(root).runtime_root, registry=root / "local-config" / "latest-replay.json")
+        except Exception:
+            pass  # Replay is observational; never change a command's outcome.
     return _emit(result, as_json=args.json)
 
 

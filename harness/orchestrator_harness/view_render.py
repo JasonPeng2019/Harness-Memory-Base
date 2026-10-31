@@ -211,6 +211,11 @@ def artifact_lines(text: str, width: int, depth: int, *, prompt: bool = False) -
     return body
 
 
+def artifact_viewport(height: int, state: dict, interactive: bool = True) -> int:
+    extra = 2 if state.get('replay') else (1 if state.get('replay_error') else 0)
+    return max(0, height - 4 - int(interactive) - extra)
+
+
 def render(
     state: dict[str, Any],
     width: int,
@@ -238,6 +243,16 @@ def render(
         lanes.append(state["root"])
     panel = panel or ("output" if details and lanes else None)
     lines = []
+    replay = state.get('replay')
+    if replay:
+        label = 'PAUSED' if replay['paused'] else 'PLAYING'
+        banner = f" REPLAY {replay['speed']:g}x · {label} · {replay['position']:.1f}/{replay['duration']:.1f}s"
+        if replay.get('warning'):
+            banner += ' · ' + replay['warning']
+        lines.append(Line(depth).add(banner, 'attention', bold=True).finish(width, bg='bar'))
+        lines.append(Line(depth).add(' Space pause · r restart · [/] seek 10s · +/- speed · l live', 'muted').finish(width))
+    elif state.get('replay_error'):
+        lines.append(Line(depth).add(' Replay unavailable: ' + safe_text(state['replay_error']), 'attention').finish(width))
     if panel and lanes:
         lane = lanes[max(0, min(selected, len(lanes) - 1))]
         lines.append(Line(depth).add(" " + safe_text(str(lane['lane_id'])), "text", bold=True)
@@ -258,7 +273,7 @@ def render(
         while len(lines) < height - (1 if interactive else 0):
             lines.append(Line(depth).finish(width))
         if interactive:
-            position = ("Live · revealing" if revealing else "Live") if follow else f"{min(start + 1, len(body))}–{min(start + room, len(body))}/{len(body)}"
+            position = ("Replay" if replay else "Live · revealing" if revealing else "Live") if follow else f"{min(start + 1, len(body))}–{min(start + room, len(body))}/{len(body)}"
             if panel == "events":
                 footer = " ↑/↓ event · Enter expand/collapse · PgUp/PgDn scroll · ←/→ tab · Esc back"
             elif new_activity:
@@ -323,6 +338,6 @@ def render(
         while len(lines) < height - (1 if interactive else 0):
             lines.append(Line(depth).finish(width))
         if interactive:
-            lines.append(Line(depth).add(" ↑/↓ select agent   Enter open   q quit", "muted").finish(width, bg="bar"))
+            lines.append(Line(depth).add(" ↑/↓ select agent   Enter open   r replay   q quit", "muted").finish(width, bg="bar"))
     result = lines[:height]
     return [_asciify(line) for line in result] if ascii_only else result

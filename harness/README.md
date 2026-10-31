@@ -238,6 +238,52 @@ limit; the full original files remain on disk. All attempts are included.
 Terminal control sequences are neutralized, so provider output cannot control
 the viewer terminal.
 
+Replay a run without invoking models or executing any saved commands:
+
+```sh
+python3 -m orchestrator_harness.operator_launch view --replay --speed 1.5
+python3 -m orchestrator_harness.operator_launch view --list-replays
+```
+
+Add `--runtime-root /absolute/path/to/.harness-runtime` to select another saved
+workspace. Only the latest run is retained for replay. In the live viewer, **r** starts replay of the selected runtime's latest
+run. During replay, **Space** pauses/resumes, **r** restarts, **[ / ]** seeks backward
+or forward ten seconds, **+ / -** changes speed, and **l** returns to live view.
+Agent navigation, tabs and expandable events work normally. A persistent banner
+shows REPLAY, speed, play/pause state and timeline position. Playback defaults to
+1.5×: 15 recorded seconds take 10 real seconds.
+
+When the CLI starts a newer run, replay stops automatically and the viewer switches
+to that run’s live overview, even if playback is paused or the workspace changed.
+The viewer checks run identity every quarter-second using the harness’s latest-run
+registry. It clears old output, event selections and playback caches on switching.
+Only the newest replay journal is retained; older replay databases are deleted
+when the next run is registered, while original agent logs and workspaces remain.
+Playback keeps a compact frame index and loads only the current snapshot into
+memory. `--list-replays` reports the newest run; `--epoch` accepts only that epoch.
+
+New managed runs record immutable TUI observations once per second through the
+native monitor, plus snapshots after successful mutating launcher commands.
+The journal is stored under `.harness-runtime/replay/<epoch-id>.sqlite3` and includes
+worker prompts, visible output, event payloads/history, statuses and root reviews.
+Recording is independent of whether a viewer window is open. It captures observed
+arrival timing at one-second resolution, not provider token timings. Existing
+512 KB artifact-preview limits still apply; original transcripts remain on disk.
+ROOT's external CLI conversation is not captured. Plain runs without a monitor
+have command-boundary snapshots only.
+
+Playback reads frozen snapshots, so it never reads later worktree contents or
+publishes messages, acknowledgements, reviews or work. Seeking backward hides
+later output and reviews. Partial recordings and recording failures are labeled;
+recording errors are retained in `replay/recording-errors.log` and do not interrupt
+agent execution. The latest-run pointer is stored in `local-config/latest-replay.json`.
+
+The latest completed run from before recording was introduced can be replayed
+with **Approximate timing**: saved output is paced across agents, and events and
+reviews appear at the end. Its original interleaving cannot be recovered. Older
+runs are no longer offered for replay after a newer run starts.
+
+
 “Awaiting orchestrator review” means the root orchestrator has not yet recorded
 completion-review. This viewer does not submit reviews or launch reviewers.
 

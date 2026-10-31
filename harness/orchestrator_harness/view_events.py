@@ -7,6 +7,8 @@ from typing import Any
 
 
 def mailbox_data(lane: dict[str, Any]) -> tuple[list[dict], list[dict], list[str]]:
+    if "_recorded" in lane:
+        return tuple(lane["_recorded"]["events"])
     if lane.get("role") == "root":
         inbox, outbox, errors = [], [], []
         for worker in lane.get("workers", []):

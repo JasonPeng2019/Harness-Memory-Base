@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import sys
 import time
 from contextlib import contextmanager
@@ -136,6 +137,8 @@ def _map_char(ch: str) -> str | None:
         return "up"
     if ch in ("j", "J"):
         return "down"
+    if ch in (" ", "r", "l", "[", "]", "+", "-", "="):
+        return ch
     if ch == "\t":
         return "right"
     if ch == "g":
@@ -166,12 +169,24 @@ def run_interactive(
     depth: int,
     ascii_only: bool,
     refresh_seconds: float = DEFAULT_REFRESH_SECONDS,
+    playback: Any = None,
+    replay_factory: Callable[[], Any] | None = None,
+    latest_run_changed: Callable[[], bool] | None = None,
 ) -> None:
     """Draw the live screen until the user quits."""
     _enable_windows_vt()
     keys = _Keys()
-    state = _safe_collect(collect)
+    try:
+        state = playback.state() if playback else _safe_collect(collect)
+    except (OSError, ValueError, sqlite3.Error):
+        if latest_run_changed:
+            latest_run_changed()
+        if playback:
+            playback.close()
+        playback = None
+        state = _safe_collect(collect)
     last_collect = time.monotonic()
+    last_run_check = -float("inf")
     selected, details, frame = 0, False, 0
     panel, scroll, follow = None, 0, False
     artifact_text, artifact_key, artifact_time = "", None, 0.0
@@ -190,12 +205,47 @@ def run_interactive(
         with keys.raw():
             while True:
                 now = time.monotonic()
-                if now - last_collect >= refresh_seconds:
+                changed = False
+                if latest_run_changed and now - last_run_check >= 0.25:
+                    changed = latest_run_changed()
+                    last_run_check = now
+                if changed:
+                    if playback:
+                        playback.close()
+                        playback = None
+                    state = _safe_collect(collect)
+                    selected, panel, scroll, follow = 0, None, 0, False
+                    artifact_key, artifact_text, latest_output = None, "", ""
+                    feed = Feed()
+                    event_entries, event_diagnostics, event_expanded = [], [], set()
+                    event_selected, event_focus = None, False
+                    previous = []
+                    last_collect = now
+                old_lanes = list(state.get('lanes') or []) + ([state['root']] if state.get('root') else [])
+                selected_id = old_lanes[selected]['lane_id'] if selected < len(old_lanes) else None
+                if playback:
+                    try:
+                        state = playback.state()
+                    except (OSError, ValueError, sqlite3.Error):
+                        # Retention can remove an old journal between identity polls.
+                        if latest_run_changed:
+                            latest_run_changed()
+                        playback.close()
+                        playback = None
+                        state = _safe_collect(collect)
+                        selected, panel, scroll, follow = 0, None, 0, False
+                        artifact_key, artifact_text, latest_output = None, "", ""
+                        feed = Feed()
+                        event_entries, event_diagnostics, event_expanded = [], [], set()
+                        event_selected, event_focus = None, False
+                elif now - last_collect >= refresh_seconds:
                     state = _safe_collect(collect)
                     last_collect = now
                 display_lanes = list(state.get("lanes") or [])
                 if state.get("root"):
                     display_lanes.append(state["root"])
+                if selected_id:
+                    selected = next((i for i, item in enumerate(display_lanes) if item['lane_id'] == selected_id), selected)
                 lane_count = len(display_lanes)
                 selected = max(0, min(selected, lane_count - 1)) if lane_count else 0
                 width, height = _terminal_size()
@@ -204,23 +254,23 @@ def run_interactive(
                     previous_size = (width, height)
                     out.write("\x1b[2J")
                 lane = display_lanes[selected] if lane_count else None
-                key_identity = (lane.get("lane_id"), lane.get("run_id"), panel) if lane else None
-                if panel and lane and (artifact_key != key_identity or now - artifact_time >= refresh_seconds):
+                key_identity = (lane.get("lane_id"), lane.get("run_id"), panel, playback.generation if playback else None) if lane else None
+                if panel and lane and (artifact_key != key_identity or playback or now - artifact_time >= refresh_seconds):
                     opening = artifact_key != key_identity
                     if panel == "output":
                         if opening:
                             feed = Feed(width=max(10, width - 4))
                         blocks = view_artifacts.output_blocks(lane)
-                        feed.update(blocks, now, immediate=opening)
+                        feed.update(blocks, now, immediate=opening or bool(playback))
                         latest_output = feed.full_text
-                        if opening:
+                        if opening or playback:
                             artifact_text = feed.text(now)
                     elif panel == "events":
                         event_entries, event_diagnostics = view_events.mailbox_entries(lane)
                         keys_available = [item[0] for item in event_entries]
                         if event_selected not in keys_available:
                             event_selected = keys_available[0] if keys_available else None
-                        event_focus = opening
+                        event_focus = event_focus or opening
                     else:
                         artifact_text = view_artifacts.panel_text(lane, panel)
                     artifact_key, artifact_time = key_identity, now
@@ -231,14 +281,14 @@ def run_interactive(
                     if event_focus:
                         body = view_render.artifact_lines(artifact_text, width, 0)
                         position = next((i for i, line in enumerate(body) if '> [' in line), 0)
-                        if position < scroll or position >= scroll + max(1, height - 6):
+                        if position < scroll or position >= scroll + max(1, view_render.artifact_viewport(height, state)):
                             scroll = max(0, position - 1)
                         event_focus = False
                 feed.width = max(10, width - 4)
                 if panel == "output" and follow:
                     artifact_text = feed.text(now)
                 new_activity = panel == "output" and not follow and latest_output != artifact_text
-                frame = int(now / 0.25)  # Keep stage lights at 1 Hz while text draws at 20 Hz.
+                frame = int((playback.position if playback else now) / 0.25)  # Keep stage lights at 1 Hz while text draws at 20 Hz.
                 lines = view_render.render(
                     state, width, height, selected=selected, frame=frame,
                     depth=depth, ascii_only=ascii_only, details=details,
@@ -257,6 +307,27 @@ def run_interactive(
                 key = keys.read(FRAME_SECONDS)
                 if key == "q":
                     break
+                if playback and key in (' ', 'r', '[', ']', '+', '-', '='):
+                    playback.control(key)
+                    artifact_key = None if key in ('r', '[', ']') else artifact_key
+                    if key in ('r', '[', ']'):
+                        scroll = 0
+                    continue
+                if key == 'l' and playback:
+                    playback.close()
+                    playback = None
+                    state = _safe_collect(collect)
+                    artifact_key = None
+                    scroll = 0
+                    continue
+                if key == 'r' and not playback and replay_factory:
+                    try:
+                        playback = replay_factory()
+                        artifact_key = None
+                        scroll = 0
+                    except Exception as exc:
+                        state['replay_error'] = str(exc)
+                    continue
                 if key == "enter" and lane_count and not panel:
                     panel, scroll = "output", 0
                     follow = lane.get("lifecycle") in ("running", "resuming")
@@ -286,11 +357,11 @@ def run_interactive(
                         feed.finish(time.monotonic())
                 elif key in ("up", "down", "pageup", "pagedown") and panel:
                     count = len(view_render.artifact_lines(artifact_text, width, 0, prompt=panel == "prompt"))
-                    end = max(0, count - (height - 5))
+                    end = max(0, count - view_render.artifact_viewport(height, state))
                     if follow:
                         scroll = end
                     follow = False
-                    amount = max(1, height - 7) if key in ("pageup", "pagedown") else 1
+                    amount = max(1, view_render.artifact_viewport(height, state) - 2) if key in ("pageup", "pagedown") else 1
                     scroll = min(end, max(0, scroll + (-amount if key in ("up", "pageup") else amount)))
                 elif key == "up":
                     selected = max(0, selected - 1)
@@ -302,6 +373,8 @@ def run_interactive(
     except KeyboardInterrupt:
         pass
     finally:
+        if playback:
+            playback.close()
         out.write(_LEAVE_SCREEN)
         out.flush()
 
@@ -309,6 +382,10 @@ def run_interactive(
 def run_view(
     *,
     runtime_root: str | None = None,
+    replay: bool = False,
+    replay_epoch: str | None = None,
+    replay_speed: float = 1.5,
+    list_replays: bool = False,
     once: bool = False,
     no_color: bool = False,
     ascii_only: bool = False,
@@ -330,17 +407,48 @@ def run_view(
             "next_action": "configure the harness, then run `harness setup`",
         }
 
+    from . import view_replay
+    try:
+        registry = find_harness_root() / 'local-config' / 'latest-replay.json'
+    except Exception:
+        registry = None
+    follower = view_replay.LatestRunFollower(rt, registry)
+    def latest_run_changed():
+        nonlocal rt
+        if follower.poll():
+            rt = follower.rt
+            return True
+        return False
+
+    interactive = not once and _is_tty(out) and _is_tty(sys.stdin)
+    if interactive and latest_run_changed():
+        replay, replay_epoch = False, None  # A newer run already superseded the requested replay.
+    if list_replays:
+        items = view_replay.recordings(rt)
+        return {"ok": True, "code": VIEW_OK, "summary": "\n".join(
+            f"{item['epoch_id']}  {item['opened_at']}  {'Recorded' if item['recorded'] else 'Approximate only'}" for item in items) or "No past runs found.",
+            "recordings": items, "evidence_paths": [str(rt)], "next_action": "view --replay --epoch <epoch_id>"}
+    def replay_factory():
+        return view_replay.Playback(rt, speed=replay_speed)
+    try:
+        playback = view_replay.Playback(rt, epoch=replay_epoch, speed=replay_speed) if replay else None
+    except Exception as exc:
+        if interactive and latest_run_changed():
+            playback = None
+        else:
+            return {"ok": False, "code": "VIEW_REPLAY_INVALID", "summary": str(exc),
+                    "evidence_paths": [str(rt)], "next_action": "use view --list-replays to select a retained run"}
+
     def collect() -> dict[str, Any]:
         return view_state.collect_state(rt)
 
-    interactive = not once and _is_tty(out) and _is_tty(sys.stdin)
     depth = color_depth(out, no_color=no_color)
     if not interactive:
-        state = _safe_collect(collect)
+        state = playback.state() if playback else _safe_collect(collect)
         width, _ = _terminal_size() if _is_tty(out) else (120, 0)
         lanes = len(state.get("lanes") or [])
         needs = min(3, len(state.get("needs_you") or []))
-        height = 3 + 6 * max(1, lanes)
+        height = 3 + 6 * max(1, lanes + bool(state.get("root"))) + (2 if playback else 0)
         lines = view_render.render(
             state, width, height, depth=depth, ascii_only=ascii_only, interactive=False,
         )
@@ -354,9 +462,9 @@ def run_view(
         }
     from . import view_launch
 
-    record = view_launch.record_viewer(rt)
+    record = None if replay else view_launch.record_viewer(rt)
     try:
-        run_interactive(collect, out=out, depth=depth, ascii_only=ascii_only, refresh_seconds=refresh_seconds)
+        run_interactive(collect, out=out, depth=depth, ascii_only=ascii_only, refresh_seconds=refresh_seconds, playback=playback, replay_factory=replay_factory, latest_run_changed=latest_run_changed)
     finally:
         view_launch.clear_viewer(record)
     return {

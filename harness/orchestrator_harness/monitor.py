@@ -809,6 +809,8 @@ def main() -> int:
         return 1
     rt = config.runtime_root
     visualizer = config.visualizer
+    from . import view_replay
+    recorder_stop, recorder_thread = view_replay.start_recorder(rt, registry=harness_root / "local-config" / "latest-replay.json")
     while True:
         try:
             run_monitor_once(rt, config_identity)
@@ -816,6 +818,13 @@ def main() -> int:
             pass
         record = read_monitor_record(rt)
         if record is not None and record.get("stop_requested", False):
+            recorder_stop.set()
+            recorder_thread.join(timeout=6)
+            if recorder_thread.is_alive():
+                # Exit the process (and its daemon thread); shutdown must prove process
+                # exit rather than trust a STOPPED marker while recording is active.
+                return 1
+            view_replay.record_safely(rt, registry=harness_root / "local-config" / "latest-replay.json")
             record_path = monitor_record_path(rt)
             with RecordLock(record_path):
                 try:
