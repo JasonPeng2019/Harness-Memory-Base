@@ -431,6 +431,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     view_parser = subparsers.add_parser("view", help="read-only terminal view of every lane's steps")
+    view_parser.add_argument("--runtime-root", help="inspect an explicit .harness-runtime directory")
     view_parser.add_argument("--once", action="store_true", help="print one snapshot and exit")
     view_parser.add_argument("--no-color", action="store_true")
     view_parser.add_argument("--ascii", action="store_true", help="use plain ASCII glyphs")
@@ -510,6 +511,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
         )
     if command == "view":
         return view_term.run_view(
+            runtime_root=args.runtime_root,
             once=args.once,
             no_color=args.no_color,
             ascii_only=args.ascii,

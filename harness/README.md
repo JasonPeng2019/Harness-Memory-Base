@@ -187,3 +187,72 @@ uses empty template/hook directories, and places a controlled fake `codex` execu
 all result and transcript evidence is explicitly synthetic and is never live-provider proof. This
 dedicated macOS demonstration skips on every non-macOS host rather than reporting a cross-platform
 pass.
+
+## Inspect agents
+
+Run `python3 -m orchestrator_harness.operator_launch view`. Use
+`--runtime-root /absolute/path/to/.harness-runtime` to inspect an existing run
+without changing configuration or starting agents.
+
+The overview shows all agents with their task, model, status, and a prominent
+seven-stage light strip. Working stages pulse once per second; completed stages
+stay green, waiting stages stay amber, and unused memory stages are dim. Select an agent
+with up/down and press Enter to open it. Left/right (or Tab) switches between:
+
+- **Prompt:** the initial worker prompt and any correction prompts, verbatim.
+- **Output:** agent messages, commands and their output/exit status, file edits,
+  and provider diagnostics. Codex item updates are combined so each command appears
+  once. Transport metadata, hook events and usage envelopes are omitted.
+- **Result:** the verified root review, verdict, decision and saved check output,
+  followed by the worker’s summary, evidence and final response. Pending reviews
+  are explicitly identified.
+
+Up/down scrolls; Page Up/Page Down scrolls a page; Home goes to the beginning;
+End follows the latest output. Live agents open at the latest output, while
+completed agents open at the beginning. Escape returns to all agents; q quits.
+All new output—messages, commands, code and tool output—is revealed line by line
+at 12 lines per second between the two-second data refreshes. Updates append in
+arrival order without expanding earlier command records above the reader.
+Press End to skip the reveal queue. Existing history loads immediately when an
+agent or section is opened. This is a display effect over received text, not a
+change to provider streaming or agent execution.
+
+Scrolling up holds the displayed output steady, including when earlier command
+records grow. A “New activity ↓” indicator appears as more output arrives. Press
+End to return to live output. The agent name and the three sections stay visible
+while scrolling. Output is
+refreshed every two seconds. Files larger than 512 KB have an explicit preview
+limit; the full original files remain on disk. All attempts are included.
+Terminal control sequences are neutralized, so provider output cannot control
+the viewer terminal.
+
+“Awaiting orchestrator review” means the root orchestrator has not yet recorded
+completion-review. This viewer does not submit reviews or launch reviewers.
+
+## One-command live visualizer demo
+
+From this directory run:
+
+```bash
+python3 run_visualizer_demo.py
+```
+
+This runs the local visualizer tests, creates a fresh disposable calculator Git
+repository, opens the visualizer, and launches two real Codex workers. It uses
+your logged-in Codex account and configured model (`--model NAME` overrides it).
+Every invocation starts from the same buggy baseline in a new directory under
+`../runtime/visualizer-demos/` (outside the harness source); previous runs, logs, and your original test workspace
+are preserved. Local harness configuration is pointed at the new run; its previous
+contents are backed up in that run's `.demo/` directory. An already-open harness
+runtime must be closed first.
+
+After execution, the script runs each worker's unittest suite and independent
+calculator assertions, checks committed file scope and whitespace, and records
+acceptance only after those fixed demo checks pass. This is automated fixture
+validation, not an independent AI code review. It then shuts down the runtime,
+leaving the worktrees, logs, test reports, and viewer available for inspection.
+Failures/interrupts stop only this run's workers and preserve their evidence.
+
+Use `python3 run_visualizer_demo.py --check-only` for local tests without any
+agent launches or configuration changes. The lights and gradual text reveal are
+visible during a live run; old completed messages are shown immediately.

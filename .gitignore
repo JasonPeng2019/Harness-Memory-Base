@@ -18,3 +18,6 @@ __pycache__/
 .codex/orchestrator-harness-binding.json
 .claude/orchestrator-harness-binding.json
 .qwen/orchestrator-harness-binding.json
+
+# Disposable coding workspaces for the visualizer demo.
+/runtime/

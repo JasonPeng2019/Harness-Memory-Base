@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config
+from .core import content_hash
+from . import terminal_evidence
 from .epochs import (
     epoch_dir,
     manager_queue_path,
@@ -263,6 +265,32 @@ def _demo_progress_lane(progress: dict[str, Any], now: datetime) -> dict[str, An
     }
 
 
+def _root_review(rt: Path, epoch_id: str, lane: dict[str, Any], acceptance: dict[str, Any] | None) -> dict[str, Any] | None:
+    folder = terminal_evidence.publication_dir(rt, epoch_id, lane)
+    path = folder / "COMPLETION_REVIEW.json"
+    review = _read_json_quiet(path)
+    if review is None:
+        path = epoch_dir(rt, epoch_id) / "lanes" / str(lane["lane_id"]) / "retirement-archive" / "COMPLETION_REVIEW.json"
+        review = _read_json_quiet(path)
+    if not review or review.get("schema") != "completion-review/v1":
+        return None
+    if (review.get("lane_id") != lane.get("lane_id") or review.get("run_id") != lane.get("run_id")
+            or review.get("content_hash") != content_hash(review)):
+        return None
+    decision = acceptance
+    if decision is None:
+        candidate = _read_json_quiet(path.parent / "ORCHESTRATOR_ACCEPTANCE.json")
+        if candidate:
+            from .review import validate_lane_acceptance_chain
+            if validate_lane_acceptance_chain(review, candidate, lane):
+                decision = candidate
+    return {"verdict": review.get("review_outcome"), "summary": review.get("review_summary"),
+            "evidence": review.get("evidence", []), "reviewed_at": review.get("reviewed_at"),
+            "commit": review.get("commit"), "reviewer": (decision or {}).get("accepted_by", "ROOT"),
+            "approval": (decision or {}).get("approval", "Pending"), "path": str(path),
+            "workspace": str(rt.parent)}
+
+
 def _derive_lane(
     rt: Path,
     epoch_id: str,
@@ -319,7 +347,7 @@ def _derive_lane(
         steps[RECALL] = steps[VET] = DONE
         steps[PLAN] = WAIT
         current = PLAN
-        label, tone = "Plan waiting for your review", TONE_ATTENTION
+        label, tone = "Plan awaiting orchestrator review", TONE_ATTENTION
     else:
         for index in (RECALL, VET, PLAN, PACK):
             steps[index] = DONE
@@ -365,7 +393,7 @@ def _derive_lane(
             elif (review_agent or {}).get("state") == "failed":
                 label, tone = "Review agent failed", TONE_BAD
             else:
-                label, tone = "Needs your review", TONE_ATTENTION
+                label, tone = "Awaiting orchestrator review", TONE_ATTENTION
         elif lifecycle == "running" or lane.get("launch_pending") is True:
             steps[WORK] = NOW
             current = WORK
@@ -389,6 +417,9 @@ def _derive_lane(
     provider = lane.get("provider") if isinstance(lane.get("provider"), dict) else {}
     return {
         "lane_id": lane_id,
+        "worktree_path": str(worktree),
+        "root_review": _root_review(rt, epoch_id, lane, acceptance),
+        "artifact_paths": {key: lane.get(key) for key in ("transcript_path", "stderr_path", "result_path", "attempts_path")},
         "run_id": lane.get("run_id"),
         "task": _task_title(worktree),
         "provider": provider.get("id"),
@@ -432,8 +463,10 @@ def _needs_you(lanes: list[dict[str, Any]], queue: dict[str, Any] | None, now: d
             "text": str(event.get("summary") or event.get("type") or "manager event"),
             "state": event.get("state"),
             "age_seconds": _age_seconds(since, now),
-            "hint": f"manager acknowledge --event-id {event.get('event_id')}"
-            if event.get("state") == "PENDING" else "handle it, then manager close",
+            "hint": ("orchestrator: inspect result and record completion-review"
+                     if event.get("type") == "COMPLETION_REVIEW_REQUIRED" else
+                     f"orchestrator: manager acknowledge --event-id {event.get('event_id')}"
+                     if event.get("state") == "PENDING" else "orchestrator: handle event, then manager close"),
         })
     listed = {item["lane_id"] for item in items}
     for lane in lanes:
@@ -441,10 +474,10 @@ def _needs_you(lanes: list[dict[str, Any]], queue: dict[str, Any] | None, now: d
             continue
         if lane["tone"] in (TONE_ATTENTION, TONE_BAD) and lane["lifecycle"] not in ("retired",):
             hint = _PROBLEM_HINTS.get(str(lane["actionable"]), "")
-            if lane["label"] == "Needs your review":
-                hint = f"lane completion-review --lane-id {lane['lane_id']} ..."
-            elif lane["label"].startswith("Plan waiting"):
-                hint = "review and accept the plan, then bootstrap again"
+            if lane["label"] == "Awaiting orchestrator review":
+                hint = "orchestrator must inspect the result and record completion-review"
+            elif lane["label"].startswith("Plan awaiting"):
+                hint = "orchestrator must review the plan before execution"
             resource = (lane["orphaned_keys"] or [""])[0]
             items.append({
                 "lane_id": lane["lane_id"],

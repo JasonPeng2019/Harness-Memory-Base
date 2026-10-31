@@ -164,7 +164,7 @@ class ViewStateTests(unittest.TestCase):
         lane3 = [item for item in needs if item["lane_id"] == "lane-3"]
         self.assertEqual(1, len(lane3))
         self.assertAlmostEqual(240, lane3[0]["age_seconds"], delta=1)
-        self.assertIn("manager acknowledge --event-id ev1", lane3[0]["hint"])
+        self.assertIn("orchestrator: inspect result and record completion-review", lane3[0]["hint"])
 
     def test_active_review_agent_replaces_manual_review_prompt(self) -> None:
         _write(
@@ -242,12 +242,26 @@ class ViewRenderTests(unittest.TestCase):
                 for line in lines:
                     self.assertEqual(width, view_render.text_width(line), repr(line))
 
-    def test_wide_layout_labels_every_step(self) -> None:
+    def test_overview_shows_agents_with_stage_lights(self) -> None:
         text = "\n".join(view_render.render(self.state, 160, 30, depth=view_render.NO_COLOR))
-        for name in view_state.STEPS:
-            self.assertIn(name, text)
-        self.assertIn("Needs your review", text)
+        self.assertIn("Enter open", text)
+        self.assertIn("Fix date parser regression", text)
+        self.assertIn("Recall", text)
+        self.assertNotIn("p/o/r/x", text)
+        self.assertIn("Awaiting orchestrator review", text)
         self.assertIn("lane-3", text)
+
+    def test_only_active_agents_pulse_on_overview(self) -> None:
+        first = view_render.render(self.state, 160, 30, depth=0, frame=0)
+        second = view_render.render(self.state, 160, 30, depth=0, frame=2)
+        self.assertNotEqual(first[3], second[3])
+        self.assertNotEqual(first[4], second[4])
+        for row in (9, 10, 15, 16, 21, 22):
+            self.assertEqual(first[row], second[row])
+        self.state['status'] = 'closed'
+        self.assertEqual(
+            view_render.render(self.state, 160, 30, depth=0, frame=0),
+            view_render.render(self.state, 160, 30, depth=0, frame=2))
 
     def test_ascii_mode_is_plain_ascii(self) -> None:
         lines = view_render.render(self.state, 120, 30, depth=view_render.NO_COLOR, ascii_only=True, interactive=False)

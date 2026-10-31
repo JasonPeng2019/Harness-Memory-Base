@@ -9,6 +9,8 @@ and snapshot tests.
 from __future__ import annotations
 
 import unicodedata
+import textwrap
+from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -148,58 +150,13 @@ def _asciify(line: str) -> str:
     return "".join(ch if ch.isascii() else "?" * text_width(ch) for ch in line)
 
 
-def _duration(seconds: float | None) -> str:
-    if seconds is None:
-        return ""
-    total = int(seconds)
-    hours, rest = divmod(total, 3600)
-    minutes, secs = divmod(rest, 60)
-    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
-
-
-def _age(seconds: float | None) -> str:
-    if seconds is None:
-        return ""
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m"
-    return f"{int(seconds // 3600)}h"
-
-
-def _track(line: Line, steps: list[str], *, spacing: int, glyphs: dict[str, str], pulse: bool) -> None:
-    """Draw the seven connected step nodes."""
-    for index, code in enumerate(steps):
-        color = STEP_COLORS[index]
-        node = glyphs[code]
-        if code == DONE:
-            line.add(node, color)
-        elif code == NOW:
-            line.add(node, color, bold=pulse, dim=not pulse)
-        elif code == WAIT:
-            line.add(node, "attention")
-        elif code == FAIL:
-            line.add(node, "bad", bold=True)
-        else:
-            line.add(node, "faint")
-        if index == len(steps) - 1 or spacing <= 1:
-            continue
-        nxt = steps[index + 1]
-        if code == DONE and nxt in (DONE, NOW, WAIT, FAIL):
-            line.add(glyphs["line_done"] * (spacing - 1), color)
-        elif code == SKIP and nxt == SKIP:
-            line.add(glyphs["line_skip"] * (spacing - 1))
-        else:
-            line.add(glyphs["line_todo"] * (spacing - 1), "faint")
-
-
 def _lane_counts(lanes: list[dict[str, Any]]) -> dict[str, int]:
     counts = {"working": 0, "review": 0, "waiting": 0, "done": 0, "problem": 0}
     for lane in lanes:
         tone = lane["tone"]
         if tone == "live":
             counts["working"] += 1
-        elif lane["label"] == "Needs your review":
+        elif lane["label"] == "Awaiting orchestrator review":
             counts["review"] += 1
         elif tone == "good":
             counts["done"] += 1
@@ -210,185 +167,48 @@ def _lane_counts(lanes: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
-def _header(state: dict[str, Any], width: int, depth: int, glyphs: dict[str, str]) -> list[str]:
-    top = Line(depth)
-    top.add(" HARNESS ", "text", bold=True, bg="bar")
-    epoch = str(state.get("epoch_id") or "")[:8]
-    if epoch:
-        top.add(f" epoch {epoch}", "muted", bg="bar").add(f" · {state.get('mode') or '?'}", "muted", bg="bar")
-    status = state.get("status")
-    if status == "closed":
-        top.add("  RUN CLOSED", "good", bold=True, bg="bar")
-    right = Line(depth)
-    monitor = state.get("monitor") or {}
-    if status == "open":
-        healthy = monitor.get("state") == "healthy"
-        right.add(glyphs["dot"] + " ", "good" if healthy else "bad", bg="bar")
-        right.add(
-            f"monitor {_age(monitor.get('age_seconds'))}" if healthy else "monitor stale",
-            "muted", bg="bar",
-        )
-        right.add("   ", bg="bar")
-    right.add(_duration(state.get("run_seconds")) + " ", "text", bold=True, bg="bar")
-    top.pad_to(max(top.width, width - right.width))
-    top.segments.extend(right.segments)
-    top.width += right.width
-
-    lanes = state.get("lanes") or []
-    counts = _lane_counts(lanes)
-    stats = Line(depth).add(" ")
-    parts = [
-        (counts["working"], "working", "live"),
-        (counts["review"], "to review", "attention"),
-        (counts["waiting"], "waiting", "muted"),
-        (counts["problem"], "stuck", "bad"),
-        (counts["done"], "accepted", "good"),
-    ]
-    first = True
-    for number, noun, color in parts:
-        if number == 0 and noun in ("stuck", "to review"):
-            continue
-        if not first:
-            stats.add("   ")
-        stats.add(str(number), color, bold=True).add(f" {noun}", "muted")
-        first = False
-    if state.get("keys_held"):
-        stats.add("   ").add(f"{glyphs['key']} {state['keys_held']}", "memory").add(" keys held", "muted")
-    return [top.finish(width, bg="bar"), stats.finish(width), Line(depth).add(glyphs["rule"] * width, "faint").finish(width)]
-
-
-@dataclass
-class _Layout:
-    compact: bool
-    id_w: int
-    task_w: int
-    spacing: int
-    label_w: int
-    track_w: int
-
-
-def _layout(lanes: list[dict[str, Any]], width: int) -> _Layout:
-    id_w = max([len(str(lane["lane_id"])) for lane in lanes] + [6])
-    label_w = 26
-    # Fixed columns: select marker (3), id, gap (2), task, gap (2), track,
-    # gap (3), label, elapsed time (7).
-    fixed = 3 + id_w + 2 + 2 + 3 + label_w + 7
-    for spacing in (9, 8, 7):
-        track_w = spacing * (len(STEPS) - 1) + 1
-        task_w = width - fixed - track_w
-        if task_w >= 16:
-            return _Layout(False, id_w, min(task_w, 40), spacing, label_w, track_w)
-    track_w = len(STEPS)
-    task_w = max(8, width - fixed - track_w)
-    return _Layout(True, id_w, task_w, 1, label_w, track_w)
-
-
-def _lane_lines(lane: dict[str, Any], layout: _Layout, width: int, depth: int, glyphs: dict[str, str],
-                *, selected: bool, pulse: bool) -> list[str]:
-    tone = lane["tone"]
-    first = Line(depth)
-    first.add(f" {glyphs['select']} " if selected else "   ", "live", bold=True)
-    first.add(str(lane["lane_id"]).ljust(layout.id_w), "text", bold=selected)
-    first.add("  ")
-    task = lane.get("task") or "(no task text)"
-    first.add(_truncate(task, layout.task_w).ljust(layout.task_w), "text" if lane.get("task") else "faint")
-    first.add("  ")
-    _track(first, lane["steps"], spacing=layout.spacing, glyphs=glyphs, pulse=pulse)
-    first.add("   ")
-    label_color = {"live": "live", "memory": "memory", "plan": "plan", "attention": "attention",
-                   "good": "good", "bad": "bad"}.get(tone, "muted")
-    label = lane["label"]
-    if layout.compact:
-        label = f"{STEPS[lane['current']]}: {label}"
-    first.add(_truncate(label, layout.label_w).ljust(layout.label_w), label_color, bold=tone in ("attention", "bad"))
-    first.add(_duration(lane.get("elapsed_seconds")).rjust(7), "faint")
-
-    second = Line(depth)
-    second.add(" " * (3 + layout.id_w + 2))
-    who = " · ".join(str(x) for x in (lane.get("provider"), lane.get("model")) if x)
-    second.add(_truncate(who, layout.task_w).ljust(layout.task_w), "faint")
-    second.add("  ")
-    extras: list[tuple[str, str]] = []
-    if lane.get("detail"):
-        extras.append((lane["detail"], "memory"))
-    elif all(code == SKIP for code in lane["steps"][:4]):
-        extras.append(("no memory handoff", "faint"))
-    if lane.get("attempts", 0) > 1:
-        extras.append((f"try {lane['attempts']} of 6", "live"))
-    if lane.get("resumed"):
-        extras.append(("resumed run", "plan"))
-    for key in lane.get("keys") or []:
-        extras.append((f"{glyphs['key']} {key}", "memory"))
-    for key in lane.get("orphaned_keys") or []:
-        extras.append((f"{glyphs['key']} {key} (stuck)", "bad"))
-    for index, (text, color) in enumerate(extras):
-        if index:
-            second.add("  ·  ", "faint")
-        second.add(text, color)
-    return [first.finish(width), second.finish(width)]
-
-
-def _step_header(layout: _Layout, width: int, depth: int) -> str:
-    line = Line(depth)
-    line.add(" " * (3 + layout.id_w + 2 + layout.task_w + 2))
-    if layout.compact:
-        line.add("steps", "muted")
-    else:
-        for index, name in enumerate(STEPS):
-            cell = name if index == len(STEPS) - 1 else name.ljust(layout.spacing)
-            line.add(cell, STEP_COLORS[index] if index != 5 else "muted", bold=True)
-    return line.finish(width)
-
-
 def _centered(message: str, width: int, depth: int, color: str = "muted") -> str:
     pad = max(0, (width - text_width(message)) // 2)
     return Line(depth).add(" " * pad).add(message, color).finish(width)
 
 
-def _details(lane: dict[str, Any], width: int, depth: int, glyphs: dict[str, str], pulse: bool) -> list[str]:
-    lines = [
-        Line(depth).add(f" {lane['lane_id']}", "text", bold=True).add(f"   {lane.get('task') or ''}", "muted").finish(width),
-        Line(depth).finish(width),
-    ]
-    descriptions = {
-        0: "Look up past experience (EverOS) and shared procedures (Atlas).",
-        1: "Drop memories that are revoked, out of scope, or a poor fit.",
-        2: "Reuse a saved plan, adapt one, or plan fresh; ROOT accepts it.",
-        3: "Bundle the task, the accepted plan, and a small memory budget.",
-        4: "The worker does the task in its own worktree and writes RESULT.json.",
-        5: "ROOT reviews the result and accepts or rejects it.",
-        6: "The accepted outcome is recorded for future runs.",
-    }
-    for index, name in enumerate(STEPS):
-        code = lane["steps"][index]
-        row = Line(depth).add("   ")
-        _track(row, [code], spacing=1, glyphs=glyphs, pulse=pulse)
-        row.add(f"  {name.ljust(8)}", STEP_COLORS[index] if code != SKIP else "faint", bold=code in (NOW, WAIT, FAIL))
-        state_word = {DONE: "done", NOW: "now", WAIT: "waiting", FAIL: "needs attention",
-                      TODO: "", SKIP: "skipped (no memory handoff)"}[code]
-        row.add(state_word.ljust(28), "muted")
-        row.add(descriptions[index], "faint")
-        lines.append(row.finish(width))
-    lines.append(Line(depth).finish(width))
-    facts = [
-        ("Status", lane["label"]),
-        ("Provider", " · ".join(str(x) for x in (lane.get("provider"), lane.get("model")) if x) or "—"),
-        ("Run", str(lane.get("run_id") or "—")),
-        ("Report tries", str(lane.get("attempts") or 0)),
-        ("Keys held", ", ".join(lane.get("keys") or []) or "none"),
-    ]
-    memory = lane.get("memory")
-    if memory:
-        facts.extend([
-            ("Strategy", str(memory.get("strategy") or "—")),
-            ("Memories delivered", "—" if memory.get("delivered") is None else str(memory["delivered"])),
-            ("Memories omitted", "—" if memory.get("omitted") is None else str(memory["omitted"])),
-            ("Memory sources", ", ".join(memory.get("sources") or []) or "—"),
-            ("Plan", str(memory.get("plan_branch") or "—")),
-        ])
-    for name, value in facts:
-        lines.append(Line(depth).add(f"   {name.ljust(20)}", "muted").add(value, "text").finish(width))
-    return lines
+@lru_cache(maxsize=4)
+def artifact_lines(text: str, width: int, depth: int, *, prompt: bool = False) -> list[str]:
+    """Readable, consistently wrapped content shared by drawing and scrolling."""
+    from .view_artifacts import safe_text
+    body = []
+    fenced = False
+    for raw in safe_text(text).expandtabs(4).splitlines():
+        if raw.startswith("```") and not prompt:
+            fenced = not fenced
+            continue
+        heading = raw.startswith(("# ", "## ", "### "))
+        color = "text"
+        if heading:
+            raw = raw.lstrip("# ")
+            color = "live"
+        elif raw.startswith("$ "):
+            color = "memory"
+        elif raw.startswith("+ "):
+            color = "good"
+        elif raw.startswith("- ") and fenced:
+            color = "bad"
+        elif fenced or raw.startswith("    "):
+            color = "muted"
+        # Split by display columns so wide Unicode does not disappear at the edge.
+        chunks = textwrap.wrap(raw, width=max(10, width - 4),
+                               replace_whitespace=False, drop_whitespace=False) or [""]
+        for chunk in chunks:
+            piece, used = "", 0
+            for char in chunk:
+                size = text_width(char)
+                if used + size > width - 4:
+                    body.append(Line(depth).add("  " + piece, color, bold=heading).finish(width))
+                    piece, used = "", 0
+                piece += char
+                used += size
+            body.append(Line(depth).add("  " + piece, color, bold=heading).finish(width))
+    return body
 
 
 def render(
@@ -402,72 +222,102 @@ def render(
     ascii_only: bool = False,
     details: bool = False,
     interactive: bool = True,
+    panel: str | None = None,
+    artifact_text: str = "",
+    scroll: int = 0,
+    follow: bool = False,
+    new_activity: bool = False,
+    revealing: bool = False,
 ) -> list[str]:
-    """Return exactly ``height`` lines, each exactly ``width`` columns wide."""
-    width = max(40, width)
-    height = max(8, height)
+    """Two screens: agent overview, or one agent's Prompt / Output / Result."""
+    from .view_artifacts import safe_text
+    width, height = max(40, width), max(8, height)
     glyphs = ASCII_GLYPHS if ascii_only else UNICODE_GLYPHS
-    pulse = frame % 4 < 2
-    lines = _header(state, width, depth, glyphs)
     lanes = state.get("lanes") or []
-    status = state.get("status")
-
-    body: list[str] = []
-    if status == "no_runtime":
-        body = [Line(depth).finish(width), _centered("No harness runtime yet. Run `harness setup` first.", width, depth)]
-    elif status == "idle" or not lanes:
-        body = [Line(depth).finish(width), _centered("No lanes yet. Bootstrap and launch a lane to see it here.", width, depth)]
-    elif details:
-        body = _details(lanes[max(0, min(selected, len(lanes) - 1))], width, depth, glyphs, pulse)
+    panel = panel or ("output" if details and lanes else None)
+    lines = []
+    if panel and lanes:
+        lane = lanes[max(0, min(selected, len(lanes) - 1))]
+        lines.append(Line(depth).add(" " + safe_text(str(lane['lane_id'])), "text", bold=True)
+                     .add("  ·  " + safe_text(str(lane.get('label', ''))), "muted").finish(width, bg="bar"))
+        provider = " · ".join(str(lane.get(k) or "") for k in ("provider", "model"))
+        lines.append(Line(depth).add(" " + safe_text(provider), "muted").finish(width))
+        tabs = Line(depth).add(" ")
+        for name in ("prompt", "output", "result"):
+            tabs.add(f" [{name.title()}] " if name == panel else f"  {name.title()}  ", "live" if name == panel else "muted", bold=name == panel,
+                     bg="bar" if name == panel else None)
+        lines.append(tabs.finish(width))
+        lines.append(Line(depth).add(glyphs["rule"] * width, "faint").finish(width))
+        body = artifact_lines(artifact_text, width, depth, prompt=panel == "prompt")
+        room = max(0, height - len(lines) - (1 if interactive else 0))
+        end = max(0, len(body) - room)
+        start = end if follow else min(max(0, scroll), end)
+        lines.extend(body[start:start + room])
+        while len(lines) < height - (1 if interactive else 0):
+            lines.append(Line(depth).finish(width))
+        if interactive:
+            position = ("Live · revealing" if revealing else "Live") if follow else f"{min(start + 1, len(body))}–{min(start + room, len(body))}/{len(body)}"
+            if new_activity:
+                footer = " New activity ↓ · End latest · ↑/↓ scroll · Esc all agents"
+            else:
+                footer = " ←/→ section · ↑/↓ scroll · Esc all agents"
+                if panel == "output":
+                    footer += " · End follow"
+                footer += "  " + position
+            lines.append(Line(depth).add(footer, "muted").finish(width, bg="bar"))
     else:
-        layout = _layout(lanes, width)
-        body.append(_step_header(layout, width, depth))
-        body.append(Line(depth).finish(width))
+        status = state.get("status")
+        title = " AGENTS" + ("  ·  Run complete" if status == "closed" else "")
+        lines.append(Line(depth).add(title, "text", bold=True).finish(width, bg="bar"))
+        counts = _lane_counts(lanes)
+        summary = f" {len(lanes)} agents  ·  {counts['working']} working  ·  {counts['review']} awaiting review  ·  {counts['done']} accepted"
+        if counts['problem']:
+            summary += f"  ·  {counts['problem']} need attention"
+        lines.append(Line(depth).add(summary, "muted").finish(width))
+        lines.append(Line(depth).add(glyphs["rule"] * width, "faint").finish(width))
+        body = []
+        if not lanes:
+            message = "No run yet. Start a harness run to see its agents." if status in ("no_runtime", "idle") else "Preparing agents…"
+            body = [Line(depth).finish(width), _centered(message, width, depth)]
         for index, lane in enumerate(lanes):
-            body.extend(_lane_lines(lane, layout, width, depth, glyphs,
-                                    selected=interactive and index == selected, pulse=pulse))
+            active = index == selected and interactive
+            label = str(lane.get("label", ""))
+            color = {"live": "live", "good": "good", "bad": "bad", "attention": "attention"}.get(lane.get("tone"), "muted")
+            prefix = " > " if active else "   "
+            row = Line(depth).add(prefix, "live").add(safe_text(str(lane['lane_id'])), "text", bold=True)
+            running = status == "open" and (
+                lane.get("lifecycle") in ("running", "resuming")
+                or (lane.get("review_agent") or {}).get("state") == "running"
+                or (lane.get("lifecycle") == "preparing" and NOW in lane.get("steps", []))
+            )
+            pulse = interactive and running and frame % 4 >= 2
+            lamp = ("o" if pulse else "*") if ascii_only else ("◌" if pulse else "●")
+            row.add("  " + lamp + " " + safe_text(label), color, dim=pulse)
+            body.append(row.finish(width, bg="bar" if active else None))
+            lights, labels = Line(depth).add("   "), Line(depth).add("   ")
+            cell_width = max(5, min(13, (width - 6) // len(STEPS)))
+            for stage, code in zip(STEPS, lane.get("steps", [])):
+                stage_color = {DONE: "good", NOW: "live" if running else "attention",
+                               WAIT: "attention", FAIL: "bad", TODO: "faint", SKIP: "faint"}.get(code, "faint")
+                if code == NOW:
+                    lamp = ("ooo" if pulse else "***") if ascii_only else ("○○○" if pulse else "●●●")
+                else:
+                    lamp = {DONE: "###" if ascii_only else "●●●", WAIT: "ooo" if ascii_only else "○○○",
+                            FAIL: "xxx", SKIP: "---", TODO: "..."}.get(code, "...")
+                lights.add(("[" + lamp + "]").center(cell_width), stage_color, bold=True)
+                labels.add(_truncate(stage, cell_width).center(cell_width), stage_color,
+                           bold=code in (NOW, DONE, FAIL))
+            body.extend([lights.finish(width), labels.finish(width)])
+            body.append(Line(depth).add("   " + safe_text(str(lane.get('task') or 'Preparing task…')), "text").finish(width))
+            who = " · ".join(str(lane.get(k)) for k in ("provider", "model") if lane.get(k))
+            body.append(Line(depth).add("   " + safe_text(who), "muted").finish(width))
             body.append(Line(depth).finish(width))
-
-    needs = state.get("needs_you") or []
-    bottom: list[str] = []
-    if needs:
-        bottom.append(Line(depth).add(glyphs["rule"] * width, "faint").finish(width))
-        for item in needs[:3]:
-            row = Line(depth).add(f" {glyphs['flag']} ", "attention", bold=True)
-            lane_id = str(item.get("lane_id") or "runtime")
-            text = str(item["text"])
-            if text.startswith(lane_id + " "):
-                text = text[len(lane_id) + 1:]
-            row.add(lane_id.ljust(max(10, len(lane_id) + 2)), "text", bold=True)
-            row.add(text, "attention")
-            if item.get("age_seconds") is not None:
-                row.add(f" · {_age(item['age_seconds'])}", "muted")
-            if item.get("hint"):
-                row.add(f"   → {item['hint']}", "faint")
-            bottom.append(row.finish(width))
-        if len(needs) > 3:
-            bottom.append(Line(depth).add(f"   +{len(needs) - 3} more", "muted").finish(width))
-    if interactive:
-        footer = Line(depth).add(" ")
-        keys = [("↑↓" if not ascii_only else "up/down", "select"), ("enter", "back" if details else "details"), ("q", "quit")]
-        for index, (key, action) in enumerate(keys):
-            if index:
-                footer.add("   ")
-            footer.add(key, "text", bold=True).add(f" {action}", "muted")
-        if status == "closed":
-            footer.add("   run closed: showing its final state", "good")
-        bottom.append(footer.finish(width, bg="bar"))
-
-    room = height - len(lines) - len(bottom)
-    if len(body) > room:
-        # Keep the selected lane visible: each lane uses three lines after two header lines.
-        start = 0
-        if not details and lanes and status not in ("no_runtime", "idle"):
-            lane_top = 2 + 3 * selected
-            if lane_top + 3 > room:
-                start = min(len(body) - room, lane_top + 3 - room)
-        body = body[start:start + max(0, room)]
-    while len(body) < room:
-        body.append(Line(depth).finish(width))
-    result = (lines + body + bottom)[:height]
+        room = max(0, height - len(lines) - (1 if interactive else 0))
+        start = max(0, min(max(0, len(body) - room), 6 * selected + 6 - room))
+        lines.extend(body[start:start + room])
+        while len(lines) < height - (1 if interactive else 0):
+            lines.append(Line(depth).finish(width))
+        if interactive:
+            lines.append(Line(depth).add(" ↑/↓ select agent   Enter open   q quit", "muted").finish(width, bg="bar"))
+    result = lines[:height]
     return [_asciify(line) for line in result] if ascii_only else result

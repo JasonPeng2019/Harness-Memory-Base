@@ -3,8 +3,8 @@
 The interactive screen uses only the standard library: ANSI escape sequences
 for drawing, ``msvcrt`` for keys on Windows, and ``termios``/``select`` on
 POSIX.  It re-reads runtime records every refresh interval, redraws only the
-lines that changed, and always restores the terminal on exit.  It never
-writes runtime records and is not a harness-managed process.
+lines that changed, and always restores the terminal on exit. It does not change
+lane state; its only bookkeeping is its own viewer process identity. It is not a harness-managed process.
 """
 
 from __future__ import annotations
@@ -14,14 +14,16 @@ import shutil
 import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Iterator, TextIO
 
-from . import view_render, view_state
+from . import view_artifacts, view_render, view_state
+from .view_feed import Feed
 
 VIEW_OK = "VIEW_OK"
 VIEW_CONFIG_INVALID = "VIEW_CONFIG_INVALID"
 
-FRAME_SECONDS = 0.25
+FRAME_SECONDS = 0.05
 DEFAULT_REFRESH_SECONDS = 2.0
 
 _ENTER_SCREEN = "\x1b[?1049h\x1b[?25l\x1b[2J"
@@ -101,7 +103,7 @@ class _Keys:
                 ch = msvcrt.getwch()
                 if ch in ("\x00", "\xe0"):
                     code = msvcrt.getwch()
-                    return {"H": "up", "P": "down"}.get(code)
+                    return {"H": "up", "P": "down", "K": "left", "M": "right", "I": "pageup", "Q": "pagedown", "G": "home", "O": "end"}.get(code)
                 return _map_char(ch)
             time.sleep(0.02)
         return None
@@ -120,7 +122,7 @@ class _Keys:
         if not ready:
             return "escape"
         rest = os.read(sys.stdin.fileno(), 8).decode("utf-8", errors="ignore")
-        return {"[A": "up", "[B": "down", "OA": "up", "OB": "down"}.get(rest[:2], None)
+        return {"[A": "up", "[B": "down", "OA": "up", "OB": "down", "[C": "right", "[D": "left", "[5~": "pageup", "[6~": "pagedown", "[H": "home", "[F": "end", "[1~": "home", "[4~": "end", "OH": "home", "OF": "end"}.get(rest, None)
 
 
 def _map_char(ch: str) -> str | None:
@@ -134,6 +136,12 @@ def _map_char(ch: str) -> str | None:
         return "up"
     if ch in ("j", "J"):
         return "down"
+    if ch == "\t":
+        return "right"
+    if ch == "g":
+        return "home"
+    if ch == "G":
+        return "end"
     return None
 
 
@@ -165,6 +173,10 @@ def run_interactive(
     state = _safe_collect(collect)
     last_collect = time.monotonic()
     selected, details, frame = 0, False, 0
+    panel, scroll, follow = None, 0, False
+    artifact_text, artifact_key, artifact_time = "", None, 0.0
+    feed = Feed()
+    latest_output = ""
     previous: list[str] = []
     previous_size = (0, 0)
     out.write(_ENTER_SCREEN)
@@ -183,9 +195,31 @@ def run_interactive(
                     previous = []
                     previous_size = (width, height)
                     out.write("\x1b[2J")
+                lane = state["lanes"][selected] if lane_count else None
+                key_identity = (lane.get("lane_id"), lane.get("run_id"), panel) if lane else None
+                if panel and lane and (artifact_key != key_identity or now - artifact_time >= refresh_seconds):
+                    opening = artifact_key != key_identity
+                    if panel == "output":
+                        if opening:
+                            feed = Feed(width=max(10, width - 4))
+                        blocks = view_artifacts.output_blocks(lane)
+                        feed.update(blocks, now, immediate=opening)
+                        latest_output = feed.full_text
+                        if opening:
+                            artifact_text = feed.text(now)
+                    else:
+                        artifact_text = view_artifacts.panel_text(lane, panel)
+                    artifact_key, artifact_time = key_identity, now
+                feed.width = max(10, width - 4)
+                if panel == "output" and follow:
+                    artifact_text = feed.text(now)
+                new_activity = panel == "output" and not follow and latest_output != artifact_text
+                frame = int(now / 0.25)  # Keep stage lights at 1 Hz while text draws at 20 Hz.
                 lines = view_render.render(
                     state, width, height, selected=selected, frame=frame,
                     depth=depth, ascii_only=ascii_only, details=details,
+                    panel=panel, artifact_text=artifact_text, scroll=scroll, follow=follow,
+                    new_activity=new_activity, revealing=panel == "output" and follow and feed.revealing,
                 )
                 chunks = [_SYNC_BEGIN]
                 for row, line in enumerate(lines):
@@ -195,19 +229,39 @@ def run_interactive(
                 out.write("".join(chunks))
                 out.flush()
                 previous = lines
-                frame += 1
 
                 key = keys.read(FRAME_SECONDS)
                 if key == "q":
                     break
-                if key == "up":
+                if key == "enter" and lane_count and not panel:
+                    panel, scroll = "output", 0
+                    follow = lane.get("lifecycle") in ("running", "resuming")
+                    artifact_key = None
+                elif key in ("left", "right") and panel:
+                    tabs = ("prompt", "output", "result")
+                    panel = tabs[(tabs.index(panel) + (-1 if key == "left" else 1)) % len(tabs)]
+                    scroll = 0
+                    follow = panel == "output" and lane.get("lifecycle") in ("running", "resuming")
+                    artifact_key = None
+                elif key in ("home", "end") and panel:
+                    scroll, follow = 0, key == "end"
+                    if panel == "output" and key == "end":
+                        feed.finish(time.monotonic())
+                elif key in ("up", "down", "pageup", "pagedown") and panel:
+                    count = len(view_render.artifact_lines(artifact_text, width, 0, prompt=panel == "prompt"))
+                    end = max(0, count - (height - 5))
+                    if follow:
+                        scroll = end
+                    follow = False
+                    amount = max(1, height - 7) if key in ("pageup", "pagedown") else 1
+                    scroll = min(end, max(0, scroll + (-amount if key in ("up", "pageup") else amount)))
+                elif key == "up":
                     selected = max(0, selected - 1)
                 elif key == "down":
                     selected = min(max(0, lane_count - 1), selected + 1)
-                elif key == "enter" and lane_count:
-                    details = not details
                 elif key == "escape":
                     details = False
+                    panel = None
     except KeyboardInterrupt:
         pass
     finally:
@@ -217,6 +271,7 @@ def run_interactive(
 
 def run_view(
     *,
+    runtime_root: str | None = None,
     once: bool = False,
     no_color: bool = False,
     ascii_only: bool = False,
@@ -228,7 +283,7 @@ def run_view(
     try:
         from .config import find_harness_root, load_config
 
-        config = load_config(find_harness_root())
+        rt = Path(runtime_root).expanduser().resolve() if runtime_root else load_config(find_harness_root()).runtime_root
     except Exception as exc:
         return {
             "ok": False,
@@ -237,7 +292,6 @@ def run_view(
             "evidence_paths": [],
             "next_action": "configure the harness, then run `harness setup`",
         }
-    rt = config.runtime_root
 
     def collect() -> dict[str, Any]:
         return view_state.collect_state(rt)
@@ -249,7 +303,7 @@ def run_view(
         width, _ = _terminal_size() if _is_tty(out) else (120, 0)
         lanes = len(state.get("lanes") or [])
         needs = min(3, len(state.get("needs_you") or []))
-        height = 3 + 2 + 3 * max(1, lanes) + (needs + 1 if needs else 0)
+        height = 3 + 6 * max(1, lanes)
         lines = view_render.render(
             state, width, height, depth=depth, ascii_only=ascii_only, interactive=False,
         )
